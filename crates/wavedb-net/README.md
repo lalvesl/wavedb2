@@ -60,9 +60,9 @@ changed" events; the transport decides push vs. piggyback.
 ## Bloom Filter Screen-Sync
 
 State-sync for the **online** read path. Clients keep a Bloom filter of the
-128-bit IDs currently on screen and send it over WebSocket. The owner Quick-Node
-compares it against its live anchor slots and pushes back **only the deltas** —
-new objects, updated anchors, tombstones. Event-driven: every accepted mutation
+128-bit IDs currently on screen and send it over WebSocket. The owner node
+compares it against its live records and pushes back **only the deltas** — new
+objects, updated records, deletions. Event-driven: every accepted mutation
 triggers a notification to subscribers whose filters might match. For clients
 long offline (screen state far behind reality), sending the explicit array of
 on-screen IDs back for revalidation is cheaper than the filter.

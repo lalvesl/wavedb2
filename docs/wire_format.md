@@ -1,9 +1,10 @@
 # WaveDB Wire Format (replaces serde + postcard)
 
 Goal: shrink the WASM binary by deleting serde's generic machinery, and give the
-engine a layout it can reason about statically — every `(struct_id, version)`
-pair has a compile-time-known **stack size** and a heap section whose shape is
-described by the struct's field descriptors.
+engine a layout it can reason about statically. Each `STRUCT_HASH` has a
+compile-time-known **stack size** and a heap section whose shape is described by
+the struct's field descriptors. The layout is defined entirely by `Wire` — no
+`serde`, no `repr(C)`.
 
 ## Layout
 
@@ -63,21 +64,25 @@ Two ways a value nests, and they are different on purpose:
 
 ## Record envelope and the registry header
 
-A top-level record is prefixed with a `u32` header:
+A top-level record is prefixed with its `STRUCT_HASH` (`u64`):
 
 ```
-header = (STRUCT_ID as u24) << 8 | STRUCT_VERSION as u8
-[ u32 header LE ][ stack ][ heap ]
+[ u64 STRUCT_HASH LE ][ stack ][ heap ]
 ```
 
-All nodes (quick, slow, client/WASM) build a **static registry** at compile
-time via the `declare_objects!` macro: one module per `struct_id`, every
-version declared, searchable by the `u32` header. The registry exposes
-`&'static ObjectDescriptor`s — stack size, shape, field table (name, stack
-offset, kind, heapable flag), heap-field name list — so the storage engine can
-locate any field of any declared object without deserialising, organise
-anchors/indexes for `NonUnique`/`NestedNonUnique`, and dispatch statically
-(match on header → monomorphised fn, no `dyn`).
+`STRUCT_HASH` is the compile-time `const` hash of the struct's name, shape, and
+field names/types (see [`wavedb-core`](../crates/wavedb-core/README.md#struct_hash)),
+so it identifies both the type **and** its schema generation — there is no
+separate version byte. On read, comparing the stored `STRUCT_HASH` with the
+reader's compiled head is what drives the lazy migration walk.
+
+All nodes (server and client/WASM) build a **static registry** at compile time
+via the `declare_objects!` macro, searchable by `STRUCT_HASH`. The registry
+exposes `&'static ObjectDescriptor`s — stack size, shape, field table (name,
+stack offset, kind, heapable flag), heap-field name list — so the storage engine
+can locate any field of any declared object without deserialising, organise the
+`Pivot`/`BpTree` indexes for `NonUnique` collections, and dispatch statically
+(match on `STRUCT_HASH` → monomorphised fn, no `dyn`).
 
 ## Trade-offs vs postcard
 
