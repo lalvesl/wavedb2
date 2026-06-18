@@ -10,17 +10,17 @@ straight into the storage engine.
 
 ## Module map
 
-| Module    | Responsibility                                          |
-| --------- | ------------------------------------------------------- |
-| `frame`   | Wire frame encode/decode.                               |
-| `ws`      | WebSocket transport (preferred).                        |
-| `http`    | HTTP POST transport (fallback) + the client queue.     |
-| `notify`  | "object changed" notifications (push / piggyback).     |
-| `browse`  | Live-browse / screen-sync surface.                     |
-| `auth`    | Session auth, HMAC tokens.                              |
+| Module    | Responsibility                                                 |
+| --------- | -------------------------------------------------------------- |
+| `frame`   | Wire frame encode/decode.                                      |
+| `ws`      | WebSocket transport (preferred).                               |
+| `http`    | HTTP POST transport (fallback) + the client queue.             |
+| `notify`  | "object changed" notifications (push / piggyback).             |
+| `browse`  | Live-browse / screen-sync surface.                             |
+| `auth`    | Session auth, HMAC tokens.                                     |
 | `request` | Request/response envelopes (`TransportResponse`, `NodeError`). |
-| `metrics` | Per-node transport metrics.                             |
-| `mock`    | In-process transport for tests.                         |
+| `metrics` | Per-node transport metrics.                                    |
+| `mock`    | In-process transport for tests.                                |
 
 The crate provides a `Transport` trait with concrete WebSocket / HTTP / mock
 implementations; the same operations run on servers, native clients, and (via
@@ -30,11 +30,11 @@ implementations; the same operations run on servers, native clients, and (via
 
 ## Transports
 
-| Transport         | Native | Browser | Notes                                                |
-| ----------------- | ------ | ------- | ---------------------------------------------------- |
-| **WebSocket**     | pref.  | pref.   | Bidirectional, push-capable; carries Bloom sync.     |
+| Transport         | Native | Browser | Notes                                                  |
+| ----------------- | ------ | ------- | ------------------------------------------------------ |
+| **WebSocket**     | pref.  | pref.   | Bidirectional, push-capable; carries Bloom sync.       |
 | **HTTP POST**     | back.  | back.   | When WebSocket is blocked (proxies, restrictive nets). |
-| **Future native** | plan.  | n/a     | Higher-throughput native-only transport, in scoping. |
+| **Future native** | plan.  | n/a     | Higher-throughput native-only transport, in scoping.   |
 
 ### HTTP POST: single-queue with piggybacked notifications
 

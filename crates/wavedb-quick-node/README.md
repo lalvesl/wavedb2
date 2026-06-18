@@ -15,11 +15,11 @@ schema crate the clients compile.
 | ------------- | --------------------------------------------------------------- |
 | `server`      | The `Server` builder — bind, tenant, data_dir, registry, serve. |
 | `serve`       | Request handling loop.                                          |
-| `ring`        | Consistent-hash ring; derives tenant ownership.                |
-| `gossip`      | Membership: `Announce` / `Withdraw`, heartbeat.                |
-| `ownership`   | Tenant ownership scopes (one writer, n replicas).             |
-| `replication` | Post-commit fan-out to the replica set.                        |
-| `config`      | Node configuration.                                            |
+| `ring`        | Consistent-hash ring; derives tenant ownership.                 |
+| `gossip`      | Membership: `Announce` / `Withdraw`, heartbeat.                 |
+| `ownership`   | Tenant ownership scopes (one writer, n replicas).               |
+| `replication` | Post-commit fan-out to the replica set.                         |
+| `config`      | Node configuration.                                             |
 
 ```rust
 Server::bind("0.0.0.0:7700")

@@ -10,17 +10,17 @@ permission refs, the `Wire` serialization trait, and the query expression tree.
 
 ## Module map
 
-| Module       | Responsibility                                                  |
-| ------------ | -------------------------------------------------------------- |
-| `id`         | The 128-bit composite `Id` and its field accessors.            |
-| `metadata`   | `Metadata` — modification chain, authorship, permission ref.   |
-| `migration`  | Migration registry, chain traits, `MigrationChain` read path.  |
-| `permission` | `PermissionRef` shapes.                                        |
+| Module       | Responsibility                                                       |
+| ------------ | -------------------------------------------------------------------- |
+| `id`         | The 128-bit composite `Id` and its field accessors.                  |
+| `metadata`   | `Metadata` — modification chain, authorship, permission ref.         |
+| `migration`  | Migration registry, chain traits, `MigrationChain` read path.        |
+| `permission` | `PermissionRef` shapes.                                              |
 | `wire`       | The `Wire` trait + `WaveWire` (no serde). See `docs/wire_format.md`. |
-| `query`      | `Expr` / `Value` / `Field` query expression tree.             |
-| `registry`   | `ObjectDescriptor` / `ObjectRegistry` lookup by `STRUCT_HASH`. |
-| `traits`     | `WaveDbStruct`, shape markers.                                 |
-| `error`      | Workspace error type.                                          |
+| `query`      | `Expr` / `Value` / `Field` query expression tree.                    |
+| `registry`   | `ObjectDescriptor` / `ObjectRegistry` lookup by `STRUCT_HASH`.       |
+| `traits`     | `WaveDbStruct`, shape markers.                                       |
+| `error`      | Workspace error type.                                                |
 
 ---
 
@@ -32,17 +32,31 @@ significant field**, so a numeric ordering of the `u128` _is_ an ordering by key
 the `BpTree` indexes on.
 
 ```
-[ KEY (u64) | TENANT (u48) | FLAG (1) | SALT (7) | reserved (8) ]
-   MSB ───────────────────────────────────────────────────── LSB
+[ KEY (u64) | TENANT (u48) | FLAG (1) | SALT (15) ]
+   MSB ──────────────────────────────────────── LSB
 ```
 
-| Field      | Type   | Description                                                                                          |
-| ---------- | ------ | ---------------------------------------------------------------------------------------------------- |
-| `KEY`      | `u64`  | `STRUCT_HASH` when `FLAG = 1` (Unique anchor), or a `CREATED_AT` timestamp when `FLAG = 0`.           |
-| `TENANT`   | `u48`  | Owning tenant. `0` reserved for the system; `U48::MAX` for unauthenticated sessions. B2C: = user id. |
-| `FLAG`     | 1 bit  | `1` ⇒ `KEY` is a struct-hash key; `0` ⇒ `KEY` is a `CREATED_AT` timestamp.                            |
-| `SALT`     | 7 bits | Collision breaker within a single `(KEY, TENANT)`: writer supplies a fixed or random value.           |
-| _reserved_ | 8 bits | Unused — see the bit-budget note in the root README's status.                                        |
+| Field    | Type    | Description                                                                                          |
+| -------- | ------- | ---------------------------------------------------------------------------------------------------- |
+| `KEY`    | `u64`   | `STRUCT_HASH` when `FLAG = 1` (Unique anchor), or a `CREATED_AT` timestamp when `FLAG = 0`.          |
+| `TENANT` | `u48`   | Owning tenant. `0` reserved for the system; `U48::MAX` for unauthenticated sessions. B2C: = user id. |
+| `FLAG`   | 1 bit   | `1` ⇒ `KEY` is a struct-hash key; `0` ⇒ `KEY` is a `CREATED_AT` timestamp.                           |
+| `SALT`   | 15 bits | Per-type discriminator + collision breaker (layout below).                                           |
+
+### The `SALT` field (15 bits)
+
+The trailing 15 bits both **disambiguate the struct type** (needed when `KEY` is a
+timestamp, not a struct hash) and **break collisions** within one
+`(KEY, TENANT)`. Layout depends on the shape:
+
+| Shape                          | `SALT[14..0]`                                                |
+| ------------------------------ | ------------------------------------------------------------ |
+| **Unique**                     | `0` (all 15 bits zero — `KEY` already carries the full hash) |
+| **NonUnique / BpTree / Pivot** | `salt(u7)` ‖ `trunc8(STRUCT_HASH)`                           |
+
+`salt` is a fixed or random value the writer supplies; the 8-bit `STRUCT_HASH`
+truncation co-locates same-type records and tells the engine which type a
+timestamp-keyed `Id` belongs to.
 
 ### `CREATED_AT` time base
 
@@ -77,8 +91,9 @@ Folding field names and types into the hash means **any schema change yields a
 new `STRUCT_HASH`**. That is the migration boundary — migration is defined as a
 transform from one `STRUCT_HASH` to another, with no separate version counter.
 
-The low 7 bits of `STRUCT_HASH` (`trunc7`) are reused as the `SALT`/disambiguator
-for NonUnique and BpTree IDs, co-locating same-type records.
+An 8-bit truncation of `STRUCT_HASH` rides in the `SALT` field of every
+timestamp-keyed ID (NonUnique, BpTree, Pivot — see _The `SALT` field_),
+co-locating same-type records and identifying the type when `KEY` is a timestamp.
 
 ---
 
@@ -119,12 +134,12 @@ reconstructs the whole chain at compile time.
 
 ### Neighbour attributes
 
-| Attribute               | Direction | Kind     | Signature / value                              |
-| ----------------------- | --------- | -------- | ---------------------------------------------- |
-| `migrate_from`          | backward  | type     | The predecessor struct.                        |
-| `migrate_from_with`     | backward  | async fn | `async fn<Db>(&Db, Old) -> Result<Self>`       |
-| `migrate_rollback`      | forward   | type     | The successor (this struct receives rollback). |
-| `migrate_rollback_with` | forward   | async fn | `async fn<Db>(&Db, New) -> Result<Self>`       |
+| Attribute               | Direction | Kind     | Signature / value                                                           |
+| ----------------------- | --------- | -------- | --------------------------------------------------------------------------- |
+| `migrate_from`          | backward  | type     | The predecessor struct.                                                     |
+| `migrate_from_with`     | backward  | async fn | `async fn<Db>(&Db, Old) -> Result<Self>`                                    |
+| `migrate_rollback`      | forward   | type     | The successor (this struct receives rollback).                              |
+| `migrate_rollback_with` | forward   | async fn | `async fn<Db>(&Db, New) -> Result<Self>`                                    |
 | `first_try`             | —         | async fn | `async fn<Db>(&Db) -> Result<Option<Old>>` — runs **before** the DB search. |
 | `fallback_not_found`    | —         | async fn | `async fn<Db>(&Db) -> Result<Option<Self>>` — runs **after** a `None`.      |
 
@@ -175,12 +190,12 @@ is compiled in.
 
 Access control is stored **inline in `Metadata`**, scoped per record:
 
-| Value                                  | Semantics                                                | Wire cost |
-| -------------------------------------- | -------------------------------------------------------- | --------- |
-| `None`                                 | Tenant-only — the owning tenant's users (common case).   | 1 byte    |
-| `Some(PermissionRef::Public)`          | World-readable.                                          | 1 byte    |
-| `Some(PermissionRef::Tenants(list))`   | A specific list of other tenant ids.                    | 1 + list  |
-| `Some(PermissionRef::Group(group_id))` | Reference to a shared permission group _(deferred)_.     | 1 + ref   |
+| Value                                  | Semantics                                              | Wire cost |
+| -------------------------------------- | ------------------------------------------------------ | --------- |
+| `None`                                 | Tenant-only — the owning tenant's users (common case). | 1 byte    |
+| `Some(PermissionRef::Public)`          | World-readable.                                        | 1 byte    |
+| `Some(PermissionRef::Tenants(list))`   | A specific list of other tenant ids.                   | 1 + list  |
+| `Some(PermissionRef::Group(group_id))` | Reference to a shared permission group _(deferred)_.   | 1 + ref   |
 
 A grant is what lets a user of one tenant act on another tenant's data; without
 it, tenants never see each other's records.

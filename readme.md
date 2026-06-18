@@ -138,17 +138,21 @@ the **key**, so a numeric sort of the `u128` is a sort by key — which for
 timestamp-keyed records is a chronological order, ideal for the `BpTree`.
 
 ```
-[ KEY (u64) | TENANT (u48) | FLAG (1) | SALT (7) | reserved (8) ]
-   MSB ───────────────────────────────────────────────────── LSB
+[ KEY (u64) | TENANT (u48) | FLAG (1) | SALT (15) ]
+   MSB ──────────────────────────────────────── LSB
 ```
 
-| Field      | Width  | Meaning                                                                                            |
-| ---------- | ------ | -------------------------------------------------------------------------------------------------- |
-| `KEY`      | `u64`  | Either a `STRUCT_HASH` (Unique) **or** a `CREATED_AT` timestamp — disambiguated by `FLAG`.         |
-| `TENANT`   | `u48`  | Owning tenant. For B2C this is the user id.                                                        |
-| `FLAG`     | 1 bit  | `1` ⇒ `KEY` is a struct-hash key (Unique anchor); `0` ⇒ `KEY` is a `CREATED_AT` timestamp.         |
-| `SALT`     | 7 bits | Collision breaker within one `(KEY, TENANT)` — a fixed value or random bits chosen by the writer.  |
-| _reserved_ | 8 bits | Currently unused (see the bit-budget note at the bottom).                                          |
+| Field    | Width   | Meaning                                                                                    |
+| -------- | ------- | ------------------------------------------------------------------------------------------ |
+| `KEY`    | `u64`   | Either a `STRUCT_HASH` (Unique) **or** a `CREATED_AT` timestamp — disambiguated by `FLAG`. |
+| `TENANT` | `u48`   | Owning tenant. For B2C this is the user id.                                                |
+| `FLAG`   | 1 bit   | `1` ⇒ `KEY` is a struct-hash key (Unique anchor); `0` ⇒ `KEY` is a `CREATED_AT` timestamp. |
+| `SALT`   | 15 bits | Per-type discriminator + collision breaker — see below.                                    |
+
+The 15-bit `SALT` is shape-dependent: **Unique** = `0`; every timestamp-keyed
+shape (**NonUnique / BpTree / Pivot**) = `salt(u7) ‖ trunc8(STRUCT_HASH)`. The
+8-bit truncated hash co-locates same-type records and identifies the type when
+`KEY` is a timestamp.
 
 **`CREATED_AT` is nanosecond precision** measured from a fixed WaveDB epoch
 (a constant Rust instant), so the 64-bit timestamp orders records finely; `SALT`
@@ -174,12 +178,12 @@ separate "struct id + numeric version" is gone: you migrate **from one
 
 ### Base data types
 
-| Type         | Declared as          | Cardinality                                | ID layout (`KEY · TENANT · FLAG · SALT`)               |
-| ------------ | -------------------- | ------------------------------------------ | ------------------------------------------------------ |
-| **Unique**   | `#[wavedb]` (default)| Exactly one live record per tenant         | `STRUCT_HASH · TENANT · 1(key) · 0`                    |
-| **NonUnique**| `#[wavedb(NonUnique)]`| Many per tenant; may nest in other NonUnique | `CREATED_AT · TENANT · 0(created_at) · trunc7(STRUCT_HASH)` |
-| **Pivot**    | auto-generated       | One per NonUnique collection (the handle)  | `CREATED_AT · TENANT · 0 · STRUCT_HASH(of the Pivot type)` |
-| **BpTree**   | auto-generated       | Index nodes addressing a collection        | `CREATED_AT · TENANT · 0 · trunc7(STRUCT_HASH of BpTree)` |
+| Type          | Declared as            | Cardinality                                  | ID layout (`KEY · TENANT · FLAG · SALT`)                |
+| ------------- | ---------------------- | -------------------------------------------- | ------------------------------------------------------- |
+| **Unique**    | `#[wavedb]` (default)  | Exactly one live record per tenant           | `STRUCT_HASH · TENANT · 1 · 0`                          |
+| **NonUnique** | `#[wavedb(NonUnique)]` | Many per tenant; may nest in other NonUnique | `CREATED_AT · TENANT · 0 · salt7‖trunc8(STRUCT_HASH)` |
+| **Pivot**     | auto-generated         | One per NonUnique collection (the handle)    | `CREATED_AT · TENANT · 0 · salt7‖trunc8(STRUCT_HASH)`   |
+| **BpTree**    | auto-generated         | Index nodes addressing a collection          | `CREATED_AT · TENANT · 0 · salt7‖trunc8(STRUCT_HASH)` |
 
 **Unique** is the default — the everyday "one record per tenant" object:
 
@@ -194,7 +198,7 @@ pub struct AboutUser {
 ```
 
 Its single live record sits at a **directly computable anchor address**
-(`STRUCT_HASH · TENANT · key · 0`), so a read is one lookup with no index walk.
+(`STRUCT_HASH · TENANT · 1 · 0`), so a read is one lookup with no index walk.
 
 **NonUnique** objects exist many times within a tenant and may nest recursively
 inside other NonUnique objects. A collection is referenced through a **`PivotId`**
@@ -249,12 +253,12 @@ timeline is walkable. Deleted NonUnique records live on in the dead `BpTree`.
 
 Access control is stored inline in each record's `Metadata`, scoped per record:
 
-| Setting          | Who can access                                           |
-| ---------------- | -------------------------------------------------------- |
-| **Tenant-only**  | Only the owning tenant's users (the common case).        |
-| **Public**       | World-readable.                                          |
-| **Tenant list**  | A specific list of other tenants.                        |
-| **Group**        | A shared permission group _(deferred — not implemented)_. |
+| Setting         | Who can access                                            |
+| --------------- | --------------------------------------------------------- |
+| **Tenant-only** | Only the owning tenant's users (the common case).         |
+| **Public**      | World-readable.                                           |
+| **Tenant list** | A specific list of other tenants.                         |
+| **Group**       | A shared permission group _(deferred — not implemented)_. |
 
 This is the mechanism by which a user of one tenant can act on another tenant's
 data: the data's owner grants it.
@@ -313,16 +317,16 @@ The full client API and object lifecycle live in
 
 ## Crate map
 
-| Crate | What it owns | Read for |
-| ----- | ------------ | -------- |
-| [`wavedb`](crates/wavedb/README.md) | Client `Db` handle, typed CRUD, query surface | Quickstart, entry points, object lifecycle |
-| [`wavedb-core`](crates/wavedb-core/README.md) | `Id`, `Metadata`, `STRUCT_HASH`, migrations, permissions, query tree, wire | ID layout, struct-hash identity, **migrations** |
-| [`wavedb-macros`](crates/wavedb-macros/README.md) | `#[wavedb]`, `declare_objects!`, auto-generated `Pivot`/`BpTree` | Object declaration, `STRUCT_HASH` derivation, validate/preprocess |
-| [`wavedb-storage`](crates/wavedb-storage/README.md) | The per-node engine | **Block manager, per-`STRUCT_HASH` page directory, linear hashing**, pages, dictionaries, journal + cache pipeline |
-| [`wavedb-quick-node`](crates/wavedb-quick-node/README.md) | Serving/storage node | Tenant write-ownership ring, replication, routing/failover, node-side validation |
-| [`wavedb-slow-node`](crates/wavedb-slow-node/README.md) | Cold/history tier | _Deferred for now_ |
-| [`wavedb-net`](crates/wavedb-net/README.md) | Transport | WebSocket / HTTP queue, Bloom screen-sync |
-| [`wavedb-wasm`](crates/wavedb-wasm/README.md) | Browser client | IndexedDB key→value storage (no pages, no journal) |
+| Crate                                                     | What it owns                                                               | Read for                                                                                                           |
+| --------------------------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| [`wavedb`](crates/wavedb/README.md)                       | Client `Db` handle, typed CRUD, query surface                              | Quickstart, entry points, object lifecycle                                                                         |
+| [`wavedb-core`](crates/wavedb-core/README.md)             | `Id`, `Metadata`, `STRUCT_HASH`, migrations, permissions, query tree, wire | ID layout, struct-hash identity, **migrations**                                                                    |
+| [`wavedb-macros`](crates/wavedb-macros/README.md)         | `#[wavedb]`, `declare_objects!`, auto-generated `Pivot`/`BpTree`           | Object declaration, `STRUCT_HASH` derivation, validate/preprocess                                                  |
+| [`wavedb-storage`](crates/wavedb-storage/README.md)       | The per-node engine                                                        | **Block manager, per-`STRUCT_HASH` page directory, linear hashing**, pages, dictionaries, journal + cache pipeline |
+| [`wavedb-quick-node`](crates/wavedb-quick-node/README.md) | Serving/storage node                                                       | Tenant write-ownership ring, replication, routing/failover, node-side validation                                   |
+| [`wavedb-slow-node`](crates/wavedb-slow-node/README.md)   | Cold/history tier                                                          | _Deferred for now_                                                                                                 |
+| [`wavedb-net`](crates/wavedb-net/README.md)               | Transport                                                                  | WebSocket / HTTP queue, Bloom screen-sync                                                                          |
+| [`wavedb-wasm`](crates/wavedb-wasm/README.md)             | Browser client                                                             | IndexedDB key→value storage (no pages, no journal)                                                                 |
 
 Tooling: `wavedb-examples`, `wavedb-bench`, `wavedb-test-cluster`,
 `wavedb-monitor`, `wavedb-monitor-gui`.

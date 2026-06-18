@@ -10,23 +10,23 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 
 ## Module map
 
-| Module        | Responsibility                                                            |
-| ------------- | ------------------------------------------------------------------------- |
-| `block`       | `BlockFile` / block allocator — alloc/free/coalesce runs of 4 KiB blocks. |
-| `directory`   | The per-`STRUCT_HASH` `Vec<u64>` page directory + linear hashing.         |
-| `page`        | Page format + the `PageFormat` derive trait (crc32, id list, blob).       |
-| `dictionary`  | Per-`STRUCT_HASH` compression dictionary + its block run.                 |
-| `pipeline`    | Journal, in-memory `BTreeMap` cache, background settle + rebalance.       |
-| `node_storage`| Top-level façade tying the files together for a node.                     |
+| Module         | Responsibility                                                            |
+| -------------- | ------------------------------------------------------------------------- |
+| `block`        | `BlockFile` / block allocator — alloc/free/coalesce runs of 4 KiB blocks. |
+| `directory`    | The per-`STRUCT_HASH` `Vec<u64>` page directory + linear hashing.         |
+| `page`         | Page format + the `PageFormat` derive trait (crc32, id list, blob).       |
+| `dictionary`   | Per-`STRUCT_HASH` compression dictionary + its block run.                 |
+| `pipeline`     | Journal, in-memory `BTreeMap` cache, background settle + rebalance.       |
+| `node_storage` | Top-level façade tying the files together for a node.                     |
 
 ---
 
 ## Two storage targets
 
-| Target            | Backing store                          | Journal           |
-| ----------------- | -------------------------------------- | ----------------- |
-| **Native**        | Filesystem `data.bin` (+ block runs)   | `journal` file    |
-| **Web (wasm32)**  | IndexedDB directly (key→value)         | **not needed**    |
+| Target           | Backing store                        | Journal        |
+| ---------------- | ------------------------------------ | -------------- |
+| **Native**       | Filesystem `data.bin` (+ block runs) | `journal` file |
+| **Web (wasm32)** | IndexedDB directly (key→value)       | **not needed** |
 
 Everything in this crate describes the **native** engine. The browser owns no
 physical layout — IndexedDB is already an ordered key→value store — so the WASM
@@ -60,20 +60,20 @@ descriptor** pointing at one homogeneous page (a run of blocks holding records o
 exactly that `STRUCT_HASH`). One `Vec<u64>` per type, so unrelated types never
 share a page and each page compresses against one tight dictionary.
 
-### Page descriptor (`u64`)
+### Block descriptor (`u64`) — one format everywhere
 
-| Bits   | Field         | Width | Meaning                                                            |
-| ------ | ------------- | ----- | ------------------------------------------------------------------ |
-| 63..18 | `start_block` | `u46` | Index of the page's first 4 KiB block in `data.bin` (≈ 256 PiB).   |
-| 17..6  | `block_count` | `u12` | Contiguous blocks the page occupies (1 ≤ n ≤ 4095 ⇒ ≤ ~16 MiB).    |
-| 5..0   | `occupation`  | `u6`  | Coarse fill gauge in 1/64ths (0 = empty, 63 = full).               |
+Pages (for every `STRUCT_HASH`) **and** dictionary runs share a single 64-bit
+descriptor — there is no second format:
 
-> Bit-budget note: `u48 + u12 + u6 = 66` overflows a `u64`, so `start_block` is
-> trimmed to **`u46`** (still 2⁴⁶ × 4 KiB ≈ 256 PiB per file) to keep the
-> descriptor a single word. Confirm or re-balance these widths.
+| Bits   | Field         | Width | Meaning                                                         |
+| ------ | ------------- | ----- | --------------------------------------------------------------- |
+| 63..24 | `start_block` | `u40` | First 4 KiB block in `data.bin` (2⁴⁰ × 4 KiB ≈ **4 PiB**/file). |
+| 23..4  | `block_count` | `u20` | Contiguous blocks (1 ≤ n ≤ 2²⁰ ⇒ ≤ **~4 GiB** per page/run).    |
+| 3..0   | `occupation`  | `u4`  | Coarse fill gauge in 1/16ths (0 = empty, 15 = full).            |
 
-`occupation` is a cached summary the directory can read **without touching the
-page** — enough to decide "this page must grow / split" from the directory alone.
+`40 + 20 + 4 = 64` — exact fit. `occupation` is a cached summary the directory
+can read **without touching the page** — enough to decide "this page must grow /
+split" from the directory alone.
 
 ### Linear hashing (not `%`)
 
@@ -127,10 +127,10 @@ pub fn split_next(&mut self, file: &BlockFile) -> StorageResult<()> {
 
 ### Two kinds of growth
 
-| Growth          | Trigger                                  | Cost                                                                                                         |
-| --------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| **Page grow**   | a bucket's `occupation` crosses the limit | allocate a larger run, copy the page, free the old run, rewrite **one** descriptor. No keys move.            |
-| **Bucket split**| the warning limit trips                  | `split_next` splits one bucket by the next hash bit and appends one directory slot. Scoped to one type, one bucket. |
+| Growth           | Trigger                                   | Cost                                                                                                                |
+| ---------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| **Page grow**    | a bucket's `occupation` crosses the limit | allocate a larger run, copy the page, free the old run, rewrite **one** descriptor. No keys move.                   |
+| **Bucket split** | the warning limit trips                   | `split_next` splits one bucket by the next hash bit and appends one directory slot. Scoped to one type, one bucket. |
 
 **Page grow is the cheap, common case** — relocate one contiguous run to a bigger
 hole, patch one pointer. Growing the page in place lets writes proceed **without
@@ -172,12 +172,12 @@ The `PageFormat` trait also owns the **management of the `Vec<u64>` directory** 
 calling the block manager to allocate/free runs and driving the `Wire`
 serialize/deserialize. Page kinds:
 
-| Kind        | What the blob holds                                                       |
-| ----------- | ------------------------------------------------------------------------- |
-| **Unique**  | The single live record per tenant at its fixed anchor address.            |
-| **NonUnique**| The collection's records (timestamp-keyed).                              |
-| **Pivot**   | Collection handles: `counter`, `current`/`dead` BpTree pointers.          |
-| **BpTree**  | B+tree index nodes — record addresses, not record bytes.                  |
+| Kind          | What the blob holds                                              |
+| ------------- | ---------------------------------------------------------------- |
+| **Unique**    | The single live record per tenant at its fixed anchor address.   |
+| **NonUnique** | The collection's records (timestamp-keyed).                      |
+| **Pivot**     | Collection handles: `counter`, `current`/`dead` BpTree pointers. |
+| **BpTree**    | B+tree index nodes — record addresses, not record bytes.         |
 
 ---
 
@@ -186,13 +186,9 @@ serialize/deserialize. Page kinds:
 Because a page holds exactly one `STRUCT_HASH`, each type has **one dictionary**
 with nothing foreign to dilute it. A dictionary is its own struct, stored in
 `data.bin` in block runs handed out by the block manager and tracked by a small
-**dictionary directory** whose entries are:
-
-```
-Vec< u64 = (u48 block_position, u16 block_count) >
-```
-
-(`48 + 16 = 64`, exact fit.) Page headers reference the dictionary they were
+**dictionary directory** — a `Vec<u64>` using the **same block descriptor** as
+the page directory (`u40 start · u20 count · u4 occupation`), so allocator and
+directory code is shared. Page headers reference the dictionary they were
 compressed with so pages stay readable across a dictionary rebuild; a superseded
 dictionary run is freed once no live page references it. Variable-length heap
 values (strings/blobs) are additionally zstd-compressed. CPU is free here — there
@@ -227,7 +223,7 @@ On startup the directories and the block allocator rebuild by **journal replay**
 
 ## Operations on records
 
-- **Unique** — `get` resolves the fixed anchor (`STRUCT_HASH · TENANT · key · 0`)
+- **Unique** — `get` resolves the fixed anchor (`STRUCT_HASH · TENANT · 1 · 0`)
   in one lookup. `save` writes the new live bytes to the anchor and chains the
   previous version into history via `Metadata`.
 - **NonUnique** — `insert` / `update` / `delete` each revalidate the `Pivot`'s
@@ -248,10 +244,10 @@ On startup the directories and the block allocator rebuild by **journal replay**
 
 ## Configuration (initial)
 
-| Parameter             | Description                                                       | Default      |
-| --------------------- | ----------------------------------------------------------------- | ------------ |
-| `block_size`          | Allocation unit; a page is `block_count` of these                 | 4 KiB        |
-| `first_page_size`     | Size of the first page / directory bucket                         | 16 KiB       |
-| `max_blocks_per_page` | Ceiling on one page's run (`block_count` is `u12`)                | 4095 (~16 MiB) |
-| `warning_limit`       | Fill level that triggers a background `split_next`                | tunable      |
-| `cache_budget`        | RAM budget for the `BTreeMap` write/read cache                    | tunable      |
+| Parameter             | Description                                        | Default        |
+| --------------------- | -------------------------------------------------- | -------------- |
+| `block_size`          | Allocation unit; a page is `block_count` of these  | 4 KiB          |
+| `first_page_size`     | Size of the first page / directory bucket          | 16 KiB         |
+| `max_blocks_per_page` | Ceiling on one page's run (`block_count` is `u20`) | 2²⁰−1 (~4 GiB) |
+| `warning_limit`       | Fill level that triggers a background `split_next` | tunable        |
+| `cache_budget`        | RAM budget for the `BTreeMap` write/read cache     | tunable        |

@@ -5,8 +5,9 @@ code exists yet. Build order, roughly bottom-up:
 
 ## Foundations (`wavedb-core` + `wavedb-macros`)
 
-- `Id` (128-bit: `KEY · TENANT · FLAG · SALT`) with accessors; decide the 8
-  reserved low bits (see bit-budget note below);
+- `Id` (128-bit: `KEY u64 · TENANT u48 · FLAG 1 · SALT 15`) with accessors +
+  per-shape `SALT` packing (Unique `0`; NonUnique/BpTree/Pivot
+  `salt7‖trunc8(STRUCT_HASH)`);
 - `STRUCT_HASH` const computed from `name + shape + field names + field types`;
 - `Metadata` (modification chain, user, device, permission) — **no version
   field**;
@@ -22,13 +23,13 @@ code exists yet. Build order, roughly bottom-up:
 ## Storage engine (`wavedb-storage`)
 
 - block manager: alloc/free/coalesce/truncate runs of 4 KiB blocks, journaled;
-- per-`STRUCT_HASH` `Vec<u64>` page directory; page descriptor packing
-  (`u46 start · u12 count · u6 occupation`);
+- per-`STRUCT_HASH` `Vec<u64>` page directory; one block descriptor
+  (`u40 start · u20 count · u4 occupation`) shared by pages **and** dictionary;
 - **linear hashing** (`index` / `split_next`), 16 KiB first page, grow-in-place +
   background `split_next`;
 - `PageFormat` derive trait per page kind (Unique / NonUnique / Pivot / BpTree):
   `crc32 + STRUCT_HASH + id-list + blob`, `Wire` ser/deser;
-- per-`STRUCT_HASH` dictionaries + dictionary directory (`u48 pos · u16 count`);
+- per-`STRUCT_HASH` dictionaries + dictionary directory (same block descriptor);
 - write pipeline: journal-first → in-memory `BTreeMap<Id>` cache → background
   settle → background rebalance; journal replay on startup.
 
@@ -56,12 +57,12 @@ code exists yet. Build order, roughly bottom-up:
 - offline-first reconciliation;
 - richer async server-side functions (DB-access hooks) for full-stack backends.
 
-## Open questions / to confirm
+## Resolved bit budgets
 
-- **ID bit budget:** `KEY u64 + TENANT u48 + FLAG 1 + SALT 7 = 120` bits; 8 low
-  bits currently reserved. Confirm (extend `SALT`? add a field?).
-- **Page descriptor:** `u48 + u12 + u6 = 66` overflows `u64`; `start_block`
-  trimmed to `u46` (still ~256 PiB). Confirm or re-balance widths.
+- **ID** = `KEY u64 + TENANT u48 + FLAG 1 + SALT 15 = 128`. No reserved bits.
+- **Block descriptor** = `start u40 + count u20 + occupation u4 = 64`
+  (~4 PiB/file, ~4 GiB/page, 1/16th occupation). One format for pages **and**
+  dictionary.
 
 # DOING
 

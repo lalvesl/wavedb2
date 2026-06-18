@@ -10,17 +10,17 @@ compile this crate.
 
 ## Module map
 
-| Module       | Responsibility                                                |
-| ------------ | ------------------------------------------------------------- |
-| `lib`        | The `#[wavedb]` and `declare_objects!` entry points.          |
-| `args`       | Parse `#[wavedb(...)]` attribute arguments.                   |
-| `struct_hash`| Compute the `STRUCT_HASH: u64` const from name/shape/fields.  |
-| `descriptor` | Emit `ObjectDescriptor` (field offsets, heapable flags, names). |
-| `wire_derive`| `WaveWire` — the no-serde, no-`repr(C)` `Wire` impl.          |
-| `generated`  | Auto-emit the per-NonUnique `Pivot` + `BpTree` types.         |
-| `crud`       | Generated accessors / CRUD glue.                              |
-| `declare`    | `declare_objects!` registry codegen.                          |
-| `codegen` / `utils` | Shared emit helpers.                                   |
+| Module              | Responsibility                                                  |
+| ------------------- | --------------------------------------------------------------- |
+| `lib`               | The `#[wavedb]` and `declare_objects!` entry points.            |
+| `args`              | Parse `#[wavedb(...)]` attribute arguments.                     |
+| `struct_hash`       | Compute the `STRUCT_HASH: u64` const from name/shape/fields.    |
+| `descriptor`        | Emit `ObjectDescriptor` (field offsets, heapable flags, names). |
+| `wire_derive`       | `WaveWire` — the no-serde, no-`repr(C)` `Wire` impl.            |
+| `generated`         | Auto-emit the per-NonUnique `Pivot` + `BpTree` types.           |
+| `crud`              | Generated accessors / CRUD glue.                                |
+| `declare`           | `declare_objects!` registry codegen.                            |
+| `codegen` / `utils` | Shared emit helpers.                                            |
 
 ---
 
@@ -61,10 +61,10 @@ call site.
 
 ## Data shapes
 
-| Marker (none = Unique)       | Cardinality per tenant                       | ID `KEY`            |
-| ---------------------------- | -------------------------------------------- | ------------------- |
-| _(default)_ **Unique**       | Exactly one live record per tenant           | `STRUCT_HASH` (anchor) |
-| `NonUnique`                  | Many per tenant; may nest in other NonUnique | `CREATED_AT`        |
+| Marker (none = Unique) | Cardinality per tenant                       | ID `KEY`               |
+| ---------------------- | -------------------------------------------- | ---------------------- |
+| _(default)_ **Unique** | Exactly one live record per tenant           | `STRUCT_HASH` (anchor) |
+| `NonUnique`            | Many per tenant; may nest in other NonUnique | `CREATED_AT`           |
 
 ```rust
 #[wavedb(NonUnique)]
@@ -111,9 +111,11 @@ pub struct UserInterestedFruits {
 
 > The generated `Pivot`/`BpTree` types share a name and field shape across
 > families, so their `STRUCT_HASH` may collide. That is harmless — they are only
-> ever addressed within their own tenant/collection context. The Pivot's own ID
-> carries the full `STRUCT_HASH` of the generated type; the BpTree's carries the
-> truncated 7 bits.
+> ever addressed within their own tenant/collection context. Both are
+> timestamp-keyed, so an 8-bit `STRUCT_HASH` truncation rides in the `Id`'s
+> `SALT` — `salt7 ‖ trunc8(STRUCT_HASH)`, the same packing every timestamp-keyed
+> shape uses (see
+> [`wavedb-core`](../wavedb-core/README.md#the-salt-field-15-bits)).
 
 ---
 
@@ -127,10 +129,10 @@ monomorphised fn table (no `dyn`, no async in the WASM binary):
 pub struct Payment { pub amount_cents: u64, pub currency: String }
 ```
 
-| Hook         | Client (pre-send)              | Node (pre-commit)                         | Purpose                       |
-| ------------ | ------------------------------ | ----------------------------------------- | ----------------------------- |
-| `validate`   | ✓ — typed error, zero round-trip | ✓ — the security boundary               | invariant checks              |
-| `preprocess` | ✗                              | ✓ — re-encoded result is what's committed | normalisation, derived fields |
+| Hook         | Client (pre-send)                | Node (pre-commit)                         | Purpose                       |
+| ------------ | -------------------------------- | ----------------------------------------- | ----------------------------- |
+| `validate`   | ✓ — typed error, zero round-trip | ✓ — the security boundary                 | invariant checks              |
+| `preprocess` | ✗                                | ✓ — re-encoded result is what's committed | normalisation, derived fields |
 
 The node runs `validate` **before** `preprocess`. Hooks are synchronous and
 pure; hook-less types skip decode entirely via compile-time `HAS_VALIDATE` /

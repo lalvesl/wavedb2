@@ -10,12 +10,12 @@ browsers.
 
 ## Entry points
 
-| Mode                                        | Storage location               | Tenant model                |
-| ------------------------------------------- | ------------------------------ | --------------------------- |
-| `Db::open(url, path, user)`                 | Local file at `path`           | `tenant = user_id`          |
-| `Db::open(url, path, user, default_tenant)` | Local file at `path`           | Tenant explicit (companies) |
-| `Db::open(url, user, default_tenant)`       | Browser IndexedDB (WASM)       | Tenant explicit             |
-| `Db::open(url, user)`                       | Browser IndexedDB (WASM)       | `tenant = user_id`          |
+| Mode                                        | Storage location         | Tenant model                |
+| ------------------------------------------- | ------------------------ | --------------------------- |
+| `Db::open(url, path, user)`                 | Local file at `path`     | `tenant = user_id`          |
+| `Db::open(url, path, user, default_tenant)` | Local file at `path`     | Tenant explicit (companies) |
+| `Db::open(url, user, default_tenant)`       | Browser IndexedDB (WASM) | Tenant explicit             |
+| `Db::open(url, user)`                       | Browser IndexedDB (WASM) | `tenant = user_id`          |
 
 `url` resolves to the cluster's front door; the request is redirected to the
 Quick-Node owning the user's tenant, and the **backup** Quick-Node URL is

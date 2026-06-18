@@ -130,4 +130,4 @@ M1 (schema) ─► M2 (storage) ─► M3 (node) ─► M4 (typed E2E) ─► M7
 | Registry statics bloat the wasm binary as schemas grow            | M5 measures per-struct cost early; descriptors are `'static` data, dictionary-compressible by `wasm-opt`. |
 | `Expr` evaluation against wire bytes needs heap-field comparisons | Stack-only predicates first; heap predicates decode one field via descriptor offset. Phase the work.      |
 | Runtime abstraction (tokio vs wasm) leaks into public API         | Keep it internal to `wavedb`/`wavedb-net`; public API stays `async fn`.                                   |
-| ID / page-descriptor bit budgets (reserved bits, `u46` trim)      | Resolve before the `Id` and directory types are locked in M1/M2 (see `todo.md` open questions).           |
+| ID / block-descriptor bit budgets                                 | Resolved: `Id` = `KEY u64·TENANT u48·FLAG 1·SALT 15`; descriptor `u40·u20·u4` (pages + dictionary).       |
