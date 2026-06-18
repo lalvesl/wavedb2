@@ -16,8 +16,8 @@ code exists yet. Build order, roughly bottom-up:
 - `#[wavedb]` macro: shapes `Unique` (default) / `NonUnique`; auto-generate
   `Pivot` + `BpTree`; `PivotId` field references for nesting;
 - `declare_objects!` registry keyed by `STRUCT_HASH`;
-- migration between struct hashes (`migrate_from`/`migrate_rollback` + chain
-  traits), lazy upgrade on read;
+- schema-evolution hooks: `first_try` (pre-search) + `fallback_not_found`
+  (post-miss). No migration chains;
 - permissions: tenant-only / public / tenant-list (group deferred).
 
 ## Storage engine (`wavedb-storage`)

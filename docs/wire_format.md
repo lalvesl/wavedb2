@@ -73,8 +73,9 @@ A top-level record is prefixed with its `STRUCT_HASH` (`u64`):
 `STRUCT_HASH` is the compile-time `const` hash of the struct's name, shape, and
 field names/types (see [`wavedb-core`](../crates/wavedb-core/README.md#struct_hash)),
 so it identifies both the type **and** its schema generation — there is no
-separate version byte. On read, comparing the stored `STRUCT_HASH` with the
-reader's compiled head is what drives the lazy migration walk.
+separate version byte. On read, a stored `STRUCT_HASH` that differs from the
+reader's compiled head simply means a different type; bridging it is the
+application's job via the `first_try` / `fallback_not_found` hooks.
 
 All nodes (server and client/WASM) build a **static registry** at compile time
 via the `declare_objects!` macro, searchable by `STRUCT_HASH`. The registry

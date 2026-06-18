@@ -28,9 +28,9 @@ compile this crate.
 
 1. **Computes `STRUCT_HASH: u64`.** A `const` hash of
    `STRUCT_NAME + SHAPE + each PROPERTY_NAME + each PROPERTY_TYPE`. Because field
-   names and types are folded in, **any schema change changes the hash** — which
-   is exactly the migration boundary. There is **no `version =` attribute and no
-   version-from-type-name rule** anymore; identity is the hash.
+   names and types are folded in, **any schema change changes the hash** — a
+   changed struct is simply a different type. There is **no `version =` attribute
+   and no version-from-type-name rule** anymore; identity is the hash.
 2. **Implements `Id` + `Metadata` accessors.** `.tenant_id()`, `.key()`,
    `.created_at()`, `.struct_hash()`, plus full `Metadata` getters/setters — no
    call-site boilerplate.
@@ -40,8 +40,9 @@ compile this crate.
    compiler's struct representation.
 4. **Generates the collection machinery for `NonUnique`** — a `Pivot` type and a
    `BpTree` type (below).
-5. **Declares migrations inline** — see [`wavedb-core`](../wavedb-core/README.md#migrations)
-   for the neighbour model, chain traits, and `first_try`/`fallback_not_found`.
+5. **Wires up the schema-evolution hooks** — the optional `first_try` /
+   `fallback_not_found` functions; see
+   [`wavedb-core`](../wavedb-core/README.md#schema-evolution--lookup-hooks).
 
 ```rust
 #[wavedb]                       // Unique by default
@@ -53,7 +54,7 @@ pub struct AboutUser {
 }
 ```
 
-All `#[wavedb]` structs serialize through WaveDB's own `Wire` format; migration
+All `#[wavedb]` structs serialize through WaveDB's own `Wire` format; the hook
 fns are generic over `Db` so the macro's `__WaveDbDb` parameter resolves at the
 call site.
 

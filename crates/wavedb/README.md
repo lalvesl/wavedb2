@@ -66,8 +66,8 @@ order.delete(&db).await?;
 
 ## Everything is `async`
 
-Every public API on `Db`, every storage actor, every migration is `async` end to
-end — no blocking IO surface, no hidden thread-pool dispatch. Native runs on
+Every public API on `Db`, every storage actor, every evolution hook is `async`
+end to end — no blocking IO surface, no hidden thread-pool dispatch. Native runs on
 Tokio; the browser on `wasm_bindgen_futures`. The public API is identical.
 
 ## Unauthenticated sessions

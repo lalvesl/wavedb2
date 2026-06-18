@@ -23,10 +23,11 @@ Four properties define it:
 3. **Timeline / history as a first-class citizen.** Saving never destroys the
    old bytes — every modification is tracked so you can navigate a record's
    timeline and read its past states.
-4. **Lazy migration between schema versions.** Clients, servers, and nodes can
-   run different builds at once. Old data is migrated _on read_, in the
-   background — product evolution never blocks the DB, and yesterday's data
-   never needs a backup-and-restore migration step.
+4. **Schema evolution by `STRUCT_HASH`.** A struct's identity is a hash of its
+   shape, so changing it just makes a new type; clients, servers, and nodes can
+   run different builds at once. Bridging old and new data is done with two
+   application hooks (`first_try` / `fallback_not_found`) — no global migration
+   step, no backup-and-restore.
 
 On top of that: a **permission manager** for sharing data between users and
 tenants (tenant-only / public / a specific list of tenants / a group — groups
@@ -172,9 +173,9 @@ hash( STRUCT_NAME + SHAPE(Unique|NonUnique|NestedNonUnique)
 ```
 
 Because the hash folds in field names and types, **any schema change produces a
-new `STRUCT_HASH`** — which is exactly the migration boundary. The old model's
-separate "struct id + numeric version" is gone: you migrate **from one
-`STRUCT_HASH` to another**, full stop.
+new `STRUCT_HASH`** — a changed struct is simply a different type. The old model's
+separate "struct id + numeric version" is gone; bridging old and new data is done
+with the `first_try` / `fallback_not_found` hooks (below).
 
 ### Base data types
 
@@ -265,14 +266,14 @@ data: the data's owner grants it.
 
 ---
 
-## Migrations
+## Schema evolution
 
-A struct change yields a new `STRUCT_HASH`. You declare migration functions that
-convert **between struct hashes** (the old "version number" concept is gone).
-Because clients, servers, and nodes may run different builds, the engine migrates
-records **lazily on read** and writes the result back in the background — no
-global lock, no downtime, no separate backup/restore step. Details:
-[`wavedb-core`](crates/wavedb-core/README.md#migrations).
+A struct change yields a new `STRUCT_HASH` (the old "version number" concept is
+gone). There is no migration chain or auto-upgrade walk — bridging old and new
+data is done with two optional application hooks: **`first_try`** runs before a
+read hits storage (synthesise the value, e.g. from an older `STRUCT_HASH`), and
+**`fallback_not_found`** runs after a miss (fetch or derive a default). Details:
+[`wavedb-core`](crates/wavedb-core/README.md#schema-evolution--lookup-hooks).
 
 ---
 
@@ -320,7 +321,7 @@ The full client API and object lifecycle live in
 | Crate                                                     | What it owns                                                               | Read for                                                                                                           |
 | --------------------------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | [`wavedb`](crates/wavedb/README.md)                       | Client `Db` handle, typed CRUD, query surface                              | Quickstart, entry points, object lifecycle                                                                         |
-| [`wavedb-core`](crates/wavedb-core/README.md)             | `Id`, `Metadata`, `STRUCT_HASH`, migrations, permissions, query tree, wire | ID layout, struct-hash identity, **migrations**                                                                    |
+| [`wavedb-core`](crates/wavedb-core/README.md)             | `Id`, `Metadata`, `STRUCT_HASH`, schema-evolution hooks, permissions, query tree, wire | ID layout, struct-hash identity, **schema evolution**                                                  |
 | [`wavedb-macros`](crates/wavedb-macros/README.md)         | `#[wavedb]`, `declare_objects!`, auto-generated `Pivot`/`BpTree`           | Object declaration, `STRUCT_HASH` derivation, validate/preprocess                                                  |
 | [`wavedb-storage`](crates/wavedb-storage/README.md)       | The per-node engine                                                        | **Block manager, per-`STRUCT_HASH` page directory, linear hashing**, pages, dictionaries, journal + cache pipeline |
 | [`wavedb-quick-node`](crates/wavedb-quick-node/README.md) | Serving/storage node                                                       | Tenant write-ownership ring, replication, routing/failover, node-side validation                                   |

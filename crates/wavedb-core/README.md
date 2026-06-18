@@ -1,7 +1,7 @@
 # wavedb-core
 
 Core primitives shared by **every** node kind and by proc-macro generated code:
-the composite `Id`, `STRUCT_HASH`, `Metadata`, the migration registry,
+the composite `Id`, `STRUCT_HASH`, `Metadata`, the schema-evolution lookup hooks,
 permission refs, the `Wire` serialization trait, and the query expression tree.
 **No I/O** — safe in WASM, in macros, everywhere.
 
@@ -12,9 +12,9 @@ permission refs, the `Wire` serialization trait, and the query expression tree.
 
 | Module       | Responsibility                                                       |
 | ------------ | -------------------------------------------------------------------- |
-| `id`         | The 128-bit composite `Id` and its field accessors.                  |
+| `id`         | The 128-bit composite `Id`, the `U48` newtype, and field accessors.  |
 | `metadata`   | `Metadata` — modification chain, authorship, permission ref.         |
-| `migration`  | Migration registry, chain traits, `MigrationChain` read path.        |
+| `hooks`      | `first_try` (pre-search) and `fallback_not_found` (post-miss) hooks.  |
 | `permission` | `PermissionRef` shapes.                                              |
 | `wire`       | The `Wire` trait + `WaveWire` (no serde). See `docs/wire_format.md`. |
 | `query`      | `Expr` / `Value` / `Field` query expression tree.                    |
@@ -58,6 +58,20 @@ timestamp, not a struct hash) and **break collisions** within one
 truncation co-locates same-type records and tells the engine which type a
 timestamp-keyed `Id` belongs to.
 
+### `U48` — the 48-bit newtype
+
+Rust has no native `u48`, so the 48-bit `TENANT`/`user` values are a newtype
+wrapping a `u64`:
+
+```rust
+pub struct U48(u64); // invariant: value < 2^48
+```
+
+It range-checks on construction, exposes the `U48::MAX` (unauthenticated) and `0`
+(system) sentinels, and packs into the `Id`/`Metadata` layout as exactly 48 bits.
+Accessors such as `.tenant_id()` and `Metadata::user` return `U48`, never a raw
+`u64`. Everywhere this README writes `u48`, the Rust type is `U48`.
+
 ### `CREATED_AT` time base
 
 `CREATED_AT` is a **nanosecond** count from a fixed WaveDB epoch (a `const`
@@ -88,8 +102,8 @@ STRUCT_NAME + SHAPE + each PROPERTY_NAME + each PROPERTY_TYPE
 ```
 
 Folding field names and types into the hash means **any schema change yields a
-new `STRUCT_HASH`**. That is the migration boundary — migration is defined as a
-transform from one `STRUCT_HASH` to another, with no separate version counter.
+new `STRUCT_HASH`** — a changed struct is simply a different type. There is no
+version counter; bridging old and new is done with the lookup hooks below.
 
 An 8-bit truncation of `STRUCT_HASH` rides in the `SALT` field of every
 timestamp-keyed ID (NonUnique, BpTree, Pivot — see _The `SALT` field_),
@@ -103,86 +117,37 @@ co-locating same-type records and identifying the type when `KEY` is a timestamp
 pub struct Metadata {
     pub old_modification_id: u128, // previous version (0 = first)
     pub new_modification_id: u128, // next version (0 = live)
-    pub user: u48,                 // who wrote this version
+    pub user: U48,                 // who wrote this version (48-bit newtype)
     pub device_created: u64,       // which device produced it
     pub permission: Option<PermissionRef>, // access rule; None = tenant-only
 }
 ```
 
 No `struct_version` field — the stored record's `STRUCT_HASH` (carried in the
-wire envelope) tells the engine which schema it was written under, so the
-migration walk needs nothing extra in `Metadata`.
+wire envelope) already says which schema it was written under.
 
 ---
 
-## Schema migration & lazy upgrade
+## Schema evolution — lookup hooks
 
-Clients, servers, and nodes may run **different builds simultaneously**. On read,
-if a record's stored `STRUCT_HASH` differs from the reader's compiled head, the
-migration transform runs in memory and the upgraded record is written back **in
-the background** — partial, progressive, no global lock, no maintenance window.
-Old data is never a backup-and-restore migration; it just upgrades the next time
-it is touched.
+There is **no migration chain, no rollback graph, no auto-upgrade walk.** A
+schema change just yields a new `STRUCT_HASH`; old records keep their old hash.
+Bridging that transition is the application's job, through two optional async
+hooks declared on a struct:
 
----
+| Hook                 | Runs                        | Signature                                   |
+| -------------------- | --------------------------- | ------------------------------------------- |
+| `first_try`          | **before** the DB search    | `async fn<Db>(&Db) -> Result<Option<Self>>` |
+| `fallback_not_found` | **after** the search misses | `async fn<Db>(&Db) -> Result<Option<Self>>` |
 
-## Migrations
+- **`first_try`** lets you produce the value before touching storage — e.g.
+  synthesise it from records stored under a previous `STRUCT_HASH`, or
+  short-circuit a known case.
+- **`fallback_not_found`** runs only when the normal lookup returns `None` — the
+  place to fetch, derive a default, or lift an old record forward.
 
-**One model.** Each struct declares how it relates to its **immediate neighbour
-struct hashes** via TYPE paths plus async forward/rollback fns; the macro
-reconstructs the whole chain at compile time.
-
-### Neighbour attributes
-
-| Attribute               | Direction | Kind     | Signature / value                                                           |
-| ----------------------- | --------- | -------- | --------------------------------------------------------------------------- |
-| `migrate_from`          | backward  | type     | The predecessor struct.                                                     |
-| `migrate_from_with`     | backward  | async fn | `async fn<Db>(&Db, Old) -> Result<Self>`                                    |
-| `migrate_rollback`      | forward   | type     | The successor (this struct receives rollback).                              |
-| `migrate_rollback_with` | forward   | async fn | `async fn<Db>(&Db, New) -> Result<Self>`                                    |
-| `first_try`             | —         | async fn | `async fn<Db>(&Db) -> Result<Option<Old>>` — runs **before** the DB search. |
-| `fallback_not_found`    | —         | async fn | `async fn<Db>(&Db) -> Result<Option<Self>>` — runs **after** a `None`.      |
-
-**Chain bounds:** the oldest struct has no `migrate_from`; the current head has
-no `migrate_rollback`; every middle struct declares both. Rollback co-locates
-with the **older** struct ("I know how to receive my future self and become
-me").
-
-### Compile-time chain
-
-| Trait                          | Reads as                            | Walks    |
-| ------------------------------ | ----------------------------------- | -------- |
-| `MigratesFrom { type Source }` | "I migrate from `Source`"           | backward |
-| `RollbackFrom { type Future }` | "I receive rollbacks from `Future`" | forward  |
-
-Reaching a chain end is a compile error — the type system **is** the chain-bound
-check, so the registry is reconstructable from types alone.
-
-### Cross-hash read
-
-Every struct gets `impl<Db> MigrationChain<Db>`. `read_as_self(db, bytes,
-stored_struct_hash)`:
-
-- `stored == Self::STRUCT_HASH` → wire-decode directly.
-- stored is an older neighbour → recurse as `Self::Source`, then migrate forward.
-- stored is a newer neighbour → recurse as `Self::Future`, then roll back.
-
-Works **without** any runtime `register_migration` call; the wire envelope's
-`STRUCT_HASH` tells the engine which way to walk.
-
-### Compose & split
-
-`first_try` covers both: **compose** synthesises a source from several records
-before the search; **split** points several new structs' `first_try`s at one old
-record, each lifting its slice. Same pipeline, opposite ends.
-
-### Rollback during mixed-build deployments
-
-A node on an older build walks the registered **backward** edges to bring a
-newer record down to a hash it can read. Forward + backward must both exist for
-two adjacent struct hashes to coexist live. Code-side rollback is a one-line
-`pub type` edit; the DB keeps both readable while the `migrate_rollback_with` fn
-is compiled in.
+Both are plain functions you write; the engine simply calls them at those two
+points in the read path. Nothing else about versioning is built in.
 
 ---
 

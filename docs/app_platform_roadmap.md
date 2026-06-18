@@ -7,7 +7,7 @@ code sharing where the DB **is** the server and ships as a library.
 ```
 my-app/
 ├── crates/
-│   ├── app-schema/   # #[wavedb] structs + declare_objects! + migrations
+│   ├── app-schema/   # #[wavedb] structs + declare_objects! + evolution hooks
 │   │                 #   compiled into EVERY binary below
 │   ├── app-server/   # server-side functions (validation, jobs)
 │   ├── app-node/     # fn main() { wavedb_quick_node::run(config, REGISTRY, hooks) }
@@ -55,8 +55,8 @@ registry-linked node; cross-tenant read without a grant is refused.
 ## M4 — Typed client API, end-to-end
 
 `Db::connect`, typed CRUD, server-evaluated `Expr` round-trip, collection
-navigation through `PivotId`, delete → dead `BpTree`. Migration-on-read so
-mixed-build clusters interoperate.
+navigation through `PivotId`, delete → dead `BpTree`. The `first_try` /
+`fallback_not_found` hooks bridge mixed-build clusters.
 
 **Exit:** example apps run against a live node instead of in-process mocks.
 
@@ -100,8 +100,10 @@ function rejecting a write surfaces as a typed client error.
 ## M9 — Developer experience
 
 `cargo-generate` template (the workspace skeleton above, one struct per shape, a
-migration pair, node + native + wasm binaries, a local dev-cluster). "Building an
-app on WaveDB" guide; migration cookbook (compose/split via `first_try`).
+`first_try`/`fallback_not_found` example, node + native + wasm binaries, a local
+dev-cluster). "Building an
+app on WaveDB" guide; schema-evolution cookbook (`first_try` /
+`fallback_not_found` patterns).
 Versioning policy for the platform crates.
 
 ---
