@@ -91,17 +91,19 @@ one poll tick (HTTP).
 
 ## M8 — Auth & permission enforcement
 
-Stateless HMAC session tokens (signed with the cluster key, carry
-`user`/`tenant`/expiry/purpose); node derives identity from the **token, never
-the request body**. Login is a `#[server]` function minting the token from either
-a local Argon2 credential object **or** an external OAuth/OIDC provider (same path,
-same token). Unauthenticated tier (`user = U48::MAX`) restricted to login + public
-reads. Permission checks on every read/write/delete (tenant-only / public /
+Stateless HMAC **access** tokens (short TTL, carry `user`/`tenant`/expiry/purpose,
+verified per request with no store) + a tracked **refresh** token for revocation
+(bound to a session record; revoke = mark the record `revoked`). Node derives
+identity from the **token, never the request body**. Login is a `#[server]`
+function minting the access+refresh pair from either a local Argon2 credential
+object **or** an external OAuth/OIDC provider (same path, same pair).
+Unauthenticated tier (`user = U48::MAX`) restricted to login + public reads. Permission checks on every read/write/delete (tenant-only / public /
 tenant-list) — applied inside server-function bodies too, since they run on the
 node. Full structure: [`wavedb-net`](../crates/wavedb-net/README.md#authentication).
 
 **Exit:** cross-tenant access without a grant rejected at the node; a server
-function rejecting a write surfaces as a typed client error.
+function rejecting a write surfaces as a typed client error; revoking a session
+record blocks its next `Refresh` and its access stops within one short TTL.
 
 ## M9 — Developer experience
 

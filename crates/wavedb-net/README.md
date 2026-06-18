@@ -73,37 +73,63 @@ on-screen IDs back for revalidation is cheaper than the filter.
 
 ## Authentication
 
-Auth is **stateless** — there is no session store. A token is HMAC-signed with
-the cluster key, so any node (owner or replica) verifies it locally; this keeps
-the "same binary, no extra infra" property.
+The request hot path is **stateless**: an access token is HMAC-signed with the
+cluster key, so any node (owner or replica) verifies it locally — no session
+store, no lookup per request. The "same binary, no extra infra" property holds.
+Revocation is added by a **refresh token** that *is* tracked, but it is consulted
+only when minting a new access token (rare), never on ordinary requests.
 
-### Session token
+### Access token (stateless, short-lived)
 
 ```
-token = { user: U48, tenant: U48, expiry, purpose } + HMAC(cluster_key, …)
+access = { user: U48, tenant: U48, expiry, purpose: Access } + HMAC(cluster_key, …)
 ```
 
 The node **derives `user`/`tenant` from the verified token, never from the
-request body** — a client cannot claim an identity it wasn't issued. Expiry
-bounds replay; `Drop`/logout just stops sending the token (stateless, so nothing
-to revoke server-side beyond expiry — short TTLs + re-issue cover this).
+request body** — a client cannot claim an identity it wasn't issued. TTL is
+**short** (minutes); every request carries it; verification is signature + expiry,
+nothing else loaded.
+
+### Refresh token (revocable)
+
+Login also issues a long-lived **refresh token** bound to a stored session record:
+
+```
+refresh = { session_id, user, tenant, expiry, purpose: Refresh } + HMAC(cluster_key, …)
+```
+
+`session_id` points at a **session record** — a Unique-style `#[wavedb]` object
+`{ user, tenant, issued, revoked }`. A `Refresh` request verifies the token's
+HMAC **and** loads that record:
+
+- record live & not expired → mint a fresh access token (TTL resets), and
+  **rotate** the refresh token (new `session_id`/counter); a replayed old refresh
+  token ⇒ theft signal → revoke the session;
+- record `revoked` or missing → refuse.
+
+**Revocation = mark the session record `revoked` (or delete it)** — one record
+write. The next `Refresh` fails immediately, and any outstanding access token
+dies on its own within one short TTL. So "log out this session / log out
+everywhere, now" is cheap, and the per-request path stays store-free.
 
 ### Token families (the `purpose` tag)
 
 One HMAC machine, distinct `purpose` tags so a token minted for one path can't be
 replayed on another:
 
-| Purpose     | Issued to | Carries                    | Used for                          |
-| ----------- | --------- | -------------------------- | --------------------------------- |
-| `Session`   | end users | `user`, `tenant`, expiry   | every client request after login  |
-| node-to-node | nodes    | node id, expiry            | `Replicate` and future node paths |
+| Purpose      | Issued to | Carries                        | Used for                          | Stateful?          |
+| ------------ | --------- | ------------------------------ | --------------------------------- | ------------------ |
+| `Access`     | end users | `user`, `tenant`, short expiry | every client request after login  | no                 |
+| `Refresh`    | end users | `session_id`, `user`, expiry   | minting new access tokens         | yes (record check) |
+| node-to-node | nodes     | node id, expiry                | `Replicate` and future node paths | no                 |
 
 ### Login & credentials
 
 Login is a **`#[server]` function** (runs on the node, see
 [`wavedb-macros`](../wavedb-macros/README.md#server-functions--server)) that
-validates a credential and mints a `Session` token. Two credential sources feed
-the **same** login path and mint the **same** token:
+validates a credential, creates the session record, and mints an **access +
+refresh** pair. Two credential sources feed the **same** login path and mint the
+**same** pair:
 
 1. **Local** — a Unique `#[wavedb]` credential object per user (e.g. an Argon2
    password hash + linked-provider list), stored at its anchor like any other

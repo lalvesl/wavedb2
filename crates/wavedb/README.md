@@ -98,6 +98,6 @@ Tokio; the browser on `wasm_bindgen_futures`. The public API is identical.
 
 A client without credentials connects with `user = U48::MAX`. The session sees
 only **public data**; the API is restricted to login (local password or OAuth)
-and reading world-readable data. Login mints a stateless HMAC session token the
-node derives identity from; structure in
-[`wavedb-net`](../wavedb-net/README.md#authentication).
+and reading world-readable data. Login mints a stateless HMAC **access** token
+(short TTL, identity derived node-side) plus a revocable **refresh** token;
+structure in [`wavedb-net`](../wavedb-net/README.md#authentication).
