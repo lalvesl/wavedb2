@@ -1,0 +1,43 @@
+[package]
+name = "wavedb-quick-node"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "wavedb_quick_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wavedb-quick-node"
+path = "src/main.rs"
+
+[dependencies]
+wavedb-core = { path = "../wavedb-core" }
+wavedb-storage = { path = "../wavedb-storage" }
+wavedb-net = { path = "../wavedb-net" }
+wavedb-macros = { path = "../wavedb-macros" }
+# History flush speaks the Slow-Node's wire types (`FlushBatch` / `FlushAck`)
+# — imported from the lib target rather than mirrored, so the shapes can't
+# drift apart.
+wavedb-slow-node = { path = "../wavedb-slow-node" }
+tokio.workspace = true
+parking_lot.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+axum = { workspace = true, features = ["ws"] }
+clap = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+reqwest = { workspace = true }
+# Schema-aware handle_write tests declare real #[wave_db] structs.
+wavedb = { path = "../wavedb" }
+tempfile = { workspace = true }

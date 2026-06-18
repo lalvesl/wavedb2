@@ -1,0 +1,49 @@
+{
+  "date": "2026-06-11",
+  "git_rev": "b2a6a06",
+  "mode": "cargo",
+  "raw_bytes": 786287,
+  "gzip_bytes": 193486
+}
+{
+  "date": "2026-06-11",
+  "git_rev": "0e15db0",
+  "mode": "nix",
+  "raw_bytes": 95182,
+  "gzip_bytes": 41772
+}
+{
+  "date": "2026-06-11",
+  "git_rev": "5f02dac",
+  "mode": "cargo",
+  "raw_bytes": 786287,
+  "gzip_bytes": 193485
+}
+{
+  "date": "2026-06-11",
+  "git_rev": "0e27d97",
+  "mode": "cargo",
+  "raw_bytes": 796501,
+  "gzip_bytes": 194537
+}
+{
+  "date": "2026-06-11",
+  "git_rev": "0e27d97",
+  "mode": "nix",
+  "raw_bytes": 106022,
+  "gzip_bytes": 44145
+}
+{
+  "date": "2026-06-11",
+  "git_rev": "0e27d97",
+  "mode": "nix",
+  "raw_bytes": 104377,
+  "gzip_bytes": 43588
+}
+{
+  "date": "2026-06-11",
+  "git_rev": "0e27d97",
+  "mode": "nix",
+  "raw_bytes": 104377,
+  "gzip_bytes": 43588
+}

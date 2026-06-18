@@ -1,0 +1,27 @@
+[package]
+name = "wavedb-monitor"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wavedb-monitor"
+path = "src/main.rs"
+
+[lib]
+name = "wavedb_monitor"
+path = "src/lib.rs"
+
+[dependencies]
+wavedb-net = { path = "../wavedb-net" }
+tokio.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+sysinfo.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true

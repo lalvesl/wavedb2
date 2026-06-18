@@ -1,0 +1,105 @@
+[package]
+name = "wavedb-examples"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "unique_user_profile"
+path = "src/bin/unique_user_profile.rs"
+
+[[bin]]
+name = "nonunique_orders"
+path = "src/bin/nonunique_orders.rs"
+
+[[bin]]
+name = "nested_invoice_lines"
+path = "src/bin/nested_invoice_lines.rs"
+
+[[bin]]
+name = "nested_recursive"
+path = "src/bin/nested_recursive.rs"
+
+[[bin]]
+name = "migration_type_1"
+path = "src/bin/migration_type_1.rs"
+
+[[bin]]
+name = "migration_type_2"
+path = "src/bin/migration_type_2.rs"
+
+[[bin]]
+name = "migration_split"
+path = "src/bin/migration_split.rs"
+
+[[bin]]
+name = "distributed_cluster"
+path = "src/bin/distributed_cluster.rs"
+
+[[bin]]
+name = "refs_and_nested"
+path = "src/bin/refs_and_nested.rs"
+
+[[bin]]
+name = "anchors"
+path = "src/bin/anchors.rs"
+
+[[bin]]
+name = "cross_references"
+path = "src/bin/cross_references.rs"
+
+# ── mini_app: smallest complete app — native client + Quick-Node backend ─────
+# One shared schema.rs (Task + validate/preprocess hooks + REGISTRY) compiled
+# into both binaries.  Run the orchestrator: cargo run --bin mini_app
+
+[[bin]]
+name = "mini_app"
+path = "src/bin/mini_app/main.rs"
+
+[[bin]]
+name = "mini_app_backend"
+path = "src/bin/mini_app/backend.rs"
+
+[[bin]]
+name = "mini_app_client"
+path = "src/bin/mini_app/app.rs"
+
+# ── real_example multi-process suite ─────────────────────────────────────────
+
+[[bin]]
+name = "real_example"
+path = "src/bin/real_example/main.rs"
+
+[[bin]]
+name = "re_slow_node"
+path = "src/bin/re_slow_node.rs"
+
+[[bin]]
+name = "re_quick_node"
+path = "src/bin/re_quick_node.rs"
+
+[[bin]]
+name = "re_client"
+path = "src/bin/re_client.rs"
+
+[[bin]]
+name = "re_monitor"
+path = "src/bin/re_monitor.rs"
+
+[dependencies]
+wavedb = { path = "../wavedb" }
+wavedb-net = { path = "../wavedb-net" }
+wavedb-core = { path = "../wavedb-core" }
+wavedb-test-cluster = { path = "../wavedb-test-cluster" }
+wavedb-monitor = { path = "../wavedb-monitor" }
+wavedb-quick-node = { path = "../wavedb-quick-node" }
+wavedb-slow-node = { path = "../wavedb-slow-node" }
+tokio.workspace = true
+axum = { workspace = true, features = ["ws"] }
+# real_example opens thousands of WS connections + storage files; bump
+# RLIMIT_NOFILE at startup so we don't hit the default 1024 cap.
+rlimit = "0.10"
