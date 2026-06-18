@@ -36,12 +36,20 @@ code exists yet. Build order, roughly bottom-up:
 ## Client (`wavedb`)
 
 - `Db::connect` / `Db::open` family (native file + wasm IndexedDB);
-- typed CRUD: Unique `get`/`save`; NonUnique `insert`/`update`/`delete` via
-  `Pivot`/`BpTree`; typed `Expr` queries.
+- typed CRUD: Unique `get`/`save`; NonUnique `insert`/`update`/`delete` +
+  collection walk via `Pivot`/`BpTree`. No query DSL.
+
+## Server functions (`#[server]`) — replaces query
+
+- `#[server]` proc-macro: server-only async body + client call binding;
+- `FN_HASH` (name + arg types + return type) identity; args/return via `Wire`;
+- transport `CallServerFn { fn_hash, args }` over `wavedb-net`; registry dispatch;
+- body never enters the client binary; permission checks run in the body.
 
 ## Nodes & transport (`wavedb-quick-node`, `wavedb-net`)
 
 - node-side enforcement gates (header → decode → validate → preprocess);
+- server-function dispatch by `FN_HASH`;
 - tenant write-ownership ring + gossip + replication + routing/failover;
 - WS / HTTP transports; Bloom screen-sync.
 
@@ -54,8 +62,7 @@ code exists yet. Build order, roughly bottom-up:
 - **Slow-node / cold history tier** — out of scope for now;
 - **Permission groups**;
 - `STRUCT_HASH`-grained write-ownership (tenant-only for now);
-- offline-first reconciliation;
-- richer async server-side functions (DB-access hooks) for full-stack backends.
+- offline-first reconciliation.
 
 ## Resolved bit budgets
 

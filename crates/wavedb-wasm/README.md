@@ -38,7 +38,8 @@ layer and the journal entirely**:
   a write-through cache that can always be re-fetched from the cluster.
 
 The engine layers above storage — the Unique anchor, history chains, the
-schema-evolution hooks, query evaluation, and the `Pivot`/`BpTree` index — are
-identical on both targets. Sync needs no page parity either: the Bloom-filter
+schema-evolution hooks, and the `Pivot`/`BpTree` index — are identical on both
+targets. Filtered/derived reads are server functions (run on the node), so the
+wasm client just ships the call. Sync needs no page parity either: the Bloom-filter
 protocol exchanges objects, never pages. (`localStorage` — synchronous,
 string-only, ~5 MB — cannot fill this role.)

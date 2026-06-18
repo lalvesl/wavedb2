@@ -1,9 +1,10 @@
 # wavedb-macros
 
 The compile-time front door. `#[wavedb]` turns a plain Rust struct into a WaveDB
-object; `declare_objects!` collects objects into a registry every node shares.
-All schema rules are written once and enforced on client and server because both
-compile this crate.
+object; `#[server]` turns an `async fn` into a server-only body with a client call
+binding; `declare_objects!` collects objects (and server functions) into a
+registry every node shares. All schema rules are written once and enforced on
+client and server because both compile this crate.
 
 > For the project-wide idea and quickstart see the
 > [root README](../../readme.md).
@@ -12,7 +13,8 @@ compile this crate.
 
 | Module              | Responsibility                                                  |
 | ------------------- | --------------------------------------------------------------- |
-| `lib`               | The `#[wavedb]` and `declare_objects!` entry points.            |
+| `lib`               | The `#[wavedb]`, `#[server]`, and `declare_objects!` entry points. |
+| `server`            | `#[server]`: server body + client stub + `FN_HASH`.             |
 | `args`              | Parse `#[wavedb(...)]` attribute arguments.                     |
 | `struct_hash`       | Compute the `STRUCT_HASH: u64` const from name/shape/fields.    |
 | `descriptor`        | Emit `ObjectDescriptor` (field offsets, heapable flags, names). |
@@ -140,8 +142,45 @@ pure; hook-less types skip decode entirely via compile-time `HAS_VALIDATE` /
 `HAS_PREPROCESS` consts. Node-side enforcement (the gate order) is documented in
 [`wavedb-quick-node`](../wavedb-quick-node/README.md#node-side-enforcement).
 
-> Richer **server-side functions** (async, with DB access — the "backend" half of
-> full-stack) are planned as a separate attribute family; see the roadmap.
+---
+
+## Server functions — `#[server]`
+
+The replacement for a query DSL, and the "backend" half of full-stack. A server
+function is an `async fn` whose **body exists only on the server** (it has DB
+access) but which the client can **call** as if it were local. `#[server]`
+generates the binding; arguments and the return value travel through `Wire` over
+[`wavedb-net`](../wavedb-net/README.md).
+
+```rust
+#[server]
+async fn orders_over(db: &Db, min: u64) -> Result<Vec<Order>> {
+    // compiled ONLY into the node binary; full DB access
+    Ok(Order::all(db).await?.into_iter().filter(|o| o.amount > min).collect())
+}
+
+// On any client (native or wasm) the same name is a thin stub:
+let big: Vec<Order> = orders_over(&db, 100).await?;
+```
+
+What the macro emits:
+
+| Side                | What is compiled                                                                                   |
+| ------------------- | -------------------------------------------------------------------------------------------------- |
+| **Server** (`cfg`)  | The real body + a registry entry under a stable `FN_HASH` so the node can dispatch an incoming call. |
+| **Client** (`cfg`)  | A stub with the **same signature**: `Wire`-encode the args → send `CallServerFn { fn_hash, args }` over `wavedb-net` → `Wire`-decode the return. The body is **not** in the binary (keeps wasm small, keeps server logic private). |
+
+- **`FN_HASH: u64`** — a compile-time hash of the function name + argument types +
+  return type (same idea as `STRUCT_HASH`), so client and server agree on identity
+  and a signature change is a new function, caught at the boundary.
+- **Wire bounds** — every argument and the return type must implement `Wire`; the
+  `db: &Db` receiver is supplied by the node, never sent.
+- **Security** — the body runs on the node, so permission checks and validation
+  apply there; the client cannot bypass them by crafting a request, only call the
+  declared function with typed arguments.
+
+Server functions are collected into the registry alongside objects (below), so a
+node links them the same way it links the schema.
 
 ---
 

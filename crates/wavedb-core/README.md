@@ -2,7 +2,7 @@
 
 Core primitives shared by **every** node kind and by proc-macro generated code:
 the composite `Id`, `STRUCT_HASH`, `Metadata`, the schema-evolution lookup hooks,
-permission refs, the `Wire` serialization trait, and the query expression tree.
+permission refs, and the `Wire` serialization trait.
 **No I/O** — safe in WASM, in macros, everywhere.
 
 > For the project-wide idea and quickstart see the
@@ -17,7 +17,6 @@ permission refs, the `Wire` serialization trait, and the query expression tree.
 | `hooks`      | `first_try` (pre-search) and `fallback_not_found` (post-miss) hooks.  |
 | `permission` | `PermissionRef` shapes.                                              |
 | `wire`       | The `Wire` trait + `WaveWire` (no serde). See `docs/wire_format.md`. |
-| `query`      | `Expr` / `Value` / `Field` query expression tree.                    |
 | `registry`   | `ObjectDescriptor` / `ObjectRegistry` lookup by `STRUCT_HASH`.       |
 | `traits`     | `WaveDbStruct`, shape markers.                                       |
 | `error`      | Workspace error type.                                                |
@@ -165,15 +164,11 @@ Access control is stored **inline in `Metadata`**, scoped per record:
 A grant is what lets a user of one tenant act on another tenant's data; without
 it, tenants never see each other's records.
 
----
-
-## Query expressions
-
-`Expr` / `Value` / `Field` form the typed query tree evaluated node-side over
-descriptor offsets. `Value` covers every numeric width (`U8`…`U128`, `I8`…`I128`,
-`F32`, `F64`) plus `Str`/`Bool`/`Bytes`; `From` impls are exact-width. The macro
-generates one typed `Field` per column so a misspelt field is a compile error,
-not an empty result.
+There is **no query expression tree**. Reads are: a Unique `get`, a NonUnique
+collection walk through its `Pivot` → `BpTree` (ordered by `CREATED_AT`), or a
+**server function** for anything filtered or derived — an `async fn` that runs on
+the node with DB access and is called by a typed client binding (see
+[`wavedb-macros`](../wavedb-macros/README.md#server-functions--server)).
 
 ---
 

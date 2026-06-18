@@ -2,8 +2,10 @@
 
 The network transport layer. **WaveDB _is_ the wire protocol** — there is no
 separate REST/RPC layer, no DTO split, no API schema to keep in sync with
-storage. Whatever the client serializes as a query, the server deserializes
-straight into the storage engine.
+storage. Whatever the client serializes — a CRUD request or a server-function
+call — the server deserializes straight into the engine. Both record operations
+(`get`/`save`/`delete`/collection walk) and **server-function calls**
+(`CallServerFn { fn_hash, Wire args }`) ride the same `Transport`.
 
 > For the project-wide idea and quickstart see the
 > [root README](../../readme.md).
@@ -17,7 +19,7 @@ straight into the storage engine.
 | `http`    | HTTP POST transport (fallback) + the client queue.             |
 | `notify`  | "object changed" notifications (push / piggyback).             |
 | `browse`  | Live-browse / screen-sync surface.                             |
-| `auth`    | Session auth, HMAC tokens.                                     |
+| `auth`    | Session + node-to-node HMAC tokens, login, identity derivation. |
 | `request` | Request/response envelopes (`TransportResponse`, `NodeError`). |
 | `metrics` | Per-node transport metrics.                                    |
 | `mock`    | In-process transport for tests.                                |
@@ -66,3 +68,53 @@ objects, updated records, deletions. Event-driven: every accepted mutation
 triggers a notification to subscribers whose filters might match. For clients
 long offline (screen state far behind reality), sending the explicit array of
 on-screen IDs back for revalidation is cheaper than the filter.
+
+---
+
+## Authentication
+
+Auth is **stateless** — there is no session store. A token is HMAC-signed with
+the cluster key, so any node (owner or replica) verifies it locally; this keeps
+the "same binary, no extra infra" property.
+
+### Session token
+
+```
+token = { user: U48, tenant: U48, expiry, purpose } + HMAC(cluster_key, …)
+```
+
+The node **derives `user`/`tenant` from the verified token, never from the
+request body** — a client cannot claim an identity it wasn't issued. Expiry
+bounds replay; `Drop`/logout just stops sending the token (stateless, so nothing
+to revoke server-side beyond expiry — short TTLs + re-issue cover this).
+
+### Token families (the `purpose` tag)
+
+One HMAC machine, distinct `purpose` tags so a token minted for one path can't be
+replayed on another:
+
+| Purpose     | Issued to | Carries                    | Used for                          |
+| ----------- | --------- | -------------------------- | --------------------------------- |
+| `Session`   | end users | `user`, `tenant`, expiry   | every client request after login  |
+| node-to-node | nodes    | node id, expiry            | `Replicate` and future node paths |
+
+### Login & credentials
+
+Login is a **`#[server]` function** (runs on the node, see
+[`wavedb-macros`](../wavedb-macros/README.md#server-functions--server)) that
+validates a credential and mints a `Session` token. Two credential sources feed
+the **same** login path and mint the **same** token:
+
+1. **Local** — a Unique `#[wavedb]` credential object per user (e.g. an Argon2
+   password hash + linked-provider list), stored at its anchor like any other
+   record. No separate auth database.
+2. **External (OAuth/OIDC)** — Google et al.; the node verifies the provider's
+   token, looks up / links the local user, then mints the session.
+
+### Unauthenticated tier
+
+A client with no token connects as `user = U48::MAX`. The session is restricted
+to **login** and **public reads** (records whose `Metadata.permission` is
+`Public`); everything else is refused. Permission enforcement itself is per
+record (`PermissionRef`) — see
+[`wavedb-core`](../wavedb-core/README.md#permissions).

@@ -184,15 +184,34 @@ serialize/deserialize. Page kinds:
 ## Dictionaries
 
 Because a page holds exactly one `STRUCT_HASH`, each type has **one dictionary**
-with nothing foreign to dilute it. A dictionary is its own struct, stored in
-`data.bin` in block runs handed out by the block manager and tracked by a small
-**dictionary directory** — a `Vec<u64>` using the **same block descriptor** as
-the page directory (`u40 start · u20 count · u4 occupation`), so allocator and
-directory code is shared. Page headers reference the dictionary they were
-compressed with so pages stay readable across a dictionary rebuild; a superseded
-dictionary run is freed once no live page references it. Variable-length heap
-values (strings/blobs) are additionally zstd-compressed. CPU is free here — there
-is no join processing competing for it.
+with nothing foreign to dilute it.
+
+### Raw-content dictionary (no trainer)
+
+zstd accepts **any bytes** as a dictionary, not just a trained `ZDICT` — so the
+dictionary is simply a **growing buffer of representative records** for that
+`STRUCT_HASH`. No training pass: as inserts arrive, sample bytes are appended to
+the buffer and it grows. (`zstd::dict::{EncoderDictionary, DecoderDictionary}`
+take a raw byte slice.) Simpler than a trainer and naturally incremental.
+
+The dictionary is its own struct, stored in `data.bin` in block runs handed out
+by the block manager and tracked by a small **dictionary directory** — a
+`Vec<u64>` using the **same block descriptor** as the page directory
+(`u40 start · u20 count · u4 occupation`), so allocator and directory code is
+shared.
+
+### Versioning (the one rule)
+
+A page compressed against dictionary state X **must** be decompressed against the
+exact same bytes — you never mutate the dictionary under existing pages. So the
+buffer carries a `dict_version`; the growing happens for **new** writes (they
+bind the latest version), while old pages keep the `dict_version` stamped in
+their header and stay readable. When the buffer has grown enough, a background
+task recompresses cold pages to the newer version; a superseded dictionary run is
+freed once no live page references it.
+
+Variable-length heap values (strings/blobs) are additionally zstd-compressed.
+CPU is free here — there is no join processing competing for it.
 
 ---
 

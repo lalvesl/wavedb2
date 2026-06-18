@@ -9,7 +9,7 @@ my-app/
 ├── crates/
 │   ├── app-schema/   # #[wavedb] structs + declare_objects! + evolution hooks
 │   │                 #   compiled into EVERY binary below
-│   ├── app-server/   # server-side functions (validation, jobs)
+│   ├── app-server/   # #[server] functions, validation, jobs (server-only)
 │   ├── app-node/     # fn main() { wavedb_quick_node::run(config, REGISTRY, hooks) }
 │   ├── app-client/   # native client binary / library
 │   └── app-web/      # wasm32 build, typed API over IndexedDB + WebSocket
@@ -44,21 +44,23 @@ NonUnique through `Pivot`/`BpTree`; kill-during-write test recovers cleanly.
 
 ## M3 — Registry-aware node
 
-A node that links the schema enforces shapes and evaluates queries: header check
-→ decode → `validate` → `preprocess` before commit; `Expr` evaluated node-side
-over descriptor offsets (stack-only predicates first, heap predicates decode one
-field).
+A node that links the schema enforces shapes and serves records: header check →
+decode → `validate` → `preprocess` before commit; Unique `get` and NonUnique
+collection walks (`Pivot` → `BpTree`) served from storage.
 
-**Exit:** clients' `get`/`query` return real data from storage through a
-registry-linked node; cross-tenant read without a grant is refused.
+**Exit:** clients' `get` and collection reads return real data from storage
+through a registry-linked node; cross-tenant read without a grant is refused.
 
-## M4 — Typed client API, end-to-end
+## M4 — Typed client API + server functions, end-to-end
 
-`Db::connect`, typed CRUD, server-evaluated `Expr` round-trip, collection
-navigation through `PivotId`, delete → dead `BpTree`. The `first_try` /
-`fallback_not_found` hooks bridge mixed-build clusters.
+`Db::connect`, typed CRUD, collection navigation through `PivotId`, delete → dead
+`BpTree`, and **server functions** (`#[server]`: server-only body + client
+binding, `Wire`-encoded args/return over `wavedb-net`, dispatched by `FN_HASH`) —
+the replacement for a query DSL. The `first_try` / `fallback_not_found` hooks
+bridge mixed-build clusters.
 
-**Exit:** example apps run against a live node instead of in-process mocks.
+**Exit:** example apps run against a live node instead of in-process mocks; a
+filtered read works through a `#[server]` function end to end.
 
 ## M5 — Browser target
 
@@ -66,8 +68,8 @@ navigation through `PivotId`, delete → dead `BpTree`. The `first_try` /
 no journal); `gloo_net`/`fetch` transports behind the same async API. Measure the
 registry's per-struct wasm cost.
 
-**Exit:** a browser demo performs typed `save`/`query` against a node over
-WebSocket, with IndexedDB caching reads.
+**Exit:** a browser demo performs typed `save` + collection reads (and a
+`#[server]` call) against a node over WebSocket, with IndexedDB caching reads.
 
 ## M6 — Local cache & `Db::open`
 
@@ -82,17 +84,21 @@ between the local store and notifications.
 
 Owner node fans out mutations to subscribed sessions (WS push; HTTP piggyback +
 idle ticks). Bloom-filter screen-sync. Client event API
-(`Order::watch(&db, expr)`).
+(`Order::watch(&db)` over a collection / key).
 
 **Exit:** client A saves; client B's watcher fires within one round-trip (WS) /
 one poll tick (HTTP).
 
 ## M8 — Auth & permission enforcement
 
-Session login → token; node derives `user`/`tenant` from the token, never the
-request body. Unauthenticated tier (`user = U48::MAX`) restricted to login +
-public reads. Permission checks on every read/write/delete (tenant-only / public /
-tenant-list). Async DB-access server functions ("the backend in backend").
+Stateless HMAC session tokens (signed with the cluster key, carry
+`user`/`tenant`/expiry/purpose); node derives identity from the **token, never
+the request body**. Login is a `#[server]` function minting the token from either
+a local Argon2 credential object **or** an external OAuth/OIDC provider (same path,
+same token). Unauthenticated tier (`user = U48::MAX`) restricted to login + public
+reads. Permission checks on every read/write/delete (tenant-only / public /
+tenant-list) — applied inside server-function bodies too, since they run on the
+node. Full structure: [`wavedb-net`](../crates/wavedb-net/README.md#authentication).
 
 **Exit:** cross-tenant access without a grant rejected at the node; a server
 function rejecting a write surfaces as a typed client error.
@@ -130,6 +136,6 @@ M1 (schema) ─► M2 (storage) ─► M3 (node) ─► M4 (typed E2E) ─► M7
 | Risk                                                              | Mitigation                                                                                                |
 | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | Registry statics bloat the wasm binary as schemas grow            | M5 measures per-struct cost early; descriptors are `'static` data, dictionary-compressible by `wasm-opt`. |
-| `Expr` evaluation against wire bytes needs heap-field comparisons | Stack-only predicates first; heap predicates decode one field via descriptor offset. Phase the work.      |
+| Server functions need stable identity across client/server builds | `FN_HASH` (name + arg types + return type) bound at compile time; a signature change is a new function, caught at the boundary. |
 | Runtime abstraction (tokio vs wasm) leaks into public API         | Keep it internal to `wavedb`/`wavedb-net`; public API stays `async fn`.                                   |
 | ID / block-descriptor bit budgets                                 | Resolved: `Id` = `KEY u64·TENANT u48·FLAG 1·SALT 15`; descriptor `u40·u20·u4` (pages + dictionary).       |

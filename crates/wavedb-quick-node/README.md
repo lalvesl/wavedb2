@@ -101,10 +101,19 @@ pre-send check raises. A node built without a registry keeps the legacy
 schema-blind behaviour (opaque bytes). Hook declaration lives in
 [`wavedb-macros`](../wavedb-macros/README.md#validation--preprocessing-hooks).
 
+## Server-function dispatch
+
+The registry also holds the `#[server]` functions. A `CallServerFn { fn_hash,
+Wire args }` request is dispatched by `FN_HASH` to the function's server-only
+body, which runs on the node with full DB access; the `Wire`-encoded return
+travels back over the same transport. There is no query DSL — filtered/derived
+reads are these functions. Permission checks apply inside the body. See
+[`wavedb-macros`](../wavedb-macros/README.md#server-functions--server).
+
 ---
 
 ## Hardware & history tier
 
 Good CPU/RAM, fast NVMe. Holds active records and the in-memory write cache. A
-cold/history tier (`wavedb-slow-node`) to which older versions flush down is
-**deferred for now** — the node keeps full history locally until that tier lands.
+separate cold/history tier to which older versions flush down is **deferred —
+not the moment**; the node keeps full history locally until that tier lands.

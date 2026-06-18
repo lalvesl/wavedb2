@@ -288,13 +288,19 @@ let db = Db::connect("wss://wavedb.example", /* user */ 42, /* tenant */ 42).awa
 // Unique: one record per tenant.
 let profile: Option<AboutUser> = AboutUser::get(&db).await?;
 
-// NonUnique: navigate via the Pivot, query the collection.
-// `Order::amount` is a macro-generated typed column — a misspelt field is a
-// compile error, not an empty result.
-let recent: Vec<Order> = Order::query(&db, Order::amount.gt(100u64)).await?;
+// NonUnique: list the collection (Pivot → BpTree, time-ordered).
+let recent: Vec<Order> = Order::all(&db).await?;
 
 order.save(&db).await?;     // versioned update; old bytes chained into history
 order.delete(&db).await?;   // moves to the dead B+tree (NonUnique only)
+
+// Filtered / derived reads are server functions — an async fn that runs on the
+// node, called through a generated client binding (no client-side query DSL).
+#[server]
+async fn orders_over(db: &Db, min: u64) -> Result<Vec<Order>> {
+    Ok(Order::all(db).await?.into_iter().filter(|o| o.amount > min).collect())
+}
+let big: Vec<Order> = orders_over(&db, 100).await?;
 ```
 
 A whole application backend is one expression — attaching the registry turns a
@@ -320,17 +326,18 @@ The full client API and object lifecycle live in
 
 | Crate                                                     | What it owns                                                               | Read for                                                                                                           |
 | --------------------------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| [`wavedb`](crates/wavedb/README.md)                       | Client `Db` handle, typed CRUD, query surface                              | Quickstart, entry points, object lifecycle                                                                         |
-| [`wavedb-core`](crates/wavedb-core/README.md)             | `Id`, `Metadata`, `STRUCT_HASH`, schema-evolution hooks, permissions, query tree, wire | ID layout, struct-hash identity, **schema evolution**                                                  |
+| [`wavedb`](crates/wavedb/README.md)                       | Client `Db` handle, typed CRUD, server-fn call bindings                    | Quickstart, entry points, object lifecycle                                                                         |
+| [`wavedb-core`](crates/wavedb-core/README.md)             | `Id`, `Metadata`, `STRUCT_HASH`, schema-evolution hooks, permissions, wire | ID layout, struct-hash identity, **schema evolution**                                                              |
 | [`wavedb-macros`](crates/wavedb-macros/README.md)         | `#[wavedb]`, `declare_objects!`, auto-generated `Pivot`/`BpTree`           | Object declaration, `STRUCT_HASH` derivation, validate/preprocess                                                  |
 | [`wavedb-storage`](crates/wavedb-storage/README.md)       | The per-node engine                                                        | **Block manager, per-`STRUCT_HASH` page directory, linear hashing**, pages, dictionaries, journal + cache pipeline |
 | [`wavedb-quick-node`](crates/wavedb-quick-node/README.md) | Serving/storage node                                                       | Tenant write-ownership ring, replication, routing/failover, node-side validation                                   |
-| [`wavedb-slow-node`](crates/wavedb-slow-node/README.md)   | Cold/history tier                                                          | _Deferred for now_                                                                                                 |
 | [`wavedb-net`](crates/wavedb-net/README.md)               | Transport                                                                  | WebSocket / HTTP queue, Bloom screen-sync                                                                          |
 | [`wavedb-wasm`](crates/wavedb-wasm/README.md)             | Browser client                                                             | IndexedDB key→value storage (no pages, no journal)                                                                 |
 
-Tooling: `wavedb-examples`, `wavedb-bench`, `wavedb-test-cluster`,
-`wavedb-monitor`, `wavedb-monitor-gui`.
+Tooling: `wavedb-examples`, `wavedb-bench`, `wavedb-test-cluster`.
+
+A cold/history tier (slow-node) and cluster monitors are **deferred — not the
+moment**; their crates are intentionally absent for now.
 
 ---
 
@@ -338,7 +345,8 @@ Tooling: `wavedb-examples`, `wavedb-bench`, `wavedb-test-cluster`,
 
 - **Not OLAP.** Cross-tenant aggregations belong in a dedicated analytics pipeline.
 - **Not a general consensus system.** Consistency is tenant-scoped; multi-tenant eventual consistency is by design.
-- **Not a SQL replacement.** The query model is deliberately constrained.
+- **Not a SQL replacement.** No query DSL — reads are `get` / collection walk /
+  server functions; there is no ad-hoc cross-table query language.
 - **Not offline-first (yet).**
 
 ---
