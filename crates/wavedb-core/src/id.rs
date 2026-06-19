@@ -82,21 +82,13 @@ impl Id {
     /// The `CREATED_AT` timestamp, if `KEY` is a timestamp (`FLAG = 0`).
     #[must_use]
     pub const fn created_at(self) -> Option<u64> {
-        if self.flag() {
-            None
-        } else {
-            Some(self.key())
-        }
+        if self.flag() { None } else { Some(self.key()) }
     }
 
     /// The `STRUCT_HASH` key, if `KEY` is a struct hash (`FLAG = 1`).
     #[must_use]
     pub const fn struct_hash_key(self) -> Option<u64> {
-        if self.flag() {
-            Some(self.key())
-        } else {
-            None
-        }
+        if self.flag() { Some(self.key()) } else { None }
     }
 }
 
@@ -121,7 +113,9 @@ impl Wire for Id {
     }
     fn encode_heap(&self, _heap: &mut Vec<u8>) {}
     fn decode(stack: &mut Cursor, _heap: &mut Cursor) -> Result<Self> {
-        Ok(Self(u128::from_le_bytes(stack.take(16)?.try_into().unwrap())))
+        Ok(Self(u128::from_le_bytes(
+            stack.take(16)?.try_into().unwrap(),
+        )))
     }
 }
 

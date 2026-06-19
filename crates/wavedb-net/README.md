@@ -12,17 +12,17 @@ call — the server deserializes straight into the engine. Both record operation
 
 ## Module map
 
-| Module    | Responsibility                                                 |
-| --------- | -------------------------------------------------------------- |
-| `frame`   | Wire frame encode/decode.                                      |
-| `ws`      | WebSocket transport (preferred).                               |
-| `http`    | HTTP POST transport (fallback) + the client queue.             |
-| `notify`  | "object changed" notifications (push / piggyback).             |
-| `browse`  | Live-browse / screen-sync surface.                             |
+| Module    | Responsibility                                                  |
+| --------- | --------------------------------------------------------------- |
+| `frame`   | Wire frame encode/decode.                                       |
+| `ws`      | WebSocket transport (preferred).                                |
+| `http`    | HTTP POST transport (fallback) + the client queue.              |
+| `notify`  | "object changed" notifications (push / piggyback).              |
+| `browse`  | Live-browse / screen-sync surface.                              |
 | `auth`    | Session + node-to-node HMAC tokens, login, identity derivation. |
-| `request` | Request/response envelopes (`TransportResponse`, `NodeError`). |
-| `metrics` | Per-node transport metrics.                                    |
-| `mock`    | In-process transport for tests.                                |
+| `request` | Request/response envelopes (`TransportResponse`, `NodeError`).  |
+| `metrics` | Per-node transport metrics.                                     |
+| `mock`    | In-process transport for tests.                                 |
 
 The crate provides a `Transport` trait with concrete WebSocket / HTTP / mock
 implementations; the same operations run on servers, native clients, and (via
@@ -76,7 +76,7 @@ on-screen IDs back for revalidation is cheaper than the filter.
 The request hot path is **stateless**: an access token is HMAC-signed with the
 cluster key, so any node (owner or replica) verifies it locally — no session
 store, no lookup per request. The "same binary, no extra infra" property holds.
-Revocation is added by a **refresh token** that *is* tracked, but it is consulted
+Revocation is added by a **refresh token** that _is_ tracked, but it is consulted
 only when minting a new access token (rare), never on ordinary requests.
 
 ### Access token (stateless, short-lived)

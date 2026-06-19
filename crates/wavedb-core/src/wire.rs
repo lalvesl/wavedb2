@@ -251,7 +251,7 @@ impl<T: Wire> Wire for Option<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{from_wire, to_wire, Wire};
+    use super::{Wire, from_wire, to_wire};
 
     fn roundtrip<T: Wire + PartialEq + core::fmt::Debug>(value: T) {
         let bytes = to_wire(&value);

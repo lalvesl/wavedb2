@@ -24,4 +24,4 @@ pub mod wire;
 pub use error::{Error, Result};
 pub use id::Id;
 pub use u48::U48;
-pub use wire::{from_wire, to_wire, Cursor, Wire};
+pub use wire::{Cursor, Wire, from_wire, to_wire};

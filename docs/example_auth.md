@@ -93,12 +93,12 @@ async fn flow() -> Result<()> {
 
 ## What each step shows
 
-| Step | Concept |
-| ---- | ------- |
-| 1 | Unauthenticated tier — `user = U48::MAX`, login + public reads only. |
-| 2 | `login` is a `#[server]` fn: verifies a credential (local Argon2 **or** OAuth), creates the `Session` record, mints the **access + refresh** pair. |
-| 3 | The node derives identity from the **access token**, never the request body. |
-| 4 | Typed CRUD: `create` (versioned, history-chained), `get` (single-lookup Unique anchor). |
-| 5 | Filtered/derived reads are server functions — the body runs node-side with DB access; the client ships a `Wire` call. |
-| 6 | Short access TTL lapses → the **refresh** token mints a new access token and **rotates** itself (replay of the old one ⇒ theft signal). |
-| 7 | **Revocation** = mark the `Session` record `revoked` (one write). The next `refresh` is refused and the live access token dies within one short TTL — no per-request session store. |
+| Step | Concept                                                                                                                                                                             |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | Unauthenticated tier — `user = U48::MAX`, login + public reads only.                                                                                                                |
+| 2    | `login` is a `#[server]` fn: verifies a credential (local Argon2 **or** OAuth), creates the `Session` record, mints the **access + refresh** pair.                                  |
+| 3    | The node derives identity from the **access token**, never the request body.                                                                                                        |
+| 4    | Typed CRUD: `create` (versioned, history-chained), `get` (single-lookup Unique anchor).                                                                                             |
+| 5    | Filtered/derived reads are server functions — the body runs node-side with DB access; the client ships a `Wire` call.                                                               |
+| 6    | Short access TTL lapses → the **refresh** token mints a new access token and **rotates** itself (replay of the old one ⇒ theft signal).                                             |
+| 7    | **Revocation** = mark the `Session` record `revoked` (one write). The next `refresh` is refused and the live access token dies within one short TTL — no per-request session store. |

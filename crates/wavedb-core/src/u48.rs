@@ -92,13 +92,21 @@ mod tests {
     fn bounds() {
         assert_eq!(U48::new(0), Ok(U48::ZERO));
         assert_eq!(U48::new(U48::MASK), Ok(U48::MAX));
-        assert_eq!(U48::new(U48::MASK + 1), Err(Error::U48Overflow(U48::MASK + 1)));
+        assert_eq!(
+            U48::new(U48::MASK + 1),
+            Err(Error::U48Overflow(U48::MASK + 1))
+        );
         assert_eq!(U48::from_truncated(u64::MAX), U48::MAX);
     }
 
     #[test]
     fn wire_roundtrip() {
-        for v in [U48::ZERO, U48::MAX, U48::from(42u32), U48::from_truncated(0x1234_5678_9ABC)] {
+        for v in [
+            U48::ZERO,
+            U48::MAX,
+            U48::from(42u32),
+            U48::from_truncated(0x1234_5678_9ABC),
+        ] {
             let bytes = to_wire(&v);
             assert_eq!(bytes.len(), 6);
             assert_eq!(from_wire::<U48>(&bytes), Ok(v));

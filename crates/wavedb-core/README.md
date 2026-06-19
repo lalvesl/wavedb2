@@ -14,7 +14,7 @@ permission refs, and the `Wire` serialization trait.
 | ------------ | -------------------------------------------------------------------- |
 | `id`         | The 128-bit composite `Id`, the `U48` newtype, and field accessors.  |
 | `metadata`   | `Metadata` — modification chain, authorship, permission ref.         |
-| `hooks`      | `first_try` (pre-search) and `fallback_not_found` (post-miss) hooks.  |
+| `hooks`      | `first_try` (pre-search) and `fallback_not_found` (post-miss) hooks. |
 | `permission` | `PermissionRef` shapes.                                              |
 | `wire`       | The `Wire` trait + `WaveWire` (no serde). See `docs/wire_format.md`. |
 | `registry`   | `ObjectDescriptor` / `ObjectRegistry` lookup by `STRUCT_HASH`.       |

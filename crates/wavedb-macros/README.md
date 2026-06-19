@@ -11,18 +11,18 @@ client and server because both compile this crate.
 
 ## Module map
 
-| Module              | Responsibility                                                  |
-| ------------------- | --------------------------------------------------------------- |
+| Module              | Responsibility                                                     |
+| ------------------- | ------------------------------------------------------------------ |
 | `lib`               | The `#[wavedb]`, `#[server]`, and `declare_objects!` entry points. |
-| `server`            | `#[server]`: server body + client stub + `FN_HASH`.             |
-| `args`              | Parse `#[wavedb(...)]` attribute arguments.                     |
-| `struct_hash`       | Compute the `STRUCT_HASH: u64` const from name/shape/fields.    |
-| `descriptor`        | Emit `ObjectDescriptor` (field offsets, heapable flags, names). |
-| `wire_derive`       | `WaveWire` — the no-serde, no-`repr(C)` `Wire` impl.            |
-| `generated`         | Auto-emit the per-NonUnique `Pivot` + `BpTree` types.           |
-| `crud`              | Generated accessors / CRUD glue.                                |
-| `declare`           | `declare_objects!` registry codegen.                            |
-| `codegen` / `utils` | Shared emit helpers.                                            |
+| `server`            | `#[server]`: server body + client stub + `FN_HASH`.                |
+| `args`              | Parse `#[wavedb(...)]` attribute arguments.                        |
+| `struct_hash`       | Compute the `STRUCT_HASH: u64` const from name/shape/fields.       |
+| `descriptor`        | Emit `ObjectDescriptor` (field offsets, heapable flags, names).    |
+| `wire_derive`       | `WaveWire` — the no-serde, no-`repr(C)` `Wire` impl.               |
+| `generated`         | Auto-emit the per-NonUnique `Pivot` + `BpTree` types.              |
+| `crud`              | Generated accessors / CRUD glue.                                   |
+| `declare`           | `declare_objects!` registry codegen.                               |
+| `codegen` / `utils` | Shared emit helpers.                                               |
 
 ---
 
@@ -165,10 +165,10 @@ let big: Vec<Order> = orders_over(&db, 100).await?;
 
 What the macro emits:
 
-| Side                | What is compiled                                                                                   |
-| ------------------- | -------------------------------------------------------------------------------------------------- |
-| **Server** (`cfg`)  | The real body + a registry entry under a stable `FN_HASH` so the node can dispatch an incoming call. |
-| **Client** (`cfg`)  | A stub with the **same signature**: `Wire`-encode the args → send `CallServerFn { fn_hash, args }` over `wavedb-net` → `Wire`-decode the return. The body is **not** in the binary (keeps wasm small, keeps server logic private). |
+| Side               | What is compiled                                                                                                                                                                                                                   |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Server** (`cfg`) | The real body + a registry entry under a stable `FN_HASH` so the node can dispatch an incoming call.                                                                                                                               |
+| **Client** (`cfg`) | A stub with the **same signature**: `Wire`-encode the args → send `CallServerFn { fn_hash, args }` over `wavedb-net` → `Wire`-decode the return. The body is **not** in the binary (keeps wasm small, keeps server logic private). |
 
 - **`FN_HASH: u64`** — a compile-time hash of the function name + argument types +
   return type (same idea as `STRUCT_HASH`), so client and server agree on identity

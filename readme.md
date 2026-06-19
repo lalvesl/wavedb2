@@ -179,11 +179,11 @@ with the `first_try` / `fallback_not_found` hooks (below).
 
 ### Base data types
 
-| Type          | Declared as            | Cardinality                                  | ID layout (`KEY · TENANT · FLAG · SALT`)                |
-| ------------- | ---------------------- | -------------------------------------------- | ------------------------------------------------------- |
-| **Unique**    | `#[wavedb]` (default)  | Exactly one live record per tenant           | `STRUCT_HASH · TENANT · 1 · 0`                          |
+| Type          | Declared as            | Cardinality                                  | ID layout (`KEY · TENANT · FLAG · SALT`)              |
+| ------------- | ---------------------- | -------------------------------------------- | ----------------------------------------------------- |
+| **Unique**    | `#[wavedb]` (default)  | Exactly one live record per tenant           | `STRUCT_HASH · TENANT · 1 · 0`                        |
 | **NonUnique** | `#[wavedb(NonUnique)]` | Many per tenant; may nest in other NonUnique | `CREATED_AT · TENANT · 0 · salt7‖trunc8(STRUCT_HASH)` |
-| **Pivot**     | auto-generated         | One per NonUnique collection (the handle)    | `CREATED_AT · TENANT · 0 · salt7‖trunc8(STRUCT_HASH)`   |
+| **Pivot**     | auto-generated         | One per NonUnique collection (the handle)    | `CREATED_AT · TENANT · 0 · salt7‖trunc8(STRUCT_HASH)` |
 | **BpTree**    | auto-generated         | Index nodes addressing a collection          | `CREATED_AT · TENANT · 0 · salt7‖trunc8(STRUCT_HASH)` |
 
 **Unique** is the default — the everyday "one record per tenant" object:

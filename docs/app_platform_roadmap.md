@@ -135,9 +135,9 @@ M1 (schema) ─► M2 (storage) ─► M3 (node) ─► M4 (typed E2E) ─► M7
 
 ## Risks / open questions
 
-| Risk                                                              | Mitigation                                                                                                |
-| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| Registry statics bloat the wasm binary as schemas grow            | M5 measures per-struct cost early; descriptors are `'static` data, dictionary-compressible by `wasm-opt`. |
+| Risk                                                              | Mitigation                                                                                                                      |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Registry statics bloat the wasm binary as schemas grow            | M5 measures per-struct cost early; descriptors are `'static` data, dictionary-compressible by `wasm-opt`.                       |
 | Server functions need stable identity across client/server builds | `FN_HASH` (name + arg types + return type) bound at compile time; a signature change is a new function, caught at the boundary. |
-| Runtime abstraction (tokio vs wasm) leaks into public API         | Keep it internal to `wavedb`/`wavedb-net`; public API stays `async fn`.                                   |
-| ID / block-descriptor bit budgets                                 | Resolved: `Id` = `KEY u64·TENANT u48·FLAG 1·SALT 15`; descriptor `u40·u20·u4` (pages + dictionary).       |
+| Runtime abstraction (tokio vs wasm) leaks into public API         | Keep it internal to `wavedb`/`wavedb-net`; public API stays `async fn`.                                                         |
+| ID / block-descriptor bit budgets                                 | Resolved: `Id` = `KEY u64·TENANT u48·FLAG 1·SALT 15`; descriptor `u40·u20·u4` (pages + dictionary).                             |
