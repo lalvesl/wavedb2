@@ -253,6 +253,53 @@ impl<T: Wire> Wire for Option<T> {
     }
 }
 
+// Arrays and tuples compose **flattened**: each element's stack slots are emitted
+// inline into the parent stack, heaps appended in order — so every offset stays a
+// compile-time constant.
+
+impl<T: Wire, const N: usize> Wire for [T; N] {
+    const STACK_SIZE: usize = N * T::STACK_SIZE;
+    fn heap_size(&self) -> usize {
+        self.iter().map(Wire::heap_size).sum()
+    }
+    fn encode_stack(&self, stack: &mut Vec<u8>) {
+        for e in self {
+            e.encode_stack(stack);
+        }
+    }
+    fn encode_heap(&self, heap: &mut Vec<u8>) {
+        for e in self {
+            e.encode_heap(heap);
+        }
+    }
+    fn decode(stack: &mut Cursor, heap: &mut Cursor) -> Result<Self> {
+        let mut v = Vec::with_capacity(N);
+        for _ in 0..N {
+            v.push(T::decode(stack, heap)?);
+        }
+        // `v` has exactly N elements, so the conversion never fails.
+        v.try_into().map_err(|_| Error::UnexpectedEof)
+    }
+}
+
+macro_rules! wire_tuple {
+    ($($name:ident $idx:tt),+) => {
+        impl<$($name: Wire),+> Wire for ($($name,)+) {
+            const STACK_SIZE: usize = 0 $(+ $name::STACK_SIZE)+;
+            fn heap_size(&self) -> usize { 0 $(+ self.$idx.heap_size())+ }
+            fn encode_stack(&self, stack: &mut Vec<u8>) { $(self.$idx.encode_stack(stack);)+ }
+            fn encode_heap(&self, heap: &mut Vec<u8>) { $(self.$idx.encode_heap(heap);)+ }
+            fn decode(stack: &mut Cursor, heap: &mut Cursor) -> Result<Self> {
+                Ok(( $($name::decode(stack, heap)?,)+ ))
+            }
+        }
+    };
+}
+
+wire_tuple!(A 0, B 1);
+wire_tuple!(A 0, B 1, C 2);
+wire_tuple!(A 0, B 1, C 2, D 3);
+
 #[cfg(test)]
 mod tests {
     use super::{Wire, from_wire, to_wire};
@@ -289,5 +336,14 @@ mod tests {
         roundtrip(Some(42u64));
         roundtrip(Some("x".to_string()));
         roundtrip(vec![Some(1u8), None, Some(2)]);
+    }
+
+    #[test]
+    fn arrays_and_tuples() {
+        roundtrip([1u32, 2, 3]);
+        roundtrip(["a".to_string(), "bb".to_string()]); // array of heap-bearing elems
+        roundtrip([Some(1u8), None]);
+        roundtrip((1u8, "x".to_string(), 9u64));
+        roundtrip((vec![1u16, 2], 'z', Option::<u32>::None, true));
     }
 }
