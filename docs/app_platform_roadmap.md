@@ -121,9 +121,18 @@ Versioning policy for the platform crates.
 
 ## Deferred (explicitly out of scope for this rebuild)
 
-- **Slow-node / cold history tier** (flush-down, archive reads).
+- **Multi-node cluster** — ring ownership, replication, routing/failover. The
+  rebuild targets a **single node** first; durability is the journal. (So the
+  async-replication durability window is moot for now.)
+- **Cold history tier (slow-node) — removed** for now (not just deferred).
+  History stays single-tier in `data.bin`, **grows unbounded**; no pruning,
+  compaction, or archive tier yet — accepted.
 - **Permission groups.**
 - **`STRUCT_HASH`-grained write-ownership** — tenant-grained for now.
+- **Cross-tenant read *path*** — the multi-node routing + where the grant is
+  enforced when tenant B reads tenant A's data. The permission *model*
+  (tenant-list grant in `Metadata`) stays; the serving path is not a problem for
+  now.
 - **Offline-first reconciliation.**
 
 ### Planned generator extensions (post-rebuild)

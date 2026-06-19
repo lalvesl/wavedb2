@@ -75,6 +75,15 @@ descriptor — there is no second format:
 can read **without touching the page** — enough to decide "this page must grow /
 split" from the directory alone.
 
+### The `Id` hash
+
+`hash_of(id)` is **`ahash` over the 128-bit `Id`** — fast on `u128` and
+DoS-resistant. It is seeded with a **per-database random `[u64; 4]` seed persisted
+in the first page of `data.bin`** (page 0), read once at startup. The seed is
+per-database (not the fixed `STRUCT_HASH` seed): each node rebuilds its own
+directory consistently, and an attacker can't precompute bucket collisions. The
+resulting `u64` feeds the linear-hashing reduction below.
+
 ### Linear hashing (not `%`)
 
 Addressing uses **linear hashing**, not `hash % len`. The directory starts as one
@@ -176,7 +185,7 @@ serialize/deserialize. Page kinds:
 | ------------- | ---------------------------------------------------------------- |
 | **Unique**    | The single live record per tenant at its fixed anchor address.   |
 | **NonUnique** | The collection's records (timestamp-keyed).                      |
-| **Pivot**     | Collection handles: `counter`, `current`/`dead` BpTree pointers. |
+| **Pivot**     | Collection handles: `current`/`dead` BpTree pointers (no counter). |
 | **BpTree**    | B+tree index nodes — record addresses, not record bytes.         |
 
 ---
@@ -238,6 +247,29 @@ mutation → journal append → in-memory BTreeMap<Id> cache → (client confirm
 
 On startup the directories and the block allocator rebuild by **journal replay**.
 
+### Atomicity is the in-memory cache
+
+A single operation can touch several records (a NonUnique insert writes the data
+record **and** a `BpTree` node). These are committed as **one journal entry** and
+applied to the in-memory cache **atomically** — so readers see all-or-nothing, and
+a crash before the background settle replays the journal back into the cache. No
+separate transaction manager: the journal entry + cache update *is* the atomic
+unit. (Multi-write **server-function** transactions — several operations as one
+unit — remain a separate, later concern.)
+
+### IO cost per operation
+
+Counting journal + `data.bin` IOs (the cache absorbs repeats; cold case shown):
+
+| Operation                          | IOs | Breakdown                                                                                                 |
+| ---------------------------------- | --- | --------------------------------------------------------------------------------------------------------- |
+| **Unique `save`**                  | 4   | journal data entry · read the page · write the page · allocation delta in journal                         |
+| **NonUnique `insert`/`save`/`delete`** | 7 | journal data entry · read 3 pages (record, `Pivot`, `BpTree`) · write 2 pages (record, `BpTree`) · allocation delta in journal |
+
+The `Pivot` is **read but not written** on a normal NonUnique op (it changes only
+if a `BpTree` root moves) — that is why dropping its counter matters. Both
+allocation deltas ride in a single journal write.
+
 ---
 
 ## Operations on records
@@ -245,9 +277,38 @@ On startup the directories and the block allocator rebuild by **journal replay**
 - **Unique** — `get` resolves the fixed anchor (`STRUCT_HASH · TENANT · 1 · 0`)
   in one lookup. `save` writes the new live bytes to the anchor and chains the
   previous version into history via `Metadata`.
-- **NonUnique** — `insert` / `update` / `delete` each revalidate the `Pivot`'s
+- **NonUnique** — a collection's `Pivot` is created **explicitly** (one per tenant
+  per definition) and its `PivotId` stored by the holder; it is never
+  auto-created. `insert` / `update` / `delete` then go through that `Pivot`'s
   `BpTree`. `delete` moves the entry from the **current** tree to the **dead**
   tree; the record bytes are never erased, keeping the timeline navigable.
+
+### `BpTree` stores only `Id`s — reads are two-phase
+
+A `BpTree` holds **`Id`s, never record bytes**. Its nodes are themselves stored
+as pages (the `BpTree` `STRUCT_HASH`) and linked by `Id`, so a search walks the
+tree node-by-node and **returns a set/range of matching record `Id`s** — nothing
+more. Resolving those `Id`s to actual records is a **separate step**: each `Id` is
+fetched through its type's page directory (a normal record `get`). So a NonUnique
+read is:
+
+1. **Index search** — walk the `Pivot`'s `current` `BpTree` (ordered by
+   `CREATED_AT`) → matching `Id`s;
+2. **Record fetch** — resolve each `Id` to its bytes via the per-`STRUCT_HASH`
+   directory.
+
+Keeping the tree ID-only is what makes it small and shallow, and lets the two
+phases be scheduled independently (e.g. fetch only the page of `Id`s the caller
+actually wants).
+
+### History & space
+
+There is **no cold tier** (the slow-node was removed — not part of the design for
+now). History is first-class and **never erased**: superseded versions and
+deleted-record bytes stay in `data.bin`, reachable via the modification chain and
+the `dead` `BpTree`. So a node's `data.bin` **grows unbounded** with history — and
+that is **accepted for now**. History pruning / compaction / a separate archive
+tier is left for later; nothing reclaims old versions today.
 
 ---
 

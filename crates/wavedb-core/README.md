@@ -40,22 +40,26 @@ the `BpTree` indexes on.
 | `KEY`    | `u64`   | `STRUCT_HASH` when `FLAG = 1` (Unique anchor), or a `CREATED_AT` timestamp when `FLAG = 0`.          |
 | `TENANT` | `u48`   | Owning tenant. `0` reserved for the system; `U48::MAX` for unauthenticated sessions. B2C: = user id. |
 | `FLAG`   | 1 bit   | `1` ⇒ `KEY` is a struct-hash key; `0` ⇒ `KEY` is a `CREATED_AT` timestamp.                           |
-| `SALT`   | 15 bits | Per-type discriminator + collision breaker (layout below).                                           |
+| `SALT`   | 15 bits | Collision breaker within one `(KEY, TENANT)`.                                                        |
 
 ### The `SALT` field (15 bits)
 
-The trailing 15 bits both **disambiguate the struct type** (needed when `KEY` is a
-timestamp, not a struct hash) and **break collisions** within one
-`(KEY, TENANT)`. Layout depends on the shape:
+The trailing 15 bits **only break collisions** within a single `(KEY, TENANT)`:
 
-| Shape                          | `SALT[14..0]`                                                |
-| ------------------------------ | ------------------------------------------------------------ |
-| **Unique**                     | `0` (all 15 bits zero — `KEY` already carries the full hash) |
-| **NonUnique / BpTree / Pivot** | `salt(u7)` ‖ `trunc8(STRUCT_HASH)`                           |
+| Shape                          | `SALT[14..0]`                              |
+| ------------------------------ | ------------------------------------------ |
+| **Unique**                     | `0` (the fixed anchor needs no salt)       |
+| **NonUnique / BpTree / Pivot** | 15 bits of writer-supplied random/fixed value |
 
-`salt` is a fixed or random value the writer supplies; the 8-bit `STRUCT_HASH`
-truncation co-locates same-type records and tells the engine which type a
-timestamp-keyed `Id` belongs to.
+There is **no struct-hash truncation in the `Id`**. The type is always known
+without it — every lookup is scoped to one `STRUCT_HASH` directory (storage) or
+carried in the wire envelope, and the 48-bit `TENANT` already separates tenants.
+15 random bits plus the nanosecond `KEY` make a same-tick collision within one
+tenant astronomically unlikely; this also keeps the in-memory KV cache's key
+space clean (no 256-bucket truncation aliasing).
+
+> **Future.** The 15-bit `SALT` may be masked per connected user to shrink the
+> KV-cache collision probability further.
 
 ### `U48` — the 48-bit newtype
 
@@ -71,11 +75,24 @@ It range-checks on construction, exposes the `U48::MAX` (unauthenticated) and `0
 Accessors such as `.tenant_id()` and `Metadata::user` return `U48`, never a raw
 `u64`. Everywhere this README writes `u48`, the Rust type is `U48`.
 
-### `CREATED_AT` time base
+### `CREATED_AT` time base — the guarantee
 
-`CREATED_AT` is a **nanosecond** count from a fixed WaveDB epoch (a `const`
-Rust reference instant). Fine precision keeps collisions rare; `SALT` breaks any
-remaining tie within the same nanosecond and tenant.
+`CREATED_AT` is a **nanosecond** count from a fixed WaveDB epoch (a `const` Rust
+reference instant). What is and isn't guaranteed:
+
+- **Uniqueness (guaranteed):** the `Id` is unique within a `(KEY, TENANT)` because
+  of the **15-bit random `SALT`**, *not* because of clock monotonicity. Two writes
+  in the same nanosecond — or even with the clock running backwards (NTP step) —
+  get distinct `Id`s from the salt. At low scale 15 random bits are ample; a
+  64-write burst in one ns has a sub-1e-15 collision chance.
+- **Ordering (best-effort):** sorting by `CREATED_AT` is approximately
+  chronological — good enough for the `BpTree`'s time index — but it is **not a
+  strict total order** under clock skew/adjustment. WaveDB does not promise that
+  `Id` order equals real-time order across NTP corrections.
+
+> **Future.** At higher scale the `SALT` becomes a **per-user-session mask** (a
+> chunk reserved per connected session) so concurrent sessions can't collide and
+> the in-memory KV cache stays clean — uniqueness by construction, not just luck.
 
 ### Why the `FLAG` bit
 
@@ -93,20 +110,23 @@ identity and schema generation are both folded into `STRUCT_HASH`.
 
 ## `STRUCT_HASH`
 
-A `u64` identity computed at **compile time** by `#[wavedb]` (see
-[`wavedb-macros`](../wavedb-macros/README.md)) as a `const` hash of:
+A `u64` identity computed at **build time** (in `wavedb-build` / `#[wavedb]`, see
+[`wavedb-macros`](../wavedb-macros/README.md)) over the canonical string:
 
 ```
 STRUCT_NAME + SHAPE + each PROPERTY_NAME + each PROPERTY_TYPE
 ```
 
+**Algorithm: `ahash` with a fixed, hard-coded seed.** The seed is a compile-time
+constant baked into the tooling — *not* the random per-database seed — so the
+hash is **deterministic across every build and machine** (clients and servers
+must agree on a type's identity). ahash is fast and gives good u64 dispersion.
+
 Folding field names and types into the hash means **any schema change yields a
 new `STRUCT_HASH`** — a changed struct is simply a different type. There is no
-version counter; bridging old and new is done with the lookup hooks below.
-
-An 8-bit truncation of `STRUCT_HASH` rides in the `SALT` field of every
-timestamp-keyed ID (NonUnique, BpTree, Pivot — see _The `SALT` field_),
-co-locating same-type records and identifying the type when `KEY` is a timestamp.
+version counter; bridging old and new is done with the lookup hooks below. The
+`STRUCT_HASH` does **not** appear inside the `Id`'s `SALT`; the type is known from
+the per-`STRUCT_HASH` storage directory and the wire envelope.
 
 ---
 
@@ -163,6 +183,10 @@ Access control is stored **inline in `Metadata`**, scoped per record:
 
 A grant is what lets a user of one tenant act on another tenant's data; without
 it, tenants never see each other's records.
+
+> The cross-tenant **serving path** (which node serves tenant A's data to a
+> tenant-B user, and where the grant is enforced across nodes) is **deferred** —
+> the model above is the contract; the multi-node routing is not built yet.
 
 There is **no query expression tree**. Reads are: a Unique `get`, a NonUnique
 collection walk through its `Pivot` → `BpTree` (ordered by `CREATED_AT`), or a

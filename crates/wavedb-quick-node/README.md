@@ -32,6 +32,14 @@ Server::bind("0.0.0.0:7700")
 
 ---
 
+> **Status: single-node for now.** The current rebuild targets one node.
+> Durability is the **journal** (a write is durable once journaled, before any
+> replica). The multi-node machinery below — ring ownership, replication,
+> routing/failover — is the **target design, deferred** until the single-node
+> engine is solid. The async-replication durability window (owner crash before
+> replicating) is therefore moot for now: with one node the journal is the whole
+> guarantee.
+
 ## Write-ownership model
 
 **Ownership is never configured — it is computed.** Every node derives who owns a

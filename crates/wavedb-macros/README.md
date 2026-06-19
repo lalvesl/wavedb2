@@ -32,11 +32,13 @@ because both compile this crate.
 
 ## What `#[wavedb]` does at compile time
 
-1. **Computes `STRUCT_HASH: u64`.** A `const` hash of
-   `STRUCT_NAME + SHAPE + each PROPERTY_NAME + each PROPERTY_TYPE`. Because field
-   names and types are folded in, **any schema change changes the hash** — a
-   changed struct is simply a different type. There is **no `version =` attribute
-   and no version-from-type-name rule** anymore; identity is the hash.
+1. **Computes `STRUCT_HASH: u64`** — `ahash` (with a **fixed, hard-coded seed**)
+   over `STRUCT_NAME + SHAPE + each PROPERTY_NAME + each PROPERTY_TYPE`. The fixed
+   seed makes it deterministic across every build and machine; it is **not** the
+   random per-database seed used for runtime `Id` hashing. Because field names and
+   types are folded in, **any schema change changes the hash** — a changed struct
+   is simply a different type. No `version =` attribute, no version-from-type-name
+   rule; identity is the hash.
 2. **Implements `Id` + `Metadata` accessors.** `.tenant_id()`, `.key()`,
    `.created_at()`, `.struct_hash()`, plus full `Metadata` getters/setters — no
    call-site boilerplate.
@@ -89,22 +91,32 @@ of another NonUnique collection in a field. The collection is reached by
 
 ## Generated collection types (`Pivot` + `BpTree`)
 
-`#[wavedb(NonUnique)]` auto-generates two helper types per family. They carry no
-business data — they are pure addressing — so applications rarely name them
+`#[wavedb(NonUnique)]` auto-generates the two helper **types** per family. They
+carry no business data — pure addressing — so applications rarely name them
 directly; they reference a collection through its `PivotId`.
 
 ```rust
-// Auto-generated. The handle for one NonUnique collection.
+// Generated type. The handle for one NonUnique collection.
+// No counter — a size field would force a Pivot write on every insert/delete;
+// the Pivot stays effectively immutable (written only if a BpTree root moves).
 pub struct Pivot {
-    pub counter: u64,       // number of live elements
     pub current: BpTreeId,  // u128 → B+tree of living records
     pub dead:    BpTreeId,  // u128 → B+tree of deleted records
 }
 
-// Auto-generated. A B+tree keyed by CREATED_AT, holding NonUnique record
-// addresses (not their bytes). One instance indexes living data, one deleted.
+// Generated type. A B+tree keyed by CREATED_AT, holding NonUnique record
+// IDs (not their bytes). One instance indexes living data, one deleted.
 pub struct BpTree { /* node entries → Id */ }
 ```
+
+### The type is generated; the **instance is created explicitly**
+
+The macro emits the `Pivot`/`BpTree` *types*, but a `Pivot` *instance* is **not
+created automatically**. A collection comes into being when you **call create on
+its `Pivot`** — there is **one `Pivot` per tenant per definition** (per NonUnique
+struct type) — and then **store the returned `PivotId`** in a field of a `Unique`
+struct or of a nesting `NonUnique` (recursive collections). No stored `PivotId`
+⇒ no collection; the holder owns the handle.
 
 Referencing a collection from another object:
 
@@ -117,11 +129,10 @@ pub struct UserInterestedFruits {
 ```
 
 > The generated `Pivot`/`BpTree` types share a name and field shape across
-> families, so their `STRUCT_HASH` may collide. That is harmless — they are only
-> ever addressed within their own tenant/collection context. Both are
-> timestamp-keyed, so an 8-bit `STRUCT_HASH` truncation rides in the `Id`'s
-> `SALT` — `salt7 ‖ trunc8(STRUCT_HASH)`, the same packing every timestamp-keyed
-> shape uses (see
+> families, so their `STRUCT_HASH` may collide. That is harmless — each is
+> addressed only within its own per-`STRUCT_HASH` directory and tenant/collection
+> context, and the type is never inferred from the `Id` (the 15-bit `SALT` is pure
+> collision breaker — see
 > [`wavedb-core`](../wavedb-core/README.md#the-salt-field-15-bits)).
 
 ---
@@ -191,10 +202,20 @@ node links them the same way it links the schema.
 ## The registry — generated in `build.rs`
 
 The registry that lets **storage, server, and client all "know the structs"** is
-**generated at build time**, not hand-listed. The schema crate's `build.rs` calls
-a scanner that walks its own `src/` tree, finds every `#[wavedb]` struct and
-`#[server]` function, computes their `STRUCT_HASH` / `FN_HASH`, and emits Rust
-into `$OUT_DIR`:
+**generated at build time**, not hand-listed.
+
+**Division of labor (the two halves).**
+
+- **`#[wavedb]` (proc-macro)** does all the *per-struct* work, in place: it emits
+  the struct's `STRUCT_HASH` const, its `Wire` impl, its generated `PivotId` /
+  `Pivot` / `BpTree` types, accessors, and hook wiring. Each struct is fully
+  self-contained after the macro runs.
+- **`build.rs` (`wavedb_build::generate_registry`)** does the *aggregation*: it
+  scans the crate's own `src/`, finds every `#[wavedb]` item, and emits a module
+  that **references the macro-generated paths** — building the `Object` enum and
+  the `match` arms like `module::SomeStruct::STRUCT_HASH => module::SomeStruct::decode(…)`.
+  It generates no per-struct logic; it just wires the already-defined pieces into
+  one dispatch table.
 
 ```rust
 // build.rs
@@ -204,14 +225,24 @@ fn main() {
 ```
 
 ```rust
-// lib.rs — splice the generated code straight in
+// lib.rs — splice the generated module straight in
 include!(concat!(env!("OUT_DIR"), "/wavedb_registry.rs"));
 ```
 
-**Why `build.rs` and not a `declare_objects!` macro.** A proc-macro can't read the
-file system to *discover* every struct — it would force a manual list that drifts.
-A build script scans the crate and accumulates the registry automatically: adding
-a `#[wavedb]` struct anywhere registers it with zero extra wiring.
+**Scope: this crate's `src/` only.** The scanner walks the schema crate's own
+`src/` tree. It does **not** reach into dependency crates, and it does not expand
+macros or evaluate `cfg`. Consequences and the boundary:
+
+- A `#[wavedb]` struct from a *dependency* crate is not auto-registered here — to
+  include it, re-declare or re-export it in this crate's `src/` (or let that
+  dependency expose its own generated registry).
+- `cfg`-gated and macro-generated structs the scanner can't see textually won't
+  appear — keep `#[wavedb]` items written out in `src/`.
+
+This is the deliberate trade vs a `declare_objects!` macro (which can't read the
+file system to *discover* structs at all): build-scan auto-collects everything
+written under `src/`, at the cost of not seeing across crate / macro / cfg
+boundaries.
 
 ### The generated `Object` enum
 
@@ -219,12 +250,20 @@ The core artifact is one enum, **one variant per declared struct, keyed by
 `STRUCT_HASH`**:
 
 ```rust
-pub enum Object { AboutUser(AboutUser), Note(Note), /* … */ }
+// Variants reference the structs by their src/ path; arms use the macro-emitted
+// `STRUCT_HASH` const and `Wire` impl — build.rs writes the wiring, not the logic.
+pub enum Object { AboutUser(crate::user::AboutUser), Note(crate::notes::Note), /* … */ }
 
 impl Object {
-    pub const fn struct_hash(&self) -> u64 { /* match → STRUCT_HASH */ }
-    pub fn from_wire(hash: u64, bytes: &[u8]) -> Result<Object> { /* match hash → T::decode */ }
-    pub fn to_wire(&self) -> Vec<u8> { /* match → T::encode */ }
+    pub const fn struct_hash(&self) -> u64 { /* match self → path::Struct::STRUCT_HASH */ }
+    pub fn from_wire(hash: u64, bytes: &[u8]) -> Result<Object> {
+        match hash {
+            crate::user::AboutUser::STRUCT_HASH => Ok(Object::AboutUser(from_wire(bytes)?)),
+            crate::notes::Note::STRUCT_HASH     => Ok(Object::Note(from_wire(bytes)?)),
+            _ => Err(/* unknown hash */),
+        }
+    }
+    pub fn to_wire(&self) -> Vec<u8> { /* match self → to_wire(inner) */ }
 }
 ```
 

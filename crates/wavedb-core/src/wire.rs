@@ -85,15 +85,19 @@ pub trait Wire: Sized {
     fn decode(stack: &mut Cursor, heap: &mut Cursor) -> Result<Self>;
 }
 
-/// Serialise a value to a single `[stack][heap]` byte vector.
+/// Serialise a value to a single `[stack][heap]` byte vector in **one
+/// allocation**: `STACK_SIZE` (a compile-time sum over every field, including
+/// nested `Wire` types like `Metadata`) plus the recursively-computed
+/// `heap_size()` give the exact final length up front. `encode_stack` appends the
+/// `STACK_SIZE`-byte stack section, then `encode_heap` appends the heap section to
+/// the same buffer — no second allocation, no concat.
 #[must_use]
 pub fn to_wire<T: Wire>(value: &T) -> Vec<u8> {
-    let mut stack = Vec::with_capacity(T::STACK_SIZE + value.heap_size());
-    let mut heap = Vec::new();
-    value.encode_stack(&mut stack);
-    value.encode_heap(&mut heap);
-    stack.extend_from_slice(&heap);
-    stack
+    let mut buf = Vec::with_capacity(T::STACK_SIZE + value.heap_size());
+    value.encode_stack(&mut buf);
+    value.encode_heap(&mut buf);
+    debug_assert_eq!(buf.len(), T::STACK_SIZE + value.heap_size());
+    buf
 }
 
 /// Deserialise a value from a `[stack][heap]` byte slice.

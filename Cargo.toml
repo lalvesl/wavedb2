@@ -39,6 +39,9 @@ thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 zstd = "0.13.3"
 byteorder = "1.5.0"
+# STRUCT_HASH (fixed hard-coded seed) + runtime Id/page hashing (per-DB random
+# seed in data.bin page 0). `RandomState::with_seeds` gives a fixed-seed hasher.
+ahash = { version = "0.8.11", default-features = false }
 parking_lot = "0.12.5"
 proptest = "1.11.0"
 criterion = { version = "0.8.2", features = ["async_tokio"] }
