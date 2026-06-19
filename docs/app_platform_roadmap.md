@@ -7,7 +7,7 @@ code sharing where the DB **is** the server and ships as a library.
 ```
 my-app/
 ├── crates/
-│   ├── app-schema/   # #[wavedb] structs + declare_objects! + evolution hooks
+│   ├── app-schema/   # #[wavedb] structs + build.rs registry + evolution hooks
 │   │                 #   compiled into EVERY binary below
 │   ├── app-server/   # #[server] functions, validation, jobs (server-only)
 │   ├── app-node/     # fn main() { wavedb_quick_node::run(config, REGISTRY, hooks) }
@@ -25,13 +25,16 @@ is the protocol.
 
 ## M1 — Foundations: schema crate compiles everywhere
 
-The `app-schema` crate (`#[wavedb]` + `declare_objects!`) builds for native and
-`wasm32`, producing `STRUCT_HASH`es, `Wire` impls, descriptors, the registry, and
-the auto-generated `Pivot`/`BpTree` types. This is the keystone — every other
-milestone consumes the registry.
+The `app-schema` crate (`#[wavedb]` structs + a `build.rs` that calls
+`wavedb_build::generate_registry`) builds for native and `wasm32`, producing
+`STRUCT_HASH`es, `Wire` impls, descriptors, the auto-generated `Pivot`/`BpTree`
+types, and the generated `Object` enum (`STRUCT_HASH` → variant) spliced in with
+`include!`. This is the keystone — every other milestone consumes the registry,
+and the build-scanner + `Object` enum is what lets storage/server/client all know
+the structs by static dispatch (no `dyn`).
 
-**Exit:** the schema crate builds on both targets; the registry is queryable by
-`STRUCT_HASH`; round-trip `Wire` encode/decode is property-tested.
+**Exit:** the schema crate builds on both targets; `Object::from_wire(hash, …)`
+round-trips through the generated enum; `Wire` encode/decode is property-tested.
 
 ## M2 — Storage engine
 
@@ -122,6 +125,17 @@ Versioning policy for the platform crates.
 - **Permission groups.**
 - **`STRUCT_HASH`-grained write-ownership** — tenant-grained for now.
 - **Offline-first reconciliation.**
+
+### Planned generator extensions (post-rebuild)
+
+The `build.rs` registry generator is the natural place to grow, all by static
+dispatch on the `Object` enum (no `dyn`):
+
+- **`update_call`** — an additional generated call kind beside the server-function
+  dispatch, for update-shaped operations.
+- **More `BpTree`s per struct** — today one `BpTree` per collection keyed by
+  `CREATED_AT`; emit extra `BpTree`s indexing other properties (secondary
+  indexes).
 
 ## Sequencing
 

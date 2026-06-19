@@ -174,7 +174,12 @@ the node with DB access and is called by a typed client binding (see
 
 ## Registry
 
-`ObjectRegistry` maps a `STRUCT_HASH` to its `&'static ObjectDescriptor` (field
-offsets, heapable flags, heap-prop name list, shape). Built at compile time by
-`declare_objects!` (see [`wavedb-macros`](../wavedb-macros/README.md)); lookups
-are a const-compare chain — no `dyn`, no runtime registration.
+`ObjectDescriptor` carries a type's static shape (field offsets, heapable flags,
+heap-prop name list, shape). The **registry that maps a `STRUCT_HASH` to its type
+is generated in `build.rs`**, not here: a scanner walks the schema crate, finds
+every `#[wavedb]` struct, and emits a generated `Object` enum
+(`STRUCT_HASH` → variant) spliced in with
+`include!(concat!(env!("OUT_DIR"), …))`. Dispatch — wire-parse, the `first_try` /
+`fallback_not_found` hooks, the generated `Pivot`/`BpTree` accessors — is a
+`match` on that enum: **no `dyn`, no runtime registration**. The mechanism lives
+in [`wavedb-macros` § the registry](../wavedb-macros/README.md#the-registry--generated-in-buildrs).

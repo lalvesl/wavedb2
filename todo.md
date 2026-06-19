@@ -15,10 +15,19 @@ code exists yet. Build order, roughly bottom-up:
   `docs/wire_format.md`;
 - `#[wavedb]` macro: shapes `Unique` (default) / `NonUnique`; auto-generate
   `Pivot` + `BpTree`; `PivotId` field references for nesting;
-- `declare_objects!` registry keyed by `STRUCT_HASH`;
 - schema-evolution hooks: `first_try` (pre-search) + `fallback_not_found`
   (post-miss). No migration chains;
 - permissions: tenant-only / public / tenant-list (group deferred).
+
+## Registry generation (`wavedb-build` + `build.rs`)
+
+- `wavedb-build` crate: `generate_registry()` scans the schema crate's `src/`,
+  finds `#[wavedb]` structs + `#[server]` fns, computes `STRUCT_HASH`/`FN_HASH`;
+- emit `$OUT_DIR/wavedb_registry.rs`: `Object` enum (`STRUCT_HASH` → variant),
+  `Object::from_wire`/`to_wire`, hook routing (`first_try`/`fallback_not_found`),
+  `Pivot`/`BpTree` accessors, server-fn dispatch — static `match`, no `dyn`;
+- schema crate pulls it in with `include!(concat!(env!("OUT_DIR"), …))`.
+- _Future:_ `update_call` kind + extra per-property `BpTree`s (secondary indexes).
 
 ## Storage engine (`wavedb-storage`)
 

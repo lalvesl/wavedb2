@@ -77,13 +77,15 @@ separate version byte. On read, a stored `STRUCT_HASH` that differs from the
 reader's compiled head simply means a different type; bridging it is the
 application's job via the `first_try` / `fallback_not_found` hooks.
 
-All nodes (server and client/WASM) build a **static registry** at compile time
-via the `declare_objects!` macro, searchable by `STRUCT_HASH`. The registry
-exposes `&'static ObjectDescriptor`s — stack size, shape, field table (name,
-stack offset, kind, heapable flag), heap-field name list — so the storage engine
-can locate any field of any declared object without deserialising, organise the
-`Pivot`/`BpTree` indexes for `NonUnique` collections, and dispatch statically
-(match on `STRUCT_HASH` → monomorphised fn, no `dyn`).
+All nodes (server and client/WASM) share a **static registry generated in
+`build.rs`** — a scanner walks the schema crate, finds every `#[wavedb]` struct,
+and emits an `Object` enum (`STRUCT_HASH` → variant) plus per-struct
+`ObjectDescriptor`s (stack size, shape, field table, heap-field name list),
+spliced in with `include!`. Searchable by `STRUCT_HASH`, it lets the engine locate
+any field without deserialising, organise the `Pivot`/`BpTree` indexes, invoke the
+`first_try` / `fallback_not_found` hooks, and dispatch statically (match on the
+enum → monomorphised arm, **no `dyn`**). See
+[`wavedb-macros`](../crates/wavedb-macros/README.md#the-registry--generated-in-buildrs).
 
 ## Trade-offs vs postcard
 
