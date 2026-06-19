@@ -95,9 +95,7 @@ wavedb = { path = "../wavedb" }
 wavedb-net = { path = "../wavedb-net" }
 wavedb-core = { path = "../wavedb-core" }
 wavedb-test-cluster = { path = "../wavedb-test-cluster" }
-wavedb-monitor = { path = "../wavedb-monitor" }
 wavedb-quick-node = { path = "../wavedb-quick-node" }
-wavedb-slow-node = { path = "../wavedb-slow-node" }
 tokio.workspace = true
 axum = { workspace = true, features = ["ws"] }
 # real_example opens thousands of WS connections + storage files; bump

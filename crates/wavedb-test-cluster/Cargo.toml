@@ -14,7 +14,6 @@ wavedb-core = { path = "../wavedb-core" }
 wavedb-net = { path = "../wavedb-net" }
 wavedb-storage = { path = "../wavedb-storage" }
 wavedb-quick-node = { path = "../wavedb-quick-node" }
-wavedb-slow-node = { path = "../wavedb-slow-node" }
 tokio.workspace = true
 axum = { workspace = true, features = ["ws"] }
 bytes.workspace = true

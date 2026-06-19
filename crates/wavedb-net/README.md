@@ -144,3 +144,6 @@ to **login** and **public reads** (records whose `Metadata.permission` is
 `Public`); everything else is refused. Permission enforcement itself is per
 record (`PermissionRef`) — see
 [`wavedb-core`](../wavedb-core/README.md#permissions).
+
+> Worked end-to-end example (login → request → refresh → revoke):
+> [`docs/example_auth.md`](../../docs/example_auth.md).

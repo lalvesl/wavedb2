@@ -1,6 +1,19 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+# Staged rebuild: `members` grows as each crate is implemented bottom-up. Crates
+# still under construction (empty or bin-only targets) sit in `exclude` so the
+# workspace resolves. Move a crate from `exclude` to `members` once it builds.
+members = ["crates/wavedb-core", "crates/wavedb-macros"]
+exclude = [
+  "crates/wavedb",
+  "crates/wavedb-net",
+  "crates/wavedb-storage",
+  "crates/wavedb-quick-node",
+  "crates/wavedb-wasm",
+  "crates/wavedb-bench",
+  "crates/wavedb-examples",
+  "crates/wavedb-test-cluster",
+]
 
 [workspace.package]
 edition = "2024"
