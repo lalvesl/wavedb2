@@ -11,8 +11,8 @@ exclude = [
   "crates/wavedb-quick-node",
   "crates/wavedb-wasm",
   "crates/wavedb-bench",
-  "crates/wavedb-examples",
   "crates/wavedb-test-cluster",
+  "examples/todo-app",
 ]
 
 [workspace.package]
