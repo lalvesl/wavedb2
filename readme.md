@@ -181,12 +181,12 @@ with the `first_try` / `fallback_not_found` hooks (below).
 
 ### Base data types
 
-| Type          | Declared as            | Cardinality                                  | ID layout (`KEY · TENANT · FLAG · SALT`)              |
-| ------------- | ---------------------- | -------------------------------------------- | ----------------------------------------------------- |
-| **Unique**    | `#[wavedb]` (default)  | Exactly one live record per tenant           | `STRUCT_HASH · TENANT · 1 · 0`                        |
-| **NonUnique** | `#[wavedb(NonUnique)]` | Many per tenant; may nest in other NonUnique | `CREATED_AT · TENANT · 0 · salt15` |
-| **Pivot**     | type generated; instance on demand | One per tenant per definition (the handle)   | `CREATED_AT · TENANT · 0 · salt15` |
-| **BpTree**    | type generated         | Index nodes addressing a collection          | `CREATED_AT · TENANT · 0 · salt15` |
+| Type          | Declared as                        | Cardinality                                  | ID layout (`KEY · TENANT · FLAG · SALT`) |
+| ------------- | ---------------------------------- | -------------------------------------------- | ---------------------------------------- |
+| **Unique**    | `#[wavedb]` (default)              | Exactly one live record per tenant           | `STRUCT_HASH · TENANT · 1 · 0`           |
+| **NonUnique** | `#[wavedb(NonUnique)]`             | Many per tenant; may nest in other NonUnique | `CREATED_AT · TENANT · 0 · salt15`       |
+| **Pivot**     | type generated; instance on demand | One per tenant per definition (the handle)   | `CREATED_AT · TENANT · 0 · salt15`       |
+| **BpTree**    | type generated                     | Index nodes addressing a collection          | `CREATED_AT · TENANT · 0 · salt15`       |
 
 **Unique** is the default — the everyday "one record per tenant" object:
 
@@ -218,7 +218,7 @@ pub struct UserInterestedFruits {
 }
 ```
 
-**Pivot** — the macro generates the *type*; an *instance* is created on demand
+**Pivot** — the macro generates the _type_; an _instance_ is created on demand
 (one per tenant per definition) and its `PivotId` stored by the holder. It carries
 no business data — only the addressing into the index trees:
 
@@ -374,15 +374,15 @@ The full client API and object lifecycle live in
 
 ## Crate map
 
-| Crate                                                     | What it owns                                                               | Read for                                                                                                           |
-| --------------------------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| [`wavedb`](crates/wavedb/README.md)                       | Client `Db` handle, typed CRUD, server-fn call bindings                    | Quickstart, entry points, object lifecycle                                                                         |
-| [`wavedb-core`](crates/wavedb-core/README.md)             | `Id`, `Metadata`, `STRUCT_HASH`, schema-evolution hooks, permissions, wire | ID layout, struct-hash identity, **schema evolution**                                                              |
-| [`wavedb-macros`](crates/wavedb-macros/README.md)         | `#[wavedb]`, `#[server]`, build.rs registry, auto-generated `Pivot`/`BpTree` | Object declaration, `STRUCT_HASH` derivation, generated `Object` enum                                            |
-| [`wavedb-storage`](crates/wavedb-storage/README.md)       | The per-node engine                                                        | **Block manager, per-`STRUCT_HASH` page directory, linear hashing**, pages, dictionaries, journal + cache pipeline |
-| [`wavedb-quick-node`](crates/wavedb-quick-node/README.md) | Serving/storage node                                                       | Tenant write-ownership ring, replication, routing/failover, node-side validation                                   |
-| [`wavedb-net`](crates/wavedb-net/README.md)               | Transport                                                                  | WebSocket / HTTP queue, Bloom screen-sync                                                                          |
-| [`wavedb-wasm`](crates/wavedb-wasm/README.md)             | Browser client                                                             | IndexedDB key→value storage (no pages, no journal)                                                                 |
+| Crate                                                     | What it owns                                                                 | Read for                                                                                                           |
+| --------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| [`wavedb`](crates/wavedb/README.md)                       | Client `Db` handle, typed CRUD, server-fn call bindings                      | Quickstart, entry points, object lifecycle                                                                         |
+| [`wavedb-core`](crates/wavedb-core/README.md)             | `Id`, `Metadata`, `STRUCT_HASH`, schema-evolution hooks, permissions, wire   | ID layout, struct-hash identity, **schema evolution**                                                              |
+| [`wavedb-macros`](crates/wavedb-macros/README.md)         | `#[wavedb]`, `#[server]`, build.rs registry, auto-generated `Pivot`/`BpTree` | Object declaration, `STRUCT_HASH` derivation, generated `Object` enum                                              |
+| [`wavedb-storage`](crates/wavedb-storage/README.md)       | The per-node engine                                                          | **Block manager, per-`STRUCT_HASH` page directory, linear hashing**, pages, dictionaries, journal + cache pipeline |
+| [`wavedb-quick-node`](crates/wavedb-quick-node/README.md) | Serving/storage node                                                         | Tenant write-ownership ring, replication, routing/failover, node-side validation                                   |
+| [`wavedb-net`](crates/wavedb-net/README.md)               | Transport                                                                    | WebSocket / HTTP queue, Bloom screen-sync                                                                          |
+| [`wavedb-wasm`](crates/wavedb-wasm/README.md)             | Browser client                                                               | IndexedDB key→value storage (no pages, no journal)                                                                 |
 
 Tooling: `wavedb-examples`, `wavedb-bench`, `wavedb-test-cluster`.
 

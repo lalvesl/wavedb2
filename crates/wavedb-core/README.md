@@ -10,19 +10,19 @@ permission refs, and the `Wire` serialization trait.
 
 ## Module map
 
-| Module       | Responsibility                                                       |
-| ------------ | -------------------------------------------------------------------- |
-| `id`         | The 128-bit composite `Id`, the `U48` newtype, and field accessors.  |
-| `local_id`   | `LocalId` — compact 80-bit ID (no `TENANT`) for BpTree-internal use. |
+| Module       | Responsibility                                                                |
+| ------------ | ----------------------------------------------------------------------------- |
+| `id`         | The 128-bit composite `Id`, the `U48` newtype, and field accessors.           |
+| `local_id`   | `LocalId` — compact 80-bit ID (no `TENANT`) for BpTree-internal use.          |
 | `metadata`   | `Metadata` — modification chain, pivot back-link, authorship, permission ref. |
-| `hooks`      | `first_try` (pre-search) and `fallback_not_found` (post-miss) hooks. |
-| `permission` | `PermissionRef` shapes.                                              |
-| `wire`       | The `Wire` trait + `WaveWire` (no serde). See `docs/wire_format.md`. |
-| `registry`   | `ObjectDescriptor` / `ObjectRegistry` lookup by `STRUCT_HASH`.       |
-| `store`      | The `Store` backend trait (key→value over `Id` + atomic batch).      |
+| `hooks`      | `first_try` (pre-search) and `fallback_not_found` (post-miss) hooks.          |
+| `permission` | `PermissionRef` shapes.                                                       |
+| `wire`       | The `Wire` trait + `WaveWire` (no serde). See `docs/wire_format.md`.          |
+| `registry`   | `ObjectDescriptor` / `ObjectRegistry` lookup by `STRUCT_HASH`.                |
+| `store`      | The `Store` backend trait (key→value over `Id` + atomic batch).               |
 | `index`      | `Pivot`, `BpTree`, `IndexKey`, `Bound` — the `Store`-generic index contracts. |
-| `traits`     | `WaveDbStruct`, shape markers.                                       |
-| `error`      | Workspace error type.                                                |
+| `traits`     | `WaveDbStruct`, shape markers.                                                |
+| `error`      | Workspace error type.                                                         |
 
 ---
 
@@ -49,9 +49,9 @@ the `BpTree` indexes on.
 
 The trailing 15 bits **only break collisions** within a single `(KEY, TENANT)`:
 
-| Shape                          | `SALT[14..0]`                              |
-| ------------------------------ | ------------------------------------------ |
-| **Unique**                     | `0` (the fixed anchor needs no salt)       |
+| Shape                          | `SALT[14..0]`                                 |
+| ------------------------------ | --------------------------------------------- |
+| **Unique**                     | `0` (the fixed anchor needs no salt)          |
 | **NonUnique / BpTree / Pivot** | 15 bits of writer-supplied random/fixed value |
 
 There is **no struct-hash truncation in the `Id`**. The type is always known
@@ -84,7 +84,7 @@ Accessors such as `.tenant_id()` and `Metadata::user` return `U48`, never a raw
 reference instant). What is and isn't guaranteed:
 
 - **Uniqueness (guaranteed):** the `Id` is unique within a `(KEY, TENANT)` because
-  of the **15-bit random `SALT`**, *not* because of clock monotonicity. Two writes
+  of the **15-bit random `SALT`**, _not_ because of clock monotonicity. Two writes
   in the same nanosecond — or even with the clock running backwards (NTP step) —
   get distinct `Id`s from the salt. At low scale 15 random bits are ample; a
   64-write burst in one ns has a sub-1e-15 collision chance.
@@ -121,7 +121,7 @@ STRUCT_NAME + SHAPE + each PROPERTY_NAME + each PROPERTY_TYPE
 ```
 
 **Algorithm: `ahash` with a fixed, hard-coded seed.** The seed is a compile-time
-constant baked into the tooling — *not* the random per-database seed — so the
+constant baked into the tooling — _not_ the random per-database seed — so the
 hash is **deterministic across every build and machine** (clients and servers
 must agree on a type's identity). ahash is fast and gives good u64 dispersion.
 
@@ -171,7 +171,7 @@ never disk.
 ### `pivot_id` — the NonUnique reindex back-link
 
 A NonUnique `save` (update) **force-reindexes every live tree** of its collection —
-the `current` `BpTree` *and* every `#[wavedb::pivot(...)]` secondary — so it must
+the `current` `BpTree` _and_ every `#[wavedb::pivot(...)]` secondary — so it must
 reach all the tree roots, which live in the collection's **`Pivot`**. The record
 therefore carries its owning `PivotId` here as a `LocalId` (the typed
 `<T>::PivotId` is the compile-time view only — core never names macro types).
@@ -381,11 +381,11 @@ cycles, never disk.
 Usable bytes per page: `32 768 − 20 (header) ≈ 32 748`. Per-entry cost = **18
 bytes**. Capacity ≈ **1 819 entries per page**. Tree height in page reads:
 
-| Records   | Page reads |
-| --------- | ---------- |
-| ≤ 1 819   | 1          |
-| ≤ 3.31 M  | 2          |
-| ≤ 6.03 B  | 3          |
+| Records  | Page reads |
+| -------- | ---------- |
+| ≤ 1 819  | 1          |
+| ≤ 3.31 M | 2          |
+| ≤ 6.03 B | 3          |
 
 See [`wavedb-storage`](../../crates/wavedb-storage/README.md#bptree-page-layout--32-kib-one-node-per-page)
 for the full page layout, capacity math, split algorithm, and merge policy.

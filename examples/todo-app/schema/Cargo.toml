@@ -1,5 +1,5 @@
 [package]
-name    = "todo-app-schema"
+name = "todo-app-schema"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -8,8 +8,8 @@ license.workspace = true
 wavedb-build.workspace = true
 
 [dependencies]
-wavedb.workspace       = true
-wavedb-core.workspace  = true
-futures.workspace      = true
+wavedb.workspace = true
+wavedb-core.workspace = true
+futures.workspace = true
 async-stream.workspace = true
-sha2.workspace         = true
+sha2.workspace = true

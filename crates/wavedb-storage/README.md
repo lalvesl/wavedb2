@@ -10,13 +10,13 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 
 ## Module map
 
-| Module         | Responsibility                                                                                                                 |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `block`        | `BlockFile` / block allocator — alloc/free/coalesce runs of 4 KiB blocks.                                                      |
-| `directory`    | The per-`STRUCT_HASH` `Vec<u64>` page directory + linear hashing.                                                              |
-| `page`         | Page format + the `PageFormat` derive trait (crc32, id list, blob).                                                            |
-| `dictionary`   | Per-`STRUCT_HASH` compression dictionary + its block run.                                                                      |
-| `pipeline`     | Journal, in-memory `BTreeMap` cache, background settle + rebalance.                                                            |
+| Module         | Responsibility                                                                                                                                                                        |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `block`        | `BlockFile` / block allocator — alloc/free/coalesce runs of 4 KiB blocks.                                                                                                             |
+| `directory`    | The per-`STRUCT_HASH` `Vec<u64>` page directory + linear hashing.                                                                                                                     |
+| `page`         | Page format + the `PageFormat` derive trait (crc32, id list, blob).                                                                                                                   |
+| `dictionary`   | Per-`STRUCT_HASH` compression dictionary + its block run.                                                                                                                             |
+| `pipeline`     | Journal, in-memory `BTreeMap` cache, background settle + rebalance.                                                                                                                   |
 | `node_storage` | `NodeStorage` — the node's **authoritative** engine: owns the files + all sub-modules, runs `Pivot`/`BpTree` + page writes. Reached over the network; not the client's local `Store`. |
 
 ---
@@ -195,7 +195,7 @@ serialize/deserialize. Page kinds:
 | **Unique**    | The single live record per tenant at its fixed anchor address.     |
 | **NonUnique** | The collection's records (timestamp-keyed).                        |
 | **Pivot**     | Collection handles: `current`/`dead` BpTree pointers (no counter). |
-| **BpTree**    | 32 KiB page; one B+tree node per page; 18-byte entries.           |
+| **BpTree**    | 32 KiB page; one B+tree node per page; 18-byte entries.            |
 
 ### BpTree page layout — 32 KiB, one node per page
 
@@ -236,19 +236,19 @@ entries = 32 748 / 18  ≈  1 819 per page
 
 Tree height in **page reads** (8-byte `CREATED_AT` keys):
 
-| Records   | Page reads |
-| --------- | ---------- |
-| ≤ 1 819   | 1          |
-| ≤ 3.31 M  | 2          |
-| ≤ 6.03 B  | 3          |
+| Records  | Page reads |
+| -------- | ---------- |
+| ≤ 1 819  | 1          |
+| ≤ 3.31 M | 2          |
+| ≤ 6.03 B | 3          |
 
 Prior design (4 KiB page, 226-entry nodes, `LocalId` pointer per entry):
 
-| Records  | Page reads (old) | Page reads (new) |
-| -------- | ---------------- | ---------------- |
-| 1 M      | 4                | **2**            |
-| 1 B      | 5                | **3**            |
-| 6 B      | 5                | **3**            |
+| Records | Page reads (old) | Page reads (new) |
+| ------- | ---------------- | ---------------- |
+| 1 M     | 4                | **2**            |
+| 1 B     | 5                | **3**            |
+| 6 B     | 5                | **3**            |
 
 #### Page split
 
@@ -391,14 +391,14 @@ unit — remain a separate, later concern.)
 
 Counting journal + `data.bin` IOs (the cache absorbs repeats; cold case shown):
 
-| Operation                            | IOs | Breakdown                                                                                                                      |
-| ------------------------------------ | --- | ------------------------------------------------------------------------------------------------------------------------------ |
-| **Unique `save`**                    | 4   | journal data entry · read the page · write the page · allocation delta in journal                                              |
-| **NonUnique `save`** (update)        | `7 + 2N` | journal · read old page (old keys) · read `Pivot` (roots via `Metadata.pivot`) · write record page · reindex `current` **and** each of `N` secondary trees (read+write per tree) · allocation delta |
-| **NonUnique `insert` / `remove`**    | `7 + 2N` | journal · read 3 pages (record, `Pivot`, `BpTree`) · write record + reindex `current` **and** each of `N` secondary trees · allocation delta |
+| Operation                         | IOs      | Breakdown                                                                                                                                                                                           |
+| --------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Unique `save`**                 | 4        | journal data entry · read the page · write the page · allocation delta in journal                                                                                                                   |
+| **NonUnique `save`** (update)     | `7 + 2N` | journal · read old page (old keys) · read `Pivot` (roots via `Metadata.pivot`) · write record page · reindex `current` **and** each of `N` secondary trees (read+write per tree) · allocation delta |
+| **NonUnique `insert` / `remove`** | `7 + 2N` | journal · read 3 pages (record, `Pivot`, `BpTree`) · write record + reindex `current` **and** each of `N` secondary trees · allocation delta                                                        |
 
 A NonUnique **`save`** is no longer a free in-place rewrite: update **force-reindexes
-every live tree** — the `current` `BpTree` *and* every `#[wavedb::pivot(...)]`
+every live tree** — the `current` `BpTree` _and_ every `#[wavedb::pivot(...)]`
 secondary — removing the record's old entries and reinserting for the new version,
 so it costs **insert-class** IO that scales with the secondary-index count `N`. It
 reaches the roots through **`Metadata.pivot`**; the `Pivot` itself is still
@@ -420,14 +420,14 @@ it. All allocation deltas ride in a single journal write.
   record's **identity `Id` is fixed at `insert`** (stable anchor for references),
   so:
   - **`save`** (update) **force-reindexes every live tree** — the `current`
-    `BpTree` *and* every secondary — removing the record's old entries and
+    `BpTree` _and_ every secondary — removing the record's old entries and
     reinserting for the new version. It reaches the roots through `Metadata.pivot`.
     The **`dead`** tree is **not** touched: the previous version is retained and
     linked by the `Metadata` chain (`old_modification_id` ↔ `new_modification_id`);
   - **`insert`** adds the record to the `current` `BpTree` (and every secondary) and
     stamps `Metadata.pivot`; **`remove`** moves it to the **dead** tree — the only
     op that writes `dead`. All go through the `Pivot`.
-  The record bytes are never erased, keeping the timeline navigable.
+    The record bytes are never erased, keeping the timeline navigable.
 
 ### `BpTree` stores only `Id`s — reads are two-phase
 

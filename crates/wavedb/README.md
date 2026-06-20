@@ -68,10 +68,10 @@ authoritative writer — it runs the `Pivot`/`BpTree` engine; the client never d
 The macro implements one typed trait per shape (defined in
 [`wavedb-core`](../wavedb-core/README.md#typed-object-traits-per-struct-macro-implemented)):
 
-| Shape         | Trait              | Methods                                                            |
-| ------------- | ------------------ | ----------------------------------------------------------------- |
-| **Unique**    | `UniqueObject`     | `T::get(&db)`, `record.save(&db)`                                 |
-| **NonUnique** | `NonUniqueObject`  | `T::collection(&db, pivot) → Collection<T>` (`insert`/`get`/`all`/`remove`) + `record.save(&db)` |
+| Shape         | Trait             | Methods                                                                                          |
+| ------------- | ----------------- | ------------------------------------------------------------------------------------------------ |
+| **Unique**    | `UniqueObject`    | `T::get(&db)`, `record.save(&db)`                                                                |
+| **NonUnique** | `NonUniqueObject` | `T::collection(&db, pivot) → Collection<T>` (`insert`/`get`/`all`/`remove`) + `record.save(&db)` |
 
 `Id`s are client-known (Unique deterministic; NonUnique minted at `insert`), so
 the write-through is immediate; the node confirms. Same calls native and wasm —

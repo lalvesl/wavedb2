@@ -131,8 +131,8 @@ Versioning policy for the platform crates.
   compaction, or archive tier yet — accepted.
 - **Permission groups.**
 - **`STRUCT_HASH`-grained write-ownership** — tenant-grained for now.
-- **Cross-tenant read *path*** — the multi-node routing + where the grant is
-  enforced when tenant B reads tenant A's data. The permission *model*
+- **Cross-tenant read _path_** — the multi-node routing + where the grant is
+  enforced when tenant B reads tenant A's data. The permission _model_
   (tenant-list grant in `Metadata`) stays; the serving path is not a problem for
   now.
 - **Offline-first reconciliation.**

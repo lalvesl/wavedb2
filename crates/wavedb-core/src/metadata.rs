@@ -33,8 +33,7 @@ pub struct Metadata {
 }
 
 impl Wire for Metadata {
-    const STACK_SIZE: usize =
-          <Option<LocalId> as Wire>::STACK_SIZE        // old_modification_id  (1)
+    const STACK_SIZE: usize = <Option<LocalId> as Wire>::STACK_SIZE        // old_modification_id  (1)
         + <Option<LocalId> as Wire>::STACK_SIZE        // new_modification_id  (1)
         + <Option<LocalId> as Wire>::STACK_SIZE        // pivot_id             (1)
         + <U48 as Wire>::STACK_SIZE                    // user                 (6)
@@ -112,7 +111,10 @@ mod tests {
             pivot_id: Some(LocalId::new(0xABCD, true, 3)),
             user: U48::from(42u32),
             device_created: 0xCAFE,
-            permission: Some(PermissionRef::Tenants(vec![U48::from(1u32), U48::from(2u32)])),
+            permission: Some(PermissionRef::Tenants(vec![
+                U48::from(1u32),
+                U48::from(2u32),
+            ])),
         });
         roundtrip(Metadata {
             old_modification_id: None,

@@ -70,8 +70,14 @@ impl Wire for PermissionRef {
         let payload = heap.take(payload_len)?;
         match tag {
             TAG_PUBLIC => Ok(Self::Public),
-            TAG_TENANTS => Ok(Self::Tenants(decode_unit(payload, <Vec<U48> as Wire>::STACK_SIZE)?)),
-            TAG_GROUP => Ok(Self::Group(decode_unit(payload, <u64 as Wire>::STACK_SIZE)?)),
+            TAG_TENANTS => Ok(Self::Tenants(decode_unit(
+                payload,
+                <Vec<U48> as Wire>::STACK_SIZE,
+            )?)),
+            TAG_GROUP => Ok(Self::Group(decode_unit(
+                payload,
+                <u64 as Wire>::STACK_SIZE,
+            )?)),
             other => Err(Error::InvalidTag(other)),
         }
     }
@@ -93,7 +99,7 @@ fn decode_unit<T: Wire>(unit: &[u8], stack_size: usize) -> Result<T> {
 mod tests {
     use super::PermissionRef;
     use crate::u48::U48;
-    use crate::wire::{from_wire, to_wire, Wire};
+    use crate::wire::{Wire, from_wire, to_wire};
 
     fn roundtrip(value: PermissionRef) {
         let bytes = to_wire(&value);

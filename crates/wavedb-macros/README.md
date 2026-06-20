@@ -12,17 +12,17 @@ because both compile this crate.
 
 ## Module map
 
-| Module              | Responsibility                                                     |
-| ------------------- | ------------------------------------------------------------------ |
-| `lib`               | The `#[wavedb]` and `#[server]` macro entry points.                |
-| `server`            | `#[server]`: server body + client stub + `FN_HASH`.                |
-| `args`              | Parse `#[wavedb(...)]` attribute arguments.                        |
-| `struct_hash`       | Compute the `STRUCT_HASH: u64` const from name/shape/fields.       |
-| `descriptor`        | Emit `ObjectDescriptor` (field offsets, heapable flags, names).    |
-| `wire_derive`       | `WaveWire` — the no-serde, no-`repr(C)` `Wire` impl.               |
-| `generated`         | Auto-emit the per-NonUnique `Pivot` + `BpTree` types.              |
-| `crud`              | Generated accessors / CRUD glue.                                   |
-| `codegen` / `utils` | Shared emit helpers.                                               |
+| Module              | Responsibility                                                  |
+| ------------------- | --------------------------------------------------------------- |
+| `lib`               | The `#[wavedb]` and `#[server]` macro entry points.             |
+| `server`            | `#[server]`: server body + client stub + `FN_HASH`.             |
+| `args`              | Parse `#[wavedb(...)]` attribute arguments.                     |
+| `struct_hash`       | Compute the `STRUCT_HASH: u64` const from name/shape/fields.    |
+| `descriptor`        | Emit `ObjectDescriptor` (field offsets, heapable flags, names). |
+| `wire_derive`       | `WaveWire` — the no-serde, no-`repr(C)` `Wire` impl.            |
+| `generated`         | Auto-emit the per-NonUnique `Pivot` + `BpTree` types.           |
+| `crud`              | Generated accessors / CRUD glue.                                |
+| `codegen` / `utils` | Shared emit helpers.                                            |
 
 > The build-time registry scanner (`wavedb_build::generate_registry`) lives in a
 > separate `wavedb-build` crate (an app's `build.rs` dependency), not here — this
@@ -120,7 +120,7 @@ pub struct BpTree { /* node entries → Id */ }
 
 ### The type is generated; the **instance is created explicitly**
 
-The macro emits the `Pivot`/`BpTree` *types*, but a `Pivot` *instance* is **not
+The macro emits the `Pivot`/`BpTree` _types_, but a `Pivot` _instance_ is **not
 created automatically**. A collection comes into being when you **call create on
 its `Pivot`** — there is **one `Pivot` per tenant per definition** (per NonUnique
 struct type) — and then **store the returned `PivotId`** in a field of a `Unique`
@@ -171,7 +171,7 @@ Per declared pivot the macro:
 
 **Maintenance cost.** `insert`, `save`, and `remove` all reindex through the
 `Pivot`. A `save` (update) **force-reindexes every live tree** — the `current`
-`BpTree` *and* every secondary — removing the record's old entries and reinserting
+`BpTree` _and_ every secondary — removing the record's old entries and reinserting
 for the new version (uniform, always-consistent, no "did this field change?"
 diffing). It reaches the roots through **`Metadata.pivot`**, which `insert` stamps
 into the record from the collection handle's `PivotId`. The **`dead`** tree is
@@ -259,11 +259,11 @@ The registry that lets **storage, server, and client all "know the structs"** is
 
 **Division of labor (the two halves).**
 
-- **`#[wavedb]` (proc-macro)** does all the *per-struct* work, in place: it emits
+- **`#[wavedb]` (proc-macro)** does all the _per-struct_ work, in place: it emits
   the struct's `STRUCT_HASH` const, its `Wire` impl, its generated `PivotId` /
   `Pivot` / `BpTree` types, accessors, and hook wiring. Each struct is fully
   self-contained after the macro runs.
-- **`build.rs` (`wavedb_build::generate_registry`)** does the *aggregation*: it
+- **`build.rs` (`wavedb_build::generate_registry`)** does the _aggregation_: it
   scans the crate's own `src/`, finds every `#[wavedb]` item, and emits a module
   that **references the macro-generated paths** — building the `Object` enum and
   the `match` arms like `module::SomeStruct::STRUCT_HASH => module::SomeStruct::decode(…)`.
@@ -286,14 +286,14 @@ include!(concat!(env!("OUT_DIR"), "/wavedb_registry.rs"));
 `src/` tree. It does **not** reach into dependency crates, and it does not expand
 macros or evaluate `cfg`. Consequences and the boundary:
 
-- A `#[wavedb]` struct from a *dependency* crate is not auto-registered here — to
+- A `#[wavedb]` struct from a _dependency_ crate is not auto-registered here — to
   include it, re-declare or re-export it in this crate's `src/` (or let that
   dependency expose its own generated registry).
 - `cfg`-gated and macro-generated structs the scanner can't see textually won't
   appear — keep `#[wavedb]` items written out in `src/`.
 
 This is the deliberate trade vs a `declare_objects!` macro (which can't read the
-file system to *discover* structs at all): build-scan auto-collects everything
+file system to _discover_ structs at all): build-scan auto-collects everything
 written under `src/`, at the cost of not seeing across crate / macro / cfg
 boundaries.
 
@@ -335,6 +335,7 @@ enum compiles into client, server, and wasm: the single source of truth.
 
 > **Planned (future).** The generator is the natural place to grow, by static
 > dispatch (still no `dyn`):
+>
 > - **`update_call`** — an additional generated call kind alongside the current
 >   server-function dispatch, for update-shaped operations.
 >

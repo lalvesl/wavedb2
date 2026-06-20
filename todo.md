@@ -28,7 +28,7 @@ code exists yet. Build order, roughly bottom-up:
   `IdStreamExt` (`intersect`/`union`/`except`). Pages/journal live behind `Store`,
   not here;
 - `#[wavedb]` macro: shapes `Unique` (default) / `NonUnique`; generate the
-  `Pivot` + `BpTree` *types*; `PivotId` field references for nesting;
+  `Pivot` + `BpTree` _types_; `PivotId` field references for nesting;
 - explicit `create_pivot` (one per tenant per definition) → `PivotId` stored in a
   `Unique` or nesting `NonUnique`; never auto-created;
 - schema-evolution hooks: `first_try` (pre-search) + `fallback_not_found`
@@ -127,7 +127,7 @@ code exists yet. Build order, roughly bottom-up:
   growth accepted; pruning/compaction/archive later;
 - **Permission groups**;
 - `STRUCT_HASH`-grained write-ownership (tenant-only for now);
-- cross-tenant read *path* (multi-node routing + grant enforcement) — model
+- cross-tenant read _path_ (multi-node routing + grant enforcement) — model
   stays, serving path deferred;
 - offline-first reconciliation.
 
