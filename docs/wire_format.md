@@ -93,7 +93,8 @@ enum → monomorphised arm, **no `dyn`**). See
   per-STRUCT dictionary compressor eats the constant zero runs; predictable
   offsets are worth more than pre-compression byte count.
 - `Option<T>` reserves `T`'s stack slots even when `None` (e.g.
-  `Metadata.permission: Option<PermissionRef>` is a constant 6-byte slot, not
-  postcard's 1 byte). Same rationale: fixed offsets, dictionary-friendly.
+  `Metadata.permission: Option<PermissionRef>` is a constant 6-byte slot, and
+  `Metadata.pivot: Option<Id>` a constant `Id`-width slot, not postcard's 1 byte).
+  Same rationale: fixed offsets, dictionary-friendly.
 - In exchange: single-allocation writes, zero-copy-friendly sequential reads,
   compile-time sizes, no serde/postcard code in the binary.

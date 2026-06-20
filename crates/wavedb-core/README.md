@@ -140,11 +140,31 @@ pub struct Metadata {
     pub user: U48,                 // who wrote this version (48-bit newtype)
     pub device_created: u64,       // which device produced it
     pub permission: Option<PermissionRef>, // access rule; None = tenant-only
+    pub pivot: Option<Id>,         // owning Pivot — NonUnique reindex back-link; None = Unique
 }
 ```
 
 No `struct_version` field — the stored record's `STRUCT_HASH` (carried in the
 wire envelope) already says which schema it was written under.
+
+### `pivot` — the NonUnique reindex back-link
+
+A NonUnique `save` (update) **force-reindexes every live tree** of its collection —
+the `current` `BpTree` *and* every `#[wavedb::pivot(...)]` secondary — so it must
+reach all the tree roots, which live in the collection's **`Pivot`**. The record
+therefore carries its owning `PivotId` here (stored as a raw `Id`; the typed
+`<T>::PivotId` is the compile-time view only — core never names macro types).
+
+- **Stamped at `insert`** from the collection handle's `PivotId`; `None` for Unique.
+- Lets `save` reindex from the record alone, without re-passing the handle.
+- It is **outside `STRUCT_HASH`** (`name + shape + field names + types`), so adding
+  it changes **no** struct's identity — only Metadata's own wire layout.
+
+Why not the `dead` tree on update? Because history is the `old_modification_id` ↔
+`new_modification_id` chain above: the previous version is retained and linked, so
+update never writes `dead`. `dead` is populated **only** by `remove`. The record's
+identity `Id` (the insert anchor) stays stable across updates so references never
+break; the trees re-establish the live version against that anchor.
 
 ---
 

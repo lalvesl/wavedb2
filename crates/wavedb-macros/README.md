@@ -169,10 +169,21 @@ Per declared pivot the macro:
   iterator (`impl Stream<Item = Result<T>>`), resolved two-phase (index → `Id`s →
   fetch), exactly like the primary tree.
 
-**Maintenance cost.** `insert` and `remove` update *every* index. A `save` is
-still tree-free **unless it changes an indexed field** — then that one secondary
-`BpTree` entry moves (old key removed, new key inserted). So an indexed field is a
-write-amplification trade: faster lookups, costlier writes on that field.
+**Maintenance cost.** `insert`, `save`, and `remove` all reindex through the
+`Pivot`. A `save` (update) **force-reindexes every live tree** — the `current`
+`BpTree` *and* every secondary — removing the record's old entries and reinserting
+for the new version (uniform, always-consistent, no "did this field change?"
+diffing). It reaches the roots through **`Metadata.pivot`**, which `insert` stamps
+into the record from the collection handle's `PivotId`. The **`dead`** tree is
+**not** touched on update — history is the `Metadata` modification chain — so only
+`remove` writes `dead`. Cost is **insert-class**, scaling with the secondary-index
+count (see [`wavedb-storage`](../wavedb-storage/README.md#io-cost-per-operation)):
+secondary indexes are a write-amplification trade — faster lookups, costlier
+updates.
+
+> The primary `current` tree is keyed by the record's stable `CREATED_AT` anchor,
+> so its reindex usually lands in the same slot (cheap); secondary trees re-key by
+> the new field values. Forcing all of them keeps one uniform write path.
 
 ---
 

@@ -270,14 +270,19 @@ Counting journal + `data.bin` IOs (the cache absorbs repeats; cold case shown):
 | Operation                            | IOs | Breakdown                                                                                                                      |
 | ------------------------------------ | --- | ------------------------------------------------------------------------------------------------------------------------------ |
 | **Unique `save`**                    | 4   | journal data entry · read the page · write the page · allocation delta in journal                                              |
-| **NonUnique `save`** (update)        | 4   | same as Unique — rewrite at the identity `Id`; the `BpTree`/`Pivot` are not touched                                            |
-| **NonUnique `insert` / `remove`**    | 7   | journal data entry · read 3 pages (record, `Pivot`, `BpTree`) · write 2 pages (record, `BpTree`) · allocation delta in journal |
+| **NonUnique `save`** (update)        | `7 + 2N` | journal · read old page (old keys) · read `Pivot` (roots via `Metadata.pivot`) · write record page · reindex `current` **and** each of `N` secondary trees (read+write per tree) · allocation delta |
+| **NonUnique `insert` / `remove`**    | `7 + 2N` | journal · read 3 pages (record, `Pivot`, `BpTree`) · write record + reindex `current` **and** each of `N` secondary trees · allocation delta |
 
-A NonUnique **`save`** rewrites the record at its fixed identity `Id`, so it costs
-the **same 4 IOs as a Unique save** — only **`insert`** and **`remove`** touch the
-tree (7 IOs). The `Pivot` is **read, not written** on a normal op (it changes only
-if a `BpTree` root moves) — that is why dropping its counter matters. Both
-allocation deltas ride in a single journal write.
+A NonUnique **`save`** is no longer a free in-place rewrite: update **force-reindexes
+every live tree** — the `current` `BpTree` *and* every `#[wavedb::pivot(...)]`
+secondary — removing the record's old entries and reinserting for the new version,
+so it costs **insert-class** IO that scales with the secondary-index count `N`. It
+reaches the roots through **`Metadata.pivot`**; the `Pivot` itself is still
+**read, not written** unless a `BpTree` root moves (no counter). The **`dead`** tree
+is **not** touched on update — history is the `Metadata` modification chain — so
+only **`remove`** writes `dead`. The record's identity `Id` (insert anchor) stays
+stable so references don't break; the trees re-establish the live version against
+it. All allocation deltas ride in a single journal write.
 
 ---
 
@@ -288,11 +293,16 @@ allocation deltas ride in a single journal write.
   previous version into history via `Metadata`.
 - **NonUnique** — a collection's `Pivot` is created **explicitly** (one per tenant
   per definition) and its `PivotId` stored by the holder; never auto-created. A
-  record's **identity `Id` is fixed at `insert`**, so:
-  - **`save`** (update) rewrites at that `Id` and chains history — the `BpTree`
-    and `Pivot` are **not touched** (just like a Unique save);
-  - **`insert`** adds the new `Id` to the `current` `BpTree`, **`remove`** moves it
-    to the **dead** tree — only these go through the `Pivot`.
+  record's **identity `Id` is fixed at `insert`** (stable anchor for references),
+  so:
+  - **`save`** (update) **force-reindexes every live tree** — the `current`
+    `BpTree` *and* every secondary — removing the record's old entries and
+    reinserting for the new version. It reaches the roots through `Metadata.pivot`.
+    The **`dead`** tree is **not** touched: the previous version is retained and
+    linked by the `Metadata` chain (`old_modification_id` ↔ `new_modification_id`);
+  - **`insert`** adds the record to the `current` `BpTree` (and every secondary) and
+    stamps `Metadata.pivot`; **`remove`** moves it to the **dead** tree — the only
+    op that writes `dead`. All go through the `Pivot`.
   The record bytes are never erased, keeping the timeline navigable.
 
 ### `BpTree` stores only `Id`s — reads are two-phase

@@ -54,7 +54,7 @@ while let Some(order) = recent.next().await { let order = order?; /* … */ }
 
 let mut o = orders.get(&db, id).await?.unwrap();
 o.amount = 130;
-o.save(&db).await?;          // update in place at the identity Id; tree untouched
+o.save(&db).await?;          // reindex current + secondary trees; old version chained, dead untouched
 orders.remove(&db, id).await?; // move Id current → dead BpTree (history kept)
 ```
 

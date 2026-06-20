@@ -10,8 +10,9 @@ code exists yet. Build order, roughly bottom-up:
   struct-hash truncation);
 - `STRUCT_HASH` = ahash with a **fixed hard-coded seed** over
   `name + shape + field names + field types` (deterministic across builds);
-- `Metadata` (modification chain, user, device, permission) — **no version
-  field**;
+- `Metadata` (modification chain, user, device, permission, `pivot: Option<Id>`) —
+  **no version field**. `pivot` = owning Pivot back-link (NonUnique reindex);
+  stamped at `insert`, `None` for Unique; outside `STRUCT_HASH`;
 - `Wire` trait + `WaveWire` derive (no serde, no `repr(C)`); see
   `docs/wire_format.md`;
 - `#[wavedb]` macro: shapes `Unique` (default) / `NonUnique`; generate the
@@ -53,8 +54,11 @@ code exists yet. Build order, roughly bottom-up:
 - **atomicity = the cache**: a multi-record op (record + `BpTree`) is one journal
   entry applied to the cache atomically; no separate txn manager. `Pivot` has no
   counter, so it is read-not-written on a normal NonUnique op;
-- NonUnique record's identity `Id` is fixed at `insert`; `save` rewrites in place
-  (no tree). IO: Unique `save` = 4; NonUnique `save` = 4; `insert`/`remove` = 7.
+- NonUnique record's identity `Id` is fixed at `insert` (stable anchor). `save`
+  (update) **force-reindexes every live tree** — `current` + each secondary —
+  reaching roots via `Metadata.pivot`; `dead` is **not** touched (history = the
+  `Metadata` chain), so only `remove` writes `dead`. IO: Unique `save` = 4;
+  NonUnique `save`/`insert`/`remove` = `7 + 2N` (N = secondary indexes).
 
 ## Storage traits (core seam)
 

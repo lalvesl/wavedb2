@@ -258,24 +258,30 @@ every index; a `save` only touches a secondary tree if it changed that field.
 - **NonUnique** — `insert`, `save` (update), `remove`, reached through the
   collection's **`Pivot`**:
   - a record's **identity `Id` is assigned at `insert`** (that moment's
-    `CREATED_AT`) and **never changes** — it is the record's anchor.
-  - **`save` / update** rewrites the live bytes at that same `Id` and chains
-    history — exactly like a Unique save. The `Id` doesn't move, so the `BpTree`
-    is **untouched** and the `Pivot` isn't needed.
-  - only **`insert`** (add the new `Id` to the `current` `BpTree`) and **`remove`**
-    (move the `Id` from the **current** tree to the **dead** tree) touch the tree,
-    so only those go through the `Pivot`. Nothing is erased — history stays
-    navigable.
+    `CREATED_AT`) and is its **stable anchor** — references point at it, it never
+    changes.
+  - **`save` / update force-reindexes every live tree** — the `current` `BpTree`
+    **and** every `#[wavedb::pivot(...)]` secondary — removing the record's old
+    entries and reinserting for the new version. The **`dead`** tree is **not**
+    touched: update is not a delete, so the previous version is retained and linked
+    through `Metadata` (`old_modification_id` ↔ `new_modification_id`). Reaching all
+    tree roots needs the `Pivot`, found via **`Metadata.pivot`** (below) — so the
+    record carries its owning `PivotId` and `save` reindexes without the handle.
+  - **`remove`** moves the record from `current` to the **dead** tree — the **only**
+    op that writes `dead`. Nothing is erased; history stays navigable.
 
   `insert` / `remove` / `all` / `get(id)` are methods of a **collection handle**
-  opened from a stored `PivotId`; `save` is a method on the record (it has its
-  identity `Id`).
+  opened from a stored `PivotId`; `save` is a method on the record (it reaches the
+  `Pivot` through `Metadata.pivot`). `insert` stamps `Metadata.pivot` into the new
+  record from the handle's `PivotId`.
 
 ### History / timeline
 
-Saving never frees the old bytes. The live record's `Metadata` chains backward
-(`old_modification_id`) and forward (`new_modification_id`) so a record's full
-timeline is walkable. Deleted NonUnique records live on in the dead `BpTree`.
+Saving never frees the old bytes. Each version is retained and the live record's
+`Metadata` chains backward (`old_modification_id`) and forward
+(`new_modification_id`) so a record's full timeline is walkable — this chain is why
+update needs **no `dead`-tree write**. Removed NonUnique records live on in the
+`dead` `BpTree` (the only thing that populates it).
 
 ---
 
@@ -324,7 +330,7 @@ let id = orders.insert(&db, Order { amount: 120 }).await?;  // assigns identity 
 let mut recent = orders.all(&db);                          // async iterator: streams BpTree → Ids → fetch
 while let Some(order) = recent.next().await { let order = order?; /* … */ }
 
-order.save(&db).await?;            // update in place at its identity Id; tree untouched
+order.save(&db).await?;            // reindex current + secondary trees; old version chained, dead untouched
 orders.remove(&db, id).await?;     // move Id current → dead BpTree (history kept)
 
 // Filtered / derived reads are server functions — run on the node, called through
