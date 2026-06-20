@@ -18,6 +18,7 @@ permission refs, and the `Wire` serialization trait.
 | `permission` | `PermissionRef` shapes.                                              |
 | `wire`       | The `Wire` trait + `WaveWire` (no serde). See `docs/wire_format.md`. |
 | `registry`   | `ObjectDescriptor` / `ObjectRegistry` lookup by `STRUCT_HASH`.       |
+| `store`      | The `Store` backend trait (key→value over `Id` + wire bytes).        |
 | `traits`     | `WaveDbStruct`, shape markers.                                       |
 | `error`      | Workspace error type.                                                |
 
@@ -207,3 +208,78 @@ every `#[wavedb]` struct, and emits a generated `Object` enum
 `fallback_not_found` hooks, the generated `Pivot`/`BpTree` accessors — is a
 `match` on that enum: **no `dyn`, no runtime registration**. The mechanism lives
 in [`wavedb-macros` § the registry](../wavedb-macros/README.md#the-registry--generated-in-buildrs).
+
+---
+
+## Storage backend trait (`Store`)
+
+The basic DB operations live in two layers, with the **backend behind a trait
+defined here** so native and browser share everything above it.
+
+**`Store`** — the low-level key→value backend over `Id` + wire bytes; the *only*
+part that differs between native and web:
+
+```rust
+pub trait Store {
+    async fn get(&self, id: Id) -> Result<Option<Vec<u8>>>;
+    async fn update(&self, id: Id, bytes: &[u8]) -> Result<()>; // upsert at an Id
+    async fn remove(&self, id: Id) -> Result<()>;
+}
+```
+
+- **native** impl: `wavedb-storage` (`NodeStorage` — pages, blocks, journal).
+- **web** impl: `wavedb-wasm` (IndexedDB, key = `Id`, value = bytes).
+
+Core only declares the **contract** — `async fn` signatures, runtime-agnostic, no
+I/O — so this crate stays WASM/macro-safe. Dispatch is static (generic over
+`S: Store`), no `dyn`.
+
+**High-level CRUD is shared, written once over `S: Store`:**
+
+- **Unique** `get` / `save` (upsert) — one `Store::get` / `Store::update` at the
+  fixed anchor.
+- **NonUnique** `insert` / `save` / `remove` through a collection's `Pivot`:
+  - `save` (update) = one `Store::update` at the record's identity `Id` (assigned
+    at `insert`, never changes) — tree untouched;
+  - `insert` adds the new `Id` to the `current` `BpTree`; `remove` moves it to the
+    `dead` `BpTree` — both resolve the `Pivot`, then walk/update tree nodes via
+    `Store::get` / `Store::update`.
+
+Because the `BpTree` holds only `Id`s and a record's identity `Id` is fixed at
+insert, the whole engine reduces to `Store` calls — **identical on pages or
+IndexedDB**.
+
+### Typed object traits (per struct, macro-implemented)
+
+The CRUD is surfaced to app code as **typed traits, one per shape**, that the
+`#[wavedb]` macro implements for each struct. They are the third layer: app →
+typed trait → shared engine → `Store`.
+
+```rust
+// Implemented for each Unique struct.
+pub trait UniqueObject: WaveDbStruct {
+    async fn get(db: &Db) -> Result<Option<Self>>;
+    async fn save(&self, db: &Db) -> Result<()>;   // upsert at the fixed anchor
+}
+
+// Implemented for each NonUnique struct. Collection ops go through a handle
+// opened from a stored PivotId; `save` updates a record at its identity Id.
+pub trait NonUniqueObject: WaveDbStruct + Sized {
+    fn collection(db: &Db, pivot: PivotId) -> Collection<Self>;
+    async fn save(&self, db: &Db) -> Result<()>;   // rewrite in place; tree untouched
+}
+
+// The handle that carries the PivotId and resolves the Pivot.
+impl<T: NonUniqueObject> Collection<T> {
+    async fn insert(&self, db: &Db, record: T) -> Result<Id>; // new identity Id → current BpTree
+    async fn get(&self, db: &Db, id: Id) -> Result<Option<T>>;
+    async fn all(&self, db: &Db) -> Result<Vec<T>>;           // two-phase: BpTree → Ids → fetch
+    async fn remove(&self, db: &Db, id: Id) -> Result<()>;    // current → dead BpTree
+}
+```
+
+These are generic over the `Db` handle (which owns a `Store`), so the **same typed
+methods compile on native and wasm** — the only thing swapped underneath is the
+`Store` impl. The macro picks `UniqueObject` vs `NonUniqueObject` from the struct's
+shape; `db: &Db` here is the macro's generic `__WaveDbDb` parameter, resolved at
+the call site (no `dyn`).

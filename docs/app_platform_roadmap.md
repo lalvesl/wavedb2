@@ -42,7 +42,7 @@ The block manager, per-`STRUCT_HASH` linear-hashed page directory, page format,
 dictionaries, and the journal-first / `BTreeMap`-cache / background-settle
 pipeline. Crash recovery via journal replay.
 
-**Exit:** durable single-node `get`/`save` for Unique and `insert`/`delete` for
+**Exit:** durable single-node `get`/`save` for Unique and `insert`/`remove` for
 NonUnique through `Pivot`/`BpTree`; kill-during-write test recovers cleanly.
 
 ## M3 — Registry-aware node
@@ -56,8 +56,9 @@ through a registry-linked node; cross-tenant read without a grant is refused.
 
 ## M4 — Typed client API + server functions, end-to-end
 
-`Db::connect`, typed CRUD, collection navigation through `PivotId`, delete → dead
-`BpTree`, and **server functions** (`#[server]`: server-only body + client
+`Db::connect`, typed CRUD (`UniqueObject` / `NonUniqueObject` over the `Store`
+trait), collection navigation through `PivotId`, `remove` → dead `BpTree`, and
+**server functions** (`#[server]`: server-only body + client
 binding, `Wire`-encoded args/return over `wavedb-net`, dispatched by `FN_HASH`) —
 the replacement for a query DSL. The `first_try` / `fallback_not_found` hooks
 bridge mixed-build clusters.
@@ -76,9 +77,10 @@ registry's per-struct wasm cost.
 
 ## M6 — Local cache & `Db::open`
 
-`LocalStore` trait (`get`/`put`/`scan`/`delete` over wire bytes): native
-write-through file store, wasm IndexedDB. Reads hit local first, miss → fetch from
-owner → back-fill; writes go to owner and write-through on ack. Read-your-writes
+The core `Store` trait (`get`/`update`/`remove` over `Id` + wire bytes) gains a
+local write-through impl: native file store, wasm IndexedDB. Reads hit local
+first, miss → fetch from owner → back-fill; writes go to owner and write-through
+on ack. Read-your-writes
 between the local store and notifications.
 
 **Exit:** client survives node restart with warm local reads.
@@ -142,9 +144,10 @@ dispatch on the `Object` enum (no `dyn`):
 
 - **`update_call`** — an additional generated call kind beside the server-function
   dispatch, for update-shaped operations.
-- **More `BpTree`s per struct** — today one `BpTree` per collection keyed by
-  `CREATED_AT`; emit extra `BpTree`s indexing other properties (secondary
-  indexes).
+- **Secondary indexes — `#[wavedb::pivot(field)]` / `#[wavedb::pivot((f1, f2))]`**
+  (design specced): extra `BpTree`s on chosen properties beyond the default
+  `CREATED_AT` tree, each adding a `Pivot` root + a typed `by_field` lookup.
+  Index-maintenance cost on writes that change an indexed field.
 
 ## Sequencing
 

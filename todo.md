@@ -33,7 +33,8 @@ code exists yet. Build order, roughly bottom-up:
   `Object::from_wire`/`to_wire`, hook routing (`first_try`/`fallback_not_found`),
   `Pivot`/`BpTree` accessors, server-fn dispatch — static `match`, no `dyn`;
 - schema crate pulls it in with `include!(concat!(env!("OUT_DIR"), …))`.
-- _Future:_ `update_call` kind + extra per-property `BpTree`s (secondary indexes).
+- _Future:_ `update_call` kind; secondary indexes via `#[wavedb::pivot(field)]` /
+  `#[wavedb::pivot((f1, f2))]` (extra `BpTree` + `Pivot` root + `by_field` lookup).
 
 ## Storage engine (`wavedb-storage`)
 
@@ -52,13 +53,23 @@ code exists yet. Build order, roughly bottom-up:
 - **atomicity = the cache**: a multi-record op (record + `BpTree`) is one journal
   entry applied to the cache atomically; no separate txn manager. `Pivot` has no
   counter, so it is read-not-written on a normal NonUnique op;
-- IO budget: Unique `save` = 4 IOs; NonUnique `insert`/`save`/`delete` = 7 IOs.
+- NonUnique record's identity `Id` is fixed at `insert`; `save` rewrites in place
+  (no tree). IO: Unique `save` = 4; NonUnique `save` = 4; `insert`/`remove` = 7.
+
+## Storage traits (core seam)
+
+- core `Store` trait: `get` / `update` (upsert) / `remove` over `Id` + wire bytes
+  (async, no I/O — contract only). native impl = `NodeStorage`; wasm = IndexedDB;
+- shared high-level engine over `S: Store` (anchor, Pivot→BpTree, history, hooks);
+- typed per-struct traits the macro implements by shape: `UniqueObject`
+  (`get`/`save`), `NonUniqueObject` (`collection` → `insert`/`get`/`all`/`remove`,
+  record `save`).
 
 ## Client (`wavedb`)
 
 - `Db::connect` / `Db::open` family (native file + wasm IndexedDB);
-- typed CRUD: Unique `get`/`save`; NonUnique `insert`/`update`/`delete` +
-  collection walk via `Pivot`/`BpTree`. No query DSL.
+- typed CRUD: Unique `get`/`save`; NonUnique `insert`/`save`/`remove` + collection
+  walk via `Pivot`/`BpTree`; explicit `create_pivot`. No query DSL.
 
 ## Server functions (`#[server]`) — replaces query
 

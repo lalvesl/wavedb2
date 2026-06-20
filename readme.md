@@ -226,16 +226,23 @@ no business data — only the addressing into the index trees:
 pub struct Pivot {
     pub current: BpTreeId,      // u128 pointer to the B+tree of living records
     pub dead:    BpTreeId,      // u128 pointer to the B+tree of deleted records
+    // + one BpTreeId per #[wavedb::pivot(...)] secondary index
 }
 ```
 
-No element counter: a count would force a `Pivot` write on every insert/delete;
+No element counter: a count would force a `Pivot` write on every insert/remove;
 the `Pivot` instead stays effectively immutable, written only if a `BpTree` root
 moves.
 
 **BpTree** (also auto-generated) is the index itself — a B+tree keyed by
 `CREATED_AT`, holding addresses of NonUnique records (not the records' bytes).
 There is one tree for living data and one for deleted data.
+
+**Secondary indexes** — a NonUnique struct can declare extra `BpTree`s on its
+properties with `#[wavedb::pivot(field)]` or `#[wavedb::pivot((f1, f2))]`. Each
+adds a `BpTree` root to the `Pivot` and a typed lookup on the collection handle
+(`by_field`), resolved two-phase like the primary tree. `insert`/`remove` update
+every index; a `save` only touches a secondary tree if it changed that field.
 
 > Pivot and BpTree are generated _per_ NonUnique type. If two such generated
 > types share the same name and field shape their `STRUCT_HASH` may collide —
@@ -244,12 +251,25 @@ There is one tree for living data and one for deleted data.
 
 ### Operations
 
-- **Unique** — `get` and `save`. `save` on an existing record updates the live
-  anchor in place and chains the previous bytes into history via `Metadata`
-  (timeline preserved).
-- **NonUnique** — `insert`, `update`, `delete`. Each revalidates the `BpTree`.
-  `delete` moves the record from the **current** tree to the **dead** tree
-  (nothing is erased — history stays navigable).
+- **Unique** — `get` and `save`. There is **no `create`** (a create that errors
+  when the record exists is just friction): `save` is an upsert — it writes the
+  live bytes at the fixed anchor and chains the previous bytes into history via
+  `Metadata` (timeline preserved).
+- **NonUnique** — `insert`, `save` (update), `remove`, reached through the
+  collection's **`Pivot`**:
+  - a record's **identity `Id` is assigned at `insert`** (that moment's
+    `CREATED_AT`) and **never changes** — it is the record's anchor.
+  - **`save` / update** rewrites the live bytes at that same `Id` and chains
+    history — exactly like a Unique save. The `Id` doesn't move, so the `BpTree`
+    is **untouched** and the `Pivot` isn't needed.
+  - only **`insert`** (add the new `Id` to the `current` `BpTree`) and **`remove`**
+    (move the `Id` from the **current** tree to the **dead** tree) touch the tree,
+    so only those go through the `Pivot`. Nothing is erased — history stays
+    navigable.
+
+  `insert` / `remove` / `all` / `get(id)` are methods of a **collection handle**
+  opened from a stored `PivotId`; `save` is a method on the record (it has its
+  identity `Id`).
 
 ### History / timeline
 
@@ -294,14 +314,17 @@ use wavedb::prelude::*;
 // For a B2C app the tenant *is* the user — bound once, at connect time.
 let db = Db::connect("wss://wavedb.example", /* user */ 42, /* tenant */ 42).await?;
 
-// Unique: one record per tenant.
+// Unique: one record per tenant. No create — save is upsert.
 let profile: Option<AboutUser> = AboutUser::get(&db).await?;
+profile_var.save(&db).await?;
 
-// NonUnique: list the collection (Pivot → BpTree, time-ordered).
-let recent: Vec<Order> = Order::all(&db).await?;
+// NonUnique: open the collection from a stored PivotId.
+let orders = Order::collection(&db, user.orders);   // handle carries the PivotId
+let id = orders.insert(&db, Order { amount: 120 }).await?;  // assigns identity Id, adds to BpTree
+let recent: Vec<Order> = orders.all(&db).await?;            // walk current BpTree → Ids → fetch
 
-order.save(&db).await?;     // versioned update; old bytes chained into history
-order.delete(&db).await?;   // moves to the dead B+tree (NonUnique only)
+order.save(&db).await?;            // update in place at its identity Id; tree untouched
+orders.remove(&db, id).await?;     // move Id current → dead BpTree (history kept)
 
 // Filtered / derived reads are server functions — an async fn that runs on the
 // node, called through a generated client binding (no client-side query DSL).

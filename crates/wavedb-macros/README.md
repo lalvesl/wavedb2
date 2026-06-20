@@ -47,8 +47,14 @@ because both compile this crate.
    every field's stack/heap placement, so layout never depends on the Rust
    compiler's struct representation.
 4. **Generates the collection machinery for `NonUnique`** — a `Pivot` type and a
-   `BpTree` type (below).
-5. **Wires up the schema-evolution hooks** — the optional `first_try` /
+   `BpTree` type, plus one extra `BpTree` (secondary index) per
+   `#[wavedb::pivot(...)]` attribute (below).
+5. **Implements the typed object trait by shape** — `UniqueObject` (`get` /
+   `save`) for Unique, `NonUniqueObject` (`collection` → `insert`/`get`/`all`/
+   `remove`, plus record `save`) for NonUnique. These call the shared engine over
+   the [`Store`](../wavedb-core/README.md#storage-backend-trait-store) backend, so
+   the same typed calls compile native and wasm.
+6. **Wires up the schema-evolution hooks** — the optional `first_try` /
    `fallback_not_found` functions; see
    [`wavedb-core`](../wavedb-core/README.md#schema-evolution--lookup-hooks).
 
@@ -97,11 +103,12 @@ directly; they reference a collection through its `PivotId`.
 
 ```rust
 // Generated type. The handle for one NonUnique collection.
-// No counter — a size field would force a Pivot write on every insert/delete;
+// No counter — a size field would force a Pivot write on every insert/remove;
 // the Pivot stays effectively immutable (written only if a BpTree root moves).
 pub struct Pivot {
-    pub current: BpTreeId,  // u128 → B+tree of living records
+    pub current: BpTreeId,  // u128 → B+tree of living records (keyed by CREATED_AT)
     pub dead:    BpTreeId,  // u128 → B+tree of deleted records
+    // + one BpTreeId root per `#[wavedb::pivot(...)]` secondary index (below)
 }
 
 // Generated type. A B+tree keyed by CREATED_AT, holding NonUnique record
@@ -134,6 +141,35 @@ pub struct UserInterestedFruits {
 > context, and the type is never inferred from the `Id` (the 15-bit `SALT` is pure
 > collision breaker — see
 > [`wavedb-core`](../wavedb-core/README.md#the-salt-field-15-bits)).
+
+### Secondary indexes — `#[wavedb::pivot(...)]`
+
+By default a NonUnique collection has one index: the `current` `BpTree` keyed by
+`CREATED_AT` (time order). Declare **extra `BpTree`s on properties** with the
+repeatable `#[wavedb::pivot(...)]` attribute — single field or a composite tuple:
+
+```rust
+#[wavedb(NonUnique)]
+#[wavedb::pivot(amount)]              // a BpTree keyed by `amount`
+#[wavedb::pivot((customer, date))]   // a composite BpTree keyed by (customer, date)
+pub struct Order {
+    pub amount: u64,
+    pub customer: u64,
+    pub date: u64,
+}
+```
+
+Per declared pivot the macro:
+
+- adds a **`BpTreeId` root to the `Pivot`** (one per index);
+- generates a **typed lookup** on the collection handle — e.g. `by_amount(&db, v)`
+  / a range query, and `by_customer_date(&db, (c, d))` — returning record `Id`s,
+  resolved two-phase (index → `Id`s → fetch), exactly like the primary tree.
+
+**Maintenance cost.** `insert` and `remove` update *every* index. A `save` is
+still tree-free **unless it changes an indexed field** — then that one secondary
+`BpTree` entry moves (old key removed, new key inserted). So an indexed field is a
+write-amplification trade: faster lookups, costlier writes on that field.
 
 ---
 

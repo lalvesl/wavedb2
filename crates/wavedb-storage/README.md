@@ -10,14 +10,14 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 
 ## Module map
 
-| Module         | Responsibility                                                            |
-| -------------- | ------------------------------------------------------------------------- |
-| `block`        | `BlockFile` / block allocator — alloc/free/coalesce runs of 4 KiB blocks. |
-| `directory`    | The per-`STRUCT_HASH` `Vec<u64>` page directory + linear hashing.         |
-| `page`         | Page format + the `PageFormat` derive trait (crc32, id list, blob).       |
-| `dictionary`   | Per-`STRUCT_HASH` compression dictionary + its block run.                 |
-| `pipeline`     | Journal, in-memory `BTreeMap` cache, background settle + rebalance.       |
-| `node_storage` | Top-level façade tying the files together for a node.                     |
+| Module         | Responsibility                                                                                                                 |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `block`        | `BlockFile` / block allocator — alloc/free/coalesce runs of 4 KiB blocks.                                                      |
+| `directory`    | The per-`STRUCT_HASH` `Vec<u64>` page directory + linear hashing.                                                              |
+| `page`         | Page format + the `PageFormat` derive trait (crc32, id list, blob).                                                            |
+| `dictionary`   | Per-`STRUCT_HASH` compression dictionary + its block run.                                                                      |
+| `pipeline`     | Journal, in-memory `BTreeMap` cache, background settle + rebalance.                                                            |
+| `node_storage` | `NodeStorage` — the public entry point a node holds: owns the files + all sub-modules, implements the core `Store` trait (`get`/`update`/`remove`). |
 
 ---
 
@@ -59,6 +59,12 @@ directory — an in-memory `Vec<u64>` where every entry is a 64-bit **page
 descriptor** pointing at one homogeneous page (a run of blocks holding records of
 exactly that `STRUCT_HASH`). One `Vec<u64>` per type, so unrelated types never
 share a page and each page compresses against one tight dictionary.
+
+> **"bucket" = "page", 1:1.** A _bucket_ is one directory slot — the logical
+> hash-table slot records hash into (the linear-hashing term). A _page_ is the
+> physical run of blocks that slot points to. Each directory entry is exactly one
+> page, so the two words name the same thing: "bucket" stresses its role in the
+> hash table, "page" its on-disk form.
 
 ### Block descriptor (`u64`) — one format everywhere
 
@@ -181,12 +187,12 @@ The `PageFormat` trait also owns the **management of the `Vec<u64>` directory** 
 calling the block manager to allocate/free runs and driving the `Wire`
 serialize/deserialize. Page kinds:
 
-| Kind          | What the blob holds                                              |
-| ------------- | ---------------------------------------------------------------- |
-| **Unique**    | The single live record per tenant at its fixed anchor address.   |
-| **NonUnique** | The collection's records (timestamp-keyed).                      |
+| Kind          | What the blob holds                                                |
+| ------------- | ------------------------------------------------------------------ |
+| **Unique**    | The single live record per tenant at its fixed anchor address.     |
+| **NonUnique** | The collection's records (timestamp-keyed).                        |
 | **Pivot**     | Collection handles: `current`/`dead` BpTree pointers (no counter). |
-| **BpTree**    | B+tree index nodes — record addresses, not record bytes.         |
+| **BpTree**    | B+tree index nodes — record addresses, not record bytes.           |
 
 ---
 
@@ -233,9 +239,9 @@ mutation → journal append → in-memory BTreeMap<Id> cache → (client confirm
                                              then rebalance (split_next)
 ```
 
-1. **Journal first.** Every insert/update/delete/save — and every block
-   alloc/free — is appended to the journal before anything else. This is what
-   makes the durability guarantee and prevents leaks.
+1. **Journal first.** Every insert/save/remove — and every block alloc/free — is
+   appended to the journal before anything else. This is what makes the durability
+   guarantee and prevents leaks.
 2. **Cache as a `BTreeMap<Id, …>`.** Confirmed mutations live in an in-memory
    `BTreeMap` keyed by `Id`; reads serve from it directly (and, because `Id` is
    ordered by `KEY`, range/timeline reads are naturally ordered).
@@ -253,7 +259,7 @@ A single operation can touch several records (a NonUnique insert writes the data
 record **and** a `BpTree` node). These are committed as **one journal entry** and
 applied to the in-memory cache **atomically** — so readers see all-or-nothing, and
 a crash before the background settle replays the journal back into the cache. No
-separate transaction manager: the journal entry + cache update *is* the atomic
+separate transaction manager: the journal entry + cache update _is_ the atomic
 unit. (Multi-write **server-function** transactions — several operations as one
 unit — remain a separate, later concern.)
 
@@ -261,12 +267,15 @@ unit — remain a separate, later concern.)
 
 Counting journal + `data.bin` IOs (the cache absorbs repeats; cold case shown):
 
-| Operation                          | IOs | Breakdown                                                                                                 |
-| ---------------------------------- | --- | --------------------------------------------------------------------------------------------------------- |
-| **Unique `save`**                  | 4   | journal data entry · read the page · write the page · allocation delta in journal                         |
-| **NonUnique `insert`/`save`/`delete`** | 7 | journal data entry · read 3 pages (record, `Pivot`, `BpTree`) · write 2 pages (record, `BpTree`) · allocation delta in journal |
+| Operation                            | IOs | Breakdown                                                                                                                      |
+| ------------------------------------ | --- | ------------------------------------------------------------------------------------------------------------------------------ |
+| **Unique `save`**                    | 4   | journal data entry · read the page · write the page · allocation delta in journal                                              |
+| **NonUnique `save`** (update)        | 4   | same as Unique — rewrite at the identity `Id`; the `BpTree`/`Pivot` are not touched                                            |
+| **NonUnique `insert` / `remove`**    | 7   | journal data entry · read 3 pages (record, `Pivot`, `BpTree`) · write 2 pages (record, `BpTree`) · allocation delta in journal |
 
-The `Pivot` is **read but not written** on a normal NonUnique op (it changes only
+A NonUnique **`save`** rewrites the record at its fixed identity `Id`, so it costs
+the **same 4 IOs as a Unique save** — only **`insert`** and **`remove`** touch the
+tree (7 IOs). The `Pivot` is **read, not written** on a normal op (it changes only
 if a `BpTree` root moves) — that is why dropping its counter matters. Both
 allocation deltas ride in a single journal write.
 
@@ -278,10 +287,13 @@ allocation deltas ride in a single journal write.
   in one lookup. `save` writes the new live bytes to the anchor and chains the
   previous version into history via `Metadata`.
 - **NonUnique** — a collection's `Pivot` is created **explicitly** (one per tenant
-  per definition) and its `PivotId` stored by the holder; it is never
-  auto-created. `insert` / `update` / `delete` then go through that `Pivot`'s
-  `BpTree`. `delete` moves the entry from the **current** tree to the **dead**
-  tree; the record bytes are never erased, keeping the timeline navigable.
+  per definition) and its `PivotId` stored by the holder; never auto-created. A
+  record's **identity `Id` is fixed at `insert`**, so:
+  - **`save`** (update) rewrites at that `Id` and chains history — the `BpTree`
+    and `Pivot` are **not touched** (just like a Unique save);
+  - **`insert`** adds the new `Id` to the `current` `BpTree`, **`remove`** moves it
+    to the **dead** tree — only these go through the `Pivot`.
+  The record bytes are never erased, keeping the timeline navigable.
 
 ### `BpTree` stores only `Id`s — reads are two-phase
 

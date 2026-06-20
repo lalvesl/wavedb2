@@ -32,38 +32,47 @@ The `Drop` impl notifies the Quick-Node so the session is released promptly.
 ## The partition key is structural
 
 The tenant is bound **once, at connect** — you never restate it on a read. The
-engine only ever touches the connected tenant's data:
+engine only ever touches the connected tenant's data. The typed methods come from
+per-struct traits the `#[wavedb]` macro implements by shape (`UniqueObject` /
+`NonUniqueObject`, see below).
 
 ```rust
 use wavedb::prelude::*;
 
 let db = Db::connect("wss://wavedb.example", /* user */ 42, /* tenant */ 42).await?;
 
-// Unique: the one record of this type for tenant 42 — a single-lookup get.
-let profile: Option<AboutUser> = AboutUser::get(&db).await?;
+// Unique (UniqueObject): one record per tenant. No create — save is upsert.
+let mut profile: AboutUser = AboutUser::get(&db).await?.unwrap_or_default();
+profile.city = "Lisbon".into();
+profile.save(&db).await?;
 
-// NonUnique: walk the collection through its Pivot → BpTree (time-ordered).
-let orders: Vec<Order> = Order::all(&db).await?;
+// NonUnique (NonUniqueObject): open the collection from a stored PivotId.
+let orders = Order::collection(&db, profile.orders); // Collection<Order>, carries the PivotId
+let id = orders.insert(&db, Order { amount: 120 }).await?; // assigns identity Id, adds to BpTree
+let recent: Vec<Order> = orders.all(&db).await?;           // walk current BpTree → Ids → fetch
+
+let mut o = orders.get(&db, id).await?.unwrap();
+o.amount = 130;
+o.save(&db).await?;          // update in place at the identity Id; tree untouched
+orders.remove(&db, id).await?; // move Id current → dead BpTree (history kept)
 ```
 
-## Object lifecycle
+## Object lifecycle & the typed traits
 
-Objects are never **created in isolation**. Every `create` is preceded by a
-"does this exist?" check — if it does you `save`, if not the engine assigns a
-fresh `Id` and `Metadata` and saves. Local code uses `Default::default()` for
-both; the engine fills the real values at `save`/`send` time.
+There is **no `create`** — `save` is an upsert. A Unique `save` writes the live
+anchor; a NonUnique record gets its **identity `Id` at `insert`** and keeps it,
+so later `save`s rewrite in place and chain history without touching the `BpTree`.
 
-```rust
-// Unique lookup — Option because the record may not exist yet.
-let profile: Option<AboutUser> = AboutUser::get(&db).await?;
+The macro implements one typed trait per shape (defined in
+[`wavedb-core`](../wavedb-core/README.md#storage-backend-trait-store)):
 
-// NonUnique: list the collection (Pivot → BpTree, time-ordered).
-let recent: Vec<Order> = Order::all(&db).await?;
+| Shape         | Trait              | Methods                                                            |
+| ------------- | ------------------ | ----------------------------------------------------------------- |
+| **Unique**    | `UniqueObject`     | `T::get(&db)`, `record.save(&db)`                                 |
+| **NonUnique** | `NonUniqueObject`  | `T::collection(&db, pivot) → Collection<T>` (`insert`/`get`/`all`/`remove`) + `record.save(&db)` |
 
-// Update (versioned in place) and delete (NonUnique only).
-order.save(&db).await?;
-order.delete(&db).await?;
-```
+Both ride on the low-level `Store` backend, so the same calls work native and on
+wasm.
 
 ## Filtered / derived reads: server functions
 

@@ -4,7 +4,7 @@ The network transport layer. **WaveDB _is_ the wire protocol** — there is no
 separate REST/RPC layer, no DTO split, no API schema to keep in sync with
 storage. Whatever the client serializes — a CRUD request or a server-function
 call — the server deserializes straight into the engine. Both record operations
-(`get`/`save`/`delete`/collection walk) and **server-function calls**
+(`get`/`save`/`insert`/`remove`/collection walk) and **server-function calls**
 (`CallServerFn { fn_hash, Wire args }`) ride the same `Transport`.
 
 > For the project-wide idea and quickstart see the
