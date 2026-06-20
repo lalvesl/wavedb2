@@ -321,18 +321,20 @@ profile_var.save(&db).await?;
 // NonUnique: open the collection from a stored PivotId.
 let orders = Order::collection(&db, user.orders);   // handle carries the PivotId
 let id = orders.insert(&db, Order { amount: 120 }).await?;  // assigns identity Id, adds to BpTree
-let recent: Vec<Order> = orders.all(&db).await?;            // walk current BpTree → Ids → fetch
+let mut recent = orders.all(&db);                          // async iterator: streams BpTree → Ids → fetch
+while let Some(order) = recent.next().await { let order = order?; /* … */ }
 
 order.save(&db).await?;            // update in place at its identity Id; tree untouched
 orders.remove(&db, id).await?;     // move Id current → dead BpTree (history kept)
 
-// Filtered / derived reads are server functions — an async fn that runs on the
-// node, called through a generated client binding (no client-side query DSL).
+// Filtered / derived reads are server functions — run on the node, called through
+// a generated client binding (no client-side query DSL). A collection-returning
+// server fn yields an async iterator, streamed item-by-item over the wire.
 #[server]
-async fn orders_over(db: &Db, min: u64) -> Result<Vec<Order>> {
-    Ok(Order::all(db).await?.into_iter().filter(|o| o.amount > min).collect())
+fn orders_over(db: &Db, min: u64) -> impl Stream<Item = Result<Order>> {
+    Order::all(db).try_filter(|o| future::ready(o.amount > min))
 }
-let big: Vec<Order> = orders_over(&db, 100).await?;
+let big: Vec<Order> = orders_over(&db, 100).try_collect().await?; // or iterate with .next().await
 ```
 
 The registry that lets every node "know the structs" is **generated in

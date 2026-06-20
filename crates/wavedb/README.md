@@ -49,7 +49,8 @@ profile.save(&db).await?;
 // NonUnique (NonUniqueObject): open the collection from a stored PivotId.
 let orders = Order::collection(&db, profile.orders); // Collection<Order>, carries the PivotId
 let id = orders.insert(&db, Order { amount: 120 }).await?; // assigns identity Id, adds to BpTree
-let recent: Vec<Order> = orders.all(&db).await?;           // walk current BpTree → Ids → fetch
+let mut recent = orders.all(&db);                          // async iterator: streams BpTree → Ids → fetch
+while let Some(order) = recent.next().await { let order = order?; /* … */ }
 
 let mut o = orders.get(&db, id).await?.unwrap();
 o.amount = 130;
@@ -76,6 +77,13 @@ The macro implements one typed trait per shape (defined in
 the write-through is immediate; the node confirms. Same calls native and wasm —
 only the local `Store` swaps.
 
+**Collection reads are async iterators.** `Collection::all` and every generated
+`by_<field>` lookup return `impl Stream<Item = Result<T>>`, not a buffered `Vec` —
+the two-phase BpTree walk streams records as it resolves `Id`s, so a caller can
+stop early without fetching the whole collection. Iterate with `.next().await`, or
+`.try_collect().await?` to materialise a `Vec`. The prelude re-exports
+`Stream` / `StreamExt`.
+
 ## Filtered / derived reads: server functions
 
 There is **no client-side query DSL**. Anything past "get this" or "list the
@@ -88,12 +96,12 @@ fn; the body never enters the client binary.
 ```rust
 // Declared once in the schema crate; the body runs only on the node.
 #[server]
-async fn orders_over(db: &Db, min: u64) -> Result<Vec<Order>> {
-    Ok(Order::all(db).await?.into_iter().filter(|o| o.amount > min).collect())
+fn orders_over(db: &Db, min: u64) -> impl Stream<Item = Result<Order>> {
+    Order::all(db).try_filter(|o| future::ready(o.amount > min))
 }
 
-// Client side: a generated binding with the same signature.
-let big: Vec<Order> = orders_over(&db, 100).await?;
+// Client side: a generated binding with the same signature — an async iterator.
+let big: Vec<Order> = orders_over(&db, 100).try_collect().await?;
 ```
 
 Mechanism (the `#[server]` macro, wire-encoded args, transport) lives in

@@ -114,8 +114,10 @@ schema-blind behaviour (opaque bytes). Hook declaration lives in
 The registry also holds the `#[server]` functions. A `CallServerFn { fn_hash,
 Wire args }` request is dispatched by `FN_HASH` to the function's server-only
 body, which runs on the node with full DB access; the `Wire`-encoded return
-travels back over the same transport. There is no query DSL — filtered/derived
-reads are these functions. Permission checks apply inside the body. See
+travels back over the same transport. A collection-returning fn **streams** its
+items back as a sequence of frames (an async iterator on the client) rather than
+buffering a whole `Vec`. There is no query DSL — filtered/derived reads are these
+functions. Permission checks apply inside the body. See
 [`wavedb-macros`](../wavedb-macros/README.md#server-functions--server).
 
 ---

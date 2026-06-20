@@ -73,11 +73,17 @@ code exists yet. Build order, roughly bottom-up:
 - `Db::connect` / `Db::open` family (native file + wasm IndexedDB);
 - typed CRUD: Unique `get`/`save`; NonUnique `insert`/`save`/`remove` + collection
   walk via `Pivot`/`BpTree`; explicit `create_pivot`. No query DSL.
+- collection reads are **async iterators**: `all` / `by_<field>` (and
+  collection-returning `#[server]` fns) return `impl Stream<Item = Result<T>>`, not
+  a buffered `Vec`; `.try_collect().await?` to materialise. Prelude re-exports
+  `Stream`/`StreamExt`.
 
 ## Server functions (`#[server]`) — replaces query
 
 - `#[server]` proc-macro: server-only async body + client call binding;
-- `FN_HASH` (name + arg types + return type) identity; args/return via `Wire`;
+- `FN_HASH` (name + arg types + return type) identity; args/return via `Wire`. A
+  collection return is a `Stream<Item = Result<T>>` whose items ship one at a time
+  (back-pressured), re-exposed as an async iterator client-side — not a buffered `Vec`;
 - transport `CallServerFn { fn_hash, args }` over `wavedb-net`; registry dispatch;
 - body never enters the client binary; permission checks run in the body.
 

@@ -165,8 +165,9 @@ Per declared pivot the macro:
 
 - adds a **`BpTreeId` root to the `Pivot`** (one per index);
 - generates a **typed lookup** on the collection handle — e.g. `by_amount(&db, v)`
-  / a range query, and `by_customer_date(&db, (c, d))` — returning record `Id`s,
-  resolved two-phase (index → `Id`s → fetch), exactly like the primary tree.
+  / a range query, and `by_customer_date(&db, (c, d))` — returning a record async
+  iterator (`impl Stream<Item = Result<T>>`), resolved two-phase (index → `Id`s →
+  fetch), exactly like the primary tree.
 
 **Maintenance cost.** `insert` and `remove` update *every* index. A `save` is
 still tree-free **unless it changes an indexed field** — then that one secondary
@@ -207,13 +208,13 @@ generates the binding; arguments and the return value travel through `Wire` over
 
 ```rust
 #[server]
-async fn orders_over(db: &Db, min: u64) -> Result<Vec<Order>> {
+fn orders_over(db: &Db, min: u64) -> impl Stream<Item = Result<Order>> {
     // compiled ONLY into the node binary; full DB access
-    Ok(Order::all(db).await?.into_iter().filter(|o| o.amount > min).collect())
+    Order::all(db).try_filter(|o| future::ready(o.amount > min)) // streamed over the wire
 }
 
-// On any client (native or wasm) the same name is a thin stub:
-let big: Vec<Order> = orders_over(&db, 100).await?;
+// On any client (native or wasm) the same name is a thin stub — an async iterator:
+let big: Vec<Order> = orders_over(&db, 100).try_collect().await?;
 ```
 
 What the macro emits:
@@ -227,7 +228,10 @@ What the macro emits:
   return type (same idea as `STRUCT_HASH`), so client and server agree on identity
   and a signature change is a new function, caught at the boundary.
 - **Wire bounds** — every argument and the return type must implement `Wire`; the
-  `db: &Db` receiver is supplied by the node, never sent.
+  `db: &Db` receiver is supplied by the node, never sent. A collection-shaped
+  return is an `impl Stream<Item = Result<T>>` whose **item** `T: Wire` — the macro
+  ships items one at a time over the wire (back-pressured), and the client stub
+  re-exposes the same async iterator instead of buffering a `Vec`.
 - **Security** — the body runs on the node, so permission checks and validation
   apply there; the client cannot bypass them by crafting a request, only call the
   declared function with typed arguments.

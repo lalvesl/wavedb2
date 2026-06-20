@@ -260,7 +260,8 @@ The **node's** storage engine (pages, blocks, journal, `Pivot`/`BpTree` —
 
 **Reads.** `get(id)` checks the local `Store` first; on a miss it fetches from the
 node and back-fills. Collection queries (`all` / `by_field`) need the `BpTree`, so
-they run on the node and return records (then back-filled into the local store).
+they run on the node and **stream** records back (each back-filled into the local
+store as it arrives) — an async iterator, not a buffered `Vec`.
 
 ## Typed object traits (per struct, macro-implemented)
 
@@ -285,11 +286,18 @@ pub trait NonUniqueObject: WaveDbStruct + Sized {
 impl<T: NonUniqueObject> Collection<T> {
     async fn insert(&self, db: &Db, record: T) -> Result<Id>;  // mint Id, local + send
     async fn get(&self, db: &Db, id: Id) -> Result<Option<T>>;
-    async fn all(&self, db: &Db) -> Result<Vec<T>>;            // node-side BpTree walk
+    fn all(&self, db: &Db) -> impl Stream<Item = Result<T>>;   // node-side BpTree walk, streamed
     async fn remove(&self, db: &Db, id: Id) -> Result<()>;
-    // + a `by_<field>` lookup per `#[wavedb::pivot(...)]` secondary index.
+    // + a `by_<field>` lookup per `#[wavedb::pivot(...)]` secondary index, also a Stream.
 }
 ```
+
+**Collection reads are async iterators.** `all` and every generated `by_<field>`
+return `impl Stream<Item = Result<T>>`, never a buffered `Vec`: the two-phase
+BpTree walk (index → `Id`s → fetch) streams records as it resolves each `Id`, so a
+caller can stop early without materialising the whole collection. Use
+`.try_collect().await?` when a `Vec` is actually wanted. The prelude re-exports
+`Stream` / `StreamExt`.
 
 The macro picks `UniqueObject` vs `NonUniqueObject` by shape; `db: &Db` is the
 macro's generic `__WaveDbDb` parameter, resolved at the call site (no `dyn`). The

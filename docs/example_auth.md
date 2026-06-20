@@ -58,8 +58,8 @@ async fn refresh(db: &Db, refresh: String) -> Result<Tokens> {
 }
 
 #[server]                                    // filtered read = server fn (no query DSL)
-async fn pinned_notes(db: &Db) -> Result<Vec<Note>> {
-    Ok(Note::all(db).await?.into_iter().filter(|n| n.pinned).collect())
+fn pinned_notes(db: &Db) -> impl Stream<Item = Result<Note>> {  // async iterator, streamed
+    Note::all(db).try_filter(|n| future::ready(n.pinned))
 }
 
 // ---- client (native or wasm): same calls, bodies are stubs over the wire -----
@@ -78,8 +78,8 @@ async fn flow() -> Result<()> {
     Note { body: "ship it".into(), pinned: true }.create(&db).await?;
     let me: Option<AboutUser> = AboutUser::get(&db).await?;
 
-    // 5. filtered read via server fn
-    let pins: Vec<Note> = pinned_notes(&db).await?;
+    // 5. filtered read via server fn — async iterator (collect, or .next().await)
+    let pins: Vec<Note> = pinned_notes(&db).try_collect().await?;
 
     // 6. access expires → swap with refresh (rotates)
     let t = refresh(&pub_db, t.refresh).await?;
