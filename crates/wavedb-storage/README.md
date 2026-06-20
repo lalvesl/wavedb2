@@ -195,93 +195,83 @@ serialize/deserialize. Page kinds:
 | **Unique**    | The single live record per tenant at its fixed anchor address.     |
 | **NonUnique** | The collection's records (timestamp-keyed).                        |
 | **Pivot**     | Collection handles: `current`/`dead` BpTree pointers (no counter). |
-| **BpTree**    | 32 KiB page; multiple B+tree nodes packed per page; `u16` pointers. |
+| **BpTree**    | 32 KiB page; one B+tree node per page; 18-byte entries.           |
 
-### BpTree page layout — 32 KiB, packed nodes, `u16` pointers
+### BpTree page layout — 32 KiB, one node per page
 
-BpTree pages are **32 KiB** (8 × 4 KiB blocks). A single page holds multiple
-B+tree nodes packed together. All pointers inside a node are **`u16` (2 bytes)**,
-whether the target is on the same page or a different one — the high bit (bit 15)
-is the discriminant:
-
-```
-bit 15 = 0  →  intra-page byte offset  (0 .. 32 767, covers the full 32 KiB page)
-bit 15 = 1  →  index into the page's external LocalId table  (lower 15 bits = table index)
-```
-
-The **external LocalId table** lives at the page footer and grows downward. Each
-slot is a `LocalId` (10 bytes) pointing to a different BpTree page. A node
-references an external child with a `u16` index (bit 15 set) into this table —
-the `LocalId` is stored **once** even if multiple nodes on the same page reference
-the same external page.
+BpTree pages are **32 KiB** (8 × 4 KiB blocks). Each page holds exactly **one**
+B+tree node (either an internal node or a leaf node). Both node kinds use the
+same 18-byte entry format — no special-casing:
 
 ```
-┌────────────────────────────────────────────────────────┐  0
-│  HEADER  (24 bytes)                                    │
-│    crc32 (4) · STRUCT_HASH (8) · freespace_ptr (u16)  │
-│    ext_table_len (u16) · reserved (6)                  │
-├────────────────────────────────────────────────────────┤  24
-│                                                        │
-│  NODES  (packed, variable size, grow upward)           │
-│    node: { kind (u8) · num_entries (u16)               │
-│             entries: [ (key: [u8;8], ptr: u16) … ] }  │
-│    …                                                   │
-│                                                        │
-├────────────────────────────────────────────────────────┤
-│  FREE SPACE                                            │
-├────────────────────────────────────────────────────────┤
-│  EXTERNAL LocalId TABLE  (grows downward)              │
-│    slot[0]: LocalId (10 bytes)                         │
-│    slot[1]: LocalId (10 bytes)  …                      │
-└────────────────────────────────────────────────────────┘  32 768
+entry = [ key: [u8; 8] ][ LocalId: 10 bytes ]
 ```
 
-Every entry — internal child pointer or leaf record pointer — is the same
-**10 bytes on the wire** (`key: [u8;8]` + `ptr: u16`). The `LocalId` for
-cross-page references is amortized in the footer table, so pointers within the
-node body are always 2 bytes regardless of target location.
+- **Internal node entry**: `LocalId` is the child BpTree page pointer.
+- **Leaf node entry**: `LocalId` is the NonUnique record pointer.
 
-**Leaf node record pointers** are also `u16` into the external LocalId table
-(all leaf targets are NonUnique records on other pages — no leaf target is
-intra-page). On read, each `LocalId` is inflated to a full `Id` via
-`local_id.to_id(tenant)` (2–3 CPU cycles, never disk).
+All `LocalId`s are inflated to full `Id` via `local_id.to_id(tenant)` on read —
+2–3 CPU cycles, never disk.
+
+```
+┌──────────────────────────────────────────────────────┐  0
+│  HEADER  (20 bytes)                                  │
+│    crc32 (4) · STRUCT_HASH (8) · kind (u8)           │
+│    num_entries (u16) · reserved (5)                  │
+├──────────────────────────────────────────────────────┤  20
+│                                                      │
+│  ENTRIES  (18 bytes each, tightly packed)            │
+│    [ key: [u8; 8] | child/record: LocalId (10 B) ]  │
+│    …                                                 │
+│                                                      │
+└──────────────────────────────────────────────────────┘  32 768
+```
 
 #### Capacity and tree height
 
-Available node space per 32 KiB page (~24-byte header, `M` external LocalIds):
-
 ```
-node_bytes ≈ 32 744 − M × 10
-entries     ≈ node_bytes / 10            (10 bytes per entry: 8-byte key + u16 ptr)
+usable  = 32 768 − 20  = 32 748 bytes
+entries = 32 748 / 18  ≈  1 819 per page
 ```
 
-With `M = 0` (all children intra-page): **≈ 3 274 entries per page**.  
-With `M = 32` (32 external pages referenced): ≈ 3 274 − 32 = **3 242 entries**.
+Tree height in **page reads** (8-byte `CREATED_AT` keys):
 
-Tree height measured in **page reads**:
+| Records   | Page reads |
+| --------- | ---------- |
+| ≤ 1 819   | 1          |
+| ≤ 3.31 M  | 2          |
+| ≤ 6.03 B  | 3          |
 
-| Records         | Page reads |
-| --------------- | ---------- |
-| ≤ 3 274         | 1          |
-| ≤ 10.7 M        | 2          |
-| ≤ 35 B          | 3          |
-
-Prior design (4 KiB page, `LocalId` = 10 B, 226-entry nodes):
+Prior design (4 KiB page, 226-entry nodes, `LocalId` pointer per entry):
 
 | Records  | Page reads (old) | Page reads (new) |
 | -------- | ---------------- | ---------------- |
-| 10 M     | 4                | **2**            |
-| 1 B      | 4                | **3**            |
-| 35 B     | 5                | **3**            |
+| 1 M      | 4                | **2**            |
+| 1 B      | 5                | **3**            |
+| 6 B      | 5                | **3**            |
 
 #### Page split
 
-When a 32 KiB page fills, a **page split** creates a new 32 KiB page with a new
-`LocalId`. The parent page updates exactly one entry: the `u16` that pointed to
-this page's intra-page slot is replaced with a `u16` index (bit 15 set) to the
-new `LocalId` appended to the footer table. If the parent page also fills, the
-cascade proceeds identically. All changed pages go in one journal entry. The
-`Pivot` is updated only when the root page splits.
+When an insert fills a 32 KiB page: create a new 32 KiB page with a new
+`LocalId`, split the entries evenly (~50% each), insert the median key + new
+`LocalId` into the parent node. If the parent also fills, cascade up. A root
+split creates a new root page with a new `LocalId` and updates the `Pivot`. All
+changed pages go in **one journal entry**.
+
+#### Merge on delete
+
+When `remove` makes a node fall below **25% fill** (≈ 455 entries), check the
+adjacent sibling:
+
+- **Sibling + current ≤ 75% full** (≤ 1 364 entries): **merge** — copy all
+  entries into the sibling, free this page, remove the separator key from the
+  parent. Parent may in turn underflow → recurse.
+- **Sibling too full to absorb**: **redistribute** — steal entries from the
+  sibling until both sit near 50%, update the separator key in the parent.
+
+Both paths write all changed pages in a **single journal entry**. The `Pivot`
+is updated only if the root page is freed (tree becomes empty or shrinks to one
+level).
 
 ---
 

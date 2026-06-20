@@ -13,10 +13,11 @@ code exists yet. Build order, roughly bottom-up:
 - `STRUCT_HASH` = ahash with a **fixed hard-coded seed** over
   `name + shape + field names + field types` (deterministic across builds);
 - `Metadata` (modification chain, pivot back-link, user, device, permission) —
-  **no version field**. Uses `LocalId` for `old_modification_id`, `new_modification_id`,
-  and `pivot_id` (saves 18 bytes/record vs. `u128`). `pivot_id` = owning Pivot
-  back-link (NonUnique reindex); stamped at `insert`, `LocalId::ZERO` for Unique;
-  outside `STRUCT_HASH`;
+  **no version field**. Uses `Option<LocalId>` for `old_modification_id`,
+  `new_modification_id`, and `pivot_id` (`None` when absent — no sentinel ZERO
+  needed). Stack = 18 bytes (3×1 flag + 6 user + 8 device + 1 permission).
+  `pivot_id` = owning Pivot back-link (NonUnique reindex); stamped at `insert`,
+  `None` for Unique; outside `STRUCT_HASH`;
 - `Wire` trait + `WaveWire` derive (no serde, no `repr(C)`); see
   `docs/wire_format.md`;
 - index contracts in **core** (portable, `Store`-generic): `Store` (`get` +
@@ -59,12 +60,13 @@ code exists yet. Build order, roughly bottom-up:
   background `split_next`;
 - `PageFormat` derive trait per page kind (Unique / NonUnique / Pivot / BpTree):
   `crc32 + STRUCT_HASH + id-list + blob`, `Wire` ser/deser;
-- BpTree pages = **32 KiB** (8 × 4 KiB blocks); multiple nodes packed per page.
-  All pointers = `u16` (2 B): bit15=0 → intra-page byte offset; bit15=1 → index
-  into page-footer external LocalId table (10 B/slot, stored once, shared).
-  Per-entry cost: 8-byte key + 2-byte u16 = **10 bytes**. Capacity ≈ 3 274
-  entries/page. Tree height: ≤10.7 M records → 2 page reads; ≤35 B → 3 reads.
-  Leaf record pointers index the footer table; inflated to `Id` on return;
+- BpTree pages = **32 KiB** (8 × 4 KiB blocks); **one node per page**. Entry:
+  `key (8 B) + LocalId (10 B) = 18 bytes` — same format for internal (child page)
+  and leaf (record pointer). Capacity ≈ **1 819 entries/page**. Tree height:
+  ≤3.31 M records → 2 page reads; ≤6.03 B → 3 reads. Split: immediate on fill,
+  single journal entry, `Pivot` updated only on root split. Merge on delete:
+  node < 25% fill → merge or redistribute with sibling (single journal entry).
+  Leaf `LocalId` inflated to `Id` via `to_id(tenant)` — never disk;
 - per-`STRUCT_HASH` dictionaries + dictionary directory (same block descriptor);
 - write pipeline: journal-first → in-memory `BTreeMap<Id>` cache → background
   settle → background rebalance; journal replay on startup;

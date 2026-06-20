@@ -137,22 +137,24 @@ the per-`STRUCT_HASH` storage directory and the wire envelope.
 
 ```rust
 pub struct Metadata {
-    pub old_modification_id: LocalId,      // previous version (ZERO = first)
-    pub new_modification_id: LocalId,      // next version (ZERO = live)
-    pub pivot_id: LocalId,                 // owning Pivot back-link (ZERO = Unique)
-    pub user: U48,                         // who wrote this version (48-bit newtype)
-    pub device_created: u64,               // which device produced it
-    pub permission: Option<PermissionRef>, // access rule; None = tenant-only
+    pub old_modification_id: Option<LocalId>, // None = first version
+    pub new_modification_id: Option<LocalId>, // None = live record
+    pub pivot_id: Option<LocalId>,            // None = Unique record
+    pub user: U48,                            // who wrote this version (48-bit newtype)
+    pub device_created: u64,                  // which device produced it
+    pub permission: Option<PermissionRef>,    // access rule; None = tenant-only
 }
 ```
 
 No `struct_version` field — the stored record's `STRUCT_HASH` (carried in the
 wire envelope) already says which schema it was written under.
 
-Modification IDs and `pivot_id` use [`LocalId`](#localid--80-bit-compact-id) (80-bit)
-instead of a full `Id` (128-bit): the BpTree is already tenant-scoped, so the
-48-bit `TENANT` field is redundant in every pointer stored inside it. Saves **18
-bytes per record** vs. storing three full `u128` values.
+Modification IDs and `pivot_id` use `Option<LocalId>` (80-bit when `Some`)
+instead of a full `Id` (128-bit): the BpTree is already tenant-scoped so the
+48-bit `TENANT` is redundant, and `Option<T>` costs only 1 stack byte (flag) with
+the `LocalId` payload on the heap only when `Some`. Stack size = **18 bytes**
+(3 × 1-byte flag + 6 user + 8 device + 1 permission flag). A Unique record with
+all three `None` has zero heap bytes for those fields.
 
 ### `LocalId` — 80-bit compact ID
 
@@ -174,7 +176,7 @@ reach all the tree roots, which live in the collection's **`Pivot`**. The record
 therefore carries its owning `PivotId` here as a `LocalId` (the typed
 `<T>::PivotId` is the compile-time view only — core never names macro types).
 
-- **Stamped at `insert`** from the collection handle's `PivotId`; `LocalId::ZERO` for Unique.
+- **Stamped at `insert`** from the collection handle's `PivotId`; `None` for Unique.
 - Lets `save` reindex from the record alone, without re-passing the handle.
 - It is **outside `STRUCT_HASH`** (`name + shape + field names + types`), so it
   changes **no** struct's identity — only Metadata's own wire layout.
@@ -361,37 +363,32 @@ When a root moves the holder rewrites the `Pivot`, otherwise the `Pivot` stays
 immutable. Comparison is `memcmp` on the `IndexKey`-encoded bytes
 (== `Ordering::{Less,Equal,Greater}`), never a typed decode.
 
-### `LocalId` + packed 32 KiB pages — fanout and I/O
+### 32 KiB pages — fanout and I/O
 
-BpTree pages are **32 KiB** (8 × 4 KiB blocks), each holding multiple B+tree
-nodes. All pointers in a node — child pointers (internal nodes) and record
-pointers (leaf nodes) — are **`u16` (2 bytes)**. Bit 15 is the discriminant:
+BpTree pages are **32 KiB** (8 × 4 KiB blocks), **one node per page**. Both
+node kinds use the same 18-byte entry format:
 
 ```
-bit 15 = 0  →  intra-page byte offset  (0 .. 32 767)
-bit 15 = 1  →  index into page-footer external LocalId table
+entry = [ key: [u8; 8] ][ LocalId: 10 bytes ]
 ```
 
-Cross-page `LocalId`s (10 bytes each) are stored **once** in the page footer,
-shared by all nodes on the page. The pointer in the node body is always 2 bytes.
+- **Internal node**: `LocalId` = child BpTree page pointer.
+- **Leaf node**: `LocalId` = NonUnique record pointer.
 
-Per-entry cost: **8 bytes key + 2 bytes ptr = 10 bytes**, regardless of whether
-the target is on this page or another.
+All `LocalId`s inflate to full `Id` via `local_id.to_id(tenant)` — 2–3 CPU
+cycles, never disk.
 
-With ~3 274 usable entries per 32 KiB page, tree height in **page reads**:
+Usable bytes per page: `32 768 − 20 (header) ≈ 32 748`. Per-entry cost = **18
+bytes**. Capacity ≈ **1 819 entries per page**. Tree height in page reads:
 
-| Records  | Page reads |
-| -------- | ---------- |
-| ≤ 10.7 M | 2          |
-| ≤ 35 B   | 3          |
+| Records   | Page reads |
+| --------- | ---------- |
+| ≤ 1 819   | 1          |
+| ≤ 3.31 M  | 2          |
+| ≤ 6.03 B  | 3          |
 
-Leaf record pointers are `u16` indexes into the footer LocalId table (all leaf
-targets are NonUnique records — always cross-page). On return from `search`,
-each `LocalId` is inflated to a full `Id` via `local_id.to_id(tenant)` —
-2–3 CPU cycles, never disk.
-
-See [`wavedb-storage`](../../crates/wavedb-storage/README.md#bptree-page-layout--32-kib-packed-nodes-u16-pointers)
-for the full page layout, capacity math, and split algorithm.
+See [`wavedb-storage`](../../crates/wavedb-storage/README.md#bptree-page-layout--32-kib-one-node-per-page)
+for the full page layout, capacity math, split algorithm, and merge policy.
 
 ### Composite — set algebra on `Id` streams
 
