@@ -21,9 +21,11 @@ code exists yet. Build order, roughly bottom-up:
   `docs/wire_format.md`;
 - index contracts in **core** (portable, `Store`-generic): `Store` (`get` +
   atomic `apply(batch)`), `IndexKey` (order-preserving key encoding),
-  `Pivot` (`current`/`dead`/`secondaries` roots), `BpTree<S: Store>`
-  (`search`/`insert`/`remove`, byte-compare on encoded keys), `IdStreamExt`
-  (`intersect`/`union`/`except`). Pages/journal live behind `Store`, not here;
+  `Pivot` (`current`/`dead`/`secondaries` roots as `LocalId` — tenant stripped),
+  `BpTree<S: Store>` (`at(LocalId)`, `search` → `Id` stream, `insert`/`remove`
+  take record `Id` return `LocalId` root; byte-compare on encoded keys),
+  `IdStreamExt` (`intersect`/`union`/`except`). Pages/journal live behind `Store`,
+  not here;
 - `#[wavedb]` macro: shapes `Unique` (default) / `NonUnique`; generate the
   `Pivot` + `BpTree` *types*; `PivotId` field references for nesting;
 - explicit `create_pivot` (one per tenant per definition) → `PivotId` stored in a

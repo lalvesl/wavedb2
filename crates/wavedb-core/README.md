@@ -324,10 +324,13 @@ pub trait IndexKey {
 /// The collection's roots holder. `#[wavedb]` generates one per NonUnique type;
 /// this trait is the portable shape the engine reads. No element counter — the
 /// `Pivot` is rewritten only when a `BpTree` root moves.
+///
+/// Root pointers are `LocalId` (80-bit): the tree is tenant-scoped so `TENANT`
+/// is derivable from context — no need to repeat 6 bytes per pointer.
 pub trait Pivot: Wire + Sized {
-    fn current(&self)     -> Id;       // living-records B+tree root
-    fn dead(&self)        -> Id;       // deleted-records B+tree root
-    fn secondaries(&self) -> &[Id];    // one root per `#[wavedb::pivot(...)]`
+    fn current(&self)     -> LocalId;     // living-records B+tree root
+    fn dead(&self)        -> LocalId;     // deleted-records B+tree root
+    fn secondaries(&self) -> &[LocalId];  // one root per `#[wavedb::pivot(...)]`
 }
 
 /// A search bound over the order-preserving key space.
@@ -338,24 +341,25 @@ pub enum Bound {
     Prefix(Vec<u8>),
 }
 
-/// A B+tree index over any `Store`. Nodes are records read by `Id`; all I/O is
-/// delegated to `Store`, so one impl serves native PageStore and web IndexedDB.
-/// `search` returns record `Id`s only (two-phase: index → `Id`s → fetch).
+/// A B+tree index over any `Store`. Nodes are records read by `LocalId`; all I/O
+/// is delegated to `Store`, so one impl serves native PageStore and web IndexedDB.
+/// `search` returns full record `Id`s (two-phase: index → `Id`s → fetch).
 pub trait BpTree<S: Store>: Sized {
-    fn at(root: Id) -> Self;                                    // open a tree at a root
+    fn at(root: LocalId) -> Self;                               // open a tree at a root
 
     fn search(&self, store: &S, bound: Bound)
-        -> impl Stream<Item = Result<Id>>;                     // walk → matching record Ids
+        -> impl Stream<Item = Result<Id>>;                      // walk → matching record Ids
 
-    async fn insert(&self, store: &S, key: &[u8], id: Id) -> Result<Id>; // → (maybe moved) root
-    async fn remove(&self, store: &S, key: &[u8], id: Id) -> Result<Id>; // → (maybe moved) root
+    async fn insert(&self, store: &S, key: &[u8], id: Id) -> Result<LocalId>; // → (maybe moved) root
+    async fn remove(&self, store: &S, key: &[u8], id: Id) -> Result<LocalId>; // → (maybe moved) root
 }
 ```
 
-`insert`/`remove` return the (possibly moved) root `Id`: when a root moves the
-holder rewrites the `Pivot`, otherwise the `Pivot` stays immutable. Comparison is
-`memcmp` on the `IndexKey`-encoded bytes (== `Ordering::{Less,Equal,Greater}`),
-never a typed decode.
+`insert`/`remove` take a record `Id` (full 128-bit — external address) and return
+the (possibly moved) root as `LocalId` (tree-internal pointer, tenant stripped).
+When a root moves the holder rewrites the `Pivot`, otherwise the `Pivot` stays
+immutable. Comparison is `memcmp` on the `IndexKey`-encoded bytes
+(== `Ordering::{Less,Equal,Greater}`), never a typed decode.
 
 ### Composite — set algebra on `Id` streams
 
