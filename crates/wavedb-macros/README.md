@@ -51,9 +51,11 @@ because both compile this crate.
    `#[wavedb::pivot(...)]` attribute (below).
 5. **Implements the typed object trait by shape** — `UniqueObject` (`get` /
    `save`) for Unique, `NonUniqueObject` (`collection` → `insert`/`get`/`all`/
-   `remove`, plus record `save`) for NonUnique. These call the shared engine over
-   the [`Store`](../wavedb-core/README.md#storage-backend-trait-store) backend, so
-   the same typed calls compile native and wasm.
+   `remove`, plus record `save`) for NonUnique. Each method routes through the
+   `Db` handle: **write-through to the local `Store` + send over the network** to
+   the node, which runs the authoritative `Pivot`/`BpTree` engine. Same typed
+   calls compile native and wasm — only the local
+   [`Store`](../wavedb-core/README.md#store--the-local-backend-trait) swaps.
 6. **Wires up the schema-evolution hooks** — the optional `first_try` /
    `fallback_not_found` functions; see
    [`wavedb-core`](../wavedb-core/README.md#schema-evolution--lookup-hooks).
@@ -320,6 +322,5 @@ enum compiles into client, server, and wasm: the single source of truth.
 > dispatch (still no `dyn`):
 > - **`update_call`** — an additional generated call kind alongside the current
 >   server-function dispatch, for update-shaped operations.
-> - **More `BpTree`s per struct** — today one `BpTree` per collection keyed by
->   `CREATED_AT`; the generator will emit extra `BpTree`s indexing other
->   properties (secondary indexes).
+>
+> (Secondary indexes via `#[wavedb::pivot(...)]` are specced above, not here.)

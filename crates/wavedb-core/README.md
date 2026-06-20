@@ -211,75 +211,86 @@ in [`wavedb-macros` § the registry](../wavedb-macros/README.md#the-registry--ge
 
 ---
 
-## Storage backend trait (`Store`)
+## How a call runs: local store + network
 
-The basic DB operations live in two layers, with the **backend behind a trait
-defined here** so native and browser share everything above it.
+The developer only ever writes the typed call — `unique_var.save(&db)`,
+`T::get(&db)`, the collection methods. Each one does **two things internally**,
+and nothing else leaks:
 
-**`Store`** — the low-level key→value backend over `Id` + wire bytes; the *only*
-part that differs between native and web:
+1. **write-through to the local store** — a key→value map of `Id → wire bytes`
+   kept on the client. Gives warm reads and survives reconnects.
+2. **send to the owner node** over `wavedb-net` — the node is the **authoritative
+   writer**: it runs the real engine (confirm `Id`, pages, `Pivot`/`BpTree`,
+   history, replication) and acks.
 
 ```rust
-pub trait Store {
+unique_var.save(&db).await?;   // ← the only thing the app writes
+
+// inside (lives in `wavedb`, over the Db handle):
+let bytes = unique_var.to_wire();      // [STRUCT_HASH][Metadata][body]
+db.local().update(id, &bytes).await?;   // 1. local write-through (Store)
+db.send(Op::Save, bytes).await?;        // 2. network → node
+```
+
+The `Id` is known client-side without a round-trip: a Unique anchor is
+deterministic (`STRUCT_HASH · TENANT · 1 · 0`); a NonUnique record's identity `Id`
+is minted at `insert` (`CREATED_AT` + tenant + random `SALT`). So the
+write-through happens immediately; the node confirms.
+
+## `Store` — the local backend trait
+
+`Store` is the **client-side local store**, the *only* thing that differs native
+vs web. Core declares the contract (async, no I/O — WASM/macro-safe):
+
+```rust
+pub trait Store {                  // key→value over Id + wire bytes
     async fn get(&self, id: Id) -> Result<Option<Vec<u8>>>;
-    async fn update(&self, id: Id, bytes: &[u8]) -> Result<()>; // upsert at an Id
+    async fn update(&self, id: Id, bytes: &[u8]) -> Result<()>;
     async fn remove(&self, id: Id) -> Result<()>;
 }
 ```
 
-- **native** impl: `wavedb-storage` (`NodeStorage` — pages, blocks, journal).
-- **web** impl: `wavedb-wasm` (IndexedDB, key = `Id`, value = bytes).
+- **native** impl: a file-backed key→value store.
+- **web** impl: IndexedDB (key = `Id`, value = bytes).
 
-Core only declares the **contract** — `async fn` signatures, runtime-agnostic, no
-I/O — so this crate stays WASM/macro-safe. Dispatch is static (generic over
-`S: Store`), no `dyn`.
+The **node's** storage engine (pages, blocks, journal, `Pivot`/`BpTree` —
+`wavedb-storage`) is the authoritative store **reached over the network**. It is
+**not** a `Store` impl, and the client never calls it directly — the
+`Pivot`/`BpTree` work runs **on the node**.
 
-**High-level CRUD is shared, written once over `S: Store`:**
+**Reads.** `get(id)` checks the local `Store` first; on a miss it fetches from the
+node and back-fills. Collection queries (`all` / `by_field`) need the `BpTree`, so
+they run on the node and return records (then back-filled into the local store).
 
-- **Unique** `get` / `save` (upsert) — one `Store::get` / `Store::update` at the
-  fixed anchor.
-- **NonUnique** `insert` / `save` / `remove` through a collection's `Pivot`:
-  - `save` (update) = one `Store::update` at the record's identity `Id` (assigned
-    at `insert`, never changes) — tree untouched;
-  - `insert` adds the new `Id` to the `current` `BpTree`; `remove` moves it to the
-    `dead` `BpTree` — both resolve the `Pivot`, then walk/update tree nodes via
-    `Store::get` / `Store::update`.
+## Typed object traits (per struct, macro-implemented)
 
-Because the `BpTree` holds only `Id`s and a record's identity `Id` is fixed at
-insert, the whole engine reduces to `Store` calls — **identical on pages or
-IndexedDB**.
-
-### Typed object traits (per struct, macro-implemented)
-
-The CRUD is surfaced to app code as **typed traits, one per shape**, that the
-`#[wavedb]` macro implements for each struct. They are the third layer: app →
-typed trait → shared engine → `Store`.
+The calls above are surfaced as **typed traits, one per shape**, that `#[wavedb]`
+implements for each struct. The methods route through the `Db` handle (which owns
+the local `Store` and the transport) — they never expose `Store` or the network to
+app code.
 
 ```rust
-// Implemented for each Unique struct.
+// Unique
 pub trait UniqueObject: WaveDbStruct {
-    async fn get(db: &Db) -> Result<Option<Self>>;
-    async fn save(&self, db: &Db) -> Result<()>;   // upsert at the fixed anchor
+    async fn get(db: &Db) -> Result<Option<Self>>;   // local → (miss) node
+    async fn save(&self, db: &Db) -> Result<()>;     // local write-through + send
 }
 
-// Implemented for each NonUnique struct. Collection ops go through a handle
-// opened from a stored PivotId; `save` updates a record at its identity Id.
+// NonUnique — collection ops open a handle from a stored PivotId.
 pub trait NonUniqueObject: WaveDbStruct + Sized {
     fn collection(db: &Db, pivot: PivotId) -> Collection<Self>;
-    async fn save(&self, db: &Db) -> Result<()>;   // rewrite in place; tree untouched
+    async fn save(&self, db: &Db) -> Result<()>;     // update at identity Id (local + send)
 }
 
-// The handle that carries the PivotId and resolves the Pivot.
 impl<T: NonUniqueObject> Collection<T> {
-    async fn insert(&self, db: &Db, record: T) -> Result<Id>; // new identity Id → current BpTree
+    async fn insert(&self, db: &Db, record: T) -> Result<Id>;  // mint Id, local + send
     async fn get(&self, db: &Db, id: Id) -> Result<Option<T>>;
-    async fn all(&self, db: &Db) -> Result<Vec<T>>;           // two-phase: BpTree → Ids → fetch
-    async fn remove(&self, db: &Db, id: Id) -> Result<()>;    // current → dead BpTree
+    async fn all(&self, db: &Db) -> Result<Vec<T>>;            // node-side BpTree walk
+    async fn remove(&self, db: &Db, id: Id) -> Result<()>;
+    // + a `by_<field>` lookup per `#[wavedb::pivot(...)]` secondary index.
 }
 ```
 
-These are generic over the `Db` handle (which owns a `Store`), so the **same typed
-methods compile on native and wasm** — the only thing swapped underneath is the
-`Store` impl. The macro picks `UniqueObject` vs `NonUniqueObject` from the struct's
-shape; `db: &Db` here is the macro's generic `__WaveDbDb` parameter, resolved at
-the call site (no `dyn`).
+The macro picks `UniqueObject` vs `NonUniqueObject` by shape; `db: &Db` is the
+macro's generic `__WaveDbDb` parameter, resolved at the call site (no `dyn`). The
+same typed code compiles native and wasm — only the local `Store` impl swaps.

@@ -58,12 +58,15 @@ code exists yet. Build order, roughly bottom-up:
 
 ## Storage traits (core seam)
 
-- core `Store` trait: `get` / `update` (upsert) / `remove` over `Id` + wire bytes
-  (async, no I/O — contract only). native impl = `NodeStorage`; wasm = IndexedDB;
-- shared high-level engine over `S: Store` (anchor, Pivot→BpTree, history, hooks);
-- typed per-struct traits the macro implements by shape: `UniqueObject`
-  (`get`/`save`), `NonUniqueObject` (`collection` → `insert`/`get`/`all`/`remove`,
-  record `save`).
+- core `Store` trait = the **client-side local store** (`get`/`update`/`remove`
+  over `Id` + wire bytes; async, no I/O — contract only). native impl = file kv;
+  wasm impl = IndexedDB. **Not** the node engine;
+- typed per-struct traits (macro, by shape): `UniqueObject` (`get`/`save`),
+  `NonUniqueObject` (`collection` → `insert`/`get`/`all`/`remove`, record `save`).
+  Each call = **local `Store` write-through + network send** via the `Db` handle;
+- the authoritative `Pivot`/`BpTree`/page engine runs on the **node**
+  (`wavedb-storage`), reached over `wavedb-net`. `Id` is client-known (Unique
+  deterministic, NonUnique minted at insert) so write-through is immediate.
 
 ## Client (`wavedb`)
 

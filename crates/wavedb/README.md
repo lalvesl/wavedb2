@@ -59,20 +59,22 @@ orders.remove(&db, id).await?; // move Id current → dead BpTree (history kept)
 
 ## Object lifecycle & the typed traits
 
-There is **no `create`** — `save` is an upsert. A Unique `save` writes the live
-anchor; a NonUnique record gets its **identity `Id` at `insert`** and keeps it,
-so later `save`s rewrite in place and chain history without touching the `BpTree`.
+There is **no `create`** — `save` is an upsert. Every typed call does two things
+internally and nothing leaks: **write-through to the local `Store`** (native file
+/ web IndexedDB) **and send to the owner node** over `wavedb-net`. The node is the
+authoritative writer — it runs the `Pivot`/`BpTree` engine; the client never does.
 
 The macro implements one typed trait per shape (defined in
-[`wavedb-core`](../wavedb-core/README.md#storage-backend-trait-store)):
+[`wavedb-core`](../wavedb-core/README.md#typed-object-traits-per-struct-macro-implemented)):
 
 | Shape         | Trait              | Methods                                                            |
 | ------------- | ------------------ | ----------------------------------------------------------------- |
 | **Unique**    | `UniqueObject`     | `T::get(&db)`, `record.save(&db)`                                 |
 | **NonUnique** | `NonUniqueObject`  | `T::collection(&db, pivot) → Collection<T>` (`insert`/`get`/`all`/`remove`) + `record.save(&db)` |
 
-Both ride on the low-level `Store` backend, so the same calls work native and on
-wasm.
+`Id`s are client-known (Unique deterministic; NonUnique minted at `insert`), so
+the write-through is immediate; the node confirms. Same calls native and wasm —
+only the local `Store` swaps.
 
 ## Filtered / derived reads: server functions
 

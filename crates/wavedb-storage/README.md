@@ -17,20 +17,20 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 | `page`         | Page format + the `PageFormat` derive trait (crc32, id list, blob).                                                            |
 | `dictionary`   | Per-`STRUCT_HASH` compression dictionary + its block run.                                                                      |
 | `pipeline`     | Journal, in-memory `BTreeMap` cache, background settle + rebalance.                                                            |
-| `node_storage` | `NodeStorage` — the public entry point a node holds: owns the files + all sub-modules, implements the core `Store` trait (`get`/`update`/`remove`). |
+| `node_storage` | `NodeStorage` — the node's **authoritative** engine: owns the files + all sub-modules, runs `Pivot`/`BpTree` + page writes. Reached over the network; not the client's local `Store`. |
 
 ---
 
-## Two storage targets
+## Where this crate runs
 
-| Target           | Backing store                        | Journal        |
-| ---------------- | ------------------------------------ | -------------- |
-| **Native**       | Filesystem `data.bin` (+ block runs) | `journal` file |
-| **Web (wasm32)** | IndexedDB directly (key→value)       | **not needed** |
+This crate is the **node's authoritative engine** — native only: filesystem
+`data.bin` (block runs) + `journal`. It runs the `Pivot`/`BpTree` logic and is
+reached by clients over the network.
 
-Everything in this crate describes the **native** engine. The browser owns no
-physical layout — IndexedDB is already an ordered key→value store — so the WASM
-build skips pages, the block manager, and the journal entirely.
+It is **not** the client-side local store. The client's local key→value cache
+(`Store` trait) is a separate, lighter thing: a file kv on native, IndexedDB on
+web ([`wavedb-wasm`](../wavedb-wasm/README.md)) — no pages, no journal. See
+[`wavedb-core` § the `Store` trait](../wavedb-core/README.md#store--the-local-backend-trait).
 
 ---
 
