@@ -24,8 +24,11 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 ## Where this crate runs
 
 This crate is the **node's authoritative engine** — native only: filesystem
-`data.bin` (block runs) + `journal`. It runs the `Pivot`/`BpTree` logic and is
-reached by clients over the network.
+`data.bin` (block runs) + `journal`. It provides the native **`PageStore`** — the
+disk-optimised `Store` backend (`get` + atomic `apply`) — that the `Store`-generic
+`Pivot`/`BpTree` contracts in [`wavedb-core`](../wavedb-core/README.md#index-contracts--pivot-bptree-indexkey)
+run over. The index logic itself is portable; pages, blocks, journal, and the
+allocator are this crate's internals, hidden behind the `Store` seam.
 
 It is **not** the client-side local store. The client's local key→value cache
 (`Store` trait) is a separate, lighter thing: a file kv on native, IndexedDB on

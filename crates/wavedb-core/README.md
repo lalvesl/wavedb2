@@ -18,7 +18,8 @@ permission refs, and the `Wire` serialization trait.
 | `permission` | `PermissionRef` shapes.                                              |
 | `wire`       | The `Wire` trait + `WaveWire` (no serde). See `docs/wire_format.md`. |
 | `registry`   | `ObjectDescriptor` / `ObjectRegistry` lookup by `STRUCT_HASH`.       |
-| `store`      | The `Store` backend trait (key→value over `Id` + wire bytes).        |
+| `store`      | The `Store` backend trait (key→value over `Id` + atomic batch).      |
+| `index`      | `Pivot`, `BpTree`, `IndexKey`, `Bound` — the `Store`-generic index contracts. |
 | `traits`     | `WaveDbStruct`, shape markers.                                       |
 | `error`      | Workspace error type.                                                |
 
@@ -259,29 +260,101 @@ write-through happens immediately; the node confirms.
 
 ## `Store` — the local backend trait
 
-`Store` is the **client-side local store**, the *only* thing that differs native
-vs web. Core declares the contract (async, no I/O — WASM/macro-safe):
+`Store` is the **backend seam** — the only thing that differs native vs web. Core
+declares the contract (async, no I/O — WASM/macro-safe). It is key→value over `Id`
+plus an **atomic batch** (`apply`) so a multi-record op (record + `BpTree` node)
+commits all-or-nothing:
 
 ```rust
 pub trait Store {                  // key→value over Id + wire bytes
     async fn get(&self, id: Id) -> Result<Option<Vec<u8>>>;
-    async fn update(&self, id: Id, bytes: &[u8]) -> Result<()>;
-    async fn remove(&self, id: Id) -> Result<()>;
+    async fn apply(&self, batch: &[Write]) -> Result<()>;  // atomic: all-or-nothing
+}
+pub enum Write { Put(Id, Vec<u8>), Remove(Id) }
+```
+
+- **native node** impl: the page engine (`wavedb-storage`) — `apply` = one journal
+  entry + cache; durability + atomicity.
+- **web** impl: IndexedDB — `apply` = one IDB readwrite transaction.
+- **native client** impl: a file-backed key→value store.
+
+The pages/journal/allocator live **behind** this trait, inside the native page
+`Store`. The `Pivot`/`BpTree` logic sits **above** it (the `index` contracts below)
+and is `Store`-generic — so the **same index code runs on the node (PageStore) and
+on web (IndexedDB)**; only the backend swaps.
+
+**Reads.** `get(id)` checks the local `Store` first; on a miss it fetches from the
+node and back-fills. Collection queries (`all` / `by_field`) need the `BpTree` —
+which is `Store`-generic, so it runs **wherever the engine is linked**: on the node
+(PageStore) for a thin client, or **in-browser over IndexedDB** for a serverless app.
+
+## Index contracts — `Pivot`, `BpTree`, `IndexKey`
+
+The index lives **above** `Store` and depends only on it (`get` + `apply`), so it is
+**portable** — pages and journal are `PageStore` internals, never named here. Core
+declares the contracts; the same code compiles for the node (PageStore) and the web
+(IndexedDB).
+
+```rust
+/// Order-preserving key encoding: byte order == value order, so the `BpTree`
+/// compares keys by memcmp with no decode. Macro-implemented per indexed type
+/// (u64 → big-endian, i64 → sign-flipped, String → 0x00-terminated, tuples → concat).
+pub trait IndexKey {
+    fn encode_key(&self, out: &mut Vec<u8>);
+}
+
+/// The collection's roots holder. `#[wavedb]` generates one per NonUnique type;
+/// this trait is the portable shape the engine reads. No element counter — the
+/// `Pivot` is rewritten only when a `BpTree` root moves.
+pub trait Pivot: Wire + Sized {
+    fn current(&self)     -> Id;       // living-records B+tree root
+    fn dead(&self)        -> Id;       // deleted-records B+tree root
+    fn secondaries(&self) -> &[Id];    // one root per `#[wavedb::pivot(...)]`
+}
+
+/// A search bound over the order-preserving key space.
+pub enum Bound {
+    All,
+    Exact(Vec<u8>),
+    Range { lo: Vec<u8>, hi: Vec<u8> },  // half-open [lo, hi)
+    Prefix(Vec<u8>),
+}
+
+/// A B+tree index over any `Store`. Nodes are records read by `Id`; all I/O is
+/// delegated to `Store`, so one impl serves native PageStore and web IndexedDB.
+/// `search` returns record `Id`s only (two-phase: index → `Id`s → fetch).
+pub trait BpTree<S: Store>: Sized {
+    fn at(root: Id) -> Self;                                    // open a tree at a root
+
+    fn search(&self, store: &S, bound: Bound)
+        -> impl Stream<Item = Result<Id>>;                     // walk → matching record Ids
+
+    async fn insert(&self, store: &S, key: &[u8], id: Id) -> Result<Id>; // → (maybe moved) root
+    async fn remove(&self, store: &S, key: &[u8], id: Id) -> Result<Id>; // → (maybe moved) root
 }
 ```
 
-- **native** impl: a file-backed key→value store.
-- **web** impl: IndexedDB (key = `Id`, value = bytes).
+`insert`/`remove` return the (possibly moved) root `Id`: when a root moves the
+holder rewrites the `Pivot`, otherwise the `Pivot` stays immutable. Comparison is
+`memcmp` on the `IndexKey`-encoded bytes (== `Ordering::{Less,Equal,Greater}`),
+never a typed decode.
 
-The **node's** storage engine (pages, blocks, journal, `Pivot`/`BpTree` —
-`wavedb-storage`) is the authoritative store **reached over the network**. It is
-**not** a `Store` impl, and the client never calls it directly — the
-`Pivot`/`BpTree` work runs **on the node**.
+### Composite — set algebra on `Id` streams
 
-**Reads.** `get(id)` checks the local `Store` first; on a miss it fetches from the
-node and back-fills. Collection queries (`all` / `by_field`) need the `BpTree`, so
-they run on the node and **stream** records back (each back-filled into the local
-store as it arrives) — an async iterator, not a buffered `Vec`.
+Combining indexes (the no-DSL composite query) is free functions over the `Id`
+streams `search` yields — `Store`-agnostic, so they too run native or web:
+
+```rust
+pub trait IdStreamExt: Stream<Item = Result<Id>> + Sized {
+    fn intersect<S>(self, other: S) -> Intersect<Self, S>; // AND
+    fn union<S>(self, other: S)     -> Union<Self, S>;     // OR  (dedup)
+    fn except<S>(self, other: S)    -> Except<Self, S>;    // NOT (difference)
+}
+```
+
+Streams from different indexes arrive in different orders, so `intersect`/`except`
+buffer the **smaller** side into an `Id` set and probe the larger; `union` merges +
+dedups. A `#[server]` body composes these, then resolves survivors with a fetch.
 
 ## Typed object traits (per struct, macro-implemented)
 

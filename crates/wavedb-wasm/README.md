@@ -39,7 +39,12 @@ layer and the journal entirely**:
 
 The engine layers above storage — the Unique anchor, history chains, the
 schema-evolution hooks, and the `Pivot`/`BpTree` index — are identical on both
-targets. Filtered/derived reads are server functions (run on the node), so the
-wasm client just ships the call. Sync needs no page parity either: the Bloom-filter
+targets, because they are the `Store`-generic
+[index contracts](../wavedb-core/README.md#index-contracts--pivot-bptree-indexkey)
+in `wavedb-core`. The web build supplies an **IndexedDB `Store`** and the *same*
+`BpTree`/`Pivot` code runs on it — pages and journal are `PageStore` internals, not
+the index. A thin client still ships filtered reads to a node; a **serverless** app
+(static files from a CDN, no node) links the engine and runs the `BpTree` walk +
+`#[server]` bodies **in-browser over IndexedDB**, authoritative locally. Sync needs no page parity either: the Bloom-filter
 protocol exchanges objects, never pages. (`localStorage` — synchronous,
 string-only, ~5 MB — cannot fill this role.)
