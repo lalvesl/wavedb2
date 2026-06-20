@@ -1,74 +1,105 @@
 use futures::StreamExt;
 use wavedb::prelude::*;
 
-// Pull in the generated REGISTRY (Object enum + per-struct descriptors).
 include!(concat!(env!("OUT_DIR"), "/wavedb_registry.rs"));
 
-// ── Data model ────────────────────────────────────────────────────────────────
+// ── Global username registry (system tenant = 0) ──────────────────────────────
+
+/// Unique registry record that lives at system tenant (0).
+/// Holds the PivotId of the entire username→tenant collection.
+#[wavedb]
+pub struct AllUserNamesToTenants {
+    pub entries: <UserEntry as WaveDbStruct>::PivotId,
+}
+
+/// One record per registered user.
+/// Secondary index on `username` allows O(log n) lookup by name.
+#[wavedb(NonUnique)]
+#[wavedb::pivot(username)]
+pub struct UserEntry {
+    pub username: String,
+    pub tenant_id: u64,
+}
+
+// ── Per-tenant records ────────────────────────────────────────────────────────
 
 /// Auth — Unique, one per tenant.
-/// Stores the password hash and the current session token.
 #[wavedb]
 pub struct Auth {
     pub password_hash: String,
     pub session_token: Option<String>,
 }
 
-/// Profile — Unique, one per tenant.
-/// Holds the username and the PivotId of the user's Todo collection.
+/// Profile — Unique, one per tenant. Owns the todo collection handle.
 #[wavedb]
 pub struct Profile {
     pub username: String,
     pub todos: <Todo as WaveDbStruct>::PivotId,
 }
 
-/// Todo — NonUnique, many per tenant, ordered by insertion time.
+/// Todo item — NonUnique, many per tenant, ordered by insertion time.
 #[wavedb(NonUnique)]
 pub struct Todo {
     pub title: String,
     pub completed: bool,
 }
 
-// ── Auth server functions ─────────────────────────────────────────────────────
+// ── Auth server functions (call with system tenant db, tenant = 0) ────────────
 
-/// Create a new user for the calling tenant.
-/// Errors if the tenant already has an Auth record.
+/// Register a new user. Allocates a tenant id, writes the global UserEntry,
+/// and bootstraps Auth + Profile in the new tenant's space.
+/// Returns the assigned tenant_id — the client stores it and reconnects.
 #[server]
-pub async fn register(db: &Db, username: String, password: String) -> Result<()> {
-    if Auth::get(db).await?.is_some() {
-        return Err(Error::already_exists("user already registered"));
-    }
-    Auth {
-        password_hash: hash_password(&password),
-        session_token: None,
-    }
-    .save(db)
-    .await?;
+pub async fn register(db: &Db, username: String, password: String) -> Result<u64> {
+    let registry = ensure_registry(db).await?;
+    let col = UserEntry::collection(db, registry.entries);
 
-    let todos = Todo::create_pivot(db).await?;
-    Profile { username, todos }.save(db).await
+    if col.by_username(db, &username).next().await.is_some() {
+        return Err(Error::already_exists("username already taken"));
+    }
+
+    let tenant_id = new_tenant_id();
+    col.insert(db, UserEntry { username: username.clone(), tenant_id }).await?;
+
+    // bootstrap the new tenant's own records (server-side cross-tenant write)
+    let user_db = db.as_tenant(tenant_id);
+    Auth { password_hash: hash_password(&password), session_token: None }
+        .save(&user_db)
+        .await?;
+    let todos = Todo::create_pivot(&user_db).await?;
+    Profile { username, todos }.save(&user_db).await?;
+
+    Ok(tenant_id)
 }
 
-/// Verify the password and return a fresh session token.
+/// Verify credentials. Returns (tenant_id, session_token).
+/// Client uses the returned tenant_id to open its own tenant connection.
 #[server]
-pub async fn login(db: &Db, password: String) -> Result<String> {
-    let auth = Auth::get(db).await?.ok_or(Error::not_found("user not registered"))?;
+pub async fn login(db: &Db, username: String, password: String) -> Result<(u64, String)> {
+    let registry = ensure_registry(db).await?;
+    let col = UserEntry::collection(db, registry.entries);
+
+    let entry = col
+        .by_username(db, &username)
+        .next()
+        .await
+        .ok_or(Error::not_found("user not found"))??;
+
+    let user_db = db.as_tenant(entry.tenant_id);
+    let auth = Auth::get(&user_db).await?.ok_or(Error::not_found("auth record missing"))?;
     if auth.password_hash != hash_password(&password) {
         return Err(Error::unauthorized("wrong password"));
     }
+
     let token = new_token();
-    Auth {
-        session_token: Some(token.clone()),
-        ..auth
-    }
-    .save(db)
-    .await?;
-    Ok(token)
+    Auth { session_token: Some(token.clone()), ..auth }.save(&user_db).await?;
+
+    Ok((entry.tenant_id, token))
 }
 
-// ── Todo server functions ─────────────────────────────────────────────────────
+// ── Todo server functions (call with user tenant db) ──────────────────────────
 
-/// Add a new todo item. Returns the stable record Id.
+/// Add a new todo. Returns the stable record Id.
 #[server]
 pub async fn add_todo(db: &Db, title: String) -> Result<Id> {
     let profile = get_profile(db).await?;
@@ -89,7 +120,7 @@ pub fn all_todos(db: &Db) -> impl Stream<Item = Result<Todo>> {
     }
 }
 
-/// Mark a todo as completed (updates in place; old version kept in history).
+/// Mark a todo completed (old version kept in history chain).
 #[server]
 pub async fn complete_todo(db: &Db, id: Id) -> Result<()> {
     let profile = get_profile(db).await?;
@@ -99,26 +130,35 @@ pub async fn complete_todo(db: &Db, id: Id) -> Result<()> {
     todo.save(db).await
 }
 
-/// Remove a todo (moves to dead BpTree — history kept, record not erased).
+/// Remove a todo (moves to dead BpTree — record bytes kept, history navigable).
 #[server]
 pub async fn delete_todo(db: &Db, id: Id) -> Result<()> {
     let profile = get_profile(db).await?;
     Todo::collection(db, profile.todos).remove(db, id).await
 }
 
-// ── Private helpers (server-side only, not callable from client) ──────────────
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+/// Lazily initialise the global registry on first call.
+async fn ensure_registry(db: &Db) -> Result<AllUserNamesToTenants> {
+    if let Some(r) = AllUserNamesToTenants::get(db).await? {
+        return Ok(r);
+    }
+    let entries = UserEntry::create_pivot(db).await?;
+    let r = AllUserNamesToTenants { entries };
+    r.save(db).await?;
+    Ok(r)
+}
 
 async fn get_profile(db: &Db) -> Result<Profile> {
     Profile::get(db)
         .await?
-        .ok_or(Error::not_found("profile missing — call register first"))
+        .ok_or(Error::not_found("profile missing"))
 }
 
 fn hash_password(password: &str) -> String {
     use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(password.as_bytes());
-    format!("{:x}", h.finalize())
+    format!("{:x}", Sha256::new().chain_update(password).finalize())
 }
 
 fn new_token() -> String {
@@ -127,7 +167,14 @@ fn new_token() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let mut h = Sha256::new();
-    h.update(ts.to_le_bytes());
-    format!("{:x}", h.finalize())
+    format!("{:x}", Sha256::new().chain_update(ts.to_le_bytes()).finalize())
+}
+
+/// Mint a 48-bit tenant id from the current nanosecond timestamp.
+fn new_tenant_id() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+        & 0x0000_FFFF_FFFF_FFFF // mask to 48 bits (TENANT field width)
 }
