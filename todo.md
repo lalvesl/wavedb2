@@ -59,6 +59,10 @@ code exists yet. Build order, roughly bottom-up:
   background `split_next`;
 - `PageFormat` derive trait per page kind (Unique / NonUnique / Pivot / BpTree):
   `crc32 + STRUCT_HASH + id-list + blob`, `Wire` ser/deser;
+- BpTree node blob uses `LocalId` (10 B) for all intra-node pointers — internal
+  node child pointers **and** leaf node record pointers. `TENANT` stripped;
+  inflated to `Id` on return from `search`. 33 % better fanout vs `Id` (16 B):
+  8-byte key + 10-byte ptr = 18 B/entry → ≈226 entries/4 KiB page vs ≈170;
 - per-`STRUCT_HASH` dictionaries + dictionary directory (same block descriptor);
 - write pipeline: journal-first → in-memory `BTreeMap<Id>` cache → background
   settle → background rebalance; journal replay on startup;

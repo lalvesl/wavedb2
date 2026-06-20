@@ -197,6 +197,31 @@ serialize/deserialize. Page kinds:
 | **Pivot**     | Collection handles: `current`/`dead` BpTree pointers (no counter). |
 | **BpTree**    | B+tree index nodes — record addresses, not record bytes.           |
 
+### BpTree node layout and `LocalId` fanout
+
+A B+tree node serialises as a `Wire` value inside the page blob. All
+intra-node pointers are `LocalId` (10 bytes), **not** `Id` (16 bytes):
+
+- **Internal node** — `N` keys + `N+1` child pointers. Both child node
+  addresses and the eventual leaf's record addresses are tenant-scoped, so
+  `TENANT` (6 bytes) is redundant in every pointer.
+- **Leaf node** — `N` keys + `N` record `LocalId`s. On read, each is
+  inflated to a full `Id` via `local_id.to_id(tenant)` before returning to
+  the caller (2–3 CPU cycles, never disk).
+
+On a 4 KiB page (~14 bytes fixed overhead, 8-byte order-preserving keys):
+
+| Pointer type     | Bytes/entry (key + ptr) | Entries/page | Fanout |
+| ---------------- | ----------------------- | ------------ | ------ |
+| `Id` (16 B)      | 8 + 16 = 24             | ≈ 170        | 170    |
+| `LocalId` (10 B) | 8 + 10 = 18             | ≈ 226        | **226** |
+
+**33 % better fanout.** Where the old tree needed 4 disk reads to satisfy a
+lookup (e.g. 10 M records, fanout 170: `⌈log₁₇₀(10M)⌉ = 4`), the new tree
+needs 3 (`⌈log₂₂₆(10M)⌉ = 3`) — a 25 % reduction in I/O per lookup. The
+effect compounds: fewer pages on disk, more of the index fits in the OS page
+cache, and each leaf read resolves 33 % more record IDs.
+
 ---
 
 ## Dictionaries
