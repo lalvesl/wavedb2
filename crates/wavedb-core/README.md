@@ -361,33 +361,37 @@ When a root moves the holder rewrites the `Pivot`, otherwise the `Pivot` stays
 immutable. Comparison is `memcmp` on the `IndexKey`-encoded bytes
 (== `Ordering::{Less,Equal,Greater}`), never a typed decode.
 
-### `LocalId` inside BpTree nodes — why it matters for fanout
+### `LocalId` + packed 32 KiB pages — fanout and I/O
 
-Every pointer stored **inside** a BpTree node is tenant-scoped: child pointers in
-internal nodes point to child BpTree nodes (same tree, same tenant); record
-pointers in leaf nodes point to NonUnique records (same tenant). Neither needs
-`TENANT` repeated — it is derivable from the tree's own `Id` on lookup. So all
-intra-node pointers are `LocalId` (10 bytes), not `Id` (16 bytes).
+BpTree pages are **32 KiB** (8 × 4 KiB blocks), each holding multiple B+tree
+nodes. All pointers in a node — child pointers (internal nodes) and record
+pointers (leaf nodes) — are **`u16` (2 bytes)**. Bit 15 is the discriminant:
 
-The saving is **6 bytes per pointer**. On a 4 KiB page with ~14 bytes of
-fixed overhead and 8-byte order-preserving keys:
+```
+bit 15 = 0  →  intra-page byte offset  (0 .. 32 767)
+bit 15 = 1  →  index into page-footer external LocalId table
+```
 
-| Pointer type | Bytes / entry (key + ptr) | Entries / page | Fanout |
-| ------------ | ------------------------- | -------------- | ------ |
-| `Id` (16 B)  | 8 + 16 = 24              | ≈ 170          | 170    |
-| `LocalId` (10 B) | 8 + 10 = 18          | ≈ 226          | 226    |
+Cross-page `LocalId`s (10 bytes each) are stored **once** in the page footer,
+shared by all nodes on the page. The pointer in the node body is always 2 bytes.
 
-**33 % better fanout**. For a collection of M records the tree height is
-`⌈log_fanout(M)⌉`. Where the old tree needed 4 disk reads, the new one often
-needs 3 — a 25 % reduction in I/O per lookup. The benefit compounds:
+Per-entry cost: **8 bytes key + 2 bytes ptr = 10 bytes**, regardless of whether
+the target is on this page or another.
 
-- **Fewer pages** → smaller on-disk index footprint.
-- **More entries in OS page cache** → higher warm-cache hit rate.
-- **Leaf nodes** gain equally: 33 % more record pointers per page → more IDs
-  resolved per read during a collection walk.
+With ~3 274 usable entries per 32 KiB page, tree height in **page reads**:
 
-On return from `search`, each leaf `LocalId` is inflated to a full `Id` by
-injecting the ambient tenant — two or three CPU cycles, never disk.
+| Records  | Page reads |
+| -------- | ---------- |
+| ≤ 10.7 M | 2          |
+| ≤ 35 B   | 3          |
+
+Leaf record pointers are `u16` indexes into the footer LocalId table (all leaf
+targets are NonUnique records — always cross-page). On return from `search`,
+each `LocalId` is inflated to a full `Id` via `local_id.to_id(tenant)` —
+2–3 CPU cycles, never disk.
+
+See [`wavedb-storage`](../../crates/wavedb-storage/README.md#bptree-page-layout--32-kib-packed-nodes-u16-pointers)
+for the full page layout, capacity math, and split algorithm.
 
 ### Composite — set algebra on `Id` streams
 

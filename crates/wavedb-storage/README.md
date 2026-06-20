@@ -195,32 +195,93 @@ serialize/deserialize. Page kinds:
 | **Unique**    | The single live record per tenant at its fixed anchor address.     |
 | **NonUnique** | The collection's records (timestamp-keyed).                        |
 | **Pivot**     | Collection handles: `current`/`dead` BpTree pointers (no counter). |
-| **BpTree**    | B+tree index nodes — record addresses, not record bytes.           |
+| **BpTree**    | 32 KiB page; multiple B+tree nodes packed per page; `u16` pointers. |
 
-### BpTree node layout and `LocalId` fanout
+### BpTree page layout — 32 KiB, packed nodes, `u16` pointers
 
-A B+tree node serialises as a `Wire` value inside the page blob. All
-intra-node pointers are `LocalId` (10 bytes), **not** `Id` (16 bytes):
+BpTree pages are **32 KiB** (8 × 4 KiB blocks). A single page holds multiple
+B+tree nodes packed together. All pointers inside a node are **`u16` (2 bytes)**,
+whether the target is on the same page or a different one — the high bit (bit 15)
+is the discriminant:
 
-- **Internal node** — `N` keys + `N+1` child pointers. Both child node
-  addresses and the eventual leaf's record addresses are tenant-scoped, so
-  `TENANT` (6 bytes) is redundant in every pointer.
-- **Leaf node** — `N` keys + `N` record `LocalId`s. On read, each is
-  inflated to a full `Id` via `local_id.to_id(tenant)` before returning to
-  the caller (2–3 CPU cycles, never disk).
+```
+bit 15 = 0  →  intra-page byte offset  (0 .. 32 767, covers the full 32 KiB page)
+bit 15 = 1  →  index into the page's external LocalId table  (lower 15 bits = table index)
+```
 
-On a 4 KiB page (~14 bytes fixed overhead, 8-byte order-preserving keys):
+The **external LocalId table** lives at the page footer and grows downward. Each
+slot is a `LocalId` (10 bytes) pointing to a different BpTree page. A node
+references an external child with a `u16` index (bit 15 set) into this table —
+the `LocalId` is stored **once** even if multiple nodes on the same page reference
+the same external page.
 
-| Pointer type     | Bytes/entry (key + ptr) | Entries/page | Fanout |
-| ---------------- | ----------------------- | ------------ | ------ |
-| `Id` (16 B)      | 8 + 16 = 24             | ≈ 170        | 170    |
-| `LocalId` (10 B) | 8 + 10 = 18             | ≈ 226        | **226** |
+```
+┌────────────────────────────────────────────────────────┐  0
+│  HEADER  (24 bytes)                                    │
+│    crc32 (4) · STRUCT_HASH (8) · freespace_ptr (u16)  │
+│    ext_table_len (u16) · reserved (6)                  │
+├────────────────────────────────────────────────────────┤  24
+│                                                        │
+│  NODES  (packed, variable size, grow upward)           │
+│    node: { kind (u8) · num_entries (u16)               │
+│             entries: [ (key: [u8;8], ptr: u16) … ] }  │
+│    …                                                   │
+│                                                        │
+├────────────────────────────────────────────────────────┤
+│  FREE SPACE                                            │
+├────────────────────────────────────────────────────────┤
+│  EXTERNAL LocalId TABLE  (grows downward)              │
+│    slot[0]: LocalId (10 bytes)                         │
+│    slot[1]: LocalId (10 bytes)  …                      │
+└────────────────────────────────────────────────────────┘  32 768
+```
 
-**33 % better fanout.** Where the old tree needed 4 disk reads to satisfy a
-lookup (e.g. 10 M records, fanout 170: `⌈log₁₇₀(10M)⌉ = 4`), the new tree
-needs 3 (`⌈log₂₂₆(10M)⌉ = 3`) — a 25 % reduction in I/O per lookup. The
-effect compounds: fewer pages on disk, more of the index fits in the OS page
-cache, and each leaf read resolves 33 % more record IDs.
+Every entry — internal child pointer or leaf record pointer — is the same
+**10 bytes on the wire** (`key: [u8;8]` + `ptr: u16`). The `LocalId` for
+cross-page references is amortized in the footer table, so pointers within the
+node body are always 2 bytes regardless of target location.
+
+**Leaf node record pointers** are also `u16` into the external LocalId table
+(all leaf targets are NonUnique records on other pages — no leaf target is
+intra-page). On read, each `LocalId` is inflated to a full `Id` via
+`local_id.to_id(tenant)` (2–3 CPU cycles, never disk).
+
+#### Capacity and tree height
+
+Available node space per 32 KiB page (~24-byte header, `M` external LocalIds):
+
+```
+node_bytes ≈ 32 744 − M × 10
+entries     ≈ node_bytes / 10            (10 bytes per entry: 8-byte key + u16 ptr)
+```
+
+With `M = 0` (all children intra-page): **≈ 3 274 entries per page**.  
+With `M = 32` (32 external pages referenced): ≈ 3 274 − 32 = **3 242 entries**.
+
+Tree height measured in **page reads**:
+
+| Records         | Page reads |
+| --------------- | ---------- |
+| ≤ 3 274         | 1          |
+| ≤ 10.7 M        | 2          |
+| ≤ 35 B          | 3          |
+
+Prior design (4 KiB page, `LocalId` = 10 B, 226-entry nodes):
+
+| Records  | Page reads (old) | Page reads (new) |
+| -------- | ---------------- | ---------------- |
+| 10 M     | 4                | **2**            |
+| 1 B      | 4                | **3**            |
+| 35 B     | 5                | **3**            |
+
+#### Page split
+
+When a 32 KiB page fills, a **page split** creates a new 32 KiB page with a new
+`LocalId`. The parent page updates exactly one entry: the `u16` that pointed to
+this page's intra-page slot is replaced with a `u16` index (bit 15 set) to the
+new `LocalId` appended to the footer table. If the parent page also fills, the
+cascade proceeds identically. All changed pages go in one journal entry. The
+`Pivot` is updated only when the root page splits.
 
 ---
 
