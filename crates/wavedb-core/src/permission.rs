@@ -101,21 +101,21 @@ mod tests {
     use crate::u48::U48;
     use crate::wire::{Wire, from_wire, to_wire};
 
-    fn roundtrip(value: PermissionRef) {
-        let bytes = to_wire(&value);
+    fn roundtrip(value: &PermissionRef) {
+        let bytes = to_wire(value);
         assert_eq!(bytes.len(), PermissionRef::STACK_SIZE + value.heap_size());
-        assert_eq!(from_wire::<PermissionRef>(&bytes).expect("decode"), value);
+        assert_eq!(from_wire::<PermissionRef>(&bytes).expect("decode"), *value);
     }
 
     #[test]
     fn variants_roundtrip() {
-        roundtrip(PermissionRef::Public);
-        roundtrip(PermissionRef::Tenants(vec![]));
-        roundtrip(PermissionRef::Tenants(vec![
+        roundtrip(&PermissionRef::Public);
+        roundtrip(&PermissionRef::Tenants(vec![]));
+        roundtrip(&PermissionRef::Tenants(vec![
             U48::from(1u32),
             U48::from_truncated(0xABCD_1234_5678),
         ]));
-        roundtrip(PermissionRef::Group(0xDEAD_BEEF));
+        roundtrip(&PermissionRef::Group(0xDEAD_BEEF));
     }
 
     #[test]

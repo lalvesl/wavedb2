@@ -86,10 +86,10 @@ mod tests {
     use crate::u48::U48;
     use crate::wire::{Wire, from_wire, to_wire};
 
-    fn roundtrip(m: Metadata) {
-        let bytes = to_wire(&m);
+    fn roundtrip(m: &Metadata) {
+        let bytes = to_wire(m);
         assert_eq!(bytes.len(), Metadata::STACK_SIZE + m.heap_size());
-        assert_eq!(from_wire::<Metadata>(&bytes).expect("decode"), m);
+        assert_eq!(from_wire::<Metadata>(&bytes).expect("decode"), *m);
     }
 
     #[test]
@@ -100,12 +100,12 @@ mod tests {
         assert!(m.pivot_id.is_none());
         assert_eq!(m.user, U48::ZERO);
         assert_eq!(m.permission, None);
-        roundtrip(m);
+        roundtrip(&m);
     }
 
     #[test]
     fn full_roundtrip() {
-        roundtrip(Metadata {
+        roundtrip(&Metadata {
             old_modification_id: Some(LocalId::new(7, false, 0)),
             new_modification_id: None,
             pivot_id: Some(LocalId::new(0xABCD, true, 3)),
@@ -116,7 +116,7 @@ mod tests {
                 U48::from(2u32),
             ])),
         });
-        roundtrip(Metadata {
+        roundtrip(&Metadata {
             old_modification_id: None,
             new_modification_id: Some(LocalId::new(99, false, 1)),
             pivot_id: None,

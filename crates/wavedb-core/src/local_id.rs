@@ -87,7 +87,7 @@ impl fmt::Debug for LocalId {
             .field("key", &self.key)
             .field("flag", &self.flag())
             .field("salt", &self.salt())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

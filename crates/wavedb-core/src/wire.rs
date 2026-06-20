@@ -85,12 +85,13 @@ pub trait Wire: Sized {
     fn decode(stack: &mut Cursor, heap: &mut Cursor) -> Result<Self>;
 }
 
-/// Serialise a value to a single `[stack][heap]` byte vector in **one
-/// allocation**: `STACK_SIZE` (a compile-time sum over every field, including
-/// nested `Wire` types like `Metadata`) plus the recursively-computed
-/// `heap_size()` give the exact final length up front. `encode_stack` appends the
-/// `STACK_SIZE`-byte stack section, then `encode_heap` appends the heap section to
-/// the same buffer — no second allocation, no concat.
+/// Serialise a value to a single `[stack][heap]` byte vector in one allocation.
+///
+/// `STACK_SIZE` (a compile-time sum over every field, including nested `Wire` types
+/// like `Metadata`) plus the recursively-computed `heap_size()` give the exact final
+/// length up front. `encode_stack` appends the `STACK_SIZE`-byte stack section, then
+/// `encode_heap` appends the heap section to the same buffer — no second allocation,
+/// no concat.
 #[must_use]
 pub fn to_wire<T: Wire>(value: &T) -> Vec<u8> {
     let mut buf = Vec::with_capacity(T::STACK_SIZE + value.heap_size());
@@ -231,7 +232,7 @@ impl<T: Wire> Wire for Option<T> {
         self.as_ref().map_or(0, |v| T::STACK_SIZE + v.heap_size())
     }
     fn encode_stack(&self, stack: &mut Vec<u8>) {
-        stack.push(if self.is_some() { 1 } else { 0 });
+        stack.push(u8::from(self.is_some()));
     }
     fn encode_heap(&self, heap: &mut Vec<u8>) {
         if let Some(v) = self {
@@ -300,46 +301,46 @@ wire_tuple!(A 0, B 1, C 2, D 3);
 mod tests {
     use super::{Wire, from_wire, to_wire};
 
-    fn roundtrip<T: Wire + PartialEq + core::fmt::Debug>(value: T) {
-        let bytes = to_wire(&value);
+    fn roundtrip<T: Wire + PartialEq + core::fmt::Debug>(value: &T) {
+        let bytes = to_wire(value);
         assert_eq!(bytes.len(), T::STACK_SIZE + value.heap_size());
         let back: T = from_wire(&bytes).expect("decode");
-        assert_eq!(value, back);
+        assert_eq!(*value, back);
     }
 
     #[test]
     fn scalars() {
-        roundtrip(0u8);
-        roundtrip(u128::MAX);
-        roundtrip(-7i32);
-        roundtrip(2.5f64);
-        roundtrip(true);
-        roundtrip('🌊');
+        roundtrip(&0u8);
+        roundtrip(&u128::MAX);
+        roundtrip(&-7i32);
+        roundtrip(&2.5f64);
+        roundtrip(&true);
+        roundtrip(&'🌊');
     }
 
     #[test]
     fn strings_and_vecs() {
-        roundtrip(String::new());
-        roundtrip("wave".to_string());
-        roundtrip(vec![1u32, 2, 3]);
-        roundtrip(vec!["a".to_string(), String::new(), "ccc".to_string()]);
-        roundtrip(vec![vec![1u8], vec![], vec![2u8, 3]]);
+        roundtrip(&String::new());
+        roundtrip(&"wave".to_string());
+        roundtrip(&vec![1u32, 2, 3]);
+        roundtrip(&vec!["a".to_string(), String::new(), "ccc".to_string()]);
+        roundtrip(&vec![vec![1u8], vec![], vec![2u8, 3]]);
     }
 
     #[test]
     fn options() {
-        roundtrip(Option::<u64>::None);
-        roundtrip(Some(42u64));
-        roundtrip(Some("x".to_string()));
-        roundtrip(vec![Some(1u8), None, Some(2)]);
+        roundtrip(&Option::<u64>::None);
+        roundtrip(&Some(42u64));
+        roundtrip(&Some("x".to_string()));
+        roundtrip(&vec![Some(1u8), None, Some(2)]);
     }
 
     #[test]
     fn arrays_and_tuples() {
-        roundtrip([1u32, 2, 3]);
-        roundtrip(["a".to_string(), "bb".to_string()]); // array of heap-bearing elems
-        roundtrip([Some(1u8), None]);
-        roundtrip((1u8, "x".to_string(), 9u64));
-        roundtrip((vec![1u16, 2], 'z', Option::<u32>::None, true));
+        roundtrip(&[1u32, 2, 3]);
+        roundtrip(&["a".to_string(), "bb".to_string()]); // array of heap-bearing elems
+        roundtrip(&[Some(1u8), None]);
+        roundtrip(&(1u8, "x".to_string(), 9u64));
+        roundtrip(&(vec![1u16, 2], 'z', Option::<u32>::None, true));
     }
 }
