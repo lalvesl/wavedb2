@@ -11,6 +11,9 @@ workspace = true
 [dependencies]
 thiserror.workspace = true
 byteorder.workspace = true
+# `Stream` + combinators for the Store-generic index contracts (BpTree search,
+# IdStreamExt set algebra). Pure async, WASM-safe — no I/O.
+futures = { workspace = true }
 # The derive emits absolute `::wavedb_core::` paths; `extern crate self as
 # wavedb_core` in lib.rs lets this crate use its own derive (query DSL).
 wavedb-macros = { path = "../wavedb-macros" }
