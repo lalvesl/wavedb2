@@ -224,32 +224,28 @@ impl<T: Wire> Wire for Vec<T> {
 }
 
 impl<T: Wire> Wire for Option<T> {
-    const STACK_SIZE: usize = 1 + T::STACK_SIZE; // flag + inner stack (zero-filled when None)
+    // 1 flag byte in stack; T's full wire representation (stack + heap) goes
+    // into the parent's heap section only when Some. None costs exactly 1 byte.
+    const STACK_SIZE: usize = 1;
     fn heap_size(&self) -> usize {
-        self.as_ref().map_or(0, Wire::heap_size)
+        self.as_ref().map_or(0, |v| T::STACK_SIZE + v.heap_size())
     }
     fn encode_stack(&self, stack: &mut Vec<u8>) {
-        if let Some(v) = self {
-            stack.push(1);
-            v.encode_stack(stack);
-        } else {
-            stack.push(0);
-            stack.extend(core::iter::repeat_n(0u8, T::STACK_SIZE));
-        }
+        stack.push(if self.is_some() { 1 } else { 0 });
     }
     fn encode_heap(&self, heap: &mut Vec<u8>) {
         if let Some(v) = self {
+            v.encode_stack(heap); // T's stack bytes land in parent heap
             v.encode_heap(heap);
         }
     }
     fn decode(stack: &mut Cursor, heap: &mut Cursor) -> Result<Self> {
-        let flag = stack.u8()?;
-        let inner = stack.take(T::STACK_SIZE)?;
-        if flag == 0 {
+        if stack.u8()? == 0 {
             return Ok(None);
         }
-        let mut is = Cursor::new(inner);
-        Ok(Some(T::decode(&mut is, heap)?))
+        let t_stack = heap.take(T::STACK_SIZE)?;
+        let mut ts = Cursor::new(t_stack);
+        Ok(Some(T::decode(&mut ts, heap)?))
     }
 }
 

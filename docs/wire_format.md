@@ -38,7 +38,7 @@ value.heap_size())`.
 | `[T; N]`                          | `N * T::STACK_SIZE`                                  | elements' heap, in order        |
 | `String`                          | `u32` byte-length                                    | UTF-8 bytes                     |
 | `Vec<T>`                          | `u32` region byte-length                             | element units, back-to-back     |
-| `Option<T>`                       | `1` flag + `T::STACK_SIZE` (zero-filled when `None`) | `T`'s heap when `Some`          |
+| `Option<T>`                       | `1` flag                                             | `T`'s full wire (`stack`+`heap`) when `Some`; nothing when `None` |
 | struct                            | sum of field stack sizes                             | fields' heap, declaration order |
 | enum, all variants field-less     | 1 (tag)                                              | —                               |
 | enum, any variant with fields     | 1 (tag) + `u32` payload length                       | variant fields as a unit        |
@@ -93,11 +93,12 @@ enum → monomorphised arm, **no `dyn`**). See
 - No varints: integers cost their full width before compression. The
   per-STRUCT dictionary compressor eats the constant zero runs; predictable
   offsets are worth more than pre-compression byte count.
-- `Option<T>` reserves `T`'s stack slots even when `None` (e.g.
-  `Metadata.permission: Option<PermissionRef>` is a constant 6-byte slot, not
-  postcard's 1 byte). Same rationale: fixed offsets, dictionary-friendly.
-- `LocalId` (10 bytes) is used in `Metadata` instead of a full `Id` (16 bytes) for
-  the modification chain and pivot back-link: the BpTree is tenant-scoped so
-  `TENANT (u48)` is redundant per-pointer. Saves 18 bytes per record.
+- `Option<T>` uses **1 stack byte** (the flag) and puts `T`'s full wire
+  representation in the heap only when `Some`. `None` costs exactly 1 byte.
+  Postcard uses 1 byte for None too, but its Some also wastes `T::STACK_SIZE` in
+  the stack when T is large — this encoding doesn't.
+- `LocalId` (10 bytes) is used inside `Option<LocalId>` in `Metadata` instead of
+  a full `Id` (16 bytes): the BpTree is tenant-scoped so `TENANT (u48)` is
+  redundant. `Metadata` stack = 18 bytes; heap grows only for fields that are Some.
 - In exchange: single-allocation writes, zero-copy-friendly sequential reads,
   compile-time sizes, no serde/postcard code in the binary.
