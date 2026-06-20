@@ -18,6 +18,7 @@ extern crate self as wavedb_core;
 
 pub mod error;
 pub mod id;
+pub mod local_id;
 pub mod metadata;
 pub mod permission;
 pub mod u48;
@@ -25,6 +26,7 @@ pub mod wire;
 
 pub use error::{Error, Result};
 pub use id::Id;
+pub use local_id::LocalId;
 pub use metadata::Metadata;
 pub use permission::PermissionRef;
 pub use u48::U48;
