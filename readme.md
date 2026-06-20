@@ -224,9 +224,9 @@ no business data — only the addressing into the index trees:
 
 ```rust
 pub struct Pivot {
-    pub current: BpTreeId,      // u128 pointer to the B+tree of living records
-    pub dead:    BpTreeId,      // u128 pointer to the B+tree of deleted records
-    // + one BpTreeId per #[wavedb::pivot(...)] secondary index
+    pub current: LocalId,      // 80-bit pointer to the B+tree of living records
+    pub dead:    LocalId,      // 80-bit pointer to the B+tree of deleted records
+    // + one LocalId per #[wavedb::pivot(...)] secondary index
 }
 ```
 
@@ -265,14 +265,14 @@ every index; a `save` only touches a secondary tree if it changed that field.
     entries and reinserting for the new version. The **`dead`** tree is **not**
     touched: update is not a delete, so the previous version is retained and linked
     through `Metadata` (`old_modification_id` ↔ `new_modification_id`). Reaching all
-    tree roots needs the `Pivot`, found via **`Metadata.pivot`** (below) — so the
-    record carries its owning `PivotId` and `save` reindexes without the handle.
+    tree roots needs the `Pivot`, found via **`Metadata.pivot_id`** (below) — so the
+    record carries its owning `PivotId` as a `LocalId` and `save` reindexes without the handle.
   - **`remove`** moves the record from `current` to the **dead** tree — the **only**
     op that writes `dead`. Nothing is erased; history stays navigable.
 
   `insert` / `remove` / `all` / `get(id)` are methods of a **collection handle**
   opened from a stored `PivotId`; `save` is a method on the record (it reaches the
-  `Pivot` through `Metadata.pivot`). `insert` stamps `Metadata.pivot` into the new
+  `Pivot` through `Metadata.pivot_id`). `insert` stamps `Metadata.pivot_id` into the new
   record from the handle's `PivotId`.
 
 ### History / timeline

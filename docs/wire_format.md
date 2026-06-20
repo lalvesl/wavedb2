@@ -34,6 +34,7 @@ value.heap_size())`.
 | `bool`                            | 1 (`0`/`1`)                                          | —                               |
 | `char`                            | 4 (`u32` scalar)                                     | —                               |
 | `Id`                              | 16                                                   | —                               |
+| `LocalId`                         | 10 (`KEY u64 LE` + `FLAG\|SALT u16 LE`)              | —                               |
 | `[T; N]`                          | `N * T::STACK_SIZE`                                  | elements' heap, in order        |
 | `String`                          | `u32` byte-length                                    | UTF-8 bytes                     |
 | `Vec<T>`                          | `u32` region byte-length                             | element units, back-to-back     |
@@ -93,8 +94,10 @@ enum → monomorphised arm, **no `dyn`**). See
   per-STRUCT dictionary compressor eats the constant zero runs; predictable
   offsets are worth more than pre-compression byte count.
 - `Option<T>` reserves `T`'s stack slots even when `None` (e.g.
-  `Metadata.permission: Option<PermissionRef>` is a constant 6-byte slot, and
-  `Metadata.pivot: Option<Id>` a constant `Id`-width slot, not postcard's 1 byte).
-  Same rationale: fixed offsets, dictionary-friendly.
+  `Metadata.permission: Option<PermissionRef>` is a constant 6-byte slot, not
+  postcard's 1 byte). Same rationale: fixed offsets, dictionary-friendly.
+- `LocalId` (10 bytes) is used in `Metadata` instead of a full `Id` (16 bytes) for
+  the modification chain and pivot back-link: the BpTree is tenant-scoped so
+  `TENANT (u48)` is redundant per-pointer. Saves 18 bytes per record.
 - In exchange: single-allocation writes, zero-copy-friendly sequential reads,
   compile-time sizes, no serde/postcard code in the binary.

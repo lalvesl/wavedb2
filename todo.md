@@ -8,11 +8,15 @@ code exists yet. Build order, roughly bottom-up:
 - `Id` (128-bit: `KEY u64 · TENANT u48 · FLAG 1 · SALT 15`) with accessors +
   per-shape `SALT` (Unique `0`; NonUnique/BpTree/Pivot = 15 random bits, no
   struct-hash truncation);
+- `LocalId` (80-bit: `KEY u64 · FLAG 1 · SALT 15`) — `Id` with `TENANT` stripped
+  for BpTree-internal pointers; `from_id`/`to_id(tenant)` conversions; 10-byte wire;
 - `STRUCT_HASH` = ahash with a **fixed hard-coded seed** over
   `name + shape + field names + field types` (deterministic across builds);
-- `Metadata` (modification chain, user, device, permission, `pivot: Option<Id>`) —
-  **no version field**. `pivot` = owning Pivot back-link (NonUnique reindex);
-  stamped at `insert`, `None` for Unique; outside `STRUCT_HASH`;
+- `Metadata` (modification chain, pivot back-link, user, device, permission) —
+  **no version field**. Uses `LocalId` for `old_modification_id`, `new_modification_id`,
+  and `pivot_id` (saves 18 bytes/record vs. `u128`). `pivot_id` = owning Pivot
+  back-link (NonUnique reindex); stamped at `insert`, `LocalId::ZERO` for Unique;
+  outside `STRUCT_HASH`;
 - `Wire` trait + `WaveWire` derive (no serde, no `repr(C)`); see
   `docs/wire_format.md`;
 - index contracts in **core** (portable, `Store`-generic): `Store` (`get` +
@@ -120,6 +124,8 @@ code exists yet. Build order, roughly bottom-up:
 ## Resolved bit budgets
 
 - **ID** = `KEY u64 + TENANT u48 + FLAG 1 + SALT 15 = 128`. No reserved bits.
+- **LocalId** = `KEY u64 + FLAG 1 + SALT 15 = 80` (10 bytes). `Id` without `TENANT`
+  for BpTree-internal pointers — tenant known from tree scope.
 - **Block descriptor** = `start u40 + count u20 + occupation u4 = 64`
   (~4 PiB/file, ~4 GiB/page, 1/16th occupation). One format for pages **and**
   dictionary.

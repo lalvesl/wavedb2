@@ -13,7 +13,8 @@ permission refs, and the `Wire` serialization trait.
 | Module       | Responsibility                                                       |
 | ------------ | -------------------------------------------------------------------- |
 | `id`         | The 128-bit composite `Id`, the `U48` newtype, and field accessors.  |
-| `metadata`   | `Metadata` — modification chain, authorship, permission ref.         |
+| `local_id`   | `LocalId` — compact 80-bit ID (no `TENANT`) for BpTree-internal use. |
+| `metadata`   | `Metadata` — modification chain, pivot back-link, authorship, permission ref. |
 | `hooks`      | `first_try` (pre-search) and `fallback_not_found` (post-miss) hooks. |
 | `permission` | `PermissionRef` shapes.                                              |
 | `wire`       | The `Wire` trait + `WaveWire` (no serde). See `docs/wire_format.md`. |
@@ -136,30 +137,47 @@ the per-`STRUCT_HASH` storage directory and the wire envelope.
 
 ```rust
 pub struct Metadata {
-    pub old_modification_id: u128, // previous version (0 = first)
-    pub new_modification_id: u128, // next version (0 = live)
-    pub user: U48,                 // who wrote this version (48-bit newtype)
-    pub device_created: u64,       // which device produced it
+    pub old_modification_id: LocalId,      // previous version (ZERO = first)
+    pub new_modification_id: LocalId,      // next version (ZERO = live)
+    pub pivot_id: LocalId,                 // owning Pivot back-link (ZERO = Unique)
+    pub user: U48,                         // who wrote this version (48-bit newtype)
+    pub device_created: u64,               // which device produced it
     pub permission: Option<PermissionRef>, // access rule; None = tenant-only
-    pub pivot: Option<Id>,         // owning Pivot — NonUnique reindex back-link; None = Unique
 }
 ```
 
 No `struct_version` field — the stored record's `STRUCT_HASH` (carried in the
 wire envelope) already says which schema it was written under.
 
-### `pivot` — the NonUnique reindex back-link
+Modification IDs and `pivot_id` use [`LocalId`](#localid--80-bit-compact-id) (80-bit)
+instead of a full `Id` (128-bit): the BpTree is already tenant-scoped, so the
+48-bit `TENANT` field is redundant in every pointer stored inside it. Saves **18
+bytes per record** vs. storing three full `u128` values.
+
+### `LocalId` — 80-bit compact ID
+
+```
+[ KEY (u64) | FLAG (1) | SALT (15) ]
+   MSB ─────────────────────────── LSB
+```
+
+`LocalId` is `Id` with `TENANT (u48)` stripped — 10 bytes on the wire. The BpTree
+is already scoped to a tenant, so `TENANT` is derivable from context. Reconstruct
+a full `Id` with `local_id.to_id(tenant)` — two or three CPU cycles, in memory,
+never disk.
+
+### `pivot_id` — the NonUnique reindex back-link
 
 A NonUnique `save` (update) **force-reindexes every live tree** of its collection —
 the `current` `BpTree` *and* every `#[wavedb::pivot(...)]` secondary — so it must
 reach all the tree roots, which live in the collection's **`Pivot`**. The record
-therefore carries its owning `PivotId` here (stored as a raw `Id`; the typed
+therefore carries its owning `PivotId` here as a `LocalId` (the typed
 `<T>::PivotId` is the compile-time view only — core never names macro types).
 
-- **Stamped at `insert`** from the collection handle's `PivotId`; `None` for Unique.
+- **Stamped at `insert`** from the collection handle's `PivotId`; `LocalId::ZERO` for Unique.
 - Lets `save` reindex from the record alone, without re-passing the handle.
-- It is **outside `STRUCT_HASH`** (`name + shape + field names + types`), so adding
-  it changes **no** struct's identity — only Metadata's own wire layout.
+- It is **outside `STRUCT_HASH`** (`name + shape + field names + types`), so it
+  changes **no** struct's identity — only Metadata's own wire layout.
 
 Why not the `dead` tree on update? Because history is the `old_modification_id` ↔
 `new_modification_id` chain above: the previous version is retained and linked, so
