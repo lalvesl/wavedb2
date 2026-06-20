@@ -252,11 +252,56 @@ Prior design (4 KiB page, 226-entry nodes, `LocalId` pointer per entry):
 
 #### Page split
 
-When an insert fills a 32 KiB page: create a new 32 KiB page with a new
-`LocalId`, split the entries evenly (~50% each), insert the median key + new
-`LocalId` into the parent node. If the parent also fills, cascade up. A root
-split creates a new root page with a new `LocalId` and updates the `Pivot`. All
-changed pages go in **one journal entry**.
+Triggered when an insert would push a node past 1 819 entries (page full).
+
+**Step 1 — split the full node.**
+
+```
+page_X (FULL — 1 819 entries):
+  [ e0, e1, … e908 | e909, e910, … e1818 ]
+                   ↑
+              median = e909
+
+→ allocate page_Y (new LocalId)
+→ page_X keeps  [ e0  … e908 ]   (~50%)
+→ page_Y gets   [ e909 … e1818 ] (~50%)
+```
+
+**Step 2 — push median key up to parent.**
+
+Insert `(e909.key, page_Y_localid)` into the parent internal node, immediately
+to the right of the entry that pointed at `page_X`:
+
+```
+BEFORE parent: [ … | keyA → page_X | … ]
+AFTER  parent: [ … | keyA → page_X | e909.key → page_Y | … ]
+```
+
+**Step 3 — cascade if parent is also full.**
+
+The parent insert from Step 2 may itself overflow → apply Step 1–2 on the
+parent, recursing up the ancestor path.
+
+**Step 4 — root split (special case).**
+
+If the root page overflows there is no parent to absorb the pushed key.
+Instead:
+
+```
+old root (FULL):  [ e0 … e1818 ]
+
+→ allocate page_L, page_R  (two new LocalIds)
+→ page_L ← left  half  [ e0   … e908  ]
+→ page_R ← right half  [ e909 … e1818 ]
+→ allocate new root page_ROOT with one entry:
+      page_ROOT: [ e909.key → page_R ]
+      (implicit left child = page_L, stored as the "less-than" pointer)
+→ Pivot.current (or .dead / secondary root) ← page_ROOT LocalId
+```
+
+The tree grows one level. **All allocated pages and the updated `Pivot` are
+written in a single journal entry** — crash before the entry is committed leaves
+the tree unchanged; crash after is a complete, consistent state.
 
 #### Merge on delete
 
