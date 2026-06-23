@@ -1,0 +1,17 @@
+[package]
+name = "schema-smoke"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+wavedb-core = { path = "../../crates/wavedb-core" }
+wavedb-macros = { path = "../../crates/wavedb-macros" }
+
+[build-dependencies]
+wavedb-build = { path = "../../crates/wavedb-build" }
