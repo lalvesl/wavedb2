@@ -142,4 +142,36 @@ code exists yet. Build order, roughly bottom-up:
 
 # DOING
 
+- **Storage engine** (`wavedb-storage`): `block` + `directory` landed; next is the
+  block-backed file (`BlockFile`), page format (crc32 + id-list + blob), BpTree page
+  split/merge, dictionaries, and the journal/cache pipeline.
+
 # DONE
+
+- **`wavedb-core`** — `Id`, `LocalId`, `U48`, `Metadata`, `PermissionRef`, `Wire`
+  (no-serde, single-alloc), `Error`. Plus the portable contracts: `WaveDbStruct` +
+  `Shape`, `Store` (+ `Write`), `LookupHooks`, `ObjectRegistry`/`ObjectDescriptor`,
+  and the `index` layer — `IndexKey` (order-preserving), `Bound`, `Pivot`, `BpTree`,
+  `IdStreamExt` (intersect/union/except stream adapters).
+- **`wavedb-macros`** — `#[derive(WaveWire)]` (named/tuple/unit) and `#[wavedb]`
+  (Unique/NonUnique): emits `STRUCT_HASH`, `Wire`, inherent consts
+  (`SHAPE`/`HAS_VALIDATE`/`HAS_PREPROCESS`/`OBJECT_DESCRIPTOR`), `WaveDbStruct`, and
+  for NonUnique the generated `{Name}PivotId` + `{Name}Pivot`. `#[wavedb::pivot(...)]`
+  parsed/stripped → secondary-index count. `#[server]` deferred to M4 (needs `Db`).
+  - **`STRUCT_HASH` uses FNV-1a, not `ahash`** — `ahash`'s AES path is CPU-dependent,
+    which would break client/server identity agreement. FNV is bit-identical everywhere.
+- **`wavedb-build`** — `generate_registry()` scans `src/`, emits the `Object` enum
+  (`from_wire`/`to_wire`/`struct_hash`) + `Registry: ObjectRegistry`. Generated code
+  carries `#[allow(...)]` so it never lints the user's crate.
+- **`examples/schema-smoke`** — end-to-end M1 proof: `#[wavedb]` + `build.rs` +
+  `include!` → registry resolves + `Object` round-trips. (Real example; `todo-app`
+  still needs M4 `#[server]`/`Db`.)
+- **`wavedb-storage` foundations** — `block` (`BlockDescriptor` u40·u20·u4 packing,
+  `Run`, `BlockAllocator`: best-fit alloc / coalescing free / tail truncate) and
+  `directory` (linear-hashing `bucket_index`/`next_split_bucket`, `Directory`).
+  - **Page `hash_of` is a stable seeded mix, not `ahash`** — `data.bin` is rebuilt by
+    journal replay; a CPU-dependent hash would reroute records when the file moves
+    machines. Random per-DB seed keeps DoS resistance.
+
+_82 tests, clippy-clean. Workspace members: core, macros, build, storage,
+schema-smoke._
