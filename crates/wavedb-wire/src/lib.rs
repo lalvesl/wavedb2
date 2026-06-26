@@ -176,25 +176,25 @@ pub fn from_wire<T: Wire>(bytes: &[u8]) -> Result<T> {
 // ---- fixed-width scalars ----------------------------------------------------
 
 macro_rules! wire_le {
-    ($($t:ty => $n:literal),* $(,)?) => {$(
+    ($($t:ty),* $(,)?) => {$(
         impl Wire for $t {
-            const STACK_SIZE: usize = $n;
+            const STACK_SIZE: usize = size_of::<$t>();
             fn heap_size(&self) -> usize { 0 }
             fn encode_stack(&self, stack: &mut Vec<u8>) {
                 stack.extend_from_slice(&self.to_le_bytes());
             }
             fn encode_heap(&self, _heap: &mut Vec<u8>) {}
             fn decode(stack: &mut Cursor, _heap: &mut Cursor) -> Result<Self> {
-                Ok(<$t>::from_le_bytes(stack.take($n)?.try_into().unwrap()))
+                Ok(<$t>::from_le_bytes(stack.take(size_of::<$t>())?.try_into().unwrap()))
             }
         }
     )*};
 }
 
 wire_le! {
-    u8 => 1, u16 => 2, u32 => 4, u64 => 8, u128 => 16,
-    i8 => 1, i16 => 2, i32 => 4, i64 => 8, i128 => 16,
-    f32 => 4, f64 => 8,
+    u8, u16, u32, u64, u128,
+    i8, i16, i32, i64, i128,
+    f32, f64,
 }
 
 impl Wire for bool {
@@ -216,7 +216,7 @@ impl Wire for bool {
 }
 
 impl Wire for char {
-    const STACK_SIZE: usize = 4;
+    const STACK_SIZE: usize = size_of::<Self>();
     fn heap_size(&self) -> usize {
         0
     }
@@ -233,7 +233,7 @@ impl Wire for char {
 // ---- dynamic types ----------------------------------------------------------
 
 impl Wire for String {
-    const STACK_SIZE: usize = 4; // u32 byte-length
+    const STACK_SIZE: usize = size_of::<u32>(); // byte-length
     fn heap_size(&self) -> usize {
         self.len()
     }
@@ -251,7 +251,7 @@ impl Wire for String {
 }
 
 impl<T: Wire> Wire for Vec<T> {
-    const STACK_SIZE: usize = 4; // u32 region byte-length
+    const STACK_SIZE: usize = size_of::<u32>(); // byte-length
     fn heap_size(&self) -> usize {
         // Each element is a self-contained unit: its stack bytes then its heap.
         self.iter().map(|e| T::STACK_SIZE + e.heap_size()).sum()
