@@ -86,12 +86,14 @@ split" from the directory alone.
 
 ### The `Id` hash
 
-`hash_of(id)` is **`ahash` over the 128-bit `Id`** — fast on `u128` and
+`hash_of(id)` is **SeaHash over the 16 little-endian bytes of the `Id`** — fast and
 DoS-resistant. It is seeded with a **per-database random `[u64; 4]` seed persisted
 in the first page of `data.bin`** (page 0), read once at startup. The seed is
 per-database (not the fixed `STRUCT_HASH` seed): each node rebuilds its own
-directory consistently, and an attacker can't precompute bucket collisions. The
-resulting `u64` feeds the linear-hashing reduction below.
+directory consistently, and an attacker can't precompute bucket collisions. SeaHash
+is portable across architectures and endianness, so a `data.bin` rebuilt by journal
+replay on another machine routes every record to the same bucket. The resulting
+`u64` feeds the linear-hashing reduction below.
 
 ### Linear hashing (not `%`)
 

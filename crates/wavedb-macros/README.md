@@ -32,13 +32,14 @@ because both compile this crate.
 
 ## What `#[wavedb]` does at compile time
 
-1. **Computes `STRUCT_HASH: u64`** — `ahash` (with a **fixed, hard-coded seed**)
-   over `STRUCT_NAME + SHAPE + each PROPERTY_NAME + each PROPERTY_TYPE`. The fixed
-   seed makes it deterministic across every build and machine; it is **not** the
-   random per-database seed used for runtime `Id` hashing. Because field names and
-   types are folded in, **any schema change changes the hash** — a changed struct
-   is simply a different type. No `version =` attribute, no version-from-type-name
-   rule; identity is the hash.
+1. **Computes `STRUCT_HASH: u64`** — **SeaHash** (the pinned `seahash` crate) over
+   `STRUCT_NAME + SHAPE + each PROPERTY_NAME + each PROPERTY_TYPE`, with a fixed
+   four-lane WaveDB seed. SeaHash is portable across every build, machine,
+   architecture, and endianness, so clients and servers always agree on a type's
+   identity; the crate is pinned exactly so a version bump can't silently change
+   every hash. Because field names and types are folded in, **any schema change
+   changes the hash** — a changed struct is simply a different type. No `version =`
+   attribute, no version-from-type-name rule; identity is the hash.
 2. **Implements `Id` + `Metadata` accessors.** `.tenant_id()`, `.key()`,
    `.created_at()`, `.struct_hash()`, plus full `Metadata` getters/setters — no
    call-site boilerplate.

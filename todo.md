@@ -10,8 +10,9 @@ code exists yet. Build order, roughly bottom-up:
   struct-hash truncation);
 - `LocalId` (80-bit: `KEY u64 · FLAG 1 · SALT 15`) — `Id` with `TENANT` stripped
   for BpTree-internal pointers; `from_id`/`to_id(tenant)` conversions; 10-byte wire;
-- `STRUCT_HASH` = ahash with a **fixed hard-coded seed** over
-  `name + shape + field names + field types` (deterministic across builds);
+- `STRUCT_HASH` = **SeaHash** (pinned `seahash` crate) over
+  `name + shape + field names + field types`, fixed four-lane WaveDB seed
+  (portable across builds/arches/endianness);
 - `Metadata` (modification chain, pivot back-link, user, device, permission) —
   **no version field**. Uses `Option<LocalId>` for `old_modification_id`,
   `new_modification_id`, and `pivot_id` (`None` when absent — no sentinel ZERO
@@ -54,7 +55,7 @@ code exists yet. Build order, roughly bottom-up:
 - block manager: alloc/free/coalesce/truncate runs of 4 KiB blocks, journaled;
 - per-`STRUCT_HASH` `Vec<u64>` page directory; one block descriptor
   (`u40 start · u20 count · u4 occupation`) shared by pages **and** dictionary;
-- `hash_of(id)` = ahash over the `u128`, seeded by a **per-DB random `[u64;4]`
+- `hash_of(id)` = SeaHash over the `u128`'s 16 LE bytes, seeded by a **per-DB random `[u64;4]`
   in data.bin page 0**; result feeds linear hashing;
 - **linear hashing** (`index` / `split_next`), 16 KiB first page, grow-in-place +
   background `split_next`;
@@ -158,8 +159,8 @@ code exists yet. Build order, roughly bottom-up:
   (`SHAPE`/`HAS_VALIDATE`/`HAS_PREPROCESS`/`OBJECT_DESCRIPTOR`), `WaveDbStruct`, and
   for NonUnique the generated `{Name}PivotId` + `{Name}Pivot`. `#[wavedb::pivot(...)]`
   parsed/stripped → secondary-index count. `#[server]` deferred to M4 (needs `Db`).
-  - **`STRUCT_HASH` uses FNV-1a, not `ahash`** — `ahash`'s AES path is CPU-dependent,
-    which would break client/server identity agreement. FNV is bit-identical everywhere.
+  - **`STRUCT_HASH` uses SeaHash (pinned crate)** — portable across arch/endianness so
+    client and server agree on identity; the crate is version-pinned so identity can't drift.
 - **`wavedb-build`** — `generate_registry()` scans `src/`, emits the `Object` enum
   (`from_wire`/`to_wire`/`struct_hash`) + `Registry: ObjectRegistry`. Generated code
   carries `#[allow(...)]` so it never lints the user's crate.
@@ -169,9 +170,9 @@ code exists yet. Build order, roughly bottom-up:
 - **`wavedb-storage` foundations** — `block` (`BlockDescriptor` u40·u20·u4 packing,
   `Run`, `BlockAllocator`: best-fit alloc / coalescing free / tail truncate) and
   `directory` (linear-hashing `bucket_index`/`next_split_bucket`, `Directory`).
-  - **Page `hash_of` is a stable seeded mix, not `ahash`** — `data.bin` is rebuilt by
-    journal replay; a CPU-dependent hash would reroute records when the file moves
-    machines. Random per-DB seed keeps DoS resistance.
+  - **Page `hash_of` is SeaHash** — portable across arch/endianness, so journal replay
+    rebuilds `data.bin` with the same routing even when the file moves machines. Random
+    per-DB seed keeps DoS resistance.
 
 _82 tests, clippy-clean. Workspace members: core, macros, build, storage,
 schema-smoke._

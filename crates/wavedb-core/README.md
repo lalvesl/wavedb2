@@ -120,10 +120,13 @@ A `u64` identity computed at **build time** (in `wavedb-build` / `#[wavedb]`, se
 STRUCT_NAME + SHAPE + each PROPERTY_NAME + each PROPERTY_TYPE
 ```
 
-**Algorithm: `ahash` with a fixed, hard-coded seed.** The seed is a compile-time
-constant baked into the tooling — _not_ the random per-database seed — so the
-hash is **deterministic across every build and machine** (clients and servers
-must agree on a type's identity). ahash is fast and gives good u64 dispersion.
+**Algorithm: SeaHash**, over the canonical string with a fixed four-lane WaveDB
+seed (domain-separated from the random per-database seed used for page routing).
+SeaHash is **portable across every build, machine, architecture, and endianness**
+for a given seed — exactly what type identity needs: clients and servers must
+agree on a type's identity. The `seahash` crate is **pinned to an exact version**,
+because the algorithm is identity-load-bearing: an unreviewed bump that changed it
+would invalidate every stored record's `STRUCT_HASH`.
 
 Folding field names and types into the hash means **any schema change yields a
 new `STRUCT_HASH`** — a changed struct is simply a different type. There is no

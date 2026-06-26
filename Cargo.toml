@@ -44,9 +44,12 @@ thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 zstd = "0.13.3"
 byteorder = "1.5.0"
-# STRUCT_HASH (fixed hard-coded seed) + runtime Id/page hashing (per-DB random
-# seed in data.bin page 0). `RandomState::with_seeds` gives a fixed-seed hasher.
-ahash = { version = "0.8.11", default-features = false }
+# The one hash function everywhere: STRUCT_HASH (fixed seed, compile-time type
+# identity) + runtime Id/page routing (per-DB random seed in data.bin page 0).
+# SeaHash is portable across arch/endianness for a given seed. PINNED EXACTLY:
+# STRUCT_HASH identity is load-bearing, so a version bump that changed the
+# algorithm would invalidate every stored record's type hash — never loosen `=`.
+seahash = "=4.1.0"
 parking_lot = "0.12.5"
 proptest = "1.11.0"
 criterion = { version = "0.8.2", features = ["async_tokio"] }

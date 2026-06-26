@@ -16,6 +16,8 @@ parking_lot.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
 crc32fast.workspace = true
+# Runtime Id/page-routing hash (per-DB random seed).
+seahash.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

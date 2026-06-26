@@ -31,9 +31,9 @@ impl Shape {
 /// Implemented by every `#[wavedb]` struct (by the proc-macro). The single source
 /// of a type's compile-time identity, shape, and collection-handle type.
 ///
-/// `STRUCT_HASH` is `ahash(name + shape + field names + field types)` with a
-/// fixed, hard-coded seed, so client and server agree on identity and any schema
-/// change yields a new value.
+/// `STRUCT_HASH` is `seahash(name + shape + field names + field types)` with a
+/// fixed seed. SeaHash is portable across architectures, so client and server
+/// agree on identity; any schema change yields a new value.
 pub trait WaveDbStruct: Wire {
     /// Compile-time identity of this type and its schema generation.
     const STRUCT_HASH: u64;

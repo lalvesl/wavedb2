@@ -24,6 +24,10 @@ pub enum Error {
     /// A value handed to `U48::new` did not fit in 48 bits.
     #[error("value {0} exceeds 48 bits")]
     U48Overflow(u64),
+    /// A wire envelope carried a `STRUCT_HASH` not declared in this build's
+    /// registry (a record written under a schema this binary doesn't know).
+    #[error("unknown struct hash {0:#018x}")]
+    UnknownStructHash(u64),
 }
 
 /// Shorthand for a `Result` carrying the workspace [`Error`].
