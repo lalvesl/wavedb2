@@ -11,6 +11,9 @@ workspace = true
 [dependencies]
 thiserror.workspace = true
 byteorder.workspace = true
+# The Wire codec, re-exported as `wavedb_core::wire`. Lives in its own crate so
+# the serialization layer carries no STRUCT_HASH / engine coupling.
+wavedb-wire.workspace = true
 # `Stream` + combinators for the Store-generic index contracts (BpTree search,
 # IdStreamExt set algebra). Pure async, WASM-safe — no I/O.
 futures = { workspace = true }

@@ -12,9 +12,8 @@
 
 use core::fmt;
 
-use crate::error::Result;
 use crate::u48::U48;
-use crate::wire::{Cursor, Wire};
+use crate::wire::WaveWire;
 
 const KEY_SHIFT: u32 = 64;
 const TENANT_SHIFT: u32 = 16;
@@ -23,7 +22,12 @@ const SALT_BITS: u32 = 15;
 const SALT_MASK: u128 = (1 << SALT_BITS) - 1;
 
 /// A 128-bit composite record identifier.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+///
+/// `Wire` is derived: a tuple struct over `u128`, so it encodes as the inner
+/// `u128`'s 16 little-endian bytes — identical to the previous hand impl.
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, WaveWire,
+)]
 pub struct Id(u128);
 
 impl Id {
@@ -100,22 +104,6 @@ impl fmt::Debug for Id {
             .field("flag", &self.flag())
             .field("salt", &self.salt())
             .finish()
-    }
-}
-
-impl Wire for Id {
-    const STACK_SIZE: usize = 16;
-    fn heap_size(&self) -> usize {
-        0
-    }
-    fn encode_stack(&self, stack: &mut Vec<u8>) {
-        stack.extend_from_slice(&self.0.to_le_bytes());
-    }
-    fn encode_heap(&self, _heap: &mut Vec<u8>) {}
-    fn decode(stack: &mut Cursor, _heap: &mut Cursor) -> Result<Self> {
-        Ok(Self(u128::from_le_bytes(
-            stack.take(16)?.try_into().unwrap(),
-        )))
     }
 }
 

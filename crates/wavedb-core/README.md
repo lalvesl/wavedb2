@@ -17,7 +17,7 @@ permission refs, and the `Wire` serialization trait.
 | `metadata`   | `Metadata` — modification chain, pivot back-link, authorship, permission ref. |
 | `hooks`      | `first_try` (pre-search) and `fallback_not_found` (post-miss) hooks.          |
 | `permission` | `PermissionRef` shapes.                                                       |
-| `wire`       | The `Wire` trait + `WaveWire` (no serde). See `docs/wire_format.md`.          |
+| `wire`       | Re-export of the standalone [`wavedb-wire`](../wavedb-wire/README.md) codec.  |
 | `store`      | The `Store` backend trait (key→value over `Id` + atomic batch).               |
 | `index`      | `Pivot`, `BpTree`, `IndexKey`, `Bound` — the `Store`-generic index contracts. |
 | `traits`     | `WaveDbStruct`, shape markers.                                                |

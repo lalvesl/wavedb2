@@ -512,7 +512,7 @@ mod tests {
         block_on(async {
             let left = stream::iter(vec![
                 Ok(Id::default()),
-                Err(crate::error::Error::Utf8),
+                Err(crate::error::Error::Wire(wavedb_wire::Error::Utf8)),
             ]);
             let right = ids(&[]);
             let got: Vec<Result<Id>> = left.intersect(right).collect().await;

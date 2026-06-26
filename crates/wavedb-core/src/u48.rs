@@ -75,7 +75,12 @@ impl Wire for U48 {
         stack.extend_from_slice(&self.0.to_le_bytes()[..6]);
     }
     fn encode_heap(&self, _heap: &mut Vec<u8>) {}
-    fn decode(stack: &mut Cursor, _heap: &mut Cursor) -> Result<Self> {
+    // `Result` in this file is the core workspace alias (for `U48::new`); the Wire
+    // trait wants the wire crate's, so spell it out here.
+    fn decode(
+        stack: &mut Cursor,
+        _heap: &mut Cursor,
+    ) -> wavedb_wire::Result<Self> {
         let mut bytes = [0u8; 8];
         bytes[..6].copy_from_slice(stack.take(6)?);
         Ok(Self(u64::from_le_bytes(bytes)))

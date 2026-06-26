@@ -11,16 +11,20 @@
 
 use core::fmt;
 
-use crate::error::Result;
 use crate::id::Id;
 use crate::u48::U48;
-use crate::wire::{Cursor, Wire};
+use crate::wire::WaveWire;
 
 const FLAG_SHIFT: u32 = 15;
 const SALT_MASK: u16 = (1 << FLAG_SHIFT) - 1;
 
 /// Compact 80-bit record identifier — [`Id`] with `TENANT` removed.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+///
+/// `Wire` is derived: `key` (8 LE bytes) then `lower` (2 LE bytes) = 10 bytes,
+/// identical to the previous hand impl.
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, WaveWire,
+)]
 pub struct LocalId {
     /// KEY field — a `STRUCT_HASH` or `CREATED_AT` timestamp.
     key: u64,
@@ -88,32 +92,6 @@ impl fmt::Debug for LocalId {
             .field("flag", &self.flag())
             .field("salt", &self.salt())
             .finish_non_exhaustive()
-    }
-}
-
-impl Wire for LocalId {
-    const STACK_SIZE: usize = 10; // 8 (key) + 2 (lower)
-
-    fn heap_size(&self) -> usize {
-        0
-    }
-
-    fn encode_stack(&self, stack: &mut Vec<u8>) {
-        stack.extend_from_slice(&self.key.to_le_bytes());
-        stack.extend_from_slice(&self.lower.to_le_bytes());
-    }
-
-    fn encode_heap(&self, _heap: &mut Vec<u8>) {}
-
-    fn decode(stack: &mut Cursor, _heap: &mut Cursor) -> Result<Self> {
-        let mut kb = [0u8; 8];
-        kb.copy_from_slice(stack.take(8)?);
-        let mut lb = [0u8; 2];
-        lb.copy_from_slice(stack.take(2)?);
-        Ok(Self {
-            key: u64::from_le_bytes(kb),
-            lower: u16::from_le_bytes(lb),
-        })
     }
 }
 

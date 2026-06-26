@@ -1,5 +1,11 @@
 # WaveDB Wire Format (replaces serde + postcard)
 
+> The `Wire` trait and its built-in impls live in the standalone, dependency-free
+> [`wavedb-wire`](../crates/wavedb-wire/README.md) crate (no `STRUCT_HASH`, no
+> registry — pure value ⇄ bytes). `wavedb-core` re-exports it as
+> `wavedb_core::wire`. The record **envelope** (the `STRUCT_HASH` prefix, below)
+> and WaveDB's own type impls (`Id`, `Metadata`, …) stay in `wavedb-core`.
+
 Goal: shrink the WASM binary by deleting serde's generic machinery, and give the
 engine a layout it can reason about statically. Each `STRUCT_HASH` has a
 compile-time-known **stack size** and a heap section whose shape is described by

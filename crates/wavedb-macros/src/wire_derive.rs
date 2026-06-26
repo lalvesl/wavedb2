@@ -80,9 +80,9 @@ pub fn derive(input: &DeriveInput) -> syn::Result<TokenStream> {
             }
 
             fn decode(
-                stack: &mut ::wavedb_core::Cursor,
-                heap: &mut ::wavedb_core::Cursor,
-            ) -> ::wavedb_core::Result<Self> {
+                stack: &mut ::wavedb_core::wire::Cursor,
+                heap: &mut ::wavedb_core::wire::Cursor,
+            ) -> ::wavedb_core::wire::Result<Self> {
                 #decode_body
             }
         }

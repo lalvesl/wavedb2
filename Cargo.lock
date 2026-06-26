@@ -831,6 +831,7 @@ dependencies = [
  "proptest",
  "thiserror",
  "wavedb-macros",
+ "wavedb-wire",
 ]
 
 [[package]]
@@ -859,6 +860,23 @@ dependencies = [
  "wavedb-core",
  "wavedb-macros",
  "zstd",
+]
+
+[[package]]
+name = "wavedb-wire"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "wavedb-wire-derive",
+]
+
+[[package]]
+name = "wavedb-wire-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

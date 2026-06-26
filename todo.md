@@ -149,8 +149,25 @@ code exists yet. Build order, roughly bottom-up:
 
 # DONE
 
+- **`wavedb-wire`** — the `Wire` codec extracted into a standalone crate (only
+  `thiserror`): trait + `Cursor` + builtin impls + `to_wire`/`from_wire` + its own
+  `Error`. No `STRUCT_HASH`, registry, `Id`, or engine coupling — pure value ⇄
+  bytes, decode fails only on a buffer/size mismatch (`UnexpectedEof`) plus
+  intrinsic per-type checks. `wavedb-core` re-exports it as `wavedb_core::wire` and
+  wraps its `Error` via `#[from]`, so every existing path + the macros' `WaveWire`
+  derive (now targeting `wavedb_core::wire::Result`) keep working.
+- **`wavedb-wire-derive`** — the wire crate's own `#[derive(WaveWire)]` proc-macro
+  (serde/serde_derive pattern; re-exported as `wavedb_wire::WaveWire`), emitting
+  `::wavedb_wire::` paths. Supports structs (named/tuple/unit) **and enums** (the
+  canonical tag form — `tag u8 [+ payload-len u32]`, declaration-order tags). Used
+  to **replace the hand `Wire` impls** in core for `Id`, `LocalId`, `Metadata`, and
+  `PermissionRef` (byte-identical — existing roundtrip/length tests pass unchanged).
+  `U48` stays hand-written (6-byte 48-bit packing, not field-derivable). The older
+  `wavedb-macros::WaveWire` (emits `wavedb_core::wire` paths, struct-only) is left
+  for `#[wavedb]`; the two derives coexist by path target.
 - **`wavedb-core`** — `Id`, `LocalId`, `U48`, `Metadata`, `PermissionRef`, `Wire`
-  (no-serde, single-alloc), `Error`. Plus the portable contracts: `WaveDbStruct` +
+  (re-exported from `wavedb-wire`; the first four derive it, `U48` hand-written),
+  `Error`. Plus the portable contracts: `WaveDbStruct` +
   `Shape`, `Store` (+ `Write`), `LookupHooks`,
   and the `index` layer — `IndexKey` (order-preserving), `Bound`, `Pivot`, `BpTree`,
   `IdStreamExt` (intersect/union/except stream adapters).
@@ -175,5 +192,5 @@ code exists yet. Build order, roughly bottom-up:
     rebuilds `data.bin` with the same routing even when the file moves machines. Random
     per-DB seed keeps DoS resistance.
 
-_82 tests, clippy-clean. Workspace members: core, macros, build, storage,
-schema-smoke._
+_86 tests, clippy-clean. Workspace members: wire, wire-derive, core, macros, build,
+storage, schema-smoke._

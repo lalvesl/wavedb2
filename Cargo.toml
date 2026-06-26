@@ -4,6 +4,8 @@ resolver = "2"
 # still under construction (empty or bin-only targets) sit in `exclude` so the
 # workspace resolves. Move a crate from `exclude` to `members` once it builds.
 members = [
+  "crates/wavedb-wire",
+  "crates/wavedb-wire-derive",
   "crates/wavedb-core",
   "crates/wavedb-macros",
   "crates/wavedb-build",
@@ -40,6 +42,11 @@ trivially_copy_pass_by_ref = "allow"
 
 [workspace.dependencies]
 # Shared versions; sub-crates pick what they need.
+# The standalone Wire codec (pure value ⇄ bytes, no STRUCT_HASH). `wavedb-core`
+# re-exports it as `wavedb_core::wire`.
+wavedb-wire = { path = "crates/wavedb-wire" }
+# Its companion `#[derive(WaveWire)]` proc-macro, re-exported by `wavedb-wire`.
+wavedb-wire-derive = { path = "crates/wavedb-wire-derive" }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 zstd = "0.13.3"

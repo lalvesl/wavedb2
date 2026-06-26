@@ -7,8 +7,7 @@
 //! durability (journaling every alloc/free) is the pipeline's job, not this
 //! module's.
 
-use wavedb_core::Result;
-use wavedb_core::wire::{Cursor, Wire};
+use wavedb_core::wire::{Cursor, Result, Wire};
 
 /// Size of one block in bytes (the allocation unit).
 pub const BLOCK_SIZE: usize = 4096;

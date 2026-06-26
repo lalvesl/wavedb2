@@ -1,11 +1,10 @@
 //! `Metadata` — the per-record header carried by every stored record: the
 //! version chain, authorship, and the access rule.
 
-use crate::error::Result;
 use crate::local_id::LocalId;
 use crate::permission::PermissionRef;
 use crate::u48::U48;
-use crate::wire::{Cursor, Wire};
+use crate::wire::WaveWire;
 
 /// Per-record metadata. Injected alongside the record body; serialised through
 /// `Wire` like everything else.
@@ -16,7 +15,7 @@ use crate::wire::{Cursor, Wire};
 ///   tenant-scoped so `TENANT` is derivable from context.
 /// - `Option<T>` has `STACK_SIZE = 1` (flag only); the payload lands in the
 ///   heap section, so `None` costs exactly **1 byte** instead of 11.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, WaveWire)]
 pub struct Metadata {
     /// Previous version in the modification chain (`None` = first version).
     pub old_modification_id: Option<LocalId>,
@@ -32,51 +31,10 @@ pub struct Metadata {
     pub permission: Option<PermissionRef>,
 }
 
-impl Wire for Metadata {
-    const STACK_SIZE: usize = <Option<LocalId> as Wire>::STACK_SIZE        // old_modification_id  (1)
-        + <Option<LocalId> as Wire>::STACK_SIZE        // new_modification_id  (1)
-        + <Option<LocalId> as Wire>::STACK_SIZE        // pivot_id             (1)
-        + <U48 as Wire>::STACK_SIZE                    // user                 (6)
-        + <u64 as Wire>::STACK_SIZE                    // device_created       (8)
-        + <Option<PermissionRef> as Wire>::STACK_SIZE; // permission           (1)
-    // Stack total = 18 bytes. Heap grows only for fields that are Some.
-
-    fn heap_size(&self) -> usize {
-        self.old_modification_id.heap_size()
-            + self.new_modification_id.heap_size()
-            + self.pivot_id.heap_size()
-            + self.permission.heap_size()
-    }
-
-    fn encode_stack(&self, stack: &mut Vec<u8>) {
-        self.old_modification_id.encode_stack(stack);
-        self.new_modification_id.encode_stack(stack);
-        self.pivot_id.encode_stack(stack);
-        self.user.encode_stack(stack);
-        self.device_created.encode_stack(stack);
-        self.permission.encode_stack(stack);
-    }
-
-    fn encode_heap(&self, heap: &mut Vec<u8>) {
-        self.old_modification_id.encode_heap(heap);
-        self.new_modification_id.encode_heap(heap);
-        self.pivot_id.encode_heap(heap);
-        self.user.encode_heap(heap);
-        self.device_created.encode_heap(heap);
-        self.permission.encode_heap(heap);
-    }
-
-    fn decode(stack: &mut Cursor, heap: &mut Cursor) -> Result<Self> {
-        Ok(Self {
-            old_modification_id: Option::<LocalId>::decode(stack, heap)?,
-            new_modification_id: Option::<LocalId>::decode(stack, heap)?,
-            pivot_id: Option::<LocalId>::decode(stack, heap)?,
-            user: U48::decode(stack, heap)?,
-            device_created: u64::decode(stack, heap)?,
-            permission: Option::<PermissionRef>::decode(stack, heap)?,
-        })
-    }
-}
+// `Wire` is derived field-by-field in declaration order: three `Option<LocalId>`
+// (1 byte each) + `U48` (6) + `u64` (8) + `Option<PermissionRef>` (1) = 18-byte
+// stack; heap grows only for the `Some` fields. Byte-identical to the prior hand
+// impl.
 
 #[cfg(test)]
 mod tests {

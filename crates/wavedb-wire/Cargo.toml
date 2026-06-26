@@ -1,0 +1,18 @@
+[package]
+name = "wavedb-wire"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# A derive for the tiny self-contained error enum. No wavedb crates — this layer
+# is pure value ⇄ bytes, it knows nothing about `STRUCT_HASH`, the registry, ids,
+# or the engine.
+thiserror.workspace = true
+# The companion derive, re-exported as `wavedb_wire::WaveWire` (serde/serde_derive
+# pattern). Compile-time only; emits `::wavedb_wire::` paths.
+wavedb-wire-derive.workspace = true
