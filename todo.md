@@ -151,19 +151,20 @@ code exists yet. Build order, roughly bottom-up:
 
 - **`wavedb-core`** — `Id`, `LocalId`, `U48`, `Metadata`, `PermissionRef`, `Wire`
   (no-serde, single-alloc), `Error`. Plus the portable contracts: `WaveDbStruct` +
-  `Shape`, `Store` (+ `Write`), `LookupHooks`, `ObjectRegistry`/`ObjectDescriptor`,
+  `Shape`, `Store` (+ `Write`), `LookupHooks`,
   and the `index` layer — `IndexKey` (order-preserving), `Bound`, `Pivot`, `BpTree`,
   `IdStreamExt` (intersect/union/except stream adapters).
 - **`wavedb-macros`** — `#[derive(WaveWire)]` (named/tuple/unit) and `#[wavedb]`
   (Unique/NonUnique): emits `STRUCT_HASH`, `Wire`, inherent consts
-  (`SHAPE`/`HAS_VALIDATE`/`HAS_PREPROCESS`/`OBJECT_DESCRIPTOR`), `WaveDbStruct`, and
+  (`SHAPE`/`HAS_VALIDATE`/`HAS_PREPROCESS`), `WaveDbStruct`, and
   for NonUnique the generated `{Name}PivotId` + `{Name}Pivot`. `#[wavedb::pivot(...)]`
   parsed/stripped → secondary-index count. `#[server]` deferred to M4 (needs `Db`).
   - **`STRUCT_HASH` uses SeaHash (pinned crate)** — portable across arch/endianness so
     client and server agree on identity; the crate is version-pinned so identity can't drift.
 - **`wavedb-build`** — `generate_registry()` scans `src/`, emits the `Object` enum
-  (`from_wire`/`to_wire`/`struct_hash`) + `Registry: ObjectRegistry`. Generated code
-  carries `#[allow(...)]` so it never lints the user's crate.
+  (`from_wire`/`to_wire`/`struct_hash` + a `STRUCT_HASH`-printing `Debug`) — the enum
+  *is* the registry, no descriptor table. Generated code carries `#[allow(...)]` so it
+  never lints the user's crate.
 - **`examples/schema-smoke`** — end-to-end M1 proof: `#[wavedb]` + `build.rs` +
   `include!` → registry resolves + `Object` round-trips. (Real example; `todo-app`
   still needs M4 `#[server]`/`Db`.)

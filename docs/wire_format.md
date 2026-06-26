@@ -80,12 +80,13 @@ application's job via the `first_try` / `fallback_not_found` hooks.
 
 All nodes (server and client/WASM) share a **static registry generated in
 `build.rs`** — a scanner walks the schema crate, finds every `#[wavedb]` struct,
-and emits an `Object` enum (`STRUCT_HASH` → variant) plus per-struct
-`ObjectDescriptor`s (stack size, shape, field table, heap-field name list),
-spliced in with `include!`. Searchable by `STRUCT_HASH`, it lets the engine locate
-any field without deserialising, organise the `Pivot`/`BpTree` indexes, invoke the
-`first_try` / `fallback_not_found` hooks, and dispatch statically (match on the
-enum → monomorphised arm, **no `dyn`**). See
+and emits an `Object` enum (`STRUCT_HASH` → variant) spliced in with `include!`.
+The enum's inherent `from_wire` / `to_wire` / `struct_hash` are the dispatch: from
+a `STRUCT_HASH` (read off the wire envelope or the `Id`) a `match` selects the
+concrete arm, monomorphised — **no `dyn`** — giving the wire parser, the
+`first_try` / `fallback_not_found` hooks, and the `Pivot`/`BpTree` accessors. A
+type's static facts (`STACK_SIZE`, `SHAPE`) are inherent `const`s reached through
+that arm — no descriptor table. See
 [`wavedb-macros`](../crates/wavedb-macros/README.md#the-registry--generated-in-buildrs).
 
 ## Trade-offs vs postcard

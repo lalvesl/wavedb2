@@ -2,9 +2,9 @@
 //!
 //! A schema crate's `build.rs` calls [`generate_registry`]. It scans the crate's
 //! own `src/` tree, finds every `#[wavedb]` struct, and writes
-//! `$OUT_DIR/wavedb_registry.rs` — an `Object` enum (`STRUCT_HASH → variant`) with
-//! static `from_wire` / `to_wire` / `struct_hash` dispatch, plus a `Registry`
-//! value implementing [`wavedb_core::registry::ObjectRegistry`]. The schema crate
+//! `$OUT_DIR/wavedb_registry.rs` — an `Object` enum (`STRUCT_HASH → variant`) whose
+//! inherent `from_wire` / `to_wire` / `struct_hash` methods are the whole dispatch
+//! seam: a `match` on the hash, no `dyn`, no descriptor table. The schema crate
 //! splices it in with `include!`.
 //!
 //! ```ignore
@@ -100,12 +100,6 @@ pub fn render(entries: &[ObjectEntry]) -> Result<String, String> {
         quote!(Object::#ident(v) => ::wavedb_core::to_wire(v))
     });
 
-    let descriptor_arms = entries.iter().map(|e| {
-        let path = e.path_tokens();
-        quote!(h if h == <#path>::STRUCT_HASH =>
-            ::core::option::Option::Some(&<#path>::OBJECT_DESCRIPTOR))
-    });
-
     // Empty schema: an uninhabited enum still needs valid match bodies.
     let (struct_hash_body, to_wire_body) = if entries.is_empty() {
         (quote!(match *self {}), quote!(match *self {}))
@@ -152,27 +146,15 @@ pub fn render(entries: &[ObjectEntry]) -> Result<String, String> {
             }
         }
 
-        /// The schema's static object registry.
+        // `Object` is underived (no bounds on the schema structs), so Debug is
+        // written by hand: it identifies the variant by its `STRUCT_HASH` — no
+        // stored name, no `T: Debug` requirement.
         #allow
-        #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy)]
-        pub struct Registry;
-
-        #allow
-        impl ::wavedb_core::registry::ObjectRegistry for Registry {
-            fn descriptor(
-                &self,
-                struct_hash: u64,
-            ) -> ::core::option::Option<&'static ::wavedb_core::registry::ObjectDescriptor> {
-                match struct_hash {
-                    #(#descriptor_arms,)*
-                    _ => ::core::option::Option::None,
-                }
+        impl ::core::fmt::Debug for Object {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                ::core::write!(f, "Object(struct_hash={:#018x})", self.struct_hash())
             }
         }
-
-        /// The generated registry value, passed to a node's `Server`/`QuickNode`.
-        #allow
-        pub const REGISTRY: Registry = Registry;
     };
 
     // Format for readability; fall back to raw tokens if parsing the generated
@@ -212,10 +194,9 @@ mod tests {
         assert!(code.contains("AboutUser(crate::AboutUser)"));
         assert!(code.contains("Note(crate::notes::Note)"));
         assert!(code.contains("Deep(crate::a::b::Deep)"));
-        assert!(code.contains("pub const REGISTRY: Registry = Registry;"));
-        assert!(code.contains(
-            "impl ::wavedb_core::registry::ObjectRegistry for Registry"
-        ));
+        assert!(code.contains("pub enum Object"));
+        assert!(code.contains("fn from_wire"));
+        assert!(code.contains("impl ::core::fmt::Debug for Object"));
     }
 
     #[test]

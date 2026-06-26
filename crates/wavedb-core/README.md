@@ -18,7 +18,6 @@ permission refs, and the `Wire` serialization trait.
 | `hooks`      | `first_try` (pre-search) and `fallback_not_found` (post-miss) hooks.          |
 | `permission` | `PermissionRef` shapes.                                                       |
 | `wire`       | The `Wire` trait + `WaveWire` (no serde). See `docs/wire_format.md`.          |
-| `registry`   | `ObjectDescriptor` / `ObjectRegistry` lookup by `STRUCT_HASH`.                |
 | `store`      | The `Store` backend trait (key→value over `Id` + atomic batch).               |
 | `index`      | `Pivot`, `BpTree`, `IndexKey`, `Bound` — the `Store`-generic index contracts. |
 | `traits`     | `WaveDbStruct`, shape markers.                                                |
@@ -243,14 +242,17 @@ the node with DB access and is called by a typed client binding (see
 
 ## Registry
 
-`ObjectDescriptor` carries a type's static shape (field offsets, heapable flags,
-heap-prop name list, shape). The **registry that maps a `STRUCT_HASH` to its type
-is generated in `build.rs`**, not here: a scanner walks the schema crate, finds
-every `#[wavedb]` struct, and emits a generated `Object` enum
-(`STRUCT_HASH` → variant) spliced in with
-`include!(concat!(env!("OUT_DIR"), …))`. Dispatch — wire-parse, the `first_try` /
-`fallback_not_found` hooks, the generated `Pivot`/`BpTree` accessors — is a
-`match` on that enum: **no `dyn`, no runtime registration**. The mechanism lives
+The **registry that maps a `STRUCT_HASH` to its type is generated in `build.rs`**,
+not here: a scanner walks the schema crate, finds every `#[wavedb]` struct, and
+emits a generated `Object` enum (`STRUCT_HASH` → variant) spliced in with
+`include!(concat!(env!("OUT_DIR"), …))`. **The enum *is* the registry** — its
+inherent `from_wire` / `to_wire` / `struct_hash` methods, the `first_try` /
+`fallback_not_found` hooks, and the generated `Pivot`/`BpTree` accessors all
+dispatch by a `match` on the hash: **no `dyn`, no runtime registration, no
+descriptor table**. Per-type static facts (`STACK_SIZE`, `SHAPE`) are inherent
+`const`s on the struct, reached through the matched arm's concrete type — not a
+duplicated data table. The generated `Object` carries a hand-written `Debug` that
+prints the `STRUCT_HASH` (no stored name, no `T: Debug` bound). The mechanism lives
 in [`wavedb-macros` § the registry](../wavedb-macros/README.md#the-registry--generated-in-buildrs).
 
 ---

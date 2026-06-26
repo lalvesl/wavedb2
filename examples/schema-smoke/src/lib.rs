@@ -4,8 +4,8 @@
 
 use wavedb_macros::wavedb;
 
-// The generated `Object` enum + `REGISTRY`. Items resolve regardless of order, so
-// splicing this above the struct definitions is fine.
+// The generated `Object` enum (the dispatch seam). Items resolve regardless of
+// order, so splicing this above the struct definitions is fine.
 include!(concat!(env!("OUT_DIR"), "/wavedb_registry.rs"));
 
 /// Unique: one live record per tenant.
@@ -40,52 +40,61 @@ pub mod billing {
 mod tests {
     use super::billing::Invoice;
     use super::{AboutUser, Note, Object};
-    use wavedb_core::registry::ObjectRegistry;
     use wavedb_core::traits::Shape;
     use wavedb_core::wire::to_wire;
 
+    // The registry *is* the `Object` enum: every declared struct's `STRUCT_HASH`
+    // routes to its variant by `match`, decodes, and round-trips — no descriptor
+    // table, no stored names.
     #[test]
-    fn registry_resolves_every_declared_struct() {
-        assert_eq!(
-            super::REGISTRY.descriptor(AboutUser::STRUCT_HASH).unwrap().name,
-            "AboutUser"
-        );
-        assert_eq!(
-            super::REGISTRY.descriptor(Note::STRUCT_HASH).unwrap().shape,
-            Shape::NonUnique
-        );
-        assert_eq!(
-            super::REGISTRY.descriptor(Invoice::STRUCT_HASH).unwrap().name,
-            "Invoice"
-        );
-        assert!(super::REGISTRY.descriptor(0xDEAD_BEEF).is_none());
-    }
-
-    #[test]
-    fn object_dispatch_roundtrips() {
-        let u = AboutUser {
+    fn object_dispatch_roundtrips_every_struct() {
+        let about = AboutUser {
             name: "Ada".into(),
             city: "London".into(),
         };
-        let bytes = to_wire(&u);
-
-        let obj = Object::from_wire(AboutUser::STRUCT_HASH, &bytes).unwrap();
-        let Object::AboutUser(decoded) = obj else {
-            panic!("wrong variant");
+        let note = Note {
+            body: "hi".into(),
+            pinned: true,
         };
-        assert_eq!(decoded, u);
+        let invoice = Invoice { cents: 42 };
 
-        let obj = Object::AboutUser(u);
+        let about_bytes = to_wire(&about);
+        assert!(matches!(
+            Object::from_wire(AboutUser::STRUCT_HASH, &about_bytes),
+            Ok(Object::AboutUser(ref d)) if *d == about
+        ));
+        assert!(matches!(
+            Object::from_wire(Note::STRUCT_HASH, &to_wire(&note)),
+            Ok(Object::Note(ref d)) if *d == note
+        ));
+        assert!(matches!(
+            Object::from_wire(Invoice::STRUCT_HASH, &to_wire(&invoice)),
+            Ok(Object::Invoice(ref d)) if *d == invoice
+        ));
+
+        // Encode side + identity.
+        let obj = Object::AboutUser(about);
         assert_eq!(obj.struct_hash(), AboutUser::STRUCT_HASH);
-        assert_eq!(obj.to_wire(), bytes);
+        assert_eq!(obj.to_wire(), about_bytes);
     }
 
+    // Shape is a compile-time `const` on the type — reached directly, no runtime
+    // lookup.
     #[test]
-    fn unknown_hash_is_an_error() {
-        // `Object` is intentionally underived, so `matches!` rather than `unwrap_err`.
-        assert!(matches!(
-            Object::from_wire(0x1234_5678, &[]),
-            Err(wavedb_core::Error::UnknownStructHash(0x1234_5678))
-        ));
+    fn shape_is_a_const_not_a_lookup() {
+        assert_eq!(AboutUser::SHAPE, Shape::Unique);
+        assert_eq!(Note::SHAPE, Shape::NonUnique);
+        assert_eq!(Invoice::SHAPE, Shape::Unique);
+    }
+
+    // An unknown hash is refused, and the error carries the `STRUCT_HASH` for
+    // diagnostics. `Object`'s Debug also prints the hash, not a name.
+    #[test]
+    fn unknown_hash_errors_with_the_hash() {
+        let err = Object::from_wire(0x1234_5678, &[]).unwrap_err();
+        assert_eq!(err, wavedb_core::Error::UnknownStructHash(0x1234_5678));
+
+        let dbg = format!("{:?}", Object::AboutUser(AboutUser::default()));
+        assert!(dbg.contains("struct_hash"), "Object Debug shows the hash: {dbg}");
     }
 }

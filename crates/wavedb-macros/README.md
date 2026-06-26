@@ -18,7 +18,6 @@ because both compile this crate.
 | `server`            | `#[server]`: server body + client stub + `FN_HASH`.             |
 | `args`              | Parse `#[wavedb(...)]` attribute arguments.                     |
 | `struct_hash`       | Compute the `STRUCT_HASH: u64` const from name/shape/fields.    |
-| `descriptor`        | Emit `ObjectDescriptor` (field offsets, heapable flags, names). |
 | `wire_derive`       | `WaveWire` — the no-serde, no-`repr(C)` `Wire` impl.            |
 | `generated`         | Auto-emit the per-NonUnique `Pivot` + `BpTree` types.           |
 | `crud`              | Generated accessors / CRUD glue.                                |

@@ -73,7 +73,6 @@ pub fn expand(
         Ident::new(args.shape.core_variant(), Span::call_site());
     let has_validate = args.validate.is_some();
     let has_preprocess = args.preprocess.is_some();
-    let name_str = name.to_string();
 
     // The PivotId associated type: () for Unique, the generated newtype otherwise.
     let (pivot_id_ty, generated_types) = match args.shape {
@@ -97,16 +96,6 @@ pub fn expand(
             pub const HAS_VALIDATE: bool = #has_validate;
             /// Whether a `preprocess` hook is declared.
             pub const HAS_PREPROCESS: bool = #has_preprocess;
-            /// Static description for the build-time registry. The field table is
-            /// empty for now (heap-field offsets land with the descriptor work).
-            pub const OBJECT_DESCRIPTOR: ::wavedb_core::ObjectDescriptor =
-                ::wavedb_core::ObjectDescriptor {
-                    struct_hash: #hash,
-                    name: #name_str,
-                    shape: ::wavedb_core::Shape::#shape_variant,
-                    stack_size: <Self as ::wavedb_core::Wire>::STACK_SIZE,
-                    fields: &[],
-                };
         }
 
         #wire_impl

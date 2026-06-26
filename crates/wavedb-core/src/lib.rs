@@ -27,7 +27,6 @@ pub mod index;
 pub mod local_id;
 pub mod metadata;
 pub mod permission;
-pub mod registry;
 pub mod store;
 pub mod traits;
 pub mod u48;
@@ -42,7 +41,6 @@ pub use index::{
 pub use local_id::LocalId;
 pub use metadata::Metadata;
 pub use permission::PermissionRef;
-pub use registry::{FieldDescriptor, ObjectDescriptor, ObjectRegistry};
 pub use store::{Store, Write};
 pub use traits::{Shape, WaveDbStruct};
 pub use u48::U48;
