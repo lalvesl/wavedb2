@@ -49,7 +49,7 @@ pub struct Todo {
 /// Register a new user. Allocates a tenant id, writes the global UserEntry,
 /// and bootstraps Auth + Profile in the new tenant's space.
 /// Returns the assigned tenant_id — the client stores it and reconnects.
-#[server]
+#[server(public)]
 pub async fn register(db: &Db, username: String, password: String) -> Result<u64> {
     let registry = ensure_registry(db).await?;
     let col = UserEntry::collection(db, registry.entries);
@@ -74,7 +74,7 @@ pub async fn register(db: &Db, username: String, password: String) -> Result<u64
 
 /// Verify credentials. Returns (tenant_id, session_token).
 /// Client uses the returned tenant_id to open its own tenant connection.
-#[server]
+#[server(public)]
 pub async fn login(db: &Db, username: String, password: String) -> Result<(u64, String)> {
     let registry = ensure_registry(db).await?;
     let col = UserEntry::collection(db, registry.entries);
