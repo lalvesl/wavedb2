@@ -1,6 +1,6 @@
 # wavedb-wire
 
-The standalone **`Wire` codec** — pure value ⇄ bytes, zero WaveDB coupling.
+The standalone **`WaveWire` codec** — pure value ⇄ bytes, zero WaveDB coupling.
 
 > For the project-wide idea and quickstart see the
 > [root README](../../readme.md). For how the layout is specified see
@@ -8,9 +8,10 @@ The standalone **`Wire` codec** — pure value ⇄ bytes, zero WaveDB coupling.
 
 ## What it is
 
-`wavedb-wire` is the `Wire` trait plus its built-in impls (scalars, `bool`,
+`wavedb-wire` is the `WaveWire` trait plus its built-in impls (scalars, `bool`,
 `char`, `String`, `Vec`, `Option`, arrays, tuples), the two free functions, and a
-`#[derive(WaveWire)]`:
+`#[derive(WaveWire)]`. The trait and the derive share the name `WaveWire` (the
+same-name pattern as `Clone`):
 
 ```rust
 #[derive(wavedb_wire::WaveWire)]
@@ -26,7 +27,7 @@ That is the whole surface. The crate knows nothing about the rest of WaveDB.
 
 Re-exported from the companion proc-macro crate
 [`wavedb-wire-derive`](../wavedb-wire-derive) (the serde / serde_derive split — a
-proc-macro must live in its own crate). It generates a `Wire` impl for:
+proc-macro must live in its own crate). It generates a `WaveWire` impl for:
 
 - **structs** — named, tuple, or unit: fields encode in declaration order.
 - **enums** — the canonical tag form. All variants field-less ⇒ a single `u8`
@@ -64,6 +65,6 @@ in the heap. Serialisation allocates once. Full spec in
 `wavedb-core` depends on this crate and re-exports it as `wavedb_core::wire`, so
 existing `wavedb_core::wire::{Wire, Cursor, to_wire, from_wire}` paths and the
 `#[derive(WaveWire)]` codegen keep working unchanged. `wavedb_core::Error` wraps
-this crate's `Error` (`#[from]`). The `Wire` impls for WaveDB's own types (`Id`,
+this crate's `Error` (`#[from]`). The `WaveWire` impls for WaveDB's own types (`Id`,
 `LocalId`, `U48`, `Metadata`, `PermissionRef`, …) live in `wavedb-core`, where
 those types are defined.

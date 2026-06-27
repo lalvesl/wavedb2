@@ -7,7 +7,7 @@
 //! durability (journaling every alloc/free) is the pipeline's job, not this
 //! module's.
 
-use wavedb_core::wire::{Cursor, Result, Wire};
+use wavedb_core::wire::{Cursor, Result, WaveWire};
 
 /// Size of one block in bytes (the allocation unit).
 pub const BLOCK_SIZE: usize = 4096;
@@ -161,7 +161,7 @@ impl core::fmt::Debug for BlockDescriptor {
     }
 }
 
-impl Wire for BlockDescriptor {
+impl WaveWire for BlockDescriptor {
     const STACK_SIZE: usize = 8;
     fn heap_size(&self) -> usize {
         0

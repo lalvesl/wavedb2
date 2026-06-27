@@ -1,5 +1,5 @@
 //! `wavedb-core` — primitives shared by every node kind and by proc-macro
-//! generated code: the composite [`Id`], the [`U48`] newtype, the [`Wire`]
+//! generated code: the composite [`Id`], the [`U48`] newtype, the [`WaveWire`]
 //! serialization format, and the workspace [`Error`]. **No I/O.**
 //!
 //! See `crates/wavedb-core/README.md` for the design.
@@ -44,4 +44,4 @@ pub use permission::PermissionRef;
 pub use store::{Store, Write};
 pub use traits::{Shape, WaveDbStruct};
 pub use u48::U48;
-pub use wire::{Cursor, Wire, from_wire, to_wire};
+pub use wire::{Cursor, WaveWire, from_wire, to_wire};

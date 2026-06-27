@@ -1,6 +1,6 @@
 # WaveDB Wire Format (replaces serde + postcard)
 
-> The `Wire` trait and its built-in impls live in the standalone, dependency-free
+> The `WaveWire` trait (and its `#[derive(WaveWire)]`) and built-in impls live in the standalone, dependency-free
 > [`wavedb-wire`](../crates/wavedb-wire/README.md) crate (no `STRUCT_HASH`, no
 > registry — pure value ⇄ bytes). `wavedb-core` re-exports it as
 > `wavedb_core::wire`. The record **envelope** (the `STRUCT_HASH` prefix, below)

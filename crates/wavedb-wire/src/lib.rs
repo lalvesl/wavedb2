@@ -1,4 +1,4 @@
-//! `wavedb-wire` — the standalone `Wire` (de)serialization format.
+//! `wavedb-wire` — the standalone `WaveWire` (de)serialization format.
 //!
 //! Pure value ⇄ bytes. It knows **nothing** about `STRUCT_HASH`, the registry,
 //! `Id`, permissions, or the engine — it is just a deterministic, platform-
@@ -37,7 +37,7 @@ extern crate self as wavedb_wire;
 
 use thiserror::Error;
 
-/// Derive a [`Wire`] impl for a struct or enum. Re-exported from
+/// Derive a [`WaveWire`] impl for a struct or enum. Re-exported from
 /// [`wavedb-wire-derive`](wavedb_wire_derive); see its docs for the supported
 /// shapes (structs: named/tuple/unit; enums: canonical tag form).
 pub use wavedb_wire_derive::WaveWire;
@@ -120,10 +120,10 @@ impl<'a> Cursor<'a> {
 
 /// A type with a deterministic, platform-independent wire layout.
 ///
-/// Implementors guarantee that [`encode_stack`](Wire::encode_stack) writes
-/// **exactly** `STACK_SIZE` bytes and that [`decode`](Wire::decode) reads exactly
+/// Implementors guarantee that [`encode_stack`](WaveWire::encode_stack) writes
+/// **exactly** `STACK_SIZE` bytes and that [`decode`](WaveWire::decode) reads exactly
 /// `STACK_SIZE` bytes from its stack cursor.
-pub trait Wire: Sized {
+pub trait WaveWire: Sized {
     /// Fixed number of bytes this type occupies in the stack section.
     const STACK_SIZE: usize;
 
@@ -144,13 +144,13 @@ pub trait Wire: Sized {
 
 /// Serialise a value to a single `[stack][heap]` byte vector in one allocation.
 ///
-/// `STACK_SIZE` (a compile-time sum over every field, including nested `Wire`
+/// `STACK_SIZE` (a compile-time sum over every field, including nested `WaveWire`
 /// types) plus the recursively-computed `heap_size()` give the exact final length
 /// up front. `encode_stack` appends the `STACK_SIZE`-byte stack section, then
 /// `encode_heap` appends the heap section to the same buffer — no second
 /// allocation, no concat.
 #[must_use]
-pub fn to_wire<T: Wire>(value: &T) -> Vec<u8> {
+pub fn to_wire<T: WaveWire>(value: &T) -> Vec<u8> {
     let mut buf = Vec::with_capacity(T::STACK_SIZE + value.heap_size());
     value.encode_stack(&mut buf);
     value.encode_heap(&mut buf);
@@ -163,7 +163,7 @@ pub fn to_wire<T: Wire>(value: &T) -> Vec<u8> {
 /// No type tag is consulted — the caller picks `T`, and decode just tries to read
 /// a `T`. A buffer shorter than `T::STACK_SIZE` is the size mismatch that fails as
 /// [`Error::UnexpectedEof`].
-pub fn from_wire<T: Wire>(bytes: &[u8]) -> Result<T> {
+pub fn from_wire<T: WaveWire>(bytes: &[u8]) -> Result<T> {
     if bytes.len() < T::STACK_SIZE {
         return Err(Error::UnexpectedEof);
     }
@@ -177,7 +177,7 @@ pub fn from_wire<T: Wire>(bytes: &[u8]) -> Result<T> {
 
 macro_rules! wire_le {
     ($($t:ty),* $(,)?) => {$(
-        impl Wire for $t {
+        impl WaveWire for $t {
             const STACK_SIZE: usize = size_of::<$t>();
             fn heap_size(&self) -> usize { 0 }
             fn encode_stack(&self, stack: &mut Vec<u8>) {
@@ -197,7 +197,7 @@ wire_le! {
     f32, f64,
 }
 
-impl Wire for bool {
+impl WaveWire for bool {
     const STACK_SIZE: usize = 1;
     fn heap_size(&self) -> usize {
         0
@@ -215,7 +215,7 @@ impl Wire for bool {
     }
 }
 
-impl Wire for char {
+impl WaveWire for char {
     const STACK_SIZE: usize = size_of::<Self>();
     fn heap_size(&self) -> usize {
         0
@@ -232,7 +232,7 @@ impl Wire for char {
 
 // ---- dynamic types ----------------------------------------------------------
 
-impl Wire for String {
+impl WaveWire for String {
     const STACK_SIZE: usize = size_of::<u32>(); // byte-length
     fn heap_size(&self) -> usize {
         self.len()
@@ -250,7 +250,7 @@ impl Wire for String {
     }
 }
 
-impl<T: Wire> Wire for Vec<T> {
+impl<T: WaveWire> WaveWire for Vec<T> {
     const STACK_SIZE: usize = size_of::<u32>(); // byte-length
     fn heap_size(&self) -> usize {
         // Each element is a self-contained unit: its stack bytes then its heap.
@@ -285,7 +285,7 @@ impl<T: Wire> Wire for Vec<T> {
     }
 }
 
-impl<T: Wire> Wire for Option<T> {
+impl<T: WaveWire> WaveWire for Option<T> {
     // 1 flag byte in stack; T's full wire representation (stack + heap) goes
     // into the parent's heap section only when Some. None costs exactly 1 byte.
     const STACK_SIZE: usize = 1;
@@ -315,10 +315,10 @@ impl<T: Wire> Wire for Option<T> {
 // inline into the parent stack, heaps appended in order — so every offset stays a
 // compile-time constant.
 
-impl<T: Wire, const N: usize> Wire for [T; N] {
+impl<T: WaveWire, const N: usize> WaveWire for [T; N] {
     const STACK_SIZE: usize = N * T::STACK_SIZE;
     fn heap_size(&self) -> usize {
-        self.iter().map(Wire::heap_size).sum()
+        self.iter().map(WaveWire::heap_size).sum()
     }
     fn encode_stack(&self, stack: &mut Vec<u8>) {
         for e in self {
@@ -342,7 +342,7 @@ impl<T: Wire, const N: usize> Wire for [T; N] {
 
 macro_rules! wire_tuple {
     ($($name:ident $idx:tt),+) => {
-        impl<$($name: Wire),+> Wire for ($($name,)+) {
+        impl<$($name: WaveWire),+> WaveWire for ($($name,)+) {
             const STACK_SIZE: usize = 0 $(+ $name::STACK_SIZE)+;
             fn heap_size(&self) -> usize { 0 $(+ self.$idx.heap_size())+ }
             fn encode_stack(&self, stack: &mut Vec<u8>) { $(self.$idx.encode_stack(stack);)+ }
@@ -360,9 +360,9 @@ wire_tuple!(A 0, B 1, C 2, D 3);
 
 #[cfg(test)]
 mod tests {
-    use super::{Wire, from_wire, to_wire};
+    use super::{WaveWire, from_wire, to_wire};
 
-    fn roundtrip<T: Wire + PartialEq + core::fmt::Debug>(value: &T) {
+    fn roundtrip<T: WaveWire + PartialEq + core::fmt::Debug>(value: &T) {
         let bytes = to_wire(value);
         assert_eq!(bytes.len(), T::STACK_SIZE + value.heap_size());
         let back: T = from_wire(&bytes).expect("decode");
@@ -414,8 +414,8 @@ mod tests {
     }
 
     // ---- #[derive(WaveWire)] ------------------------------------------------
-
-    use super::WaveWire;
+    // `WaveWire` (trait + derive macro, same name) is imported at the top of the
+    // module.
 
     #[derive(WaveWire, PartialEq, Debug)]
     struct Named {

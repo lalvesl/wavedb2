@@ -13,14 +13,14 @@ use core::fmt;
 
 use crate::id::Id;
 use crate::u48::U48;
-use crate::wire::WaveWire;
+use wavedb_wire::WaveWire;
 
 const FLAG_SHIFT: u32 = 15;
 const SALT_MASK: u16 = (1 << FLAG_SHIFT) - 1;
 
 /// Compact 80-bit record identifier — [`Id`] with `TENANT` removed.
 ///
-/// `Wire` is derived: `key` (8 LE bytes) then `lower` (2 LE bytes) = 10 bytes,
+/// `WaveWire` is derived: `key` (8 LE bytes) then `lower` (2 LE bytes) = 10 bytes,
 /// identical to the previous hand impl.
 #[derive(
     Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, WaveWire,
@@ -100,7 +100,7 @@ mod tests {
     use super::LocalId;
     use crate::id::Id;
     use crate::u48::U48;
-    use crate::wire::{Wire, from_wire, to_wire};
+    use crate::wire::{WaveWire, from_wire, to_wire};
 
     #[test]
     fn stack_size_is_10() {

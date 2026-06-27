@@ -4,7 +4,7 @@
 //! Core only declares the surface; the macro fills in `STRUCT_HASH`, `SHAPE`, and
 //! the generated `PivotId` for each declared object.
 
-use crate::wire::Wire;
+use crate::wire::WaveWire;
 
 /// The cardinality discipline of a `#[wavedb]` object.
 ///
@@ -34,7 +34,7 @@ impl Shape {
 /// `STRUCT_HASH` is `seahash(name + shape + field names + field types)` with a
 /// fixed seed. SeaHash is portable across architectures, so client and server
 /// agree on identity; any schema change yields a new value.
-pub trait WaveDbStruct: Wire {
+pub trait WaveDbStruct: WaveWire {
     /// Compile-time identity of this type and its schema generation.
     const STRUCT_HASH: u64;
 

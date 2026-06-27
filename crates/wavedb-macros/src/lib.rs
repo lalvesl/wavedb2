@@ -1,9 +1,9 @@
 //! WaveDB compile-time front door: `#[wavedb]` and `#[derive(WaveWire)]`.
 //!
-//! - **`#[derive(WaveWire)]`** emits a [`Wire`](wavedb_core::wire::Wire) impl for a
+//! - **`#[derive(WaveWire)]`** emits a [`WaveWire`](wavedb_core::wire::WaveWire) impl for a
 //!   struct (no serde, no `repr(C)`).
 //! - **`#[wavedb]`** turns a struct into a WaveDB object: it computes the
-//!   `STRUCT_HASH`, emits the `Wire` impl and the
+//!   `STRUCT_HASH`, emits the `WaveWire` impl and the
 //!   [`WaveDbStruct`](wavedb_core::traits::WaveDbStruct) impl, and — for
 //!   `NonUnique` shapes — generates the `PivotId` / `Pivot` collection types.
 //!
@@ -18,7 +18,7 @@ mod struct_hash;
 mod wavedb_attr;
 mod wire_derive;
 
-/// Derive [`Wire`](wavedb_core::wire::Wire) for a struct (named, tuple, or unit).
+/// Derive [`WaveWire`](wavedb_core::wire::WaveWire) for a struct (named, tuple, or unit).
 ///
 /// Field stack slots encode inline in declaration order; heap payloads append
 /// depth-first. See [`docs/wire_format.md`](../../../docs/wire_format.md).

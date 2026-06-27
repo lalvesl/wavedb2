@@ -19,8 +19,8 @@ code exists yet. Build order, roughly bottom-up:
   needed). Stack = 18 bytes (3×1 flag + 6 user + 8 device + 1 permission).
   `pivot_id` = owning Pivot back-link (NonUnique reindex); stamped at `insert`,
   `None` for Unique; outside `STRUCT_HASH`;
-- `Wire` trait + `WaveWire` derive (no serde, no `repr(C)`); see
-  `docs/wire_format.md`;
+- `WaveWire` trait + `#[derive(WaveWire)]` (trait + derive share the name, like
+  `Clone`; no serde, no `repr(C)`); see `docs/wire_format.md`;
 - index contracts in **core** (portable, `Store`-generic): `Store` (`get` +
   atomic `apply(batch)`), `IndexKey` (order-preserving key encoding),
   `Pivot` (`current`/`dead`/`secondaries` roots as `LocalId` — tenant stripped),
@@ -149,25 +149,26 @@ code exists yet. Build order, roughly bottom-up:
 
 # DONE
 
-- **`wavedb-wire`** — the `Wire` codec extracted into a standalone crate (only
+- **`wavedb-wire`** — the `WaveWire` codec extracted into a standalone crate (only
   `thiserror`): trait + `Cursor` + builtin impls + `to_wire`/`from_wire` + its own
   `Error`. No `STRUCT_HASH`, registry, `Id`, or engine coupling — pure value ⇄
   bytes, decode fails only on a buffer/size mismatch (`UnexpectedEof`) plus
-  intrinsic per-type checks. `wavedb-core` re-exports it as `wavedb_core::wire` and
-  wraps its `Error` via `#[from]`, so every existing path + the macros' `WaveWire`
-  derive (now targeting `wavedb_core::wire::Result`) keep working.
+  intrinsic per-type checks. The trait is named `WaveWire` (renamed from `Wire`);
+  trait + derive share the name like `Clone`. `wavedb-core` re-exports it as
+  `wavedb_core::wire` **and directly** at the crate root (`wavedb_core::WaveWire`),
+  and wraps its `Error` via `#[from]`, so every existing path keeps working.
 - **`wavedb-wire-derive`** — the wire crate's own `#[derive(WaveWire)]` proc-macro
   (serde/serde_derive pattern; re-exported as `wavedb_wire::WaveWire`), emitting
   `::wavedb_wire::` paths. Supports structs (named/tuple/unit) **and enums** (the
   canonical tag form — `tag u8 [+ payload-len u32]`, declaration-order tags). Used
-  to **replace the hand `Wire` impls** in core for `Id`, `LocalId`, `Metadata`, and
-  `PermissionRef` (byte-identical — existing roundtrip/length tests pass unchanged).
-  `U48` stays hand-written (6-byte 48-bit packing, not field-derivable). The older
-  `wavedb-macros::WaveWire` (emits `wavedb_core::wire` paths, struct-only) is left
-  for `#[wavedb]`; the two derives coexist by path target.
-- **`wavedb-core`** — `Id`, `LocalId`, `U48`, `Metadata`, `PermissionRef`, `Wire`
-  (re-exported from `wavedb-wire`; the first four derive it, `U48` hand-written),
-  `Error`. Plus the portable contracts: `WaveDbStruct` +
+  to **replace the hand `WaveWire` impls** in core for `Id`, `LocalId`, `Metadata`,
+  and `PermissionRef` (byte-identical — existing roundtrip/length tests pass
+  unchanged). `U48` stays hand-written (6-byte 48-bit packing, not field-derivable).
+  The older `wavedb-macros::WaveWire` (emits `wavedb_core::wire` paths, struct-only)
+  is left for `#[wavedb]`; the two derives coexist by path target.
+- **`wavedb-core`** — `Id`, `LocalId`, `U48`, `Metadata`, `PermissionRef`,
+  `WaveWire` (re-exported from `wavedb-wire`, also at the crate root; the first four
+  derive it, `U48` hand-written), `Error`. Plus the portable contracts: `WaveDbStruct` +
   `Shape`, `Store` (+ `Write`), `LookupHooks`,
   and the `index` layer — `IndexKey` (order-preserving), `Bound`, `Pivot`, `BpTree`,
   `IdStreamExt` (intersect/union/except stream adapters).

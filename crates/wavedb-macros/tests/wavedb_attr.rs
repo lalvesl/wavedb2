@@ -1,4 +1,4 @@
-//! `#[wavedb]` produces a complete WaveDB object: identity, shape, `Wire`, and the
+//! `#[wavedb]` produces a complete WaveDB object: identity, shape, `WaveWire`, and the
 //! generated collection types for NonUnique.
 
 // These tests deliberately assert on compile-time consts to document the
@@ -7,7 +7,7 @@
 
 use wavedb_core::index::Pivot as _;
 use wavedb_core::traits::{Shape, WaveDbStruct};
-use wavedb_core::wire::{Wire, from_wire, to_wire};
+use wavedb_core::wire::{WaveWire, from_wire, to_wire};
 use wavedb_macros::wavedb;
 
 #[wavedb]

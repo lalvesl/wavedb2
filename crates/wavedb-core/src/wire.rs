@@ -12,6 +12,4 @@
 //! [`U48`](crate::U48), [`Metadata`](crate::Metadata),
 //! [`PermissionRef`](crate::PermissionRef)) live next to those types.
 
-pub use wavedb_wire::{
-    Cursor, Error, Result, WaveWire, Wire, from_wire, to_wire,
-};
+pub use wavedb_wire::{Cursor, Error, Result, WaveWire, from_wire, to_wire};

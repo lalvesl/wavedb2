@@ -7,7 +7,7 @@ use crate::u48::U48;
 use crate::wire::WaveWire;
 
 /// Per-record metadata. Injected alongside the record body; serialised through
-/// `Wire` like everything else.
+/// `WaveWire` like everything else.
 ///
 /// Modification IDs and `pivot_id` are `Option<LocalId>`:
 /// - `None` = no previous/next version, or a Unique record (no pivot).
@@ -31,7 +31,7 @@ pub struct Metadata {
     pub permission: Option<PermissionRef>,
 }
 
-// `Wire` is derived field-by-field in declaration order: three `Option<LocalId>`
+// `WaveWire` is derived field-by-field in declaration order: three `Option<LocalId>`
 // (1 byte each) + `U48` (6) + `u64` (8) + `Option<PermissionRef>` (1) = 18-byte
 // stack; heap grows only for the `Some` fields. Byte-identical to the prior hand
 // impl.
@@ -42,7 +42,7 @@ mod tests {
     use crate::local_id::LocalId;
     use crate::permission::PermissionRef;
     use crate::u48::U48;
-    use crate::wire::{Wire, from_wire, to_wire};
+    use crate::wire::{WaveWire, from_wire, to_wire};
 
     fn roundtrip(m: &Metadata) {
         let bytes = to_wire(m);

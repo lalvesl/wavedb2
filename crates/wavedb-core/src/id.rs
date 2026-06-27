@@ -23,7 +23,7 @@ const SALT_MASK: u128 = (1 << SALT_BITS) - 1;
 
 /// A 128-bit composite record identifier.
 ///
-/// `Wire` is derived: a tuple struct over `u128`, so it encodes as the inner
+/// `WaveWire` is derived: a tuple struct over `u128`, so it encodes as the inner
 /// `u128`'s 16 little-endian bytes — identical to the previous hand impl.
 #[derive(
     Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, WaveWire,

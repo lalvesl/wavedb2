@@ -24,7 +24,7 @@ pub fn nonunique_types(
     let pivot_id = format_ident!("{}PivotId", name);
     let pivot = format_ident!("{}Pivot", name);
 
-    // `struct {Name}PivotId(pub LocalId);` — Wire by delegation to LocalId.
+    // `struct {Name}PivotId(pub LocalId);` — WaveWire by delegation to LocalId.
     let pivot_id_def: syn::DeriveInput = parse_quote! {
         #[derive(::core::clone::Clone, ::core::marker::Copy,
                  ::core::cmp::PartialEq, ::core::cmp::Eq,
@@ -35,7 +35,7 @@ pub fn nonunique_types(
 
     // `struct {Name}Pivot { current, dead, secondaries: [LocalId; N] }`.
     // `#[repr(C)]` keeps a clean layout when `N == 0` (a trailing zero-sized array
-    // is otherwise a lint footgun); Wire never depends on the repr.
+    // is otherwise a lint footgun); WaveWire never depends on the repr.
     let pivot_def: syn::DeriveInput = parse_quote! {
         #[repr(C)]
         #[derive(::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq,

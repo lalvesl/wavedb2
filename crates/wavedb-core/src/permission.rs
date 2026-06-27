@@ -12,7 +12,7 @@ use crate::wire::WaveWire;
 
 /// Access rule for a record. `None` (tenant-only) lives in the `Option` around it.
 ///
-/// `Wire` is derived. Because a variant carries fields, the encoding is the
+/// `WaveWire` is derived. Because a variant carries fields, the encoding is the
 /// canonical tag form — `tag (u8) + payload-length (u32)` in the stack, the
 /// active variant's fields as a self-contained unit in the heap — with tags by
 /// declaration order (`Public = 0`, `Tenants = 1`, `Group = 2`). Byte-identical
@@ -32,7 +32,7 @@ pub enum PermissionRef {
 mod tests {
     use super::PermissionRef;
     use crate::u48::U48;
-    use crate::wire::{Wire, from_wire, to_wire};
+    use crate::wire::{WaveWire, from_wire, to_wire};
 
     fn roundtrip(value: &PermissionRef) {
         let bytes = to_wire(value);

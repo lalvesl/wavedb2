@@ -3,7 +3,7 @@
 use core::fmt;
 
 use crate::error::{Error, Result};
-use crate::wire::{Cursor, Wire};
+use crate::wire::{Cursor, WaveWire};
 
 /// A `u64` constrained to 48 bits. Used for tenant and user identifiers.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -66,7 +66,7 @@ impl fmt::Display for U48 {
     }
 }
 
-impl Wire for U48 {
+impl WaveWire for U48 {
     const STACK_SIZE: usize = 6; // a true 48-bit field, no padding
     fn heap_size(&self) -> usize {
         0
@@ -75,7 +75,7 @@ impl Wire for U48 {
         stack.extend_from_slice(&self.0.to_le_bytes()[..6]);
     }
     fn encode_heap(&self, _heap: &mut Vec<u8>) {}
-    // `Result` in this file is the core workspace alias (for `U48::new`); the Wire
+    // `Result` in this file is the core workspace alias (for `U48::new`); the WaveWire
     // trait wants the wire crate's, so spell it out here.
     fn decode(
         stack: &mut Cursor,

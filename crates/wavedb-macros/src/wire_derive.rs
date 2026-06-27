@@ -1,4 +1,4 @@
-//! `#[derive(WaveWire)]` — emit a [`Wire`] impl for a struct.
+//! `#[derive(WaveWire)]` — emit a [`WaveWire`] impl for a struct.
 //!
 //! Field stack slots are encoded inline in declaration order; heap payloads append
 //! depth-first to the shared heap section. Decode reads the same field order. The
@@ -8,7 +8,7 @@
 //! Supports named-field, tuple, and unit structs. Enums and unions are rejected
 //! with a diagnostic (enum wire layout is emitted by `#[wavedb]`, not the derive).
 //!
-//! [`Wire`]: wavedb_core::wire::Wire
+//! [`WaveWire`]: wavedb_core::wire::WaveWire
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -41,7 +41,7 @@ pub fn derive(input: &DeriveInput) -> syn::Result<TokenStream> {
                 field_types.push(ty.clone());
                 accessors.push(quote!(self.#ident));
                 decoders.push(quote! {
-                    #ident: <#ty as ::wavedb_core::Wire>::decode(stack, heap)?
+                    #ident: <#ty as ::wavedb_core::WaveWire>::decode(stack, heap)?
                 });
             }
             quote!(Ok(Self { #(#decoders,)* }))
@@ -54,7 +54,7 @@ pub fn derive(input: &DeriveInput) -> syn::Result<TokenStream> {
                 field_types.push(ty.clone());
                 accessors.push(quote!(self.#idx));
                 decoders.push(quote! {
-                    <#ty as ::wavedb_core::Wire>::decode(stack, heap)?
+                    <#ty as ::wavedb_core::WaveWire>::decode(stack, heap)?
                 });
             }
             quote!(Ok(Self( #(#decoders,)* )))
@@ -63,20 +63,20 @@ pub fn derive(input: &DeriveInput) -> syn::Result<TokenStream> {
     };
 
     Ok(quote! {
-        impl #impl_generics ::wavedb_core::Wire for #name #ty_generics #where_clause {
+        impl #impl_generics ::wavedb_core::WaveWire for #name #ty_generics #where_clause {
             const STACK_SIZE: usize =
-                0 #( + <#field_types as ::wavedb_core::Wire>::STACK_SIZE )*;
+                0 #( + <#field_types as ::wavedb_core::WaveWire>::STACK_SIZE )*;
 
             fn heap_size(&self) -> usize {
-                0 #( + ::wavedb_core::Wire::heap_size(&#accessors) )*
+                0 #( + ::wavedb_core::WaveWire::heap_size(&#accessors) )*
             }
 
             fn encode_stack(&self, stack: &mut ::std::vec::Vec<u8>) {
-                #( ::wavedb_core::Wire::encode_stack(&#accessors, stack); )*
+                #( ::wavedb_core::WaveWire::encode_stack(&#accessors, stack); )*
             }
 
             fn encode_heap(&self, heap: &mut ::std::vec::Vec<u8>) {
-                #( ::wavedb_core::Wire::encode_heap(&#accessors, heap); )*
+                #( ::wavedb_core::WaveWire::encode_heap(&#accessors, heap); )*
             }
 
             fn decode(

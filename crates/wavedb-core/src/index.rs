@@ -19,7 +19,7 @@ use crate::id::Id;
 use crate::local_id::LocalId;
 use crate::store::Store;
 use crate::u48::U48;
-use crate::wire::Wire;
+use crate::wire::WaveWire;
 
 // ---- IndexKey: order-preserving encoding ------------------------------------
 
@@ -164,7 +164,7 @@ impl Bound {
 /// the engine reads. Root pointers are [`LocalId`] (tenant-scoped tree ⇒ `TENANT`
 /// derivable). No element counter — the `Pivot` is rewritten only when a `BpTree`
 /// root moves.
-pub trait Pivot: Wire + Sized {
+pub trait Pivot: WaveWire + Sized {
     /// Root of the living-records B+tree.
     fn current(&self) -> LocalId;
     /// Root of the deleted-records B+tree.

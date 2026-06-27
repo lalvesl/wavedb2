@@ -1,4 +1,4 @@
-//! `#[derive(WaveWire)]` — emit a [`Wire`] impl, the companion proc-macro of the
+//! `#[derive(WaveWire)]` — emit a [`WaveWire`] impl, the companion proc-macro of the
 //! [`wavedb-wire`] crate (re-exported as `wavedb_wire::WaveWire`).
 //!
 //! It generates everything through absolute `::wavedb_wire::` paths, so it works
@@ -17,7 +17,7 @@
 //!
 //! Unions are rejected.
 //!
-//! [`Wire`]: https://docs.rs/wavedb-wire
+//! [`WaveWire`]: https://docs.rs/wavedb-wire
 //! [`wavedb-wire`]: https://docs.rs/wavedb-wire
 
 use proc_macro::TokenStream;
@@ -28,7 +28,7 @@ use syn::{
     spanned::Spanned,
 };
 
-/// Derive [`Wire`](wavedb_wire::Wire) for a struct or enum.
+/// Derive [`WaveWire`](wavedb_wire::WaveWire) for a struct or enum.
 #[proc_macro_derive(WaveWire)]
 pub fn wave_wire(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -48,7 +48,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     }
 }
 
-/// Wrap the four `Wire` method bodies in the trait impl for `input`.
+/// Wrap the four `WaveWire` method bodies in the trait impl for `input`.
 fn wire_impl(
     input: &DeriveInput,
     stack_size: &TokenStream2,
@@ -61,7 +61,7 @@ fn wire_impl(
     let (impl_generics, ty_generics, where_clause) =
         input.generics.split_for_impl();
     quote! {
-        impl #impl_generics ::wavedb_wire::Wire for #name #ty_generics #where_clause {
+        impl #impl_generics ::wavedb_wire::WaveWire for #name #ty_generics #where_clause {
             const STACK_SIZE: usize = #stack_size;
 
             fn heap_size(&self) -> usize { #heap_size }
@@ -98,7 +98,7 @@ fn expand_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream2 {
                     let ty = &f.ty;
                     field_types.push(ty.clone());
                     accessors.push(quote!(self.#ident));
-                    quote!(#ident: <#ty as ::wavedb_wire::Wire>::decode(stack, heap)?)
+                    quote!(#ident: <#ty as ::wavedb_wire::WaveWire>::decode(stack, heap)?)
                 })
                 .collect();
             quote!(::core::result::Result::Ok(Self { #(#decoders,)* }))
@@ -113,7 +113,7 @@ fn expand_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream2 {
                     let ty = &f.ty;
                     field_types.push(ty.clone());
                     accessors.push(quote!(self.#idx));
-                    quote!(<#ty as ::wavedb_wire::Wire>::decode(stack, heap)?)
+                    quote!(<#ty as ::wavedb_wire::WaveWire>::decode(stack, heap)?)
                 })
                 .collect();
             quote!(::core::result::Result::Ok(Self( #(#decoders,)* )))
@@ -122,13 +122,13 @@ fn expand_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream2 {
     };
 
     let stack_size =
-        quote!(0 #( + <#field_types as ::wavedb_wire::Wire>::STACK_SIZE )*);
+        quote!(0 #( + <#field_types as ::wavedb_wire::WaveWire>::STACK_SIZE )*);
     let heap_size =
-        quote!(0 #( + ::wavedb_wire::Wire::heap_size(&#accessors) )*);
+        quote!(0 #( + ::wavedb_wire::WaveWire::heap_size(&#accessors) )*);
     let encode_stack =
-        quote!(#( ::wavedb_wire::Wire::encode_stack(&#accessors, stack); )*);
+        quote!(#( ::wavedb_wire::WaveWire::encode_stack(&#accessors, stack); )*);
     let encode_heap =
-        quote!(#( ::wavedb_wire::Wire::encode_heap(&#accessors, heap); )*);
+        quote!(#( ::wavedb_wire::WaveWire::encode_heap(&#accessors, heap); )*);
 
     wire_impl(
         input,
@@ -142,7 +142,7 @@ fn expand_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream2 {
 
 // ---- enums ------------------------------------------------------------------
 
-/// The four per-variant `match`-arm sets that drive an enum's `Wire` methods.
+/// The four per-variant `match`-arm sets that drive an enum's `WaveWire` methods.
 #[derive(Default)]
 struct EnumArms {
     heap_size: Vec<TokenStream2>,    // self -> active variant's payload size
@@ -180,7 +180,7 @@ fn expand_enum(
                     let __tag: u8 = match self { #(#tag,)* };
                     stack.push(__tag);
                     stack.extend_from_slice(
-                        &(::wavedb_wire::Wire::heap_size(self) as u32).to_le_bytes(),
+                        &(::wavedb_wire::WaveWire::heap_size(self) as u32).to_le_bytes(),
                     );
                 },
                 quote!(match self { #(#encode_heap,)* }),
@@ -307,24 +307,24 @@ fn push_field_variant_arms<I, F>(
     F: FnOnce(Vec<TokenStream2>) -> TokenStream2,
 {
     let hs = binds.iter().zip(tys).map(|(b, ty)| {
-        quote!(<#ty as ::wavedb_wire::Wire>::STACK_SIZE
-            + ::wavedb_wire::Wire::heap_size(#b))
+        quote!(<#ty as ::wavedb_wire::WaveWire>::STACK_SIZE
+            + ::wavedb_wire::WaveWire::heap_size(#b))
     });
     arms.heap_size.push(quote!(#bind_pat => 0 #( + #hs )*));
     arms.tag.push(quote!(#tag_pat => #tag));
 
     let enc_stacks = binds
         .iter()
-        .map(|b| quote!(::wavedb_wire::Wire::encode_stack(#b, heap);));
+        .map(|b| quote!(::wavedb_wire::WaveWire::encode_stack(#b, heap);));
     let enc_heaps = binds
         .iter()
-        .map(|b| quote!(::wavedb_wire::Wire::encode_heap(#b, heap);));
+        .map(|b| quote!(::wavedb_wire::WaveWire::encode_heap(#b, heap);));
     arms.encode_heap
         .push(quote!(#bind_pat => { #(#enc_stacks)* #(#enc_heaps)* }));
 
     let decoders: Vec<_> = tys
         .iter()
-        .map(|ty| quote!(<#ty as ::wavedb_wire::Wire>::decode(&mut __sc, &mut __hc)?))
+        .map(|ty| quote!(<#ty as ::wavedb_wire::WaveWire>::decode(&mut __sc, &mut __hc)?))
         .collect();
     let variant_expr = build(decoders);
     arms.decode.push(unit_decode_arm(tag, tys, &variant_expr));
@@ -341,7 +341,7 @@ fn unit_decode_arm(
     quote! {
         #tag => {
             let __stack_size = 0usize
-                #( + <#field_types as ::wavedb_wire::Wire>::STACK_SIZE )*;
+                #( + <#field_types as ::wavedb_wire::WaveWire>::STACK_SIZE )*;
             if __payload.len() < __stack_size {
                 return ::core::result::Result::Err(
                     ::wavedb_wire::Error::UnexpectedEof,

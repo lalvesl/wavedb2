@@ -2,7 +2,7 @@
 
 Core primitives shared by **every** node kind and by proc-macro generated code:
 the composite `Id`, `STRUCT_HASH`, `Metadata`, the schema-evolution lookup hooks,
-permission refs, and the `Wire` serialization trait.
+permission refs, and the `WaveWire` serialization trait.
 **No I/O** — safe in WASM, in macros, everywhere.
 
 > For the project-wide idea and quickstart see the

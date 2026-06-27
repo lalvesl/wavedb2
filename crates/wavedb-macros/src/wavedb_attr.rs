@@ -3,14 +3,14 @@
 //! Turns a plain struct into a WaveDB object. For every struct it emits:
 //!
 //! - the original struct (with `#[wavedb::pivot(...)]` helper attributes stripped),
-//! - a [`Wire`] impl over the declared fields,
+//! - a [`WaveWire`] impl over the declared fields,
 //! - inherent `STRUCT_HASH` / `SHAPE` / `HAS_VALIDATE` / `HAS_PREPROCESS` consts,
 //! - a [`WaveDbStruct`] impl tying identity, shape, and the `PivotId` type together.
 //!
 //! For a `NonUnique` struct it additionally emits the generated `{Name}PivotId` and
 //! `{Name}Pivot` types (see [`crate::generated`]).
 //!
-//! [`Wire`]: wavedb_core::wire::Wire
+//! [`WaveWire`]: wavedb_wire::WaveWire
 //! [`WaveDbStruct`]: wavedb_core::traits::WaveDbStruct
 
 use proc_macro2::{Span, TokenStream};
