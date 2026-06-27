@@ -344,9 +344,11 @@ let big: Vec<Order> = orders_over(&db, 100).try_collect().await?; // or iterate 
 ```
 
 The registry that lets every node "know the structs" is **generated in
-`build.rs`** — a scanner walks the schema crate, finds every `#[wavedb]` struct,
-and emits an `Object` enum (`STRUCT_HASH` → variant) with static dispatch (no
-`dyn`) for wire-parse, the evolution hooks, and `Pivot`/`BpTree` access:
+`build.rs`** — a scanner walks the schema crate, finds every `#[wavedb]` struct
+(and `#[server]` function) and emits a **`match` on each `STRUCT_HASH`** — not a
+big `Object` enum — dispatching wire-parse, the evolution hooks, `Pivot`/`BpTree`
+access, and server-fn calls to a concrete, monomorphized arm (no `dyn`, no sum
+type):
 
 ```rust
 // build.rs
@@ -380,7 +382,7 @@ The full client API and object lifecycle live in
 | [`wavedb-wire`](crates/wavedb-wire/README.md)             | The standalone `WaveWire` codec — pure value ⇄ bytes, no `STRUCT_HASH`       | `WaveWire` trait, `to_wire`/`from_wire`, `#[derive(WaveWire)]`, decode = size-only failure                         |
 | [`wavedb-wire-derive`](crates/wavedb-wire-derive)         | `#[derive(WaveWire)]` proc-macro (re-exported by `wavedb-wire`)              | Struct + enum `WaveWire` codegen, `::wavedb_wire::` paths                                                          |
 | [`wavedb-core`](crates/wavedb-core/README.md)             | `Id`, `Metadata`, `STRUCT_HASH`, schema-evolution hooks, permissions, wire   | ID layout, struct-hash identity, **schema evolution**                                                              |
-| [`wavedb-macros`](crates/wavedb-macros/README.md)         | `#[wavedb]`, `#[server]`, build.rs registry, auto-generated `Pivot`/`BpTree` | Object declaration, `STRUCT_HASH` derivation, generated `Object` enum                                              |
+| [`wavedb-macros`](crates/wavedb-macros/README.md)         | `#[wavedb]`, `#[server]`, build.rs registry, auto-generated `Pivot`/`BpTree` | Object declaration, `STRUCT_HASH` derivation, per-hash `match` dispatch                                            |
 | [`wavedb-storage`](crates/wavedb-storage/README.md)       | The per-node engine                                                          | **Block manager, per-`STRUCT_HASH` page directory, linear hashing**, pages, dictionaries, journal + cache pipeline |
 | [`wavedb-quick-node`](crates/wavedb-quick-node/README.md) | Serving/storage node                                                         | Tenant write-ownership ring, replication, routing/failover, node-side validation                                   |
 | [`wavedb-net`](crates/wavedb-net/README.md)               | Transport                                                                    | WebSocket / HTTP queue, Bloom screen-sync                                                                          |
@@ -406,7 +408,7 @@ moment**; their crates are intentionally absent for now.
 ## Implementation language
 
 Rust — the `#[wavedb]` proc-macro computes `STRUCT_HASH` and enforces ID/Metadata
-structure at compile time. The `Wire` format defines the byte layout explicitly
+structure at compile time. The `WaveWire` format defines the byte layout explicitly
 (no `repr(C)`, no serde — the macro emits the encode/decode), `async` end to end,
 and the same source compiles to native (Tokio, filesystem)
 and browser (WASM via `wasm_bindgen_futures`, `fetch`, `gloo_net`, IndexedDB).

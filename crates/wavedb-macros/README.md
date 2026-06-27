@@ -15,10 +15,10 @@ because both compile this crate.
 | Module              | Responsibility                                                  |
 | ------------------- | --------------------------------------------------------------- |
 | `lib`               | The `#[wavedb]` and `#[server]` macro entry points.             |
-| `server`            | `#[server]`: server body + client stub + `FN_HASH`.             |
+| `server`            | `#[server]`: server body + client stub + composed `STRUCT_HASH`. |
 | `args`              | Parse `#[wavedb(...)]` attribute arguments.                     |
 | `struct_hash`       | Compute the `STRUCT_HASH: u64` const from name/shape/fields.    |
-| `wire_derive`       | `WaveWire` — the no-serde, no-`repr(C)` `Wire` impl.            |
+| `wire_derive`       | `WaveWire` — the no-serde, no-`repr(C)` `WaveWire` impl.            |
 | `generated`         | Auto-emit the per-NonUnique `Pivot` + `BpTree` types.           |
 | `crud`              | Generated accessors / CRUD glue.                                |
 | `codegen` / `utils` | Shared emit helpers.                                            |
@@ -42,7 +42,7 @@ because both compile this crate.
 2. **Implements `Id` + `Metadata` accessors.** `.tenant_id()`, `.key()`,
    `.created_at()`, `.struct_hash()`, plus full `Metadata` getters/setters — no
    call-site boilerplate.
-3. **Emits the `Wire` impl.** Byte layout is defined explicitly by `WaveWire`
+3. **Emits the `WaveWire` impl.** Byte layout is defined explicitly by `WaveWire`
    (see `docs/wire_format.md`) — no `serde`, no `repr(C)`. The macro decides
    every field's stack/heap placement, so layout never depends on the Rust
    compiler's struct representation.
@@ -70,7 +70,7 @@ pub struct AboutUser {
 }
 ```
 
-All `#[wavedb]` structs serialize through WaveDB's own `Wire` format; the hook
+All `#[wavedb]` structs serialize through WaveDB's own `WaveWire` format; the hook
 fns are generic over `Db` so the macro's `__WaveDbDb` parameter resolves at the
 call site.
 
@@ -214,7 +214,7 @@ pure; hook-less types skip decode entirely via compile-time `HAS_VALIDATE` /
 The replacement for a query DSL, and the "backend" half of full-stack. A server
 function is an `async fn` whose **body exists only on the server** (it has DB
 access) but which the client can **call** as if it were local. `#[server]`
-generates the binding; arguments and the return value travel through `Wire` over
+generates the binding; arguments and the return value travel through `WaveWire` over
 [`wavedb-net`](../wavedb-net/README.md).
 
 ```rust
@@ -232,23 +232,31 @@ What the macro emits:
 
 | Side               | What is compiled                                                                                                                                                                                                                   |
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Server** (`cfg`) | The real body + a registry entry under a stable `FN_HASH` so the node can dispatch an incoming call.                                                                                                                               |
-| **Client** (`cfg`) | A stub with the **same signature**: `Wire`-encode the args → send `CallServerFn { fn_hash, args }` over `wavedb-net` → `Wire`-decode the return. The body is **not** in the binary (keeps wasm small, keeps server logic private). |
+| **Server** (`cfg`) | The real body + a dispatch arm under the function's own `STRUCT_HASH` (below) so the node can route an incoming call.                                                                                                              |
+| **Client** (`cfg`) | A stub with the **same signature**: `WaveWire`-encode the args → send `CallServerFn { struct_hash, args }` over `wavedb-net` → `WaveWire`-decode the return. The body is **not** in the binary (keeps wasm small, keeps server logic private). |
 
-- **`FN_HASH: u64`** — a compile-time hash of the function name + argument types +
-  return type (same idea as `STRUCT_HASH`), so client and server agree on identity
-  and a signature change is a new function, caught at the boundary.
-- **Wire bounds** — every argument and the return type must implement `Wire`; the
+- **A function has a `STRUCT_HASH: u64` too — there is no separate `FN_HASH`.** It
+  is computed at compile time by the **same SeaHash + fixed four-lane WaveDB seed**
+  as a struct's, but **composed from its input/output objects' `STRUCT_HASH`es**:
+  `seahash_wavedb(fn_name + each ARG::STRUCT_HASH + RETURN::STRUCT_HASH)`. Builtin
+  args (`u64`, `String`, …) fold a fixed per-type wire tag so the whole expression
+  stays a `const`. Because an argument object's hash is folded in, **evolving any
+  input type's schema changes that object's `STRUCT_HASH` and therefore the
+  function's** — schema evolution propagates transitively into the call identity,
+  and a signature change is a new function, caught at the boundary. Functions and
+  structs share **one uniform `STRUCT_HASH` space**, routed by the same
+  per-`STRUCT_HASH` `match`.
+- **Wire bounds** — every argument and the return type must implement `WaveWire`; the
   `db: &Db` receiver is supplied by the node, never sent. A collection-shaped
-  return is an `impl Stream<Item = Result<T>>` whose **item** `T: Wire` — the macro
+  return is an `impl Stream<Item = Result<T>>` whose **item** `T: WaveWire` — the macro
   ships items one at a time over the wire (back-pressured), and the client stub
   re-exposes the same async iterator instead of buffering a `Vec`.
 - **Security** — the body runs on the node, so permission checks and validation
   apply there; the client cannot bypass them by crafting a request, only call the
   declared function with typed arguments.
 
-Server functions are collected into the registry alongside objects (below), so a
-node links them the same way it links the schema.
+Server functions are aggregated into the same per-`STRUCT_HASH` dispatch as
+structs (below), so a node links them the same way it links the schema.
 
 ---
 
@@ -260,15 +268,16 @@ The registry that lets **storage, server, and client all "know the structs"** is
 **Division of labor (the two halves).**
 
 - **`#[wavedb]` (proc-macro)** does all the _per-struct_ work, in place: it emits
-  the struct's `STRUCT_HASH` const, its `Wire` impl, its generated `PivotId` /
+  the struct's `STRUCT_HASH` const, its `WaveWire` impl, its generated `PivotId` /
   `Pivot` / `BpTree` types, accessors, and hook wiring. Each struct is fully
   self-contained after the macro runs.
 - **`build.rs` (`wavedb_build::generate_registry`)** does the _aggregation_: it
-  scans the crate's own `src/`, finds every `#[wavedb]` item, and emits a module
-  that **references the macro-generated paths** — building the `Object` enum and
-  the `match` arms like `module::SomeStruct::STRUCT_HASH => module::SomeStruct::decode(…)`.
-  It generates no per-struct logic; it just wires the already-defined pieces into
-  one dispatch table.
+  scans the crate's own `src/`, finds every `#[wavedb]` struct **and `#[server]`
+  function**, and emits a module that **references the macro-generated paths** —
+  one `match struct_hash { … }` per operation, with arms like
+  `module::SomeStruct::STRUCT_HASH => decode::<module::SomeStruct>(bytes)`. It
+  generates no per-struct logic; it just wires the already-defined pieces into the
+  dispatch. There is **no `Object` enum** — see below.
 
 ```rust
 // build.rs
@@ -297,41 +306,49 @@ file system to _discover_ structs at all): build-scan auto-collects everything
 written under `src/`, at the cost of not seeing across crate / macro / cfg
 boundaries.
 
-### The generated `Object` enum
+### Dispatch: a `match` on `STRUCT_HASH` — no sum type
 
-The core artifact is one enum, **one variant per declared struct, keyed by
-`STRUCT_HASH`**:
+The aggregated artifact is **not** an enum with one variant per struct. A sum type
+like that is sized to its largest variant (memory waste), grows and recompiles as
+the schema grows, and forces every consumer to handle every variant — it does not
+scale. Instead build.rs emits, **per operation, one `match` on the 64-bit
+`STRUCT_HASH`** whose arms decode into the **concrete** type *inside the arm*, do
+the work, and return a uniform result. The concrete type never escapes the arm, so
+there is **no `Object` value, no trait object, no `dyn`** — only monomorphized
+calls the optimiser sees through:
 
 ```rust
-// Variants reference the structs by their src/ path; arms use the macro-emitted
-// `STRUCT_HASH` const and `Wire` impl — build.rs writes the wiring, not the logic.
-pub enum Object { AboutUser(crate::user::AboutUser), Note(crate::notes::Note), /* … */ }
-
-impl Object {
-    pub const fn struct_hash(&self) -> u64 { /* match self → path::Struct::STRUCT_HASH */ }
-    pub fn from_wire(hash: u64, bytes: &[u8]) -> Result<Object> {
-        match hash {
-            crate::user::AboutUser::STRUCT_HASH => Ok(Object::AboutUser(from_wire(bytes)?)),
-            crate::notes::Note::STRUCT_HASH     => Ok(Object::Note(from_wire(bytes)?)),
-            _ => Err(/* unknown hash */),
-        }
+// build.rs-generated — no `Object` enum. One `match` per operation; structs and
+// server functions live in the SAME `STRUCT_HASH` space.
+pub fn decode_validate(struct_hash: u64, bytes: &[u8]) -> wavedb_core::Result<()> {
+    match struct_hash {
+        crate::user::AboutUser::STRUCT_HASH => validate::<crate::user::AboutUser>(bytes),
+        crate::notes::Note::STRUCT_HASH     => validate::<crate::notes::Note>(bytes),
+        crate::srv::login::STRUCT_HASH      => call::<crate::srv::login>(bytes), // server fn
+        _ => Err(wavedb_core::Error::UnknownStruct(struct_hash)),
     }
-    pub fn to_wire(&self) -> Vec<u8> { /* match self → to_wire(inner) */ }
+}
+
+// Each arm's helper is generic — instantiated once per matched type, nothing boxed.
+fn validate<T: WaveDbStruct>(bytes: &[u8]) -> wavedb_core::Result<()> {
+    T::validate(&wavedb_core::from_wire::<T>(bytes)?)
 }
 ```
 
-Everything dispatches on this enum by `match` — **no `dyn`, no trait objects**.
-From a `STRUCT_HASH` (read off the wire envelope or the `Id`) the engine gets:
+From a `STRUCT_HASH` (read off the wire envelope or the `Id`) the generated matches
+give the engine, each as its own `match`:
 
-- the right **wire parser** (`Object::from_wire`);
-- the server-side **hooks** — `first_try(hash, db, …)` and
-  `fallback_not_found(hash, db, …)` route to the declared struct's fns;
+- the right **wire parser** — decode `bytes` into the concrete `T`;
+- the server-side **hooks** — `first_try(struct_hash, db, …)` /
+  `fallback_not_found(struct_hash, db, …)` route to the declared struct's fns;
 - the matching generated **`Pivot` / `BpTree`** types for a collection;
-- the **server functions** (`FN_HASH` → call), accumulated the same way.
+- the **server-function call** — the *same hash space*: a `STRUCT_HASH` arm decodes
+  the `WaveWire` args and invokes the node-side body.
 
-Because it is plain generated code spliced in with `include!`, it monomorphises
-fully — every arm is a concrete type, the optimiser sees through it, and the same
-enum compiles into client, server, and wasm: the single source of truth.
+Because each is plain generated code spliced in with `include!`, every arm is a
+concrete type the optimiser monomorphizes fully, and the same matches compile into
+client, server, and wasm — the single source of truth, with no per-struct
+descriptor table and no sum type to size or maintain.
 
 > **Planned (future).** The generator is the natural place to grow, by static
 > dispatch (still no `dyn`):

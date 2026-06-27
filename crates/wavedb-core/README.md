@@ -243,17 +243,22 @@ the node with DB access and is called by a typed client binding (see
 ## Registry
 
 The **registry that maps a `STRUCT_HASH` to its type is generated in `build.rs`**,
-not here: a scanner walks the schema crate, finds every `#[wavedb]` struct, and
-emits a generated `Object` enum (`STRUCT_HASH` → variant) spliced in with
-`include!(concat!(env!("OUT_DIR"), …))`. **The enum *is* the registry** — its
-inherent `from_wire` / `to_wire` / `struct_hash` methods, the `first_try` /
-`fallback_not_found` hooks, and the generated `Pivot`/`BpTree` accessors all
-dispatch by a `match` on the hash: **no `dyn`, no runtime registration, no
+not here: a scanner walks the schema crate, finds every `#[wavedb]` struct **and
+`#[server]` function**, and emits — spliced in with `include!(concat!(env!("OUT_DIR"),
+…))` — **one `match` on the 64-bit `STRUCT_HASH` per operation**, *not* an `Object`
+enum. **The matches *are* the registry**: `from_wire` / `to_wire`, the `first_try` /
+`fallback_not_found` hooks, the generated `Pivot`/`BpTree` accessors, and the
+server-function call all dispatch by `match struct_hash { … }` to a **concrete,
+monomorphized** arm — **no sum type, no `dyn`, no runtime registration, no
 descriptor table**. Per-type static facts (`STACK_SIZE`, `SHAPE`) are inherent
 `const`s on the struct, reached through the matched arm's concrete type — not a
-duplicated data table. The generated `Object` carries a hand-written `Debug` that
-prints the `STRUCT_HASH` (no stored name, no `T: Debug` bound). The mechanism lives
-in [`wavedb-macros` § the registry](../wavedb-macros/README.md#the-registry--generated-in-buildrs).
+duplicated data table. A sum type with one variant per struct is deliberately
+avoided: it is sized to its largest variant and grows with the schema; a bare
+`match` to monomorphized arms costs nothing at runtime and scales to any schema
+size. Server functions share the **same `STRUCT_HASH` space** — a function's hash
+is composed by SeaHash from its argument/return objects' `STRUCT_HASH`es, so there
+is **no separate `FN_HASH`**. The mechanism lives in
+[`wavedb-macros` § the registry](../wavedb-macros/README.md#the-registry--generated-in-buildrs).
 
 ---
 

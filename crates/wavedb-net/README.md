@@ -5,7 +5,7 @@ separate REST/RPC layer, no DTO split, no API schema to keep in sync with
 storage. Whatever the client serializes — a CRUD request or a server-function
 call — the server deserializes straight into the engine. Both record operations
 (`get`/`save`/`insert`/`remove`/collection walk) and **server-function calls**
-(`CallServerFn { fn_hash, Wire args }`) ride the same `Transport`. Collection
+(`CallServerFn { struct_hash, Wire args }`) ride the same `Transport`. Collection
 reads (`all` / `by_field`) and collection-returning server fns are **async
 iterators**: the node streams record items back as a sequence of frames rather
 than buffering a whole `Vec`, so the client can stop early.

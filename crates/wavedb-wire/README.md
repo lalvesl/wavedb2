@@ -1,70 +1,56 @@
 # wavedb-wire
 
-The standalone **`WaveWire` codec** — pure value ⇄ bytes, zero WaveDB coupling.
+A small, standalone **`WaveWire` codec**: turn a value into bytes and back.
 
-> For the project-wide idea and quickstart see the
-> [root README](../../readme.md). For how the layout is specified see
-> [`docs/wire_format.md`](../../docs/wire_format.md).
+```rust
+let bytes: Vec<u8> = wavedb_wire::to_wire(&value);        // T       -> Vec<u8>
+let value: T       = wavedb_wire::from_wire::<T>(&bytes)?; // Vec<u8> -> T
+```
 
-## What it is
+That is the whole job. The crate has **one** dependency (`thiserror`).
 
-`wavedb-wire` is the `WaveWire` trait plus its built-in impls (scalars, `bool`,
-`char`, `String`, `Vec`, `Option`, arrays, tuples), the two free functions, and a
-`#[derive(WaveWire)]`. The trait and the derive share the name `WaveWire` (the
-same-name pattern as `Clone`):
+## The trait and the derive
+
+`WaveWire` is the trait every encodable type implements; `#[derive(WaveWire)]`
+generates it. The trait and the derive share the name (the same pattern as
+`Clone`):
 
 ```rust
 #[derive(wavedb_wire::WaveWire)]
 struct Point { x: u64, y: u64 }
-
-let bytes: Vec<u8> = wavedb_wire::to_wire(&value);
-let value: T       = wavedb_wire::from_wire::<T>(&bytes)?;
 ```
 
-That is the whole surface. The crate knows nothing about the rest of WaveDB.
-
-### `#[derive(WaveWire)]`
-
-Re-exported from the companion proc-macro crate
-[`wavedb-wire-derive`](../wavedb-wire-derive) (the serde / serde_derive split — a
-proc-macro must live in its own crate). It generates a `WaveWire` impl for:
+Built-in impls cover the common types: integers and floats, `bool`, `char`,
+`String`, `Vec`, `Option`, arrays, and tuples. The derive handles:
 
 - **structs** — named, tuple, or unit: fields encode in declaration order.
-- **enums** — the canonical tag form. All variants field-less ⇒ a single `u8`
-  tag; any variant with fields ⇒ `tag (u8) + payload-length (u32)` in the stack
-  and the active variant's fields as a unit in the heap. Tags are the variant
-  declaration order.
+- **enums** — all variants field-less ⇒ a single `u8` tag; any variant with
+  fields ⇒ `tag (u8) + payload length (u32)` plus the active variant's fields.
+  Tags follow variant declaration order.
 
 The derive emits absolute `::wavedb_wire::` paths, so it works from any crate that
 depends on `wavedb-wire`.
 
-## What it deliberately does *not* do
+## Layout
 
-- **No `STRUCT_HASH`, no registry, no envelope.** The bytes carry no type
-  identity. `from_wire::<T>` does not check "is this really a `T`?" — it just
-  reads a `T` out of the buffer. Type identity / dispatch is a higher layer
-  (`wavedb-core` + the generated `Object` enum), not this one.
-- **No type validation.** The only ways a decode fails are layout/shape
-  mismatches: the buffer is **too short for the type's size**
-  (`Error::UnexpectedEof` — the dominant case) or an intrinsic per-type check
-  trips (`InvalidBool`, `InvalidChar`, `Utf8`, `InvalidTag`).
+A value is two contiguous parts:
 
-So decoding the wrong type against a long-enough buffer does not error — it
-yields some other value. Distinguishing types is the caller's job (it picks `T`).
+```
+[ STACK — T::STACK_SIZE bytes, fixed ][ HEAP — variable ]
+```
 
-## Layout (one-line recap)
-
-A value is `[ STACK (T::STACK_SIZE bytes, fixed) ][ HEAP (variable) ]`. Every
-fixed-width field is packed little-endian in the stack at a compile-time offset;
-dynamic fields keep a `u32` length / flag slot in the stack and put their payload
-in the heap. Serialisation allocates once. Full spec in
+Fixed-width fields pack little-endian into the stack at compile-time offsets;
+dynamic fields (`String`, `Vec`, …) keep a `u32` length slot in the stack and put
+their payload in the heap, so serialisation allocates once. Full spec in
 [`docs/wire_format.md`](../../docs/wire_format.md).
 
-## Relationship to `wavedb-core`
+## What it does *not* do
 
-`wavedb-core` depends on this crate and re-exports it as `wavedb_core::wire`, so
-existing `wavedb_core::wire::{Wire, Cursor, to_wire, from_wire}` paths and the
-`#[derive(WaveWire)]` codegen keep working unchanged. `wavedb_core::Error` wraps
-this crate's `Error` (`#[from]`). The `WaveWire` impls for WaveDB's own types (`Id`,
-`LocalId`, `U48`, `Metadata`, `PermissionRef`, …) live in `wavedb-core`, where
-those types are defined.
+- **The bytes carry no type tag.** `from_wire::<T>` does not check "is this really
+  a `T`?" — it just reads a `T` out of the buffer. Picking the right `T` is the
+  caller's job; this crate only moves bytes.
+- **No validation beyond layout.** A decode fails only on a size/shape mismatch:
+  the buffer is too short (`Error::UnexpectedEof`, the common case) or an intrinsic
+  per-type check trips (`InvalidBool`, `InvalidChar`, `Utf8`, `InvalidTag`).
+  Decoding the wrong type against a long-enough buffer yields some other value, not
+  an error.

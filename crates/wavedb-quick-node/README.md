@@ -97,8 +97,8 @@ not a deployment.
 Every incoming write passes these gates **before the journal commit**:
 
 1. **Header check** — the record's `STRUCT_HASH` must be declared in
-   the generated registry (`Object` enum); unknown hashes refused.
-2. **Decode check** — the payload must parse as the declared type via `Wire`.
+   the generated registry (a per-hash `match` arm); unknown hashes refused.
+2. **Decode check** — the payload must parse as the declared type via `WaveWire`.
 3. **`validate`** — the same fn the client ran (catches bypassers / stale rules).
    This is the security boundary.
 4. **`preprocess`** — the re-encoded result replaces the client's bytes.
@@ -111,9 +111,10 @@ schema-blind behaviour (opaque bytes). Hook declaration lives in
 
 ## Server-function dispatch
 
-The registry also holds the `#[server]` functions. A `CallServerFn { fn_hash,
-Wire args }` request is dispatched by `FN_HASH` to the function's server-only
-body, which runs on the node with full DB access; the `Wire`-encoded return
+The registry also holds the `#[server]` functions. A `CallServerFn { struct_hash,
+Wire args }` request is dispatched by the function's `STRUCT_HASH` (composed from
+its argument/return objects' hashes — no separate `FN_HASH`) to the function's
+server-only body, which runs on the node with full DB access; the `WaveWire`-encoded return
 travels back over the same transport. A collection-returning fn **streams** its
 items back as a sequence of frames (an async iterator on the client) rather than
 buffering a whole `Vec`. There is no query DSL — filtered/derived reads are these

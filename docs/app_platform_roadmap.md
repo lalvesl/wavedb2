@@ -27,14 +27,15 @@ is the protocol.
 
 The `app-schema` crate (`#[wavedb]` structs + a `build.rs` that calls
 `wavedb_build::generate_registry`) builds for native and `wasm32`, producing
-`STRUCT_HASH`es, `Wire` impls, the auto-generated `Pivot`/`BpTree`
-types, and the generated `Object` enum (`STRUCT_HASH` → variant) spliced in with
-`include!`. This is the keystone — every other milestone consumes the registry,
-and the build-scanner + `Object` enum is what lets storage/server/client all know
-the structs by static dispatch (no `dyn`).
+`STRUCT_HASH`es, `WaveWire` impls, the auto-generated `Pivot`/`BpTree`
+types, and the generated **per-`STRUCT_HASH` `match` dispatch** (not an `Object`
+enum) spliced in with `include!`. This is the keystone — every other milestone
+consumes the registry, and the build-scanner + per-hash `match` is what lets
+storage/server/client all know the structs by static dispatch (no `dyn`, no sum
+type).
 
-**Exit:** the schema crate builds on both targets; `Object::from_wire(hash, …)`
-round-trips through the generated enum; `Wire` encode/decode is property-tested.
+**Exit:** the schema crate builds on both targets; `from_wire(struct_hash, …)`
+round-trips through the generated dispatch; `WaveWire` encode/decode is property-tested.
 
 ## M2 — Storage engine
 
@@ -59,7 +60,8 @@ through a registry-linked node; cross-tenant read without a grant is refused.
 `Db::connect`, typed CRUD (`UniqueObject` / `NonUniqueObject` over the `Store`
 trait), collection navigation through `PivotId`, `remove` → dead `BpTree`, and
 **server functions** (`#[server]`: server-only body + client
-binding, `Wire`-encoded args/return over `wavedb-net`, dispatched by `FN_HASH`) —
+binding, `WaveWire`-encoded args/return over `wavedb-net`, dispatched by the function's
+composed `STRUCT_HASH`) —
 the replacement for a query DSL. The `first_try` / `fallback_not_found` hooks
 bridge mixed-build clusters.
 
@@ -140,7 +142,7 @@ Versioning policy for the platform crates.
 ### Planned generator extensions (post-rebuild)
 
 The `build.rs` registry generator is the natural place to grow, all by static
-dispatch on the `Object` enum (no `dyn`):
+per-`STRUCT_HASH` `match` dispatch (no `dyn`, no sum type):
 
 - **`update_call`** — an additional generated call kind beside the server-function
   dispatch, for update-shaped operations.
@@ -163,7 +165,7 @@ M1 (schema) ─► M2 (storage) ─► M3 (node) ─► M4 (typed E2E) ─► M7
 
 | Risk                                                              | Mitigation                                                                                                                      |
 | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| Registry code grows the wasm binary as schemas grow               | The registry is just the `Object` enum + a `match`; the only per-struct code is the `Wire` encode/decode the app needs anyway — no descriptor tables, no stored names. M5 measures per-struct cost early. |
-| Server functions need stable identity across client/server builds | `FN_HASH` (name + arg types + return type) bound at compile time; a signature change is a new function, caught at the boundary. |
+| Registry code grows the wasm binary as schemas grow               | The registry is just a per-`STRUCT_HASH` `match` (no sum type — nothing sized to the largest variant); the only per-struct code is the `WaveWire` encode/decode the app needs anyway — no descriptor tables, no stored names. M5 measures per-struct cost early. |
+| Server functions need stable identity across client/server builds | A server fn's identity is a `STRUCT_HASH` (no separate `FN_HASH`) composed by SeaHash from its argument/return objects' `STRUCT_HASH`es, bound at compile time; a signature change — or a schema change to any argument type — is a new function, caught at the boundary. |
 | Runtime abstraction (tokio vs wasm) leaks into public API         | Keep it internal to `wavedb`/`wavedb-net`; public API stays `async fn`.                                                         |
 | ID / block-descriptor bit budgets                                 | Resolved: `Id` = `KEY u64·TENANT u48·FLAG 1·SALT 15`; descriptor `u40·u20·u4` (pages + dictionary).                             |

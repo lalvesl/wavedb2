@@ -38,14 +38,15 @@ code exists yet. Build order, roughly bottom-up:
 
 ## Registry generation (`wavedb-build` + `build.rs`)
 
-- division of labor: `#[wavedb]` does per-struct codegen (`STRUCT_HASH`, `Wire`,
+- division of labor: `#[wavedb]` does per-struct codegen (`STRUCT_HASH`, `WaveWire`,
   `PivotId`/`Pivot`/`BpTree`, hooks); `wavedb-build` only **aggregates**;
 - `generate_registry()` scans this crate's `src/` **only** (no deps, no `cfg`
   expansion, no macro-generated structs) and references macro-emitted paths
   (`module::Struct::STRUCT_HASH`); deps must re-export into `src/` to register;
-- emit `$OUT_DIR/wavedb_registry.rs`: `Object` enum (`STRUCT_HASH` → variant),
-  `Object::from_wire`/`to_wire`, hook routing (`first_try`/`fallback_not_found`),
-  `Pivot`/`BpTree` accessors, server-fn dispatch — static `match`, no `dyn`;
+- emit `$OUT_DIR/wavedb_registry.rs`: a per-`STRUCT_HASH` `match` (no `Object`
+  enum) for `from_wire`/`to_wire`, hook routing fot knowed types to(`first_try`/`fallback_not_found`),
+  `Pivot`/`BpTree` accessors, server-fn dispatch — static `match` to monomorphized
+  arms, no sum type, no `dyn`;
 - schema crate pulls it in with `include!(concat!(env!("OUT_DIR"), …))`.
 - _Future:_ `update_call` kind; secondary indexes via `#[wavedb::pivot(field)]` /
   `#[wavedb::pivot((f1, f2))]` (extra `BpTree` + `Pivot` root + `by_field` lookup).
@@ -60,7 +61,7 @@ code exists yet. Build order, roughly bottom-up:
 - **linear hashing** (`index` / `split_next`), 16 KiB first page, grow-in-place +
   background `split_next`;
 - `PageFormat` derive trait per page kind (Unique / NonUnique / Pivot / BpTree):
-  `crc32 + STRUCT_HASH + id-list + blob`, `Wire` ser/deser;
+  `crc32 + STRUCT_HASH + id-list + blob`, `WaveWire` ser/deser;
 - BpTree pages = **32 KiB** (8 × 4 KiB blocks); **one node per page**. Entry:
   `key (8 B) + LocalId (10 B) = 18 bytes` — same format for internal (child page)
   and leaf (record pointer). Capacity ≈ **1 819 entries/page**. Tree height:
@@ -105,17 +106,18 @@ code exists yet. Build order, roughly bottom-up:
 ## Server functions (`#[server]`) — replaces query
 
 - `#[server]` proc-macro: server-only async body + client call binding;
-- `FN_HASH` (name + arg types + return type) identity; args/return via `Wire`. A
+- a function's `STRUCT_HASH` (SeaHash over fn name + each arg/return object's
+  `STRUCT_HASH`, no separate `FN_HASH`) is its identity; args/return via `WaveWire`. A
   collection return is a `Stream<Item = Result<T>>` whose items ship one at a time
   (back-pressured), re-exposed as an async iterator client-side — not a buffered `Vec`;
-- transport `CallServerFn { fn_hash, args }` over `wavedb-net`; registry dispatch;
+- transport `CallServerFn { struct_hash, args }` over `wavedb-net`; registry dispatch;
 - body never enters the client binary; permission checks run in the body.
 
 ## Nodes & transport (`wavedb-quick-node`, `wavedb-net`)
 
 - **single node first** — durability = journal; ring/replication/failover deferred;
 - node-side enforcement gates (header → decode → validate → preprocess);
-- server-function dispatch by `FN_HASH`;
+- server-function dispatch by `STRUCT_HASH` (same per-hash `match` as structs);
 - WS / HTTP transports; Bloom screen-sync.
 
 ## Browser (`wavedb-wasm`)
@@ -153,7 +155,7 @@ code exists yet. Build order, roughly bottom-up:
   `thiserror`): trait + `Cursor` + builtin impls + `to_wire`/`from_wire` + its own
   `Error`. No `STRUCT_HASH`, registry, `Id`, or engine coupling — pure value ⇄
   bytes, decode fails only on a buffer/size mismatch (`UnexpectedEof`) plus
-  intrinsic per-type checks. The trait is named `WaveWire` (renamed from `Wire`);
+  intrinsic per-type checks. The trait is named `WaveWire` (renamed from `WaveWire`);
   trait + derive share the name like `Clone`. `wavedb-core` re-exports it as
   `wavedb_core::wire` **and directly** at the crate root (`wavedb_core::WaveWire`),
   and wraps its `Error` via `#[from]`, so every existing path keeps working.
@@ -173,18 +175,20 @@ code exists yet. Build order, roughly bottom-up:
   and the `index` layer — `IndexKey` (order-preserving), `Bound`, `Pivot`, `BpTree`,
   `IdStreamExt` (intersect/union/except stream adapters).
 - **`wavedb-macros`** — `#[derive(WaveWire)]` (named/tuple/unit) and `#[wavedb]`
-  (Unique/NonUnique): emits `STRUCT_HASH`, `Wire`, inherent consts
+  (Unique/NonUnique): emits `STRUCT_HASH`, `WaveWire`, inherent consts
   (`SHAPE`/`HAS_VALIDATE`/`HAS_PREPROCESS`), `WaveDbStruct`, and
   for NonUnique the generated `{Name}PivotId` + `{Name}Pivot`. `#[wavedb::pivot(...)]`
   parsed/stripped → secondary-index count. `#[server]` deferred to M4 (needs `Db`).
   - **`STRUCT_HASH` uses SeaHash (pinned crate)** — portable across arch/endianness so
     client and server agree on identity; the crate is version-pinned so identity can't drift.
-- **`wavedb-build`** — `generate_registry()` scans `src/`, emits the `Object` enum
-  (`from_wire`/`to_wire`/`struct_hash` + a `STRUCT_HASH`-printing `Debug`) — the enum
-  *is* the registry, no descriptor table. Generated code carries `#[allow(...)]` so it
-  never lints the user's crate.
+- **`wavedb-build`** — `generate_registry()` scans `src/`, emits the dispatch
+  (`from_wire`/`to_wire`/`struct_hash` + a `STRUCT_HASH`-printing `Debug`), no
+  descriptor table. Generated code carries `#[allow(...)]` so it never lints the
+  user's crate. _(Currently a single `Object` enum; **being replaced** by a
+  per-`STRUCT_HASH` `match` to monomorphized arms — no sum type — so the registry
+  scales with schema size and folds `#[server]` fns into the same hash space.)_
 - **`examples/schema-smoke`** — end-to-end M1 proof: `#[wavedb]` + `build.rs` +
-  `include!` → registry resolves + `Object` round-trips. (Real example; `todo-app`
+  `include!` → registry resolves + round-trips. (Real example; `todo-app`
   still needs M4 `#[server]`/`Db`.)
 - **`wavedb-storage` foundations** — `block` (`BlockDescriptor` u40·u20·u4 packing,
   `Run`, `BlockAllocator`: best-fit alloc / coalescing free / tail truncate) and

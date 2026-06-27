@@ -14,7 +14,7 @@ The whole flow in one line each:
 
 Every read is `get` / `::all` / a `#[server]` function — there is **no query
 DSL**. Every server-function body (`login`, `refresh`, `pinned_notes`) compiles
-**only into the node**; the client sees typed stubs that ship `Wire`-encoded
+**only into the node**; the client sees typed stubs that ship `WaveWire`-encoded
 arguments over the transport.
 
 ```rust
@@ -36,7 +36,7 @@ pub struct Credentials { pub argon2: String }
 #[wavedb]
 pub struct Session { pub user: U48, pub tenant: U48, pub issued: u64, pub revoked: bool }
 
-#[derive(Wire)] pub struct Tokens { pub access: String, pub refresh: String }
+#[derive(WaveWire)] pub struct Tokens { pub access: String, pub refresh: String }
 
 // ---- server functions: body runs ONLY on the node ---------------------------
 
@@ -99,6 +99,6 @@ async fn flow() -> Result<()> {
 | 2    | `login` is a `#[server]` fn: verifies a credential (local Argon2 **or** OAuth), creates the `Session` record, mints the **access + refresh** pair.                                  |
 | 3    | The node derives identity from the **access token**, never the request body.                                                                                                        |
 | 4    | Typed CRUD: `create` (versioned, history-chained), `get` (single-lookup Unique anchor).                                                                                             |
-| 5    | Filtered/derived reads are server functions — the body runs node-side with DB access; the client ships a `Wire` call.                                                               |
+| 5    | Filtered/derived reads are server functions — the body runs node-side with DB access; the client ships a `WaveWire` call.                                                               |
 | 6    | Short access TTL lapses → the **refresh** token mints a new access token and **rotates** itself (replay of the old one ⇒ theft signal).                                             |
 | 7    | **Revocation** = mark the `Session` record `revoked` (one write). The next `refresh` is refused and the live access token dies within one short TTL — no per-request session store. |

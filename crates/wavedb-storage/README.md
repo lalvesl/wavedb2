@@ -167,7 +167,7 @@ written page.
 
 A page is **homogeneous** — records of exactly one `STRUCT_HASH`. The
 `#[wavedb]` macro emits, via a `PageFormat` derive trait, the layout and the
-serialize/deserialize over `Wire`, separately for each of the four page kinds
+serialize/deserialize over `WaveWire`, separately for each of the four page kinds
 (`Unique`, `NonUnique`, `Pivot`, `BpTree`) so each gets its own optimal
 dictionary and compression.
 
@@ -186,10 +186,10 @@ dictionary and compression.
   the dictionary.
 - **id list** — the `u128` IDs with each record's dynamic size and position in the
   blob. Present for all four kinds (`Unique`, `NonUnique`, `Pivot`, `BpTree`).
-- **blob** — the `Wire`-encoded record bytes to parse.
+- **blob** — the `WaveWire`-encoded record bytes to parse.
 
 The `PageFormat` trait also owns the **management of the `Vec<u64>` directory** —
-calling the block manager to allocate/free runs and driving the `Wire`
+calling the block manager to allocate/free runs and driving the `WaveWire`
 serialize/deserialize. Page kinds:
 
 | Kind          | What the blob holds                                                |
