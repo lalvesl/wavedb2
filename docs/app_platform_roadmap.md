@@ -48,9 +48,13 @@ NonUnique through `Pivot`/`BpTree`; kill-during-write test recovers cleanly.
 
 ## M3 — Registry-aware node
 
-A node that links the schema enforces shapes and serves records: header check →
-decode → `validate` → `preprocess` before commit; Unique `get` and NonUnique
-collection walks (`Pivot` → `BpTree`) served from storage.
+A node that links the schema enforces shapes and serves records. A request is a
+**command frame** `{ struct_hash, command, payload }`; the node gates it
+(identity from the access token → header → decode → **permission** → `validate` →
+`preprocess`) then dispatches **`match struct_hash → match command`** (`Get`/`Save`
+for Unique, `Insert`/`Update`/`Remove` for NonUnique) to the type's compile-time
+engine fn. Unique `get` and NonUnique collection walks (`Pivot` → `BpTree`) served
+from storage. Transport is **HTTP POST only for now** (WebSocket deferred).
 
 **Exit:** clients' `get` and collection reads return real data from storage
 through a registry-linked node; cross-tenant read without a grant is refused.
@@ -104,9 +108,16 @@ verified per request with no store) + a tracked **refresh** token for revocation
 identity from the **token, never the request body**. Login is a `#[server]`
 function minting the access+refresh pair from either a local Argon2 credential
 object **or** an external OAuth/OIDC provider (same path, same pair).
-Unauthenticated tier (`user = U48::MAX`) restricted to login + public reads. Permission checks on every read/write/delete (tenant-only / public /
-tenant-list) — applied inside server-function bodies too, since they run on the
-node. Full structure: [`wavedb-net`](../crates/wavedb-net/README.md#authentication).
+Unauthenticated tier (`user = U48::MAX`) restricted to login + public reads.
+**Every `#[server]` fn requires a logged-in session; `#[server(public)]` (e.g.
+`login`/`refresh`) opens one to the unauthenticated tier** — the auth guard is
+injected into the function **body**, not the registry `match`, so dispatch stays a
+uniform `struct_hash → body` router. Permission checks on every
+read/write/delete (tenant-only / public / tenant-list) — applied inside
+server-function bodies too, since they run on the node. NonUnique permission is
+**two-level**: the `Pivot` default seeds inserts / gates collection ops, each
+record's `Metadata` overrides (authoritative, keeps `Update` atomic). Full
+structure: [`wavedb-net`](../crates/wavedb-net/README.md#authentication).
 
 **Exit:** cross-tenant access without a grant rejected at the node; a server
 function rejecting a write surfaces as a typed client error; revoking a session

@@ -228,6 +228,25 @@ Access control is stored **inline in `Metadata`**, scoped per record:
 A grant is what lets a user of one tenant act on another tenant's data; without
 it, tenants never see each other's records.
 
+### NonUnique: collection default + per-record override
+
+For a NonUnique collection, permission is **two-level** — stored in both the
+`Pivot` and each record's `Metadata`, on purpose:
+
+- the collection's **`Pivot` carries a default** `PermissionRef`, applied to a
+  record at `insert` when it specifies none, and checked for collection-scope ops
+  (`Insert`, `All`) where no single record is loaded yet;
+- each **record's `Metadata.permission` is authoritative** for that record — a
+  record may diverge from its collection default (override).
+
+The per-record copy keeps an `Update`/`Remove`/`Get(id)` **atomic and
+Pivot-free**: the single journal entry validates and rewrites permission from the
+record alone, no `Pivot` read. The `Pivot` default keeps `Insert`/`All`
+checkable before any record is read, and seeds new records. Changing the `Pivot`
+default does **not** rewrite existing records — it is the default for *new*
+inserts, not a broadcast. Enforcement runs node-side — see
+[`wavedb-quick-node`](../wavedb-quick-node/README.md#permission-enforcement).
+
 > The cross-tenant **serving path** (which node serves tenant A's data to a
 > tenant-B user, and where the grant is enforced across nodes) is **deferred** —
 > the model above is the contract; the multi-node routing is not built yet.
@@ -335,14 +354,16 @@ pub trait IndexKey {
 
 /// The collection's roots holder. `#[wavedb]` generates one per NonUnique type;
 /// this trait is the portable shape the engine reads. No element counter — the
-/// `Pivot` is rewritten only when a `BpTree` root moves.
+/// `Pivot` is rewritten only when a `BpTree` root moves or its default
+/// permission changes (a rare admin op, not a per-write cost).
 ///
 /// Root pointers are `LocalId` (80-bit): the tree is tenant-scoped so `TENANT`
 /// is derivable from context — no need to repeat 6 bytes per pointer.
 pub trait Pivot: Wire + Sized {
-    fn current(&self)     -> LocalId;     // living-records B+tree root
-    fn dead(&self)        -> LocalId;     // deleted-records B+tree root
-    fn secondaries(&self) -> &[LocalId];  // one root per `#[wavedb::pivot(...)]`
+    fn current(&self)     -> LocalId;             // living-records B+tree root
+    fn dead(&self)        -> LocalId;             // deleted-records B+tree root
+    fn secondaries(&self) -> &[LocalId];          // one root per `#[wavedb::pivot(...)]`
+    fn permission(&self)  -> Option<&PermissionRef>; // collection default; record metadata overrides
 }
 
 /// A search bound over the order-preserving key space.

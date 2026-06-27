@@ -23,18 +23,21 @@ code exists yet. Build order, roughly bottom-up:
   `Clone`; no serde, no `repr(C)`); see `docs/wire_format.md`;
 - index contracts in **core** (portable, `Store`-generic): `Store` (`get` +
   atomic `apply(batch)`), `IndexKey` (order-preserving key encoding),
-  `Pivot` (`current`/`dead`/`secondaries` roots as `LocalId` — tenant stripped),
-  `BpTree<S: Store>` (`at(LocalId)`, `search` → `Id` stream, `insert`/`remove`
-  take record `Id` return `LocalId` root; byte-compare on encoded keys),
-  `IdStreamExt` (`intersect`/`union`/`except`). Pages/journal live behind `Store`,
-  not here;
+  `Pivot` (`current`/`dead`/`secondaries` roots as `LocalId` — tenant stripped —
+  **+ collection-default `permission`**), `BpTree<S: Store>` (`at(LocalId)`,
+  `search` → `Id` stream, `insert`/`remove` take record `Id` return `LocalId`
+  root; byte-compare on encoded keys), `IdStreamExt` (`intersect`/`union`/`except`).
+  Pages/journal live behind `Store`, not here;
 - `#[wavedb]` macro: shapes `Unique` (default) / `NonUnique`; generate the
   `Pivot` + `BpTree` _types_; `PivotId` field references for nesting;
 - explicit `create_pivot` (one per tenant per definition) → `PivotId` stored in a
   `Unique` or nesting `NonUnique`; never auto-created;
 - schema-evolution hooks: `first_try` (pre-search) + `fallback_not_found`
   (post-miss). No migration chains;
-- permissions: tenant-only / public / tenant-list (group deferred).
+- permissions: tenant-only / public / tenant-list (group deferred). NonUnique is
+  **two-level** — `Pivot` holds the collection default (seeds inserts, gates
+  collection-scope ops), each record's `Metadata` overrides (authoritative; keeps
+  `Update` atomic, no `Pivot` read).
 
 ## Registry generation (`wavedb-build` + `build.rs`)
 
@@ -98,6 +101,8 @@ code exists yet. Build order, roughly bottom-up:
 - `Db::connect` / `Db::open` family (native file + wasm IndexedDB);
 - typed CRUD: Unique `get`/`save`; NonUnique `insert`/`save`/`remove` + collection
   walk via `Pivot`/`BpTree`; explicit `create_pivot`. No query DSL.
+- each write = **local `Store` write-through + a command frame** over the
+  transport (HTTP POST for now); `save()` emits the `Update` command for NonUnique;
 - collection reads are **async iterators**: `all` / `by_<field>` (and
   collection-returning `#[server]` fns) return `impl Stream<Item = Result<T>>`, not
   a buffered `Vec`; `.try_collect().await?` to materialise. Prelude re-exports
@@ -111,14 +116,23 @@ code exists yet. Build order, roughly bottom-up:
   collection return is a `Stream<Item = Result<T>>` whose items ship one at a time
   (back-pressured), re-exposed as an async iterator client-side — not a buffered `Vec`;
 - transport `CallServerFn { struct_hash, args }` over `wavedb-net`; registry dispatch;
-- body never enters the client binary; permission checks run in the body.
+- body never enters the client binary; permission checks run in the body;
+- **auth: login-required by default**; `#[server(public)]` opens a fn to the
+  unauthenticated tier (`login`/`refresh`). The macro injects the auth guard into
+  the **body**, not the registry `match` (uniform `struct_hash → body` dispatch —
+  simpler builder); identity is the verified Access token, never the request body.
 
 ## Nodes & transport (`wavedb-quick-node`, `wavedb-net`)
 
 - **single node first** — durability = journal; ring/replication/failover deferred;
-- node-side enforcement gates (header → decode → validate → preprocess);
+- command frame `{ struct_hash, command, payload }`; `command` = `Get`/`Save`
+  (Unique) | `Insert`/`Update`/`Remove` (NonUnique); dispatch =
+  `match struct_hash → match command` to the type's compile-time engine fn;
+- node-side enforcement gates: identity (from access token, not body) → header →
+  decode → permission → `validate` → `preprocess`;
 - server-function dispatch by `STRUCT_HASH` (same per-hash `match` as structs);
-- WS / HTTP transports; Bloom screen-sync.
+  auth/permission inside the body;
+- **HTTP POST only for now**; WebSocket / push / Bloom screen-sync deferred.
 
 ## Browser (`wavedb-wasm`)
 

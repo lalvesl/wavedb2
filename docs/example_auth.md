@@ -17,6 +17,11 @@ DSL**. Every server-function body (`login`, `refresh`, `pinned_notes`) compiles
 **only into the node**; the client sees typed stubs that ship `WaveWire`-encoded
 arguments over the transport.
 
+`login` / `refresh` are **`#[server(public)]`** — reachable before any token
+exists; everything else requires a logged-in session. The auth guard is injected
+into the **function body**, not the dispatch `match`, so the registry stays a
+uniform `struct_hash → body` router.
+
 ```rust
 use wavedb::prelude::*;
 
@@ -40,7 +45,7 @@ pub struct Session { pub user: U48, pub tenant: U48, pub issued: u64, pub revoke
 
 // ---- server functions: body runs ONLY on the node ---------------------------
 
-#[server]                                    // login: verify credential, mint pair
+#[server(public)]                            // public: reachable before any token exists
 async fn login(db: &Db, user: U48, password: String) -> Result<Tokens> {
     let cred = Credentials::get_for(db, user).await?.ok_or(Error::NoUser)?;
     argon2_verify(&cred.argon2, &password)?;            // or: verify OAuth token
@@ -49,7 +54,7 @@ async fn login(db: &Db, user: U48, password: String) -> Result<Tokens> {
     Ok(Tokens { access: mint_access(user, user), refresh: mint_refresh(sid) })
 }
 
-#[server]                                    // revocable refresh
+#[server(public)]                            // public: authenticates via the refresh token in-body
 async fn refresh(db: &Db, refresh: String) -> Result<Tokens> {
     let sid = verify_refresh(&refresh)?;                 // HMAC ok...
     let s = Session::get_by_id(db, sid).await?.ok_or(Error::Revoked)?;
@@ -57,7 +62,7 @@ async fn refresh(db: &Db, refresh: String) -> Result<Tokens> {
     Ok(Tokens { access: mint_access(s.user, s.tenant), refresh: rotate_refresh(sid) })
 }
 
-#[server]                                    // filtered read = server fn (no query DSL)
+#[server]                                    // login-required (default): filtered read, no query DSL
 fn pinned_notes(db: &Db) -> impl Stream<Item = Result<Note>> {  // async iterator, streamed
     Note::all(db).try_filter(|n| future::ready(n.pinned))
 }

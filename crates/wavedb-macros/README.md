@@ -51,11 +51,17 @@ because both compile this crate.
    `#[wavedb::pivot(...)]` attribute (below).
 5. **Implements the typed object trait by shape** — `UniqueObject` (`get` /
    `save`) for Unique, `NonUniqueObject` (`collection` → `insert`/`get`/`all`/
-   `remove`, plus record `save`) for NonUnique. Each method routes through the
-   `Db` handle: **write-through to the local `Store` + send over the network** to
-   the node, which runs the authoritative `Pivot`/`BpTree` engine. Same typed
-   calls compile native and wasm — only the local
-   [`Store`](../wavedb-core/README.md#store--the-local-backend-trait) swaps.
+   `remove`, plus record `save`) for NonUnique. On the **client** each method
+   routes through the `Db` handle: **write-through to the local `Store` + send a
+   command frame over the network** to the node. On the **node** the macro emits
+   the matching compile-time **engine fns** (`get`/`save` for Unique;
+   `insert`/`update`/`remove` for NonUnique) that the registry's `match command`
+   calls — these drive the storage internals (block allocator, journal, the
+   object's page directory, `Pivot`/`BpTree`) directly, monomorphized, no `dyn`.
+   So the wire command set is `Get`/`Save` (Unique) and
+   `Insert`/`Update`/`Remove` (NonUnique); the client-side `save()` method emits
+   the `Update` command for NonUnique. Same typed calls compile native and wasm —
+   only the local [`Store`](../wavedb-core/README.md#store--the-local-backend-trait) swaps.
 6. **Wires up the schema-evolution hooks** — the optional `first_try` /
    `fallback_not_found` functions; see
    [`wavedb-core`](../wavedb-core/README.md#schema-evolution--lookup-hooks).
@@ -108,8 +114,9 @@ directly; they reference a collection through its `PivotId`.
 // No counter — a size field would force a Pivot write on every insert/remove;
 // the Pivot stays effectively immutable (written only if a BpTree root moves).
 pub struct Pivot {
-    pub current: BpTreeId,  // u128 → B+tree of living records (keyed by CREATED_AT)
-    pub dead:    BpTreeId,  // u128 → B+tree of deleted records
+    pub current:    BpTreeId,              // u128 → B+tree of living records (keyed by CREATED_AT)
+    pub dead:       BpTreeId,              // u128 → B+tree of deleted records
+    pub permission: Option<PermissionRef>, // collection-default access; per-record Metadata overrides
     // + one BpTreeId root per `#[wavedb::pivot(...)]` secondary index (below)
 }
 
@@ -251,9 +258,22 @@ What the macro emits:
   return is an `impl Stream<Item = Result<T>>` whose **item** `T: WaveWire` — the macro
   ships items one at a time over the wire (back-pressured), and the client stub
   re-exposes the same async iterator instead of buffering a `Vec`.
+- **Auth** — **every server function requires a logged-in session by default**;
+  `#[server(public)]` opens one to anyone (incl. the unauthenticated tier,
+  `user = U48::MAX`) — that is how `login` / `refresh` are reachable before an
+  access token exists. The macro injects the auth guard **into the generated
+  body**, not into the registry `match`: the dispatch only routes
+  `struct_hash → body`, so the build-time match stays uniform (one arm per fn, no
+  per-fn auth policy) — a deliberately simpler builder. Identity inside the body
+  is the verified Access token's `user`/`tenant`, never the request body.
 - **Security** — the body runs on the node, so permission checks and validation
   apply there; the client cannot bypass them by crafting a request, only call the
   declared function with typed arguments.
+
+```rust
+#[server(public)]                            // open: reachable before login
+async fn login(db: &Db, user: U48, password: String) -> Result<Tokens> { /* … */ }
+```
 
 Server functions are aggregated into the same per-`STRUCT_HASH` dispatch as
 structs (below), so a node links them the same way it links the schema.

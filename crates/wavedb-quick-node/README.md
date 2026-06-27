@@ -94,20 +94,50 @@ not a deployment.
 
 ## Node-side enforcement
 
-Every incoming write passes these gates **before the journal commit**:
+Every incoming command frame (`struct_hash` + `command` + payload) passes these
+gates **before the journal commit**, in order:
 
-1. **Header check** — the record's `STRUCT_HASH` must be declared in
-   the generated registry (a per-hash `match` arm); unknown hashes refused.
-2. **Decode check** — the payload must parse as the declared type via `WaveWire`.
-3. **`validate`** — the same fn the client ran (catches bypassers / stale rules).
+1. **Identity** — the request's identity is the verified Access token's
+   `user`/`tenant`, **never the request body**. The connected tenant is bound at
+   session open (simple apps: `tenant = user`); a frame targeting another tenant
+   without a grant is refused (cross-tenant serving path deferred).
+2. **Header check** — the frame's `STRUCT_HASH` must be declared in the generated
+   registry (a per-hash `match` arm); unknown hashes refused.
+3. **Decode check** — the payload must parse as the declared type via `WaveWire`
+   (a `Get`/`Remove` payload is an `Id`, not a full record).
+4. **Permission** — the record's access rule is enforced here (by shape, below).
+5. **`validate`** — the same fn the client ran (catches bypassers / stale rules).
    This is the security boundary.
-4. **`preprocess`** — the re-encoded result replaces the client's bytes.
+6. **`preprocess`** — the re-encoded result replaces the client's bytes.
+
+Once the gates pass, the registry routes the frame — **`match struct_hash`** to
+the concrete type, then **`match command`** (`Get`/`Save` for Unique,
+`Insert`/`Update`/`Remove` for NonUnique) to that type's compile-time engine fn,
+which runs the authoritative `Pivot`/`BpTree` + page writes through
+[`wavedb-storage`](../wavedb-storage/README.md). The command match lives inside
+the matched arm, so the concrete type never escapes — no `dyn`, no `Object` enum.
 
 Rejections travel back as a structured `NodeError {code, struct_hash, field,
 message}` and the client maps it to the same typed `Error::Validation` its local
 pre-send check raises. A node built without a registry keeps the legacy
 schema-blind behaviour (opaque bytes). Hook declaration lives in
 [`wavedb-macros`](../wavedb-macros/README.md#validation--preprocessing-hooks).
+
+### Permission enforcement
+
+Permission is checked at gate 4, by shape:
+
+- **Unique** — the record's `Metadata.permission` (`None` = tenant-only).
+- **NonUnique** — **per-record `Metadata.permission` is authoritative** (a record
+  may diverge from its collection). The collection's `Pivot` carries a
+  **default** permission, applied to a record at `insert` when it specifies none
+  and checked for collection-scope ops where no single record is loaded yet
+  (`Insert`, `All`). So the gate reads the record's own metadata for
+  `Update`/`Remove`/`Get(id)`, and the `Pivot` default for the collection entry
+  points. The per-record copy is what makes an `Update` **atomic** — the single
+  journal entry validates and rewrites the record's permission without reading
+  the `Pivot`. Changing the `Pivot` default does **not** rewrite existing records;
+  it only seeds new inserts. Model: [`wavedb-core`](../wavedb-core/README.md#permissions).
 
 ## Server-function dispatch
 
@@ -118,7 +148,15 @@ server-only body, which runs on the node with full DB access; the `WaveWire`-enc
 travels back over the same transport. A collection-returning fn **streams** its
 items back as a sequence of frames (an async iterator on the client) rather than
 buffering a whole `Vec`. There is no query DSL — filtered/derived reads are these
-functions. Permission checks apply inside the body. See
+functions.
+
+**Every server function requires a logged-in session; only `#[server(public)]`
+(e.g. `login`, `refresh`) is reachable from the unauthenticated tier.** The
+login/auth check runs **inside the function body**, not in the dispatch `match` —
+the registry only routes `struct_hash → body`, so the generated dispatch stays
+uniform (one arm per function, no per-function auth policy in the match). The
+macro injects the auth guard into the body for non-public functions; permission
+checks also apply inside the body. See
 [`wavedb-macros`](../wavedb-macros/README.md#server-functions--server).
 
 ---

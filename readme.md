@@ -224,8 +224,9 @@ no business data — only the addressing into the index trees:
 
 ```rust
 pub struct Pivot {
-    pub current: LocalId,      // 80-bit pointer to the B+tree of living records
-    pub dead:    LocalId,      // 80-bit pointer to the B+tree of deleted records
+    pub current:    LocalId,               // 80-bit pointer to the B+tree of living records
+    pub dead:       LocalId,               // 80-bit pointer to the B+tree of deleted records
+    pub permission: Option<PermissionRef>, // collection-default access (per-record Metadata overrides)
     // + one LocalId per #[wavedb::pivot(...)] secondary index
 }
 ```
@@ -299,6 +300,13 @@ Access control is stored inline in each record's `Metadata`, scoped per record:
 This is the mechanism by which a user of one tenant can act on another tenant's
 data: the data's owner grants it.
 
+For a **NonUnique collection** permission is two-level: the collection's `Pivot`
+holds a **default** (seeds new inserts, gates collection-scope ops), and each
+record's `Metadata` holds the **authoritative** value for that record (a record
+may override its collection). The per-record copy is what makes an atomic
+`Update` validate without reading the `Pivot`. See
+[`wavedb-core` §Permissions](crates/wavedb-core/README.md#permissions).
+
 ---
 
 ## Schema evolution
@@ -368,6 +376,22 @@ Server::bind("0.0.0.0:7700")
     .serve()
     .await
 ```
+
+### How a write travels
+
+A typed call (`record.save(&db)`) does two things: **write-through to the local
+`Store`**, then send a **command frame** over the network. The frame is
+`{ STRUCT_HASH, command, payload }` — `command` is `Get`/`Save` for Unique,
+`Insert`/`Update`/`Remove` for NonUnique. The transport for now is **HTTP POST
+only** (WebSocket/push deferred). Node-side the request is gated (identity from
+the access token → header → decode → permission → `validate` → `preprocess`),
+then routed by the registry: **`match struct_hash`** to the concrete type, then
+**`match command`** to that type's compile-time engine fn, which drives the
+storage internals (allocator, journal, pages, `Pivot`/`BpTree`). A `#[server]`
+function call is the same `struct_hash` space as a second frame kind; its auth +
+permission checks live **inside the body**, not the match. Full path:
+[`wavedb-net`](crates/wavedb-net/README.md#command-envelope--dispatch) and
+[`wavedb-quick-node`](crates/wavedb-quick-node/README.md#node-side-enforcement).
 
 The full client API and object lifecycle live in
 [`wavedb`](crates/wavedb/README.md).

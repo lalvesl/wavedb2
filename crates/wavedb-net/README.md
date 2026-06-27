@@ -35,11 +35,17 @@ implementations; the same operations run on servers, native clients, and (via
 
 ## Transports
 
-| Transport         | Native | Browser | Notes                                                  |
-| ----------------- | ------ | ------- | ------------------------------------------------------ |
-| **WebSocket**     | pref.  | pref.   | Bidirectional, push-capable; carries Bloom sync.       |
-| **HTTP POST**     | back.  | back.   | When WebSocket is blocked (proxies, restrictive nets). |
-| **Future native** | plan.  | n/a     | Higher-throughput native-only transport, in scoping.   |
+> **Status: HTTP POST only for now.** The current rebuild wires a single
+> transport — **HTTP POST** — on both native and browser. WebSocket (and with it
+> server push, idle-tick piggyback, and Bloom screen-sync) is **deferred**; the
+> table below is the target shape. The request path is built so the transport is
+> swappable later without touching the command / dispatch / auth layers.
+
+| Transport         | Native | Browser | Status    | Notes                                                  |
+| ----------------- | ------ | ------- | --------- | ------------------------------------------------------ |
+| **HTTP POST**     | ✓      | ✓       | **wired** | The only transport for now. FIFO queue per client.     |
+| **WebSocket**     | pref.  | pref.   | deferred  | Bidirectional, push-capable; carries Bloom sync.       |
+| **Future native** | plan.  | n/a     | planned   | Higher-throughput native-only transport, in scoping.   |
 
 ### HTTP POST: single-queue with piggybacked notifications
 
@@ -62,7 +68,46 @@ changed" events; the transport decides push vs. piggyback.
 
 ---
 
+## Command envelope & dispatch
+
+Every record operation rides the transport as one **command frame**:
+
+```
+CommandFrame {
+    struct_hash: u64,     // which type — the registry key
+    command:     Command, // the operation, by shape
+    payload:     Wire,    // record bytes (Save/Insert/Update) or an Id (Get/Remove)
+}
+```
+
+The client builds the frame from a typed call (`record.save(&db)`,
+`collection.insert(&db, …)`) right after the local write-through. `command` is
+the shape's operation set:
+
+| Shape         | `Command` values                                     |
+| ------------- | ---------------------------------------------------- |
+| **Unique**    | `Get`, `Save`                                        |
+| **NonUnique** | `Insert`, `Update`, `Remove` (+ `Get` / `All` reads) |
+
+> The NonUnique update command is `Update`; the client-side method stays
+> `record.save(&db)` (save = upsert). One name on the wire, the familiar `save`
+> at the call site.
+
+The node routes the frame through the generated registry — **one `match` on
+`struct_hash`** to the concrete type's arm, then a shape-specific
+`match command { … }` to that type's compile-time `get`/`save` /
+`insert`/`update`/`remove` fn, which drives the storage engine (allocator,
+journal, pages, `Pivot`/`BpTree`). Server-function calls share the same
+`struct_hash` space as a second frame kind, `CallServerFn` (below). Identity and
+permission are enforced **before** the engine runs — see
+[`wavedb-quick-node` § node-side enforcement](../wavedb-quick-node/README.md#node-side-enforcement).
+
+---
+
 ## Bloom Filter Screen-Sync
+
+> **Deferred** — screen-sync rides WebSocket push, which the current rebuild does
+> not wire (HTTP POST only). The protocol below is the target.
 
 State-sync for the **online** read path. Clients keep a Bloom filter of the
 128-bit IDs currently on screen and send it over WebSocket. The owner node
@@ -147,6 +192,24 @@ to **login** and **public reads** (records whose `Metadata.permission` is
 `Public`); everything else is refused. Permission enforcement itself is per
 record (`PermissionRef`) — see
 [`wavedb-core`](../wavedb-core/README.md#permissions).
+
+### Server-function access policy
+
+Calling a server function is itself gated:
+
+- **`#[server]` (default) requires a logged-in session** — unreachable from the
+  unauthenticated tier.
+- **`#[server(public)]` is open to anyone**, including `user = U48::MAX`. This is
+  how `login` (and `refresh`, which carries its own refresh token) is reachable
+  before an access token exists.
+
+The check lives **inside the generated function body, not in the registry
+match**. The `#[server]` macro injects an auth guard at the top of the node-side
+body (skipped for `public`); the `match struct_hash { … }` only routes a
+`CallServerFn` to its body and carries no per-function auth policy. Keeping auth
+out of the match keeps build-time dispatch uniform — one routing arm per
+function, nothing else — and identity inside the body is the verified Access
+token's `user`/`tenant`, never the request body.
 
 > Worked end-to-end example (login → request → refresh → revoke):
 > [`docs/example_auth.md`](../../docs/example_auth.md).
