@@ -105,7 +105,9 @@ one poll tick (HTTP).
 Stateless HMAC **access** tokens (short TTL, carry `user`/`tenant`/expiry/purpose,
 verified per request with no store) + a tracked **refresh** token for revocation
 (bound to a session record; revoke = mark the record `revoked`). Node derives
-identity from the **token, never the request body**. Login is a `#[server]`
+identity from the **token, never an unsigned field of the operation** — the token
+rides inside the WaveDB request envelope (the POST body), not an HTTP header
+(transport stays a dumb tunnel; WebSocket sends it once at handshake). Login is a `#[server]`
 function minting the access+refresh pair from either a local Argon2 credential
 object **or** an external OAuth/OIDC provider (same path, same pair).
 Unauthenticated tier (`user = U48::MAX`) restricted to login + public reads.

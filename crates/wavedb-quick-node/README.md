@@ -97,10 +97,13 @@ not a deployment.
 Every incoming command frame (`struct_hash` + `command` + payload) passes these
 gates **before the journal commit**, in order:
 
-1. **Identity** — the request's identity is the verified Access token's
-   `user`/`tenant`, **never the request body**. The connected tenant is bound at
-   session open (simple apps: `tenant = user`); a frame targeting another tenant
-   without a grant is refused (cross-tenant serving path deferred).
+1. **Identity** — the request's identity is the **verified Access token**, carried
+   inside the WaveDB request envelope (no HTTP `Authorization` header) and trusted
+   only after its HMAC + expiry check. `user`/`tenant` come from that token, never
+   from an unsigned field of the operation. The connected tenant is bound at
+   session open (simple apps: `tenant = user`); over WebSocket (deferred) the token
+   is sent once at the handshake. A frame targeting another tenant without a grant
+   is refused (cross-tenant serving path deferred).
 2. **Header check** — the frame's `STRUCT_HASH` must be declared in the generated
    registry (a per-hash `match` arm); unknown hashes refused.
 3. **Decode check** — the payload must parse as the declared type via `WaveWire`
@@ -141,14 +144,17 @@ Permission is checked at gate 4, by shape:
 
 ## Server-function dispatch
 
-The registry also holds the `#[server]` functions. A `CallServerFn { struct_hash,
-Wire args }` request is dispatched by the function's `STRUCT_HASH` (composed from
-its argument/return objects' hashes — no separate `FN_HASH`) to the function's
-server-only body, which runs on the node with full DB access; the `WaveWire`-encoded return
-travels back over the same transport. A collection-returning fn **streams** its
-items back as a sequence of frames (an async iterator on the client) rather than
-buffering a whole `Vec`. There is no query DSL — filtered/derived reads are these
-functions.
+The registry also holds the `#[server]` functions — in the **same `struct_hash`
+space** as structs, carried by the **same `CommandFrame`** (`struct_hash` +
+`command` + `payload`). There is no separate call frame: the node cannot — and
+need not — tell a function call from an object op at the frame level. The single
+`match struct_hash` is the discriminator; a function arm (its hash composed from
+the argument/return objects' hashes — no separate `FN_HASH`) ignores `command`,
+decodes `payload` as the args tuple, and runs the server-only body with full DB
+access. The `WaveWire`-encoded return travels back over the same transport. A
+collection-returning fn **streams** its items back as a sequence of frames (an
+async iterator on the client) rather than buffering a whole `Vec`. There is no
+query DSL — filtered/derived reads are these functions.
 
 **Every server function requires a logged-in session; only `#[server(public)]`
 (e.g. `login`, `refresh`) is reachable from the unauthenticated tier.** The

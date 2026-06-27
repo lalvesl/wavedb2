@@ -380,16 +380,22 @@ Server::bind("0.0.0.0:7700")
 ### How a write travels
 
 A typed call (`record.save(&db)`) does two things: **write-through to the local
-`Store`**, then send a **command frame** over the network. The frame is
-`{ STRUCT_HASH, command, payload }` — `command` is `Get`/`Save` for Unique,
-`Insert`/`Update`/`Remove` for NonUnique. The transport for now is **HTTP POST
-only** (WebSocket/push deferred). Node-side the request is gated (identity from
+`Store`**, then send a **command frame** over the network. The frame
+`{ STRUCT_HASH, command, payload }` is wrapped with the **access token** into one
+self-contained `Request` — WaveDB uses **no HTTP headers/cookies**; the POST body
+carries everything, identity included (transport = dumb tunnel). `command` is
+`Get`/`Save` for Unique, `Insert`/`Update`/`Remove` for NonUnique. The transport
+for now is **HTTP POST only** (WebSocket sends the token once at handshake; push
+deferred). Node-side the request is gated (identity from
 the access token → header → decode → permission → `validate` → `preprocess`),
 then routed by the registry: **`match struct_hash`** to the concrete type, then
 **`match command`** to that type's compile-time engine fn, which drives the
 storage internals (allocator, journal, pages, `Pivot`/`BpTree`). A `#[server]`
-function call is the same `struct_hash` space as a second frame kind; its auth +
-permission checks live **inside the body**, not the match. Full path:
+function call rides the **same `CommandFrame`** in the **same `struct_hash`
+space** — no separate call frame; you can't tell a call from an object op at the
+frame level, only the `match struct_hash` can. A function arm decodes `payload` as
+its args and runs the body, whose auth + permission checks live **inside the
+body**, not the match. Full path:
 [`wavedb-net`](crates/wavedb-net/README.md#command-envelope--dispatch) and
 [`wavedb-quick-node`](crates/wavedb-quick-node/README.md#node-side-enforcement).
 

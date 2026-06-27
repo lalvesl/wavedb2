@@ -240,7 +240,7 @@ What the macro emits:
 | Side               | What is compiled                                                                                                                                                                                                                   |
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Server** (`cfg`) | The real body + a dispatch arm under the function's own `STRUCT_HASH` (below) so the node can route an incoming call.                                                                                                              |
-| **Client** (`cfg`) | A stub with the **same signature**: `WaveWire`-encode the args → send `CallServerFn { struct_hash, args }` over `wavedb-net` → `WaveWire`-decode the return. The body is **not** in the binary (keeps wasm small, keeps server logic private). |
+| **Client** (`cfg`) | A stub with the **same signature**: `WaveWire`-encode the args → send a `CommandFrame { struct_hash, command, payload = args }` over `wavedb-net` (the **same** frame an object op uses — no separate call frame) → `WaveWire`-decode the return. The body is **not** in the binary (keeps wasm small, keeps server logic private). |
 
 - **A function has a `STRUCT_HASH: u64` too — there is no separate `FN_HASH`.** It
   is computed at compile time by the **same SeaHash + fixed four-lane WaveDB seed**

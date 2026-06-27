@@ -5,10 +5,12 @@ separate REST/RPC layer, no DTO split, no API schema to keep in sync with
 storage. Whatever the client serializes — a CRUD request or a server-function
 call — the server deserializes straight into the engine. Both record operations
 (`get`/`save`/`insert`/`remove`/collection walk) and **server-function calls**
-(`CallServerFn { struct_hash, Wire args }`) ride the same `Transport`. Collection
-reads (`all` / `by_field`) and collection-returning server fns are **async
-iterators**: the node streams record items back as a sequence of frames rather
-than buffering a whole `Vec`, so the client can stop early.
+ride the same `Transport` as **one uniform `CommandFrame`** (`struct_hash` +
+`command` + `payload`) — functions and structs share the hash space, so there is
+no separate call frame (see [Command envelope](#command-envelope--dispatch)).
+Collection reads (`all` / `by_field`) and collection-returning server fns are
+**async iterators**: the node streams record items back as a sequence of frames
+rather than buffering a whole `Vec`, so the client can stop early.
 
 > For the project-wide idea and quickstart see the
 > [root README](../../readme.md).
@@ -70,19 +72,45 @@ changed" events; the transport decides push vs. piggyback.
 
 ## Command envelope & dispatch
 
-Every record operation rides the transport as one **command frame**:
+**The transport is a dumb tunnel — WaveDB uses no HTTP-protocol features.** No
+`Authorization` header, no cookies, no HTTP status semantics: identity, the
+command, and errors all ride **inside** the WaveDB wire object. An HTTP POST body
+*is* a complete, self-contained `Request`; HTTP only moves the bytes.
+
+Every operation — a record op **or** a server-function call — rides the transport
+as **one uniform frame**; there is no separate request type for functions:
 
 ```
+Request {
+    auth:  AccessToken,   // identity — carried IN the body, never an HTTP header
+    frame: CommandFrame,  // record op OR server-fn call — same shape for both
+}
+
 CommandFrame {
-    struct_hash: u64,     // which type — the registry key
-    command:     Command, // the operation, by shape
-    payload:     Wire,    // record bytes (Save/Insert/Update) or an Id (Get/Remove)
+    struct_hash: u64,     // a #[wavedb] struct OR a #[server] fn — ONE hash space
+    command:     Command, // struct op; ignored for a function (the hash IS the op)
+    payload:     Wire,    // record / Id (struct op) or the args tuple (server fn)
 }
 ```
 
+**From the frame alone you cannot tell a server-fn call from an object save** —
+and you don't need to. The sole discriminator is the generated **`match
+struct_hash`**: every hash is, at compile time, either a `#[wavedb]` struct or a
+`#[server]` function, and the matched arm knows which. A struct arm reads
+`command` and treats `payload` as the record or `Id`; a function arm ignores
+`command` (its hash names exactly one function) and decodes `payload` as the args
+tuple, then runs the body. Same frame, same match — the builder never
+special-cases a "call" frame.
+
+Over **HTTP POST** (the only wired transport) every POST body is a full `Request`
+— the access token is re-sent inline each time, because plain HTTP has no
+connection to bind it to. Over **WebSocket** (deferred) the token is presented
+**once at the handshake** and the socket is bound to that identity, so subsequent
+frames carry only the `CommandFrame`.
+
 The client builds the frame from a typed call (`record.save(&db)`,
-`collection.insert(&db, …)`) right after the local write-through. `command` is
-the shape's operation set:
+`collection.insert(&db, …)`) right after the local write-through. For a struct,
+`command` is the shape's operation set:
 
 | Shape         | `Command` values                                     |
 | ------------- | ---------------------------------------------------- |
@@ -94,12 +122,12 @@ the shape's operation set:
 > at the call site.
 
 The node routes the frame through the generated registry — **one `match` on
-`struct_hash`** to the concrete type's arm, then a shape-specific
-`match command { … }` to that type's compile-time `get`/`save` /
+`struct_hash`** to the concrete type's arm. For a struct hash the arm runs a
+shape-specific `match command { … }` to that type's compile-time `get`/`save` /
 `insert`/`update`/`remove` fn, which drives the storage engine (allocator,
-journal, pages, `Pivot`/`BpTree`). Server-function calls share the same
-`struct_hash` space as a second frame kind, `CallServerFn` (below). Identity and
-permission are enforced **before** the engine runs — see
+journal, pages, `Pivot`/`BpTree`); for a function hash the same match runs the
+server-fn body on the decoded args instead. Identity and permission are enforced
+**before** the engine runs — see
 [`wavedb-quick-node` § node-side enforcement](../wavedb-quick-node/README.md#node-side-enforcement).
 
 ---
@@ -133,10 +161,13 @@ only when minting a new access token (rare), never on ordinary requests.
 access = { user: U48, tenant: U48, expiry, purpose: Access } + HMAC(cluster_key, …)
 ```
 
-The node **derives `user`/`tenant` from the verified token, never from the
-request body** — a client cannot claim an identity it wasn't issued. TTL is
-**short** (minutes); every request carries it; verification is signature + expiry,
-nothing else loaded.
+The node **derives `user`/`tenant` from the verified token, never from any
+unsigned field of the operation** — a client cannot claim an identity it wasn't
+issued. The token rides **inside the WaveDB request envelope** (the POST body),
+**not** an HTTP `Authorization` header — the transport stays a dumb tunnel. TTL is
+**short** (minutes); over HTTP POST every request re-sends it, over WebSocket
+(deferred) it is presented once at the handshake and bound to the connection.
+Verification is signature + expiry, nothing else loaded.
 
 ### Refresh token (revocable)
 
@@ -205,8 +236,8 @@ Calling a server function is itself gated:
 
 The check lives **inside the generated function body, not in the registry
 match**. The `#[server]` macro injects an auth guard at the top of the node-side
-body (skipped for `public`); the `match struct_hash { … }` only routes a
-`CallServerFn` to its body and carries no per-function auth policy. Keeping auth
+body (skipped for `public`); the `match struct_hash { … }` only routes the
+frame's `struct_hash` to its body and carries no per-function auth policy. Keeping auth
 out of the match keeps build-time dispatch uniform — one routing arm per
 function, nothing else — and identity inside the body is the verified Access
 token's `user`/`tenant`, never the request body.

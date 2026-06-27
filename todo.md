@@ -115,7 +115,9 @@ code exists yet. Build order, roughly bottom-up:
   `STRUCT_HASH`, no separate `FN_HASH`) is its identity; args/return via `WaveWire`. A
   collection return is a `Stream<Item = Result<T>>` whose items ship one at a time
   (back-pressured), re-exposed as an async iterator client-side — not a buffered `Vec`;
-- transport `CallServerFn { struct_hash, args }` over `wavedb-net`; registry dispatch;
+- transport: the **same `CommandFrame`** `{ struct_hash, command, payload=args }`
+  as an object op — no separate call frame; the single `match struct_hash`
+  disambiguates (function arm ignores `command`, decodes `payload` as args);
 - body never enters the client binary; permission checks run in the body;
 - **auth: login-required by default**; `#[server(public)]` opens a fn to the
   unauthenticated tier (`login`/`refresh`). The macro injects the auth guard into
@@ -125,14 +127,22 @@ code exists yet. Build order, roughly bottom-up:
 ## Nodes & transport (`wavedb-quick-node`, `wavedb-net`)
 
 - **single node first** — durability = journal; ring/replication/failover deferred;
-- command frame `{ struct_hash, command, payload }`; `command` = `Get`/`Save`
-  (Unique) | `Insert`/`Update`/`Remove` (NonUnique); dispatch =
-  `match struct_hash → match command` to the type's compile-time engine fn;
-- node-side enforcement gates: identity (from access token, not body) → header →
-  decode → permission → `validate` → `preprocess`;
+- request envelope `{ auth: access_token, frame: CommandFrame }`; **one uniform
+  frame** `{ struct_hash, command, payload }` for both object ops AND server-fn
+  calls (functions + structs share the hash space — can't tell apart at the frame,
+  only `match struct_hash` can); `command` = `Get`/`Save` (Unique) |
+  `Insert`/`Update`/`Remove` (NonUnique), ignored for a function (hash = the op);
+  dispatch = `match struct_hash` → struct: `match command` to engine fn / function:
+  decode `payload` args + run body;
+- **transport = dumb tunnel**: no HTTP headers/cookies/status — auth (access
+  token), command, and errors all ride **inside** the WaveDB envelope (the POST
+  body is self-contained). **HTTP POST only for now** (token re-sent each request);
+  WebSocket sends the token once at handshake (deferred), with push / Bloom sync;
+- node-side enforcement gates: identity (verified access token from the envelope,
+  not HTTP headers / unsigned fields) → header → decode → permission → `validate`
+  → `preprocess`;
 - server-function dispatch by `STRUCT_HASH` (same per-hash `match` as structs);
-  auth/permission inside the body;
-- **HTTP POST only for now**; WebSocket / push / Bloom screen-sync deferred.
+  auth/permission inside the body.
 
 ## Browser (`wavedb-wasm`)
 

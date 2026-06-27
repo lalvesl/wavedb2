@@ -62,13 +62,15 @@ orders.remove(&db, id).await?; // move Id current → dead BpTree (history kept)
 
 There is **no `create`** — `save` is an upsert. Every typed call does two things
 internally and nothing leaks: **write-through to the local `Store`** (native file
-/ web IndexedDB) **and send a command frame to the owner node** over `wavedb-net`.
-The frame is `{ STRUCT_HASH, command, payload }` — `command` is `Get`/`Save` for
-Unique, `Insert`/`Update`/`Remove` for NonUnique (the `save()` method emits
-`Update`); see
+/ web IndexedDB) **and send a self-contained `Request` to the owner node** over
+`wavedb-net`. The request wraps the access token around a command frame
+`{ STRUCT_HASH, command, payload }` — `command` is `Get`/`Save` for Unique,
+`Insert`/`Update`/`Remove` for NonUnique (the `save()` method emits `Update`); see
 [`wavedb-net` §Command envelope](../wavedb-net/README.md#command-envelope--dispatch).
-The transport is **HTTP POST only for now** (WebSocket/push deferred). The node is
-the authoritative writer — it runs the `Pivot`/`BpTree` engine; the client never does.
+WaveDB uses **no HTTP headers/cookies** — identity rides inside the body
+(transport = dumb tunnel). The transport is **HTTP POST only for now** (WebSocket
+sends the token once at handshake; push deferred). The node is the authoritative
+writer — it runs the `Pivot`/`BpTree` engine; the client never does.
 
 The macro implements one typed trait per shape (defined in
 [`wavedb-core`](../wavedb-core/README.md#typed-object-traits-per-struct-macro-implemented)):
