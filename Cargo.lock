@@ -852,6 +852,7 @@ version = "0.1.0"
 dependencies = [
  "byteorder",
  "crc32fast",
+ "futures",
  "parking_lot",
  "proptest",
  "seahash",
