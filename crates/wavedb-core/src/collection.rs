@@ -123,9 +123,11 @@ where
 
 // ---- Collection ---------------------------------------------------------------
 
-/// The typed handle into one NonUnique collection: a `PivotId` plus the tenant,
-/// nothing else — cheap to construct per call. Every op loads the `Pivot`
-/// record fresh, so concurrent root moves are always observed.
+/// The typed handle into one NonUnique collection.
+///
+/// Holds a `PivotId` plus the tenant, nothing else — cheap to construct per
+/// call. Every op loads the `Pivot` record fresh, so concurrent root moves are
+/// always observed.
 #[derive(Debug)]
 pub struct Collection<T: NonUniqueStruct> {
     pivot: LocalId,
@@ -169,7 +171,8 @@ impl<T: NonUniqueStruct> Collection<T> {
 
     /// A tree handle at `root` with this collection's capacities.
     fn tree(&self, root: LocalId) -> BpTree {
-        BpTree::at(root, self.tenant).with_caps(self.leaf_cap, self.internal_cap)
+        BpTree::at(root, self.tenant)
+            .with_caps(self.leaf_cap, self.internal_cap)
     }
 
     /// Create a new, empty collection under `tenant`: two empty B+trees
@@ -182,8 +185,8 @@ impl<T: NonUniqueStruct> Collection<T> {
     pub async fn create<S: Store>(store: &S, tenant: U48) -> Result<LocalId> {
         let (current, current_write) = BpTree::plan_create(tenant);
         let (dead, dead_write) = BpTree::plan_create(tenant);
-        let pivot_record = T::Pivot::default()
-            .replace_roots(current.root(), dead.root());
+        let pivot_record =
+            T::Pivot::default().replace_roots(current.root(), dead.root());
         let pivot_id = mint_timestamped_id(tenant);
         let pivot_write = Write::Put(
             pivot_id,
@@ -319,10 +322,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         })
         .try_flatten()
         .and_then(move |id| async move {
-            let bytes = store
-                .get(id)
-                .await?
-                .ok_or(Error::RecordMissing(id))?;
+            let bytes = store.get(id).await?.ok_or(Error::RecordMissing(id))?;
             Ok((id, decode_envelope::<T>(T::STRUCT_HASH, &bytes)?))
         })
     }
@@ -450,9 +450,8 @@ mod tests {
     fn insert_walk_save_remove_lifecycle() {
         block_on(async {
             let store = MemStore::default();
-            let pivot = Collection::<Doc>::create(&store, tenant())
-                .await
-                .unwrap();
+            let pivot =
+                Collection::<Doc>::create(&store, tenant()).await.unwrap();
             let col = Collection::<Doc>::at(pivot, tenant());
 
             let a = col.insert(&store, &Doc { n: 1 }).await.unwrap();
@@ -470,10 +469,7 @@ mod tests {
 
             // Update in place: same Id, new bytes, still one walk entry.
             col.save(&store, b, &Doc { n: 22 }).await.unwrap();
-            assert_eq!(
-                col.get(&store, b).await.unwrap(),
-                Some(Doc { n: 22 })
-            );
+            assert_eq!(col.get(&store, b).await.unwrap(), Some(Doc { n: 22 }));
 
             // Remove drops it from the walk but keeps the bytes (history).
             assert!(col.remove(&store, b).await.unwrap());
@@ -496,9 +492,8 @@ mod tests {
     fn root_moves_rewrite_the_pivot_and_survive_reopen() {
         block_on(async {
             let store = MemStore::default();
-            let pivot = Collection::<Doc>::create(&store, tenant())
-                .await
-                .unwrap();
+            let pivot =
+                Collection::<Doc>::create(&store, tenant()).await.unwrap();
             let col = Collection::<Doc>::at(pivot, tenant()).with_caps(4, 4);
 
             // Enough inserts to split the current tree's root repeatedly.
@@ -534,10 +529,8 @@ mod tests {
     fn stale_pivot_and_wrong_type_are_typed_errors() {
         block_on(async {
             let store = MemStore::default();
-            let bogus = Collection::<Doc>::at(
-                LocalId::new(42, false, 1),
-                tenant(),
-            );
+            let bogus =
+                Collection::<Doc>::at(LocalId::new(42, false, 1), tenant());
             assert!(matches!(
                 bogus.insert(&store, &Doc { n: 1 }).await,
                 Err(Error::PivotMissing(_))
@@ -548,15 +541,10 @@ mod tests {
             save_unique(&store, tenant(), &Settings { volume: 1 })
                 .await
                 .unwrap();
-            let anchor = crate::id::Id::new(
-                Settings::STRUCT_HASH,
-                tenant(),
-                true,
-                0,
-            );
-            let pivot = Collection::<Doc>::create(&store, tenant())
-                .await
-                .unwrap();
+            let anchor =
+                crate::id::Id::new(Settings::STRUCT_HASH, tenant(), true, 0);
+            let pivot =
+                Collection::<Doc>::create(&store, tenant()).await.unwrap();
             let col = Collection::<Doc>::at(pivot, tenant());
             assert!(matches!(
                 col.get(&store, anchor).await,

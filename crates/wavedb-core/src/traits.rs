@@ -50,8 +50,9 @@ pub trait WaveDbStruct: WaveWire {
     type PivotId;
 }
 
-/// Implemented (by the proc-macro) for every `#[wavedb(NonUnique)]` struct,
-/// tying the record type to its generated `{Name}Pivot` roots holder. This is
+/// Implemented (by the proc-macro) for every `#[wavedb(NonUnique)]` struct.
+///
+/// Ties the record type to its generated `{Name}Pivot` roots holder. This is
 /// the bound [`Collection`](crate::collection::Collection) is generic over —
 /// `Unique` types don't implement it, so a `Unique` type can never be driven
 /// through a collection at compile time.
