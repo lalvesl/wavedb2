@@ -9,7 +9,12 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-wavedb-core = { path = "../wavedb-core" }
+# `validation` turns on the crc32-framed checked wire encoding the journal and
+# superblock persist with.
+wavedb-core = { path = "../wavedb-core", features = ["validation"] }
+# Direct dep (not just via core): `#[derive(WaveWire)]` expands to absolute
+# `::wavedb_wire::` paths, so any crate deriving it must name the crate itself.
+wavedb-wire.workspace = true
 # The engine is single-writer per node; one non-async mutex guards its state.
 parking_lot.workspace = true
 thiserror.workspace = true
