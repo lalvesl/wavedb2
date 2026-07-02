@@ -1,8 +1,9 @@
 //! [`SlotPage`] — the on-disk page format for a homogeneous run of records.
 //!
 //! A page holds records of **exactly one `STRUCT_HASH`** (Unique anchors, NonUnique
-//! records, Pivots — the `BpTree` node page is a separate, fixed-size format in
-//! [`crate::bptree`]). The layout, little-endian throughout:
+//! records, Pivots, `BpTree` nodes — the node encoding lives in `wavedb_core`'s
+//! index layer and is stored here as ordinary bytes). The layout, little-endian
+//! throughout:
 //!
 //! ```text
 //! ┌───────────────────────────────────────────────────────────┐
@@ -169,17 +170,20 @@ impl SlotPage {
             return Err(StorageError::Corrupt("page crc mismatch"));
         }
         let struct_hash = u64::from_le_bytes(
-            buf[OFF_STRUCT_HASH..OFF_STRUCT_HASH + 8].try_into().unwrap(),
+            buf[OFF_STRUCT_HASH..OFF_STRUCT_HASH + 8]
+                .try_into()
+                .unwrap(),
         );
-        let count =
-            u32::from_le_bytes(buf[OFF_COUNT..OFF_COUNT + 4].try_into().unwrap())
-                as usize;
+        let count = u32::from_le_bytes(
+            buf[OFF_COUNT..OFF_COUNT + 4].try_into().unwrap(),
+        ) as usize;
 
-        let id_list_end = HEADER_LEN
-            .checked_add(count.checked_mul(ENTRY_LEN).ok_or(
-                StorageError::Corrupt("page entry count overflow"),
-            )?)
-            .ok_or(StorageError::Corrupt("page entry count overflow"))?;
+        let id_list_end =
+            HEADER_LEN
+                .checked_add(count.checked_mul(ENTRY_LEN).ok_or(
+                    StorageError::Corrupt("page entry count overflow"),
+                )?)
+                .ok_or(StorageError::Corrupt("page entry count overflow"))?;
         if buf.len() < id_list_end {
             return Err(StorageError::Corrupt("page id list truncated"));
         }
@@ -189,9 +193,9 @@ impl SlotPage {
         for i in 0..count {
             let at = HEADER_LEN + i * ENTRY_LEN;
             let raw = u128::from_le_bytes(buf[at..at + 16].try_into().unwrap());
-            let offset = u32::from_le_bytes(
-                buf[at + 16..at + 20].try_into().unwrap(),
-            ) as usize;
+            let offset =
+                u32::from_le_bytes(buf[at + 16..at + 20].try_into().unwrap())
+                    as usize;
             let size =
                 u32::from_le_bytes(buf[at + 20..at + 24].try_into().unwrap())
                     as usize;

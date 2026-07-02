@@ -197,7 +197,10 @@ impl Directory {
         id: Id,
     ) -> StorageResult<Option<Vec<u8>>> {
         let bucket = self.bucket_of(id.raw());
-        Ok(self.read_page(struct_hash, file, bucket)?.get(id).map(<[u8]>::to_vec))
+        Ok(self
+            .read_page(struct_hash, file, bucket)?
+            .get(id)
+            .map(<[u8]>::to_vec))
     }
 
     /// Route `id` to its bucket, upsert its bytes, and rewrite the page.
@@ -268,7 +271,8 @@ impl Directory {
 
         let mut keep = SlotPage::new(struct_hash);
         let mut moved = SlotPage::new(struct_hash);
-        for (id, bytes) in self.read_page(struct_hash, file, s)?.into_entries() {
+        for (id, bytes) in self.read_page(struct_hash, file, s)?.into_entries()
+        {
             // Bit `level` decides: 0 stays in `s`, 1 moves to the new bucket.
             if (self.hash(id.raw()) >> level) & 1 == 0 {
                 keep.upsert(id, bytes);
@@ -301,7 +305,10 @@ fn place(
     let bytes = page.to_bytes();
     let run = alloc.alloc(page.blocks_needed());
     file.write_run(run, &bytes)?;
-    Ok(BlockDescriptor::from_run(run, occupation_of(bytes.len() as u64, run.byte_len())))
+    Ok(BlockDescriptor::from_run(
+        run,
+        occupation_of(bytes.len() as u64, run.byte_len()),
+    ))
 }
 
 /// Coarse 1/16th fill gauge: how full a page's bytes leave its allocated run.
@@ -461,12 +468,19 @@ mod tests {
             .unwrap();
         dir.upsert_record(sh, &bf, &mut alloc, rec_id(2), vec![4, 5])
             .unwrap();
-        assert_eq!(dir.get_record(sh, &bf, rec_id(1)).unwrap(), Some(vec![1, 2, 3]));
-        assert_eq!(dir.get_record(sh, &bf, rec_id(2)).unwrap(), Some(vec![4, 5]));
+        assert_eq!(
+            dir.get_record(sh, &bf, rec_id(1)).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            dir.get_record(sh, &bf, rec_id(2)).unwrap(),
+            Some(vec![4, 5])
+        );
         assert_eq!(dir.get_record(sh, &bf, rec_id(9)).unwrap(), None);
 
         // Overwrite, then remove.
-        dir.upsert_record(sh, &bf, &mut alloc, rec_id(1), vec![9]).unwrap();
+        dir.upsert_record(sh, &bf, &mut alloc, rec_id(1), vec![9])
+            .unwrap();
         assert_eq!(dir.get_record(sh, &bf, rec_id(1)).unwrap(), Some(vec![9]));
         assert!(dir.remove_record(sh, &bf, &mut alloc, rec_id(1)).unwrap());
         assert_eq!(dir.get_record(sh, &bf, rec_id(1)).unwrap(), None);
