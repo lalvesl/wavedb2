@@ -27,3 +27,5 @@ futures.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The NonUnique end-to-end test drives the real derived collection API.
+wavedb-macros = { path = "../wavedb-macros" }

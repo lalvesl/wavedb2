@@ -12,3 +12,7 @@ workspace = true
 [dependencies]
 wavedb-core = { path = "../../crates/wavedb-core" }
 wavedb-macros = { path = "../../crates/wavedb-macros" }
+
+[dev-dependencies]
+# block_on + stream combinators for the collection-flow smoke test.
+futures.workspace = true

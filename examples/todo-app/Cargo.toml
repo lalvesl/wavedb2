@@ -11,7 +11,6 @@ license = "MIT OR Apache-2.0"
 todo-app-schema = { path = "schema" }
 wavedb = { path = "../../crates/wavedb" }
 wavedb-core = { path = "../../crates/wavedb-core" }
-wavedb-build = { path = "../../crates/wavedb-build" }
 wavedb-quick-node = { path = "../../crates/wavedb-quick-node" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"

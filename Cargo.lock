@@ -343,6 +343,7 @@ dependencies = [
 name = "schema-smoke"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "wavedb-core",
  "wavedb-macros",
 ]
@@ -637,6 +638,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "wavedb-core",
+ "wavedb-macros",
  "wavedb-wire",
 ]
 
