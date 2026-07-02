@@ -26,6 +26,10 @@ use std::hash::{BuildHasher, Hasher};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+use wavedb_core::wire::{
+    CRC_PREFIX_LEN, WaveWire, from_wire_checked, to_wire_checked,
+};
+
 use crate::block::{BLOCK_SIZE, Run};
 use crate::error::{StorageError, StorageResult};
 
@@ -33,19 +37,33 @@ use crate::error::{StorageError, StorageResult};
 const MAGIC: &[u8; 8] = b"WAVEDBIN";
 
 /// On-disk format version. Bump on any incompatible superblock/layout change.
-const FORMAT_VERSION: u32 = 1;
+/// (v2: superblock body moved to the checked wire encoding; a v1 file fails the
+/// crc — [`StorageError::Corrupt`] rather than `BadVersion` — acceptable
+/// pre-1.0.)
+const FORMAT_VERSION: u32 = 2;
 
 /// Blocks reserved at the head of the file for engine metadata (the superblock).
 /// The allocator must never hand these out.
 pub const RESERVED_BLOCKS: u64 = 1;
 
-// Superblock byte layout within block 0 (little-endian), the rest zero-padded:
-//   [0..8)   magic
-//   [8..12)  format version (u32)
-//   [12..16) reserved (u32, 0)
-//   [16..48) hash seed (4 × u64)
-const OFF_VERSION: usize = 8;
-const OFF_SEED: usize = 16;
+// Superblock byte layout within block 0, the rest zero-padded:
+//   [0..8)  magic
+//   [8..)   to_wire_checked(SuperblockBody) = [ crc32 (u32 LE) ][ wire bytes ]
+const OFF_BODY: usize = 8;
+
+/// Everything the superblock persists besides the magic. Stack-only wire value
+/// (fixed size), so its checked encoding has a compile-time length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WaveWire)]
+struct SuperblockBody {
+    /// On-disk format version — inside the crc-protected body.
+    version: u32,
+    /// The per-database hash seed every record is routed with.
+    seed: [u64; 4],
+}
+
+/// Byte length of the checked-encoded [`SuperblockBody`] within block 0.
+const BODY_CHECKED_LEN: usize =
+    CRC_PREFIX_LEN + <SuperblockBody as WaveWire>::STACK_SIZE;
 
 /// `data.bin` opened as an array of fixed [`BLOCK_SIZE`]-byte blocks.
 #[derive(Debug)]
@@ -171,19 +189,18 @@ impl BlockFile {
     fn write_superblock(&self) -> StorageResult<()> {
         let mut block = vec![0u8; BLOCK_SIZE];
         block[..MAGIC.len()].copy_from_slice(MAGIC);
-        block[OFF_VERSION..OFF_VERSION + 4]
-            .copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        for (i, lane) in self.seed.iter().enumerate() {
-            let at = OFF_SEED + i * 8;
-            block[at..at + 8].copy_from_slice(&lane.to_le_bytes());
-        }
+        let body = to_wire_checked(&SuperblockBody {
+            version: FORMAT_VERSION,
+            seed: self.seed,
+        });
+        block[OFF_BODY..OFF_BODY + BODY_CHECKED_LEN].copy_from_slice(&body);
         self.ensure_len(BLOCK_SIZE as u64)?;
         self.file.write_all_at(&block, 0)?;
         Ok(())
     }
 }
 
-/// Read block 0, verify magic + version, and return the stored seed.
+/// Read block 0, verify magic + crc + version, and return the stored seed.
 fn read_and_check_superblock(file: &File) -> StorageResult<[u64; 4]> {
     let have = file.metadata()?.len();
     if have < BLOCK_SIZE as u64 {
@@ -198,18 +215,13 @@ fn read_and_check_superblock(file: &File) -> StorageResult<[u64; 4]> {
     if &block[..MAGIC.len()] != MAGIC {
         return Err(StorageError::BadMagic);
     }
-    let version = u32::from_le_bytes(
-        block[OFF_VERSION..OFF_VERSION + 4].try_into().unwrap(),
-    );
-    if version != FORMAT_VERSION {
-        return Err(StorageError::BadVersion(version));
+    let body: SuperblockBody =
+        from_wire_checked(&block[OFF_BODY..OFF_BODY + BODY_CHECKED_LEN])
+            .map_err(|_| StorageError::Corrupt("superblock"))?;
+    if body.version != FORMAT_VERSION {
+        return Err(StorageError::BadVersion(body.version));
     }
-    let mut seed = [0u64; 4];
-    for (i, lane) in seed.iter_mut().enumerate() {
-        let at = OFF_SEED + i * 8;
-        *lane = u64::from_le_bytes(block[at..at + 8].try_into().unwrap());
-    }
-    Ok(seed)
+    Ok(body.seed)
 }
 
 /// A per-database random `[u64; 4]` seed, drawn from the OS via the stdlib's
@@ -227,10 +239,11 @@ fn random_seed() -> [u64; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockFile, FORMAT_VERSION, MAGIC, OFF_VERSION};
+    use super::{BlockFile, FORMAT_VERSION, MAGIC, OFF_BODY, SuperblockBody};
     use crate::block::{BLOCK_SIZE, Run};
     use crate::error::StorageError;
     use std::os::unix::fs::FileExt;
+    use wavedb_core::wire::to_wire_checked;
 
     fn temp_path() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -327,18 +340,45 @@ mod tests {
     fn wrong_version_is_rejected() {
         let (_d, path) = temp_path();
         {
+            // A well-formed (crc-valid) superblock claiming a future version.
             let f = std::fs::File::create(&path).unwrap();
             f.set_len(BLOCK_SIZE as u64).unwrap();
             f.write_all_at(MAGIC, 0).unwrap();
-            f.write_all_at(
-                &(FORMAT_VERSION + 1).to_le_bytes(),
-                OFF_VERSION as u64,
-            )
-            .unwrap();
+            let body = to_wire_checked(&SuperblockBody {
+                version: FORMAT_VERSION + 1,
+                seed: [1, 2, 3, 4],
+            });
+            f.write_all_at(&body, OFF_BODY as u64).unwrap();
         }
         assert!(matches!(
             BlockFile::open(&path).unwrap_err(),
-            StorageError::BadVersion(_)
+            StorageError::BadVersion(v) if v == FORMAT_VERSION + 1
+        ));
+    }
+
+    #[test]
+    fn corrupt_superblock_body_is_rejected() {
+        let (_d, path) = temp_path();
+        {
+            let bf = BlockFile::open(&path).unwrap();
+            drop(bf);
+        }
+        // Flip a byte inside the crc-protected body (the seed area).
+        {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let at = (OFF_BODY + 8) as u64;
+            let mut b = [0u8];
+            f.read_exact_at(&mut b, at).unwrap();
+            b[0] ^= 0xFF;
+            f.write_all_at(&b, at).unwrap();
+        }
+        assert!(matches!(
+            BlockFile::open(&path).unwrap_err(),
+            StorageError::Corrupt("superblock")
         ));
     }
 }
