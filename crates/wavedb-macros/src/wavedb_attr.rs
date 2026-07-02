@@ -75,8 +75,10 @@ pub fn expand(
     let has_preprocess = args.preprocess.is_some();
 
     // The PivotId associated type: () for Unique, the generated newtype otherwise.
+    // Unique types get the anchor ops (`get`/`save`); NonUnique types get their
+    // collection machinery from `generated::nonunique_types`.
     let (pivot_id_ty, generated_types) = match args.shape {
-        Shape::Unique => (quote!(()), TokenStream::new()),
+        Shape::Unique => (quote!(()), unique_ops(&name)),
         Shape::NonUnique => {
             let pivot_id = format_ident!("{}PivotId", name);
             let types = generated::nonunique_types(&name, num_secondaries)?;
@@ -108,6 +110,41 @@ pub fn expand(
 
         #generated_types
     })
+}
+
+/// The `Unique` anchor ops: `get` / `save` inherent fns over any `Store`.
+/// `save` **is** the upsert — a `Unique` type has no separate create.
+fn unique_ops(name: &Ident) -> TokenStream {
+    quote! {
+        impl #name {
+            /// Fetch this tenant's record from its `STRUCT_HASH` anchor.
+            /// `None` = never saved.
+            ///
+            /// # Errors
+            /// Propagates a [`Store`](::wavedb_core::Store) failure or a
+            /// decode fault.
+            #[allow(clippy::future_not_send)]
+            pub async fn get<S: ::wavedb_core::Store>(
+                store: &S,
+                tenant: ::wavedb_core::U48,
+            ) -> ::wavedb_core::Result<::core::option::Option<Self>> {
+                ::wavedb_core::collection::get_unique(store, tenant).await
+            }
+
+            /// Save (insert-or-overwrite) this tenant's record at its anchor.
+            ///
+            /// # Errors
+            /// Propagates a [`Store`](::wavedb_core::Store) failure.
+            #[allow(clippy::future_not_send)]
+            pub async fn save<S: ::wavedb_core::Store>(
+                &self,
+                store: &S,
+                tenant: ::wavedb_core::U48,
+            ) -> ::wavedb_core::Result<()> {
+                ::wavedb_core::collection::save_unique(store, tenant, self).await
+            }
+        }
+    }
 }
 
 /// Remove every `#[wavedb::pivot(...)]` attribute from `attrs`, returning how many

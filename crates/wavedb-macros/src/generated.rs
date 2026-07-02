@@ -33,10 +33,7 @@ pub fn nonunique_types(
         &[
             ("current".into(), "LocalId".into()),
             ("dead".into(), "LocalId".into()),
-            (
-                "secondaries".into(),
-                format!("[LocalId;{num_secondaries}]"),
-            ),
+            ("secondaries".into(), format!("[LocalId;{num_secondaries}]")),
             ("permission".into(), "Option<PermissionRef>".into()),
         ],
     );
