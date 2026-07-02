@@ -10,5 +10,7 @@ cognitive-complexity-threshold = 15
 # blanks excluded. Ratchet: this sits at the workspace's current ceiling
 too-many-lines-threshold = 90
 
+too-many-lines-in-file-threshold = 350
+
 # `clippy::too_many_arguments` (style, on by default). Current ceiling: the
 too-many-arguments-threshold = 7

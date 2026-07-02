@@ -8,7 +8,6 @@ members = [
   "crates/wavedb-wire-derive",
   "crates/wavedb-core",
   "crates/wavedb-macros",
-  "crates/wavedb-build",
   "crates/wavedb-storage",
   "examples/schema-smoke",
 ]
