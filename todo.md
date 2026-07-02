@@ -169,9 +169,34 @@ code exists yet. Build order, roughly bottom-up:
 
 # DOING
 
-- **Storage engine** (`wavedb-storage`): `block` + `directory` landed; next is the
-  block-backed file (`BlockFile`), page format (crc32 + id-list + blob), BpTree page
-  split/merge, dictionaries, and the journal/cache pipeline.
+- **Storage engine** (`wavedb-storage`): durable single-node `Store` landed
+  (`BlockFile` + `SlotPage` page format + `directory` split + `Journal` +
+  `PageStore` cache/replay pipeline + `PageBpTree`). M2 NonUnique path proven
+  end-to-end (`tests/nonunique_collection.rs`: collection walk + durable reopen).
+  **Remaining for M2:** BpTree node **merge/rebalance on delete** (insert-side
+  split done; delete currently leaves underfull nodes — correct, just unreclaimed);
+  the dedicated **32 KiB one-node-per-page** BpTree format (nodes currently ride
+  the generic `SlotPage` directory under a reserved page-kind `STRUCT_HASH`);
+  per-`STRUCT_HASH` **dictionaries** + zstd compression; **background** settle /
+  rebalance (settle is inline with `apply` for now).
+- **Open design seams surfaced (need a call before M3):**
+  - core's `BpTree` trait `at(root)` carries no tenant, but reading nodes from a
+    tenant-scoped `Store` needs one — `PageBpTree` carries `tenant` explicitly
+    instead of implementing the trait verbatim. Reconcile the trait, or keep the
+    concrete type separate.
+  - `PageStore` is **cache + journal authoritative** for reads; `data.bin` is a
+    deterministic projection rebuilt by journal replay on open. It settles a value
+    into the per-`STRUCT_HASH` page directory by reading the `STRUCT_HASH` from the
+    value's first 8 bytes — so every stored value (records **and** BpTree nodes)
+    must be `STRUCT_HASH`-headed. Typed per-command settling (knowing record vs
+    index-node vs Pivot page kind) is the M3 node layer's job.
+
+# DOING (next after storage)
+
+- **Registry**: replace the single `Object` enum in `wavedb-build` with the
+  per-`STRUCT_HASH` `match` to monomorphized arms (folds `#[server]` fns in).
+- **M3 node**: registry-linked `wavedb-quick-node` driving `PageStore` by typed
+  command dispatch; HTTP POST transport; node-side gates.
 
 # DONE
 
@@ -220,6 +245,27 @@ code exists yet. Build order, roughly bottom-up:
   - **Page `hash_of` is SeaHash** — portable across arch/endianness, so journal replay
     rebuilds `data.bin` with the same routing even when the file moves machines. Random
     per-DB seed keeps DoS resistance.
+- **`wavedb-storage` engine (M2 durable single-node `Store`)** —
+  - **`BlockFile`** — `data.bin` as block-addressed file: superblock in block 0
+    (magic + format version + per-DB seed, reserved via `RESERVED_BLOCKS`),
+    positioned `pread`/`pwrite` run I/O, grow/truncate, `fsync`.
+  - **`SlotPage`** — homogeneous record page: `crc32 + struct_hash + total_len +
+    id-list + blob`, crc-verified, reads correctly from a zero-padded run.
+  - **`directory` page I/O** — `read_page`/`upsert_record`/`remove_record` and
+    `split_next` (the page-moving half of linear hashing: repartition by the next
+    hash bit, crash-safe descriptor reorder).
+  - **`Journal`** — append-only WAL of `Write` batches; `fsync` on append =
+    durability point; torn-tail-tolerant replay (truncates a half-written frame).
+  - **`PageStore`** — implements core `Store` (`get`/atomic `apply`): journal-first
+    → in-memory `BTreeMap` cache → inline settle into per-`STRUCT_HASH` pages, with
+    split-on-growth. `open` rebuilds cache + pages + allocator by journal replay.
+    `StorageError`→`Error::Backend` bridge added to core.
+  - **`PageBpTree`** — `Store`-generic B+tree, the NonUnique `current` index. Keys
+    by the record's unique 10-byte `LocalId` (order = `CREATED_AT`). Insert with
+    full leaf/internal split + cascade + root growth; idempotent; `search` streams
+    record `Id`s by a `CREATED_AT` `Bound`; `remove` (no merge yet). Nodes carry a
+    reserved page-kind `STRUCT_HASH` so they settle as ordinary `PageStore` values.
 
-_86 tests, clippy-clean. Workspace members: wire, wire-derive, core, macros, build,
-storage, schema-smoke._
+_124 tests, clippy-clean (incl. 56 storage: 54 unit + 2 NonUnique-collection
+integration). Workspace members: wire, wire-derive, core, macros, build, storage,
+schema-smoke._

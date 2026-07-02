@@ -18,6 +18,11 @@ pub enum Error {
     /// registry (a record written under a schema this binary doesn't know).
     #[error("unknown struct hash {0:#018x}")]
     UnknownStructHash(u64),
+    /// A failure inside a [`Store`](crate::Store) backend — disk I/O, on-disk
+    /// corruption, or similar. Core stays I/O-free, so the concrete cause is
+    /// flattened to a message at the trait boundary.
+    #[error("storage backend: {0}")]
+    Backend(String),
 }
 
 /// Shorthand for a `Result` carrying the workspace [`Error`].

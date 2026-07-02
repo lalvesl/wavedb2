@@ -95,10 +95,10 @@ fn module_path_for(rel: &Path) -> Vec<String> {
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    if let Some(last) = comps.last_mut() {
-        if let Some(stem) = last.strip_suffix(".rs") {
-            *last = stem.to_string();
-        }
+    if let Some(last) = comps.last_mut()
+        && let Some(stem) = last.strip_suffix(".rs")
+    {
+        *last = stem.to_string();
     }
     if let Some("lib" | "main" | "mod") = comps.last().map(String::as_str) {
         comps.pop();
