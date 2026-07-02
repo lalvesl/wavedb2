@@ -13,3 +13,8 @@
 //! [`PermissionRef`](crate::PermissionRef)) live next to those types.
 
 pub use wavedb_wire::{Cursor, Error, Result, WaveWire, from_wire, to_wire};
+
+// The crc32-framed checked encoding, behind the same-named `validation`
+// feature (forwarded to `wavedb-wire/validation` in Cargo.toml).
+#[cfg(feature = "validation")]
+pub use wavedb_wire::{CRC_PREFIX_LEN, from_wire_checked, to_wire_checked};

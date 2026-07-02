@@ -16,3 +16,11 @@ thiserror.workspace = true
 # The companion derive, re-exported as `wavedb_wire::WaveWire` (serde/serde_derive
 # pattern). Compile-time only; emits `::wavedb_wire::` paths.
 wavedb-wire-derive.workspace = true
+# Only with the `validation` feature: the CRC32 behind the checked encoding
+# (`to_wire_checked` / `from_wire_checked`).
+crc32fast = { workspace = true, optional = true }
+
+[features]
+# CRC32-framed encoding: `to_wire_checked` prefixes the payload with a 4-byte
+# CRC32; `from_wire_checked` verifies it before decoding.
+validation = ["dep:crc32fast"]

@@ -21,5 +21,10 @@ futures = { workspace = true }
 # wavedb_core` in lib.rs lets this crate use its own derive (query DSL).
 wavedb-macros = { path = "../wavedb-macros" }
 
+[features]
+# Forwards to `wavedb-wire/validation`: the crc32-framed `to_wire_checked` /
+# `from_wire_checked`, re-exported via `wavedb_core::wire`.
+validation = ["wavedb-wire/validation"]
+
 [dev-dependencies]
 proptest.workspace = true

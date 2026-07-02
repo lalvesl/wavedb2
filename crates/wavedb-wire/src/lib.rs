@@ -66,6 +66,16 @@ pub enum Error {
     /// A `bool` field held a byte other than `0` or `1`.
     #[error("invalid bool byte {0}")]
     InvalidBool(u8),
+    /// A [`from_wire_checked`] buffer's CRC32 prefix did not match its payload —
+    /// the bytes were corrupted or truncated in a way that still parses.
+    #[cfg(feature = "validation")]
+    #[error("crc mismatch: stored {stored:#010x}, computed {computed:#010x}")]
+    CrcMismatch {
+        /// The CRC32 read from the buffer's 4-byte prefix.
+        stored: u32,
+        /// The CRC32 computed over the payload that followed it.
+        computed: u32,
+    },
 }
 
 /// Shorthand for a `Result` carrying the wire [`Error`].
@@ -171,6 +181,51 @@ pub fn from_wire<T: WaveWire>(bytes: &[u8]) -> Result<T> {
     let mut sc = Cursor::new(stack);
     let mut hc = Cursor::new(heap);
     T::decode(&mut sc, &mut hc)
+}
+
+// ---- checked encoding (crc32-framed) — feature `validation` -----------------
+
+/// Framing bytes [`to_wire_checked`] prepends: one little-endian `u32` CRC32 of
+/// the `[stack][heap]` payload that follows.
+#[cfg(feature = "validation")]
+pub const CRC_PREFIX_LEN: usize = 4;
+
+/// Serialise like [`to_wire`], prefixed with a CRC32 of the payload:
+/// `[crc32 (4 B LE)][stack][heap]`.
+///
+/// Still a single allocation: the CRC slot is reserved up front and patched
+/// after the payload is written. Decode with [`from_wire_checked`] — plain
+/// [`from_wire`] on this buffer would read the CRC bytes as the value's stack.
+#[cfg(feature = "validation")]
+#[must_use]
+pub fn to_wire_checked<T: WaveWire>(value: &T) -> Vec<u8> {
+    let mut buf =
+        Vec::with_capacity(CRC_PREFIX_LEN + T::STACK_SIZE + value.heap_size());
+    buf.extend_from_slice(&[0u8; CRC_PREFIX_LEN]); // slot, patched below
+    value.encode_stack(&mut buf);
+    value.encode_heap(&mut buf);
+    let crc = crc32fast::hash(&buf[CRC_PREFIX_LEN..]);
+    buf[..CRC_PREFIX_LEN].copy_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+/// Deserialise a [`to_wire_checked`] buffer: verify the 4-byte CRC32 prefix
+/// against the payload, then decode like [`from_wire`].
+///
+/// A buffer shorter than the prefix fails as [`Error::UnexpectedEof`]; a prefix
+/// that doesn't match the payload as [`Error::CrcMismatch`].
+#[cfg(feature = "validation")]
+pub fn from_wire_checked<T: WaveWire>(bytes: &[u8]) -> Result<T> {
+    if bytes.len() < CRC_PREFIX_LEN {
+        return Err(Error::UnexpectedEof);
+    }
+    let (prefix, payload) = bytes.split_at(CRC_PREFIX_LEN);
+    let stored = u32::from_le_bytes(prefix.try_into().unwrap());
+    let computed = crc32fast::hash(payload);
+    if stored != computed {
+        return Err(Error::CrcMismatch { stored, computed });
+    }
+    from_wire(payload)
 }
 
 // ---- fixed-width scalars ----------------------------------------------------
@@ -484,5 +539,66 @@ mod tests {
             from_wire::<MixedEnum>(&bytes),
             Err(super::Error::InvalidTag(9))
         );
+    }
+
+    // ---- feature `validation`: crc32-framed encoding -------------------------
+
+    #[cfg(feature = "validation")]
+    mod checked {
+        use super::Named;
+        use crate::{
+            CRC_PREFIX_LEN, Error, from_wire_checked, to_wire_checked,
+        };
+
+        #[test]
+        fn roundtrips_with_crc_prefix() {
+            let v = Named {
+                a: 7,
+                b: "wave".to_string(),
+                c: vec![1, 2, 3],
+            };
+            let bytes = to_wire_checked(&v);
+            assert_eq!(
+                bytes.len(),
+                CRC_PREFIX_LEN + crate::to_wire(&v).len(),
+                "checked buffer = crc prefix + plain encoding"
+            );
+            assert_eq!(&bytes[CRC_PREFIX_LEN..], crate::to_wire(&v));
+            assert_eq!(from_wire_checked::<Named>(&bytes).unwrap(), v);
+        }
+
+        #[test]
+        fn tampered_payload_is_crc_mismatch() {
+            let mut bytes = to_wire_checked(&42u64);
+            *bytes.last_mut().unwrap() ^= 0xFF;
+            assert!(matches!(
+                from_wire_checked::<u64>(&bytes),
+                Err(Error::CrcMismatch { .. })
+            ));
+        }
+
+        #[test]
+        fn tampered_prefix_is_crc_mismatch() {
+            let mut bytes = to_wire_checked(&42u64);
+            bytes[0] ^= 0xFF;
+            assert!(matches!(
+                from_wire_checked::<u64>(&bytes),
+                Err(Error::CrcMismatch { .. })
+            ));
+        }
+
+        #[test]
+        fn short_buffer_is_eof() {
+            assert_eq!(
+                from_wire_checked::<u64>(&[0u8; 3]),
+                Err(Error::UnexpectedEof)
+            );
+            // Prefix intact but payload truncated: crc fails first.
+            let bytes = to_wire_checked(&42u64);
+            assert!(matches!(
+                from_wire_checked::<u64>(&bytes[..bytes.len() - 1]),
+                Err(Error::CrcMismatch { .. })
+            ));
+        }
     }
 }

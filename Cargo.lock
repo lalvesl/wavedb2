@@ -867,6 +867,7 @@ dependencies = [
 name = "wavedb-wire"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "thiserror",
  "wavedb-wire-derive",
 ]
