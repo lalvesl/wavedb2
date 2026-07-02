@@ -178,7 +178,10 @@ code exists yet. Build order, roughly bottom-up:
   the dedicated **32 KiB one-node-per-page** BpTree format (nodes currently ride
   the generic `SlotPage` directory under a reserved page-kind `STRUCT_HASH`);
   per-`STRUCT_HASH` **dictionaries** + zstd compression; **background** settle /
-  rebalance (settle is inline with `apply` for now).
+  rebalance (settle is inline with `apply` for now); migrate engine metadata
+  (superblock body, `SlotPage` header, journal frames) onto **`WaveWire` +
+  checked framing** (`wavedb-wire/validation`, `[crc32][wire]`) per the
+  README's WaveWire rule — a `FORMAT_VERSION` bump, journal replay absorbs it.
 - **Open design seams surfaced (need a call before M3):**
   - core's `BpTree` trait `at(root)` carries no tenant, but reading nodes from a
     tenant-scoped `Store` needs one — `PageBpTree` carries `tenant` explicitly

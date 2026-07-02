@@ -55,6 +55,57 @@ leak or lose blocks.
 
 ---
 
+## On-disk metadata — the superblock & the WaveWire rule
+
+### Block 0: the superblock
+
+The first `RESERVED_BLOCKS` (currently 1) blocks of `data.bin` are engine
+metadata — the allocator never hands them out. Block 0 is the **superblock**:
+it stamps the file as a WaveDB data file and carries the per-database facts.
+Layout (little-endian, zero-padded to the block):
+
+| Offset | Field          | Size    | Meaning                                                                             |
+| ------ | -------------- | ------- | ------------------------------------------------------------------------------------ |
+| 0      | magic          | 8 B     | `WAVEDBIN` — "this is a WaveDB data file". Mismatch ⇒ `StorageError::BadMagic`.     |
+| 8      | format version | `u32`   | On-disk layout version; bumped on any incompatible change. ⇒ `BadVersion` if newer. |
+| 12     | reserved       | `u32`   | Zero.                                                                                |
+| 16     | hash seed      | 4×`u64` | The per-database random SeaHash seed that `hash_of` routes every record with.       |
+
+A fresh file mints a random seed and persists the superblock before anything
+else; opening an existing file validates magic + version and loads the seed.
+Keeping the seed in block 0 is what lets a `data.bin` rebuilt by journal replay
+on another machine route every `Id` into the same bucket.
+
+### One layout language: WaveWire (+ checked framing)
+
+Engine metadata is described with **the `WaveWire` codec only** — the same
+layout language records use. No structure gets its own bespoke byte format:
+
+- **superblock body** (version + seed) — a plain `WaveWire` struct behind the
+  magic. The 8-byte magic itself stays a raw prefix *outside* the wire payload:
+  it must be checkable before any decode is attempted;
+- **block descriptor** (`start u40 · count u20 · occupation u4`, exact-packed
+  into one `u64` — see the table below) — wire-encodes as that `u64`;
+- **page / dictionary directories** (`Vec<u64>` of descriptors) — the standard
+  `WaveWire` `Vec` encoding;
+- **per-page metadata** (the header: `struct_hash`, id list, blob layout) — a
+  `WaveWire` struct.
+
+Where a structure must survive disk corruption — **pages, journal frames** —
+it uses the wire crate's [`validation` feature](../wavedb-wire/README.md#feature-validation--crc32-framed-encoding):
+`to_wire_checked` / `from_wire_checked` frame the payload as
+`[crc32 (4 B LE)][wire bytes]`, so integrity verification is the codec's job —
+not a hand-patched CRC slot re-implemented in every format. A corrupted page
+surfaces as the wire `CrcMismatch` before any decode runs.
+
+> **Status.** The rule is the convention for all metadata going forward. Today
+> the superblock and `SlotPage` still hand-roll their layouts (a CRC placeholder
+> patched in `to_bytes`); moving them onto `WaveWire` + checked framing is a
+> `FORMAT_VERSION` bump, absorbed by the journal-replay rebuild — no migration
+> machinery.
+
+---
+
 ## Per-`STRUCT_HASH` page directory
 
 `data.bin` is **partitioned by type**: each `STRUCT_HASH` owns its own page
@@ -465,7 +516,8 @@ tier is left for later; nothing reclaims old versions today.
 - **Journal** — append-only, replayed on startup; record writes and the
   alloc/free deltas are journaled together so a mid-mutation crash can't desync
   the directory from the data.
-- **Checksums** — every page carries a CRC32 verified on read.
+- **Checksums** — every page carries a CRC32 verified on read (converging on
+  the wire `validation` framing — see _the WaveWire rule_ above).
 - **Locks** — ID-scoped, in process memory.
 
 ---
