@@ -12,6 +12,3 @@ workspace = true
 [dependencies]
 wavedb-core = { path = "../../crates/wavedb-core" }
 wavedb-macros = { path = "../../crates/wavedb-macros" }
-
-[build-dependencies]
-wavedb-build = { path = "../../crates/wavedb-build" }

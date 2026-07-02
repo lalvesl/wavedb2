@@ -47,6 +47,9 @@ jobs:
       - name: clippy
         run: nix develop --command cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: file length budget
+        run: scripts/check_file_length.sh
+
       - name: doc
         run: nix develop --command cargo doc --workspace --no-deps
 

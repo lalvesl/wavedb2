@@ -33,9 +33,6 @@ pub struct LocalId {
 }
 
 impl LocalId {
-    /// The zero/sentinel value — "no version" / "no pivot".
-    pub const ZERO: Self = Self { key: 0, lower: 0 };
-
     #[must_use]
     pub const fn new(key: u64, flag: bool, salt: u16) -> Self {
         let lower = ((flag as u16) << FLAG_SHIFT) | (salt & SALT_MASK);
@@ -77,12 +74,6 @@ impl LocalId {
     pub const fn is_unique_anchor(self) -> bool {
         self.flag()
     }
-
-    /// `true` when used as the "none" sentinel (key = 0, lower = 0).
-    #[must_use]
-    pub const fn is_zero(self) -> bool {
-        self.key == 0 && self.lower == 0
-    }
 }
 
 impl fmt::Debug for LocalId {
@@ -105,12 +96,6 @@ mod tests {
     #[test]
     fn stack_size_is_10() {
         assert_eq!(LocalId::STACK_SIZE, 10);
-    }
-
-    #[test]
-    fn zero_sentinel() {
-        assert!(LocalId::ZERO.is_zero());
-        assert!(LocalId::default().is_zero());
     }
 
     #[test]
@@ -141,7 +126,7 @@ mod tests {
     #[test]
     fn wire_roundtrip() {
         for lid in [
-            LocalId::ZERO,
+            LocalId::default(),
             LocalId::new(u64::MAX, true, 0x7FFF),
             LocalId::new(1, false, 3),
         ] {

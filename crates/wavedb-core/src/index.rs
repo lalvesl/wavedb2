@@ -17,6 +17,7 @@ use futures::Stream;
 use crate::error::Result;
 use crate::id::Id;
 use crate::local_id::LocalId;
+use crate::permission::PermissionRef;
 use crate::store::Store;
 use crate::u48::U48;
 use crate::wire::WaveWire;
@@ -163,7 +164,7 @@ impl Bound {
 /// `#[wavedb]` generates one per NonUnique type; this trait is the portable shape
 /// the engine reads. Root pointers are [`LocalId`] (tenant-scoped tree ⇒ `TENANT`
 /// derivable). No element counter — the `Pivot` is rewritten only when a `BpTree`
-/// root moves.
+/// root moves or its default permission changes (a rare admin op).
 pub trait Pivot: WaveWire + Sized {
     /// Root of the living-records B+tree.
     fn current(&self) -> LocalId;
@@ -171,6 +172,11 @@ pub trait Pivot: WaveWire + Sized {
     fn dead(&self) -> LocalId;
     /// One root per `#[wavedb::pivot(...)]` secondary index.
     fn secondaries(&self) -> &[LocalId];
+    /// Collection-default access rule: seeds new inserts and gates
+    /// collection-scope ops (`Insert`, `All`). Each record's
+    /// `Metadata.permission` overrides it (authoritative per record).
+    /// `None` = tenant-only.
+    fn permission(&self) -> Option<&PermissionRef>;
 }
 
 // ---- BpTree: the index over any Store ---------------------------------------

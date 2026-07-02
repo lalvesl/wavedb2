@@ -10,21 +10,14 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
-byteorder.workspace = true
 # The Wire codec, re-exported as `wavedb_core::wire`. Lives in its own crate so
 # the serialization layer carries no STRUCT_HASH / engine coupling.
 wavedb-wire.workspace = true
-# `Stream` + combinators for the Store-generic index contracts (BpTree search,
+# `Stream` + combinators for the Store-generic index layer (BpTree search,
 # IdStreamExt set algebra). Pure async, WASM-safe — no I/O.
 futures = { workspace = true }
-# The derive emits absolute `::wavedb_core::` paths; `extern crate self as
-# wavedb_core` in lib.rs lets this crate use its own derive (query DSL).
-wavedb-macros = { path = "../wavedb-macros" }
 
 [features]
 # Forwards to `wavedb-wire/validation`: the crc32-framed `to_wire_checked` /
 # `from_wire_checked`, re-exported via `wavedb_core::wire`.
 validation = ["wavedb-wire/validation"]
-
-[dev-dependencies]
-proptest.workspace = true

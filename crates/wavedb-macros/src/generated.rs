@@ -33,7 +33,7 @@ pub fn nonunique_types(
     };
     let pivot_id_wire = wire_derive::derive(&pivot_id_def)?;
 
-    // `struct {Name}Pivot { current, dead, secondaries: [LocalId; N] }`.
+    // `struct {Name}Pivot { current, dead, secondaries: [LocalId; N], permission }`.
     // `#[repr(C)]` keeps a clean layout when `N == 0` (a trailing zero-sized array
     // is otherwise a lint footgun); WaveWire never depends on the repr.
     let pivot_def: syn::DeriveInput = parse_quote! {
@@ -44,6 +44,7 @@ pub fn nonunique_types(
             pub current: ::wavedb_core::LocalId,
             pub dead: ::wavedb_core::LocalId,
             pub secondaries: [::wavedb_core::LocalId; #num_secondaries],
+            pub permission: ::core::option::Option<::wavedb_core::PermissionRef>,
         }
     };
     let pivot_wire = wire_derive::derive(&pivot_def)?;
@@ -72,6 +73,9 @@ pub fn nonunique_types(
             fn current(&self) -> ::wavedb_core::LocalId { self.current }
             fn dead(&self) -> ::wavedb_core::LocalId { self.dead }
             fn secondaries(&self) -> &[::wavedb_core::LocalId] { &self.secondaries }
+            fn permission(&self) -> ::core::option::Option<&::wavedb_core::PermissionRef> {
+                self.permission.as_ref()
+            }
         }
     })
 }

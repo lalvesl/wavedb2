@@ -1,12 +1,12 @@
-//! End-to-end M1 smoke: `#[wavedb]` structs + a `build.rs`-generated registry,
-//! spliced in with `include!`. Proves the whole foundation chain links and
-//! round-trips without any node, transport, or `Db` — just core + macros + build.
+//! M1 smoke: what the `#[wavedb]` derive alone guarantees, proven end-to-end
+//! without any node, transport, or `Db` — `STRUCT_HASH` identity, `WaveWire`
+//! round-trips, shape consts, and the generated NonUnique collection types.
+//!
+//! The former `build.rs` + `include!` registry (`wavedb-build`) is removed;
+//! wire reachability will come from the explicit `expose_server!` /
+//! `expose_client!` declarations once those land.
 
 use wavedb_macros::wavedb;
-
-// The generated `Object` enum (the dispatch seam). Items resolve regardless of
-// order, so splicing this above the struct definitions is fine.
-include!(concat!(env!("OUT_DIR"), "/wavedb_registry.rs"));
 
 /// Unique: one live record per tenant.
 #[wavedb]
@@ -25,7 +25,7 @@ pub struct Note {
     pub pinned: bool,
 }
 
-/// A struct in a submodule — exercises the scanner's module-path resolution.
+/// A struct in a submodule — items are named by path, not found by a scanner.
 pub mod billing {
     use wavedb_macros::wavedb;
 
@@ -39,15 +39,15 @@ pub mod billing {
 #[cfg(test)]
 mod tests {
     use super::billing::Invoice;
-    use super::{AboutUser, Note, Object};
+    use super::{AboutUser, Note, NotePivot, NotePivotId};
     use wavedb_core::traits::Shape;
-    use wavedb_core::wire::to_wire;
+    use wavedb_core::wire::{from_wire, to_wire};
+    use wavedb_core::{LocalId, WaveDbStruct};
 
-    // The registry *is* the `Object` enum: every declared struct's `STRUCT_HASH`
-    // routes to its variant by `match`, decodes, and round-trips — no descriptor
-    // table, no stored names.
+    // Every declared struct round-trips through its derive-emitted WaveWire
+    // impl, and its STRUCT_HASH is a distinct compile-time const.
     #[test]
-    fn object_dispatch_roundtrips_every_struct() {
+    fn derived_structs_roundtrip_and_hashes_differ() {
         let about = AboutUser {
             name: "Ada".into(),
             city: "London".into(),
@@ -58,28 +58,16 @@ mod tests {
         };
         let invoice = Invoice { cents: 42 };
 
-        let about_bytes = to_wire(&about);
-        assert!(matches!(
-            Object::from_wire(AboutUser::STRUCT_HASH, &about_bytes),
-            Ok(Object::AboutUser(ref d)) if *d == about
-        ));
-        assert!(matches!(
-            Object::from_wire(Note::STRUCT_HASH, &to_wire(&note)),
-            Ok(Object::Note(ref d)) if *d == note
-        ));
-        assert!(matches!(
-            Object::from_wire(Invoice::STRUCT_HASH, &to_wire(&invoice)),
-            Ok(Object::Invoice(ref d)) if *d == invoice
-        ));
+        assert_eq!(from_wire::<AboutUser>(&to_wire(&about)), Ok(about));
+        assert_eq!(from_wire::<Note>(&to_wire(&note)), Ok(note));
+        assert_eq!(from_wire::<Invoice>(&to_wire(&invoice)), Ok(invoice));
 
-        // Encode side + identity.
-        let obj = Object::AboutUser(about);
-        assert_eq!(obj.struct_hash(), AboutUser::STRUCT_HASH);
-        assert_eq!(obj.to_wire(), about_bytes);
+        assert_ne!(AboutUser::STRUCT_HASH, Note::STRUCT_HASH);
+        assert_ne!(AboutUser::STRUCT_HASH, Invoice::STRUCT_HASH);
+        assert_ne!(Note::STRUCT_HASH, Invoice::STRUCT_HASH);
     }
 
-    // Shape is a compile-time `const` on the type — reached directly, no runtime
-    // lookup.
+    // Shape is a compile-time `const` on the type — no runtime lookup.
     #[test]
     fn shape_is_a_const_not_a_lookup() {
         assert_eq!(AboutUser::SHAPE, Shape::Unique);
@@ -87,14 +75,22 @@ mod tests {
         assert_eq!(Invoice::SHAPE, Shape::Unique);
     }
 
-    // An unknown hash is refused, and the error carries the `STRUCT_HASH` for
-    // diagnostics. `Object`'s Debug also prints the hash, not a name.
+    // The NonUnique derive emits the collection machinery: a typed PivotId
+    // handle and a Pivot with current/dead roots plus one secondary slot per
+    // `#[wavedb::pivot(...)]`.
     #[test]
-    fn unknown_hash_errors_with_the_hash() {
-        let err = Object::from_wire(0x1234_5678, &[]).unwrap_err();
-        assert_eq!(err, wavedb_core::Error::UnknownStructHash(0x1234_5678));
+    fn nonunique_generates_pivot_types() {
+        let pivot = NotePivot {
+            current: LocalId::new(10, false, 1),
+            dead: LocalId::new(20, false, 2),
+            ..NotePivot::default()
+        };
+        assert_eq!(pivot.secondaries.len(), 1, "one #[wavedb::pivot(...)]");
+        assert_eq!(from_wire::<NotePivot>(&to_wire(&pivot)), Ok(pivot));
 
-        let dbg = format!("{:?}", Object::AboutUser(AboutUser::default()));
-        assert!(dbg.contains("struct_hash"), "Object Debug shows the hash: {dbg}");
+        // The typed handle is what a holder stores to reference the collection.
+        let handle: <Note as WaveDbStruct>::PivotId =
+            NotePivotId::new(LocalId::new(7, false, 0));
+        assert_eq!(handle.local_id(), LocalId::new(7, false, 0));
     }
 }
