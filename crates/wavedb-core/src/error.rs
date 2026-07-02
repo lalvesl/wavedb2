@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::local_id::LocalId;
+
 /// Errors raised by `wavedb-core`. Wire (de)serialization faults arrive through
 /// the [`Wire`](Error::Wire) variant (from the standalone `wavedb-wire` crate);
 /// the rest are core/engine concerns.
@@ -18,6 +20,15 @@ pub enum Error {
     /// registry (a record written under a schema this binary doesn't know).
     #[error("unknown struct hash {0:#018x}")]
     UnknownStructHash(u64),
+    /// A `BpTree` node pointer resolved to nothing in the backing
+    /// [`Store`](crate::Store) — a dangling root/child pointer (index out of
+    /// sync with the store).
+    #[error("bptree node {0:?} missing")]
+    BpTreeNodeMissing(LocalId),
+    /// A value read as a `BpTree` node did not start with the reserved node
+    /// tag — the pointer resolved to some other kind of value.
+    #[error("bptree node bad page-kind tag {0:#018x}")]
+    BpTreeNodeBadTag(u64),
     /// A failure inside a [`Store`](crate::Store) backend — disk I/O, on-disk
     /// corruption, or similar. Core stays I/O-free, so the concrete cause is
     /// flattened to a message at the trait boundary.
