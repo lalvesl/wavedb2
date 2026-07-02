@@ -79,7 +79,7 @@ pub(super) async fn check_invariants(
                 match leaf_depth {
                     None => leaf_depth = Some(depth),
                     Some(d) => {
-                        assert_eq!(d, depth, "leaves at differing depths")
+                        assert_eq!(d, depth, "leaves at differing depths");
                     }
                 }
                 if !is_root {

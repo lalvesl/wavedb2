@@ -125,8 +125,7 @@ fn expand_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream2 {
         quote!(0 #( + <#field_types as ::wavedb_wire::WaveWire>::STACK_SIZE )*);
     let heap_size =
         quote!(0 #( + ::wavedb_wire::WaveWire::heap_size(&#accessors) )*);
-    let encode_stack =
-        quote!(#( ::wavedb_wire::WaveWire::encode_stack(&#accessors, stack); )*);
+    let encode_stack = quote!(#( ::wavedb_wire::WaveWire::encode_stack(&#accessors, stack); )*);
     let encode_heap =
         quote!(#( ::wavedb_wire::WaveWire::encode_heap(&#accessors, heap); )*);
 
@@ -145,10 +144,10 @@ fn expand_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream2 {
 /// The four per-variant `match`-arm sets that drive an enum's `WaveWire` methods.
 #[derive(Default)]
 struct EnumArms {
-    heap_size: Vec<TokenStream2>,    // self -> active variant's payload size
-    tag: Vec<TokenStream2>,          // self -> tag literal (fields ignored)
-    encode_heap: Vec<TokenStream2>,  // self -> write the unit into the heap
-    decode: Vec<TokenStream2>,       // tag  -> reconstruct the variant
+    heap_size: Vec<TokenStream2>, // self -> active variant's payload size
+    tag: Vec<TokenStream2>,       // self -> tag literal (fields ignored)
+    encode_heap: Vec<TokenStream2>, // self -> write the unit into the heap
+    decode: Vec<TokenStream2>,    // tag  -> reconstruct the variant
 }
 
 fn expand_enum(
@@ -161,8 +160,10 @@ fn expand_enum(
             "WaveWire enums are limited to 256 variants (u8 tag)",
         ));
     }
-    let has_fields =
-        data.variants.iter().any(|v| !matches!(v.fields, Fields::Unit));
+    let has_fields = data
+        .variants
+        .iter()
+        .any(|v| !matches!(v.fields, Fields::Unit));
     let arms = enum_variant_arms(data);
     let EnumArms {
         heap_size,

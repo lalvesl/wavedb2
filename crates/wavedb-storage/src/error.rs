@@ -38,34 +38,6 @@ pub enum StorageError {
     /// An on-disk structure failed an integrity check on read (crc, bounds, tag).
     #[error("corrupt {0}")]
     Corrupt(&'static str),
-    /// A `BpTree` node pointer resolved to nothing in the backing [`Store`] —
-    /// a dangling root/child pointer (index out of sync with the store).
-    ///
-    /// [`Store`]: wavedb_core::Store
-    #[error("bptree node {0:?} missing")]
-    BpTreeNodeMissing(wavedb_core::LocalId),
-    /// A `BpTree` node's bytes ended before its fixed header.
-    #[error("bptree node header truncated: {have} bytes, need {need}")]
-    BpTreeNodeHeaderTruncated {
-        /// Bytes the fixed header requires.
-        need: usize,
-        /// Bytes the value actually held.
-        have: usize,
-    },
-    /// A `BpTree` node's leading page-kind tag was not the reserved node tag.
-    #[error("bptree node bad page-kind tag {0:#018x}")]
-    BpTreeNodeBadTag(u64),
-    /// A `BpTree` node declared more entry bytes than its buffer holds.
-    #[error("bptree node truncated: need {need} bytes, have {have}")]
-    BpTreeNodeTruncated {
-        /// Bytes the declared entries require.
-        need: usize,
-        /// Bytes the value actually held.
-        have: usize,
-    },
-    /// A `BpTree` node carried an unknown kind byte (not leaf, not internal).
-    #[error("bptree node bad kind {0}")]
-    BpTreeNodeBadKind(u8),
     /// A core/codec fault surfaced inside the engine.
     #[error(transparent)]
     Core(#[from] wavedb_core::Error),
