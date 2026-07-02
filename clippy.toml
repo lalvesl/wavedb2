@@ -1,0 +1,14 @@
+# Complexity budgets enforced by clippy (pedantic + nursery are `warn` for the
+# whole workspace, so these lints are live — see [workspace.lints] in Cargo.toml
+# and docs/development_standards.md for the rationale and the escape hatch).
+
+# `clippy::cognitive_complexity` (nursery). Clippy's successor to the old
+# cyclomatic-complexity lint: counts branching + nesting a reader must hold.
+cognitive-complexity-threshold = 15
+
+# `clippy::too_many_lines` (pedantic). Lines of code per function, comments and
+# blanks excluded. Ratchet: this sits at the workspace's current ceiling
+too-many-lines-threshold = 90
+
+# `clippy::too_many_arguments` (style, on by default). Current ceiling: the
+too-many-arguments-threshold = 7
