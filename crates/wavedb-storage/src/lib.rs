@@ -12,15 +12,14 @@
     clippy::cast_lossless,
     clippy::cast_sign_loss
 )]
-// The `Store`-generic engine (`PageBpTree`) returns futures that are only `Send`
-// when the backing `Store` is. These are internal node-side seams, not a public
+// `PageStore`'s `Store` impl returns futures that are only `Send` when the
+// caller's usage is. These are internal node-side seams, not a public
 // `Send`-bounded API, so the missing auto-`Send` is intended — same stance core
 // takes with `async_fn_in_trait`.
 #![allow(clippy::future_not_send)]
 
 pub mod block;
 pub mod block_file;
-pub mod bptree;
 pub mod directory;
 pub mod error;
 pub mod journal;
@@ -29,7 +28,6 @@ pub mod page_store;
 
 pub use block::{BLOCK_SIZE, BlockAllocator, BlockDescriptor, Run};
 pub use block_file::{BlockFile, RESERVED_BLOCKS};
-pub use bptree::PageBpTree;
 pub use directory::{Directory, bucket_index, hash_of};
 pub use error::{StorageError, StorageResult};
 pub use journal::Journal;
