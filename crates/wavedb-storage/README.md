@@ -64,12 +64,15 @@ metadata — the allocator never hands them out. Block 0 is the **superblock**:
 it stamps the file as a WaveDB data file and carries the per-database facts.
 Layout (little-endian, zero-padded to the block):
 
-| Offset | Field          | Size    | Meaning                                                                             |
-| ------ | -------------- | ------- | ------------------------------------------------------------------------------------ |
-| 0      | magic          | 8 B     | `WAVEDBIN` — "this is a WaveDB data file". Mismatch ⇒ `StorageError::BadMagic`.     |
-| 8      | format version | `u32`   | On-disk layout version; bumped on any incompatible change. ⇒ `BadVersion` if newer. |
-| 12     | reserved       | `u32`   | Zero.                                                                                |
-| 16     | hash seed      | 4×`u64` | The per-database random SeaHash seed that `hash_of` routes every record with.       |
+| Offset | Field                                | Size    | Meaning                                                                              |
+| ------ | ------------------------------------ | ------- | ------------------------------------------------------------------------------------ |
+| 0      | magic                                | 8 B     | `WAVEDBIN` — "this is a WaveDB data file". Mismatch ⇒ `StorageError::BadMagic`.      |
+| 8      | `to_wire_checked(SuperblockBody)`    | 40 B    | `[crc32 (u32 LE)][wire]` of `{ version: u32, seed: [u64; 4] }`.                      |
+
+The body is the **checked wire encoding** of `SuperblockBody` — the format
+version (bumped on any incompatible change ⇒ `BadVersion` if it mismatches) and
+the per-database random SeaHash seed that `hash_of` routes every record with. A
+crc failure (including a pre-v2 file) surfaces as `Corrupt("superblock")`.
 
 A fresh file mints a random seed and persists the superblock before anything
 else; opening an existing file validates magic + version and loads the seed.
@@ -98,9 +101,9 @@ it uses the wire crate's [`validation` feature](../wavedb-wire/README.md#feature
 not a hand-patched CRC slot re-implemented in every format. A corrupted page
 surfaces as the wire `CrcMismatch` before any decode runs.
 
-> **Status.** The rule is the convention for all metadata going forward. Today
-> the superblock and `SlotPage` still hand-roll their layouts (a CRC placeholder
-> patched in `to_bytes`); moving them onto `WaveWire` + checked framing is a
+> **Status.** The superblock body and journal frames are on checked `WaveWire`
+> (`FORMAT_VERSION` 2). `SlotPage` still hand-rolls its layout (a CRC
+> placeholder patched in `to_bytes`); moving it over is another
 > `FORMAT_VERSION` bump, absorbed by the journal-replay rebuild — no migration
 > machinery.
 
