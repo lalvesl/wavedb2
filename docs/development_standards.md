@@ -68,9 +68,11 @@ function instead.
 - Every module opens with a `//!` header stating its **one responsibility**
   (see any file in `wavedb-storage/src/`). If the header needs "and", the
   module wants splitting.
-- No hard file-length limit, but the working rule: a file that mixes two
-  layers (e.g. a codec and the thing it encodes) splits before it hits ~500
-  lines of non-test code. Tests colocate and don't count against feel.
+- **Hard file-length budget: 350 non-test lines per `.rs` file**, enforced by
+  `scripts/check_file_length.sh` in CI (clippy has no file-level lint — its
+  `too_many_lines` is per function). Tests colocate and don't count: the
+  script stops counting at the first `#[cfg(test)]`. A file over budget
+  splits by layer (e.g. a codec apart from the thing it encodes).
 - One public type/concept per module as the default; `lib.rs` re-exports the
   public surface explicitly (no `pub use module::*`).
 
