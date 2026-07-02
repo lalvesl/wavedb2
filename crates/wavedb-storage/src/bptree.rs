@@ -47,6 +47,8 @@ use wavedb_core::{
     Bound, Id, LocalId, Result, Store, U48, Write, from_wire, to_wire,
 };
 
+use crate::error::{StorageError, StorageResult};
+
 const KIND_LEAF: u8 = 0;
 const KIND_INTERNAL: u8 = 1;
 const LOCALID_LEN: usize = 10;
@@ -121,11 +123,11 @@ impl PageBpTree {
     }
 
     async fn load<S: Store>(&self, store: &S, node: LocalId) -> Result<Node> {
-        let bytes =
-            store.get(node.to_id(self.tenant)).await?.ok_or_else(|| {
-                wavedb_core::Error::Backend("bptree node missing".into())
-            })?;
-        Node::from_bytes(&bytes)
+        let bytes = store
+            .get(node.to_id(self.tenant))
+            .await?
+            .ok_or(StorageError::BpTreeNodeMissing(node))?;
+        Ok(Node::from_bytes(&bytes)?)
     }
 
     /// Whether `record_id` is present in the tree.
@@ -329,9 +331,7 @@ impl PageBpTree {
                     Ok(Some(b)) => b,
                     Ok(None) => {
                         return Some((
-                            Err(wavedb_core::Error::Backend(
-                                "bptree node missing".into(),
-                            )),
+                            Err(StorageError::BpTreeNodeMissing(node).into()),
                             st,
                         ));
                     }
@@ -352,7 +352,7 @@ impl PageBpTree {
                         }
                         st.nodes.push_front(leftmost);
                     }
-                    Err(e) => return Some((Err(e), st)),
+                    Err(e) => return Some((Err(e.into()), st)),
                 }
             }
         })
@@ -438,26 +438,31 @@ impl Node {
         out
     }
 
-    fn from_bytes(buf: &[u8]) -> Result<Self> {
-        let backend = |m: &str| wavedb_core::Error::Backend(m.to_string());
+    fn from_bytes(buf: &[u8]) -> StorageResult<Self> {
         if buf.len() < NODE_PREFIX + 3 {
-            return Err(backend("bptree node header truncated"));
+            return Err(StorageError::BpTreeNodeHeaderTruncated {
+                need: NODE_PREFIX + 3,
+                have: buf.len(),
+            });
         }
         let tag = u64::from_le_bytes(buf[..NODE_PREFIX].try_into().unwrap());
         if tag != BPTREE_NODE_STRUCT_HASH {
-            return Err(backend("bptree node bad page-kind tag"));
+            return Err(StorageError::BpTreeNodeBadTag(tag));
         }
         let kind = buf[NODE_PREFIX];
         let count =
             u16::from_le_bytes([buf[NODE_PREFIX + 1], buf[NODE_PREFIX + 2]])
                 as usize;
         let mut p: usize = NODE_PREFIX + 3;
-        let mut take = |n: usize| -> Result<&[u8]> {
-            let end = p
-                .checked_add(n)
-                .ok_or_else(|| backend("bptree node overflow"))?;
+        let mut take = |n: usize| -> StorageResult<&[u8]> {
+            // Saturation folds the (unreachable) offset-overflow case into the
+            // same truncation fault: the saturated `end` always exceeds `len`.
+            let end = p.saturating_add(n);
             if end > buf.len() {
-                return Err(backend("bptree node truncated"));
+                return Err(StorageError::BpTreeNodeTruncated {
+                    need: end,
+                    have: buf.len(),
+                });
             }
             let s = &buf[p..end];
             p = end;
@@ -467,23 +472,29 @@ impl Node {
             KIND_LEAF => {
                 let mut keys = Vec::with_capacity(count);
                 for _ in 0..count {
-                    keys.push(from_wire::<LocalId>(take(LOCALID_LEN)?)?);
+                    keys.push(read_local_id(take(LOCALID_LEN)?)?);
                 }
                 Ok(Self::Leaf(keys))
             }
             KIND_INTERNAL => {
-                let leftmost = from_wire::<LocalId>(take(LOCALID_LEN)?)?;
+                let leftmost = read_local_id(take(LOCALID_LEN)?)?;
                 let mut entries = Vec::with_capacity(count);
                 for _ in 0..count {
-                    let sep = from_wire::<LocalId>(take(LOCALID_LEN)?)?;
-                    let child = from_wire::<LocalId>(take(LOCALID_LEN)?)?;
+                    let sep = read_local_id(take(LOCALID_LEN)?)?;
+                    let child = read_local_id(take(LOCALID_LEN)?)?;
                     entries.push((sep, child));
                 }
                 Ok(Self::Internal { leftmost, entries })
             }
-            _ => Err(backend("bptree node bad kind")),
+            _ => Err(StorageError::BpTreeNodeBadKind(kind)),
         }
     }
+}
+
+/// Decode one 10-byte `LocalId`, lifting the wire fault through
+/// [`StorageError::Core`] (the documented path for codec errors).
+fn read_local_id(bytes: &[u8]) -> StorageResult<LocalId> {
+    from_wire::<LocalId>(bytes).map_err(|e| StorageError::Core(e.into()))
 }
 
 /// Mint a fresh node `LocalId`: `CREATED_AT`-style key (nanos) with `FLAG = 1` to
