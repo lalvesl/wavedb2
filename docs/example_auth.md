@@ -43,6 +43,13 @@ pub struct Session { pub user: U48, pub tenant: U48, pub issued: u64, pub revoke
 
 #[derive(WaveWire)] pub struct Tokens { pub access: String, pub refresh: String }
 
+// ---- exposure: what each side actually serves / can call --------------------
+// Credentials and Session are NOT listed: they exist in storage and are read
+// and written inside the server-fn bodies below, but no client command can
+// ever name them — an unexposed STRUCT_HASH is refused as unknown.
+wavedb::expose_server! { AboutUser, Note, login, refresh, pinned_notes }
+wavedb::expose_client! { AboutUser, Note, login, refresh, pinned_notes }
+
 // ---- server functions: body runs ONLY on the node ---------------------------
 
 #[server(public)]                            // public: reachable before any token exists

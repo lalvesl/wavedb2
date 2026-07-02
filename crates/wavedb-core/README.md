@@ -112,8 +112,9 @@ identity and schema generation are both folded into `STRUCT_HASH`.
 
 ## `STRUCT_HASH`
 
-A `u64` identity computed at **build time** (in `wavedb-build` / `#[wavedb]`, see
-[`wavedb-macros`](../wavedb-macros/README.md)) over the canonical string:
+A `u64` identity computed at **compile time** (by `#[wavedb]` /
+`#[server]`, see [`wavedb-macros`](../wavedb-macros/README.md)) over the
+canonical string:
 
 ```
 STRUCT_NAME + SHAPE + each PROPERTY_NAME + each PROPERTY_TYPE
@@ -261,23 +262,30 @@ the node with DB access and is called by a typed client binding (see
 
 ## Registry
 
-The **registry that maps a `STRUCT_HASH` to its type is generated in `build.rs`**,
-not here: a scanner walks the schema crate, finds every `#[wavedb]` struct **and
-`#[server]` function**, and emits — spliced in with `include!(concat!(env!("OUT_DIR"),
-…))` — **one `match` on the 64-bit `STRUCT_HASH` per operation**, *not* an `Object`
-enum. **The matches *are* the registry**: `from_wire` / `to_wire`, the `first_try` /
-`fallback_not_found` hooks, the generated `Pivot`/`BpTree` accessors, and the
-server-function call all dispatch by `match struct_hash { … }` to a **concrete,
-monomorphized** arm — **no sum type, no `dyn`, no runtime registration, no
-descriptor table**. Per-type static facts (`STACK_SIZE`, `SHAPE`) are inherent
-`const`s on the struct, reached through the matched arm's concrete type — not a
-duplicated data table. A sum type with one variant per struct is deliberately
-avoided: it is sized to its largest variant and grows with the schema; a bare
-`match` to monomorphized arms costs nothing at runtime and scales to any schema
-size. Server functions share the **same `STRUCT_HASH` space** — a function's hash
-is composed by SeaHash from its argument/return objects' `STRUCT_HASH`es, so there
-is **no separate `FN_HASH`**. The mechanism lives in
-[`wavedb-macros` § the registry](../wavedb-macros/README.md#the-registry--generated-in-buildrs).
+The **registry that maps a `STRUCT_HASH` to its arm is declared, not
+discovered** — and not here. The derive macros generate each item's execution
+steps in place (`#[wavedb]`: the shape's engine ops; `#[server]`: the call
+arm); an explicit **exposure module on each side** (`expose_server!` in the
+node's code, `expose_client!` in the client's) lists what is actually
+reachable, and expands to **one `match` on the 64-bit `STRUCT_HASH` per
+operation**, *not* an `Object` enum. **The matches *are* the registry**:
+`from_wire` / `to_wire`, the `first_try` / `fallback_not_found` hooks, the
+generated `Pivot`/`BpTree` accessors, the engine ops, and the server-function
+call all dispatch by `match struct_hash { … }` to a **concrete, monomorphized**
+arm — **no sum type, no `dyn`, no runtime registration, no descriptor table,
+no build-time scanner**. An unlisted item is an unknown hash at that boundary:
+a type can be storage-only (used inside server-fn bodies, never
+wire-addressable), and a listed op can be excluded or overridden with a
+hardened reimplementation. Per-type static facts (`STACK_SIZE`, `SHAPE`) are
+inherent `const`s on the struct, reached through the matched arm's concrete
+type — not a duplicated data table. A sum type with one variant per struct is
+deliberately avoided: it is sized to its largest variant and grows with the
+schema; a bare `match` to monomorphized arms costs nothing at runtime and
+scales to any schema size. Server functions share the **same `STRUCT_HASH`
+space** — a function's hash is composed by SeaHash from its argument/return
+objects' `STRUCT_HASH`es, so there is **no separate `FN_HASH`**. The mechanism
+lives in
+[`wavedb-macros` § exposure](../wavedb-macros/README.md#exposure--the-declared-registry).
 
 ---
 

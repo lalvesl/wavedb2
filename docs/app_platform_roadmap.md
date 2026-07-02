@@ -7,8 +7,9 @@ code sharing where the DB **is** the server and ships as a library.
 ```
 my-app/
 ├── crates/
-│   ├── app-schema/   # #[wavedb] structs + build.rs registry + evolution hooks
-│   │                 #   compiled into EVERY binary below
+│   ├── app-schema/   # #[wavedb] structs + evolution hooks + the exposure
+│   │                 #   modules (expose_server!/expose_client!) — compiled
+│   │                 #   into EVERY binary below
 │   ├── app-server/   # #[server] functions, validation, jobs (server-only)
 │   ├── app-node/     # fn main() { wavedb_quick_node::run(config, REGISTRY, hooks) }
 │   ├── app-client/   # native client binary / library
@@ -25,17 +26,21 @@ is the protocol.
 
 ## M1 — Foundations: schema crate compiles everywhere
 
-The `app-schema` crate (`#[wavedb]` structs + a `build.rs` that calls
-`wavedb_build::generate_registry`) builds for native and `wasm32`, producing
-`STRUCT_HASH`es, `WaveWire` impls, the auto-generated `Pivot`/`BpTree`
-types, and the generated **per-`STRUCT_HASH` `match` dispatch** (not an `Object`
-enum) spliced in with `include!`. This is the keystone — every other milestone
-consumes the registry, and the build-scanner + per-hash `match` is what lets
+The `app-schema` crate (`#[wavedb]` structs + explicit **exposure modules** —
+`expose_server!` / `expose_client!`; no `build.rs`, no scanner) builds for
+native and `wasm32`, producing `STRUCT_HASH`es, `WaveWire` impls, the
+auto-generated `Pivot`/`BpTree` types, the derive-generated **execution steps**
+(`get`/`save`/`insert`/`update`/`remove`/`search`, server-fn call arms), and —
+from the exposure lists — the **per-`STRUCT_HASH` `match` dispatch** (not an
+`Object` enum). This is the keystone — every other milestone consumes the
+exposure, and derive-generated ops + the declared per-hash `match` is what lets
 storage/server/client all know the structs by static dispatch (no `dyn`, no sum
-type).
+type), with reachability as an explicit allowlist (unlisted types stay
+storage-only; listed ops can be excluded or overridden for hardening).
 
 **Exit:** the schema crate builds on both targets; `from_wire(struct_hash, …)`
-round-trips through the generated dispatch; `WaveWire` encode/decode is property-tested.
+round-trips through the exposure dispatch; an **unlisted** struct's command is
+refused as an unknown hash; `WaveWire` encode/decode is property-tested.
 
 ## M2 — Storage engine
 
@@ -152,9 +157,9 @@ Versioning policy for the platform crates.
   now.
 - **Offline-first reconciliation.**
 
-### Planned generator extensions (post-rebuild)
+### Planned exposure extensions (post-rebuild)
 
-The `build.rs` registry generator is the natural place to grow, all by static
+The exposure macros are the natural place to grow, all by static
 per-`STRUCT_HASH` `match` dispatch (no `dyn`, no sum type):
 
 - **`update_call`** — an additional generated call kind beside the server-function

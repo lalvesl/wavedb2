@@ -39,18 +39,31 @@ code exists yet. Build order, roughly bottom-up:
   collection-scope ops), each record's `Metadata` overrides (authoritative; keeps
   `Update` atomic, no `Pivot` read).
 
-## Registry generation (`wavedb-build` + `build.rs`)
+## Exposure (derive ops + explicit declaration) — replaces `wavedb-build`
 
-- division of labor: `#[wavedb]` does per-struct codegen (`STRUCT_HASH`, `WaveWire`,
-  `PivotId`/`Pivot`/`BpTree`, hooks); `wavedb-build` only **aggregates**;
-- `generate_registry()` scans this crate's `src/` **only** (no deps, no `cfg`
-  expansion, no macro-generated structs) and references macro-emitted paths
-  (`module::Struct::STRUCT_HASH`); deps must re-export into `src/` to register;
-- emit `$OUT_DIR/wavedb_registry.rs`: a per-`STRUCT_HASH` `match` (no `Object`
-  enum) for `from_wire`/`to_wire`, hook routing fot knowed types to(`first_try`/`fallback_not_found`),
-  `Pivot`/`BpTree` accessors, server-fn dispatch — static `match` to monomorphized
-  arms, no sum type, no `dyn`;
-- schema crate pulls it in with `include!(concat!(env!("OUT_DIR"), …))`.
+- **remove `wavedb-build`** (the `build.rs` `src/`-scanner + generated registry)
+  — no build step, no auto-discovery, no `include!(OUT_DIR…)`;
+- division of labor: `#[wavedb]` / `#[server]` do **all** per-item codegen —
+  `STRUCT_HASH`, `WaveWire`, `PivotId`/`Pivot`/`BpTree`, hooks, **and the
+  execution steps** (Unique `get`/`save`; NonUnique
+  `insert`/`update`/`remove`/`get`/`search`; the server-fn call arm) as
+  generated fns on the item — defined, not yet reachable;
+- `expose_server!` / `expose_client!`: explicit declaration module per side
+  listing what that side serves / can call; expands to the per-`STRUCT_HASH`
+  `match` per operation (wire parse, hooks, `Pivot`/`BpTree` access, engine
+  ops, server-fn dispatch) — static, monomorphized, no `Object` enum.
+  **The lists are the registry**;
+- **hard constraint: NO `dyn` in the expansion** — no trait objects, no
+  fn-pointer tables, no runtime registration; overrides substitute the path
+  **inside the match arm** at expansion time (compiler-resolved, inlinable),
+  never a stored callback;
+- unlisted item = unknown hash at that boundary — storage-only types possible
+  (`Credentials`/`Session` pattern: read inside server-fn bodies, never
+  wire-addressable); entries support per-op **exclusion** (`remove: never`)
+  and **override** (`save: audited_save`) to harden or reshape the surface;
+- entries are plain Rust paths, so the old scanner limits go away:
+  dependency-crate, `cfg`-gated, and macro-generated items all declarable;
+- migrate `examples/schema-smoke` off `build.rs` + `include!` onto exposure.
 - _Future:_ `update_call` kind; secondary indexes via `#[wavedb::pivot(field)]` /
   `#[wavedb::pivot((f1, f2))]` (extra `BpTree` + `Pivot` root + `by_field` lookup).
 
@@ -196,9 +209,11 @@ code exists yet. Build order, roughly bottom-up:
 
 # DOING (next after storage)
 
-- **Registry**: replace the single `Object` enum in `wavedb-build` with the
-  per-`STRUCT_HASH` `match` to monomorphized arms (folds `#[server]` fns in).
-- **M3 node**: registry-linked `wavedb-quick-node` driving `PageStore` by typed
+- **Exposure**: remove `wavedb-build` (scanner + `Object` enum); emit the
+  execution steps from `#[wavedb]`/`#[server]`; implement `expose_server!` /
+  `expose_client!` (per-`STRUCT_HASH` `match`, per-op exclusion/override);
+  migrate `schema-smoke` off `build.rs`/`include!`.
+- **M3 node**: exposure-linked `wavedb-quick-node` driving `PageStore` by typed
   command dispatch; HTTP POST transport; node-side gates.
 
 # DONE
@@ -236,9 +251,10 @@ code exists yet. Build order, roughly bottom-up:
 - **`wavedb-build`** — `generate_registry()` scans `src/`, emits the dispatch
   (`from_wire`/`to_wire`/`struct_hash` + a `STRUCT_HASH`-printing `Debug`), no
   descriptor table. Generated code carries `#[allow(...)]` so it never lints the
-  user's crate. _(Currently a single `Object` enum; **being replaced** by a
-  per-`STRUCT_HASH` `match` to monomorphized arms — no sum type — so the registry
-  scales with schema size and folds `#[server]` fns into the same hash space.)_
+  user's crate. _(**Superseded — the crate is being removed**: the scanner and
+  its generated registry give way to derive-generated execution steps +
+  explicit `expose_server!`/`expose_client!` declaration — see the Exposure
+  section above.)_
 - **`examples/schema-smoke`** — end-to-end M1 proof: `#[wavedb]` + `build.rs` +
   `include!` → registry resolves + round-trips. (Real example; `todo-app`
   still needs M4 `#[server]`/`Db`.)
