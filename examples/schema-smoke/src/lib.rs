@@ -93,4 +93,108 @@ mod tests {
             NotePivotId::new(LocalId::new(7, false, 0));
         assert_eq!(handle.local_id(), LocalId::new(7, false, 0));
     }
+
+    /// A minimal in-memory `Store` — the whole backend contract the derived
+    /// API needs (`get` + atomic `apply`).
+    mod mem {
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+        use wavedb_core::{Id, Result, Store, Write};
+
+        #[derive(Default)]
+        pub struct MemStore(Mutex<BTreeMap<u128, Vec<u8>>>);
+
+        impl Store for MemStore {
+            async fn get(&self, id: Id) -> Result<Option<Vec<u8>>> {
+                Ok(self.0.lock().unwrap().get(&id.raw()).cloned())
+            }
+            async fn apply(&self, batch: &[Write]) -> Result<()> {
+                let mut m = self.0.lock().unwrap();
+                for w in batch {
+                    match w {
+                        Write::Put(id, b) => {
+                            m.insert(id.raw(), b.clone());
+                        }
+                        Write::Remove(id) => {
+                            m.remove(&id.raw());
+                        }
+                    }
+                }
+                drop(m);
+                Ok(())
+            }
+        }
+    }
+
+    // The generated API end-to-end, in the exact shape application code uses:
+    // an explicit `create_pivot`, then `collection(...)` driving
+    // insert / all / save / remove — no raw `BpTree` anywhere.
+    #[test]
+    fn derived_collection_flow_end_to_end() {
+        use futures::TryStreamExt;
+        use futures::executor::block_on;
+        use wavedb_core::U48;
+
+        block_on(async {
+            let store = mem::MemStore::default();
+            let tenant = U48::from(42u32);
+
+            // A Unique record holds the collection handle (the owning record).
+            let notes = Note::create_pivot(&store, tenant).await.unwrap();
+            let about = AboutUser {
+                name: "Ada".into(),
+                city: "London".into(),
+            };
+            about.save(&store, tenant).await.unwrap();
+            assert_eq!(
+                AboutUser::get(&store, tenant).await.unwrap(),
+                Some(about)
+            );
+
+            // Drive the collection through the typed handle.
+            let col = Note::collection(notes, tenant);
+            let a = col
+                .insert(
+                    &store,
+                    &Note {
+                        body: "first".into(),
+                        pinned: false,
+                    },
+                )
+                .await
+                .unwrap();
+            let b = col
+                .insert(
+                    &store,
+                    &Note {
+                        body: "second".into(),
+                        pinned: true,
+                    },
+                )
+                .await
+                .unwrap();
+
+            let walked: Vec<(wavedb_core::Id, Note)> =
+                col.all(&store).try_collect().await.unwrap();
+            assert_eq!(
+                walked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                vec![a, b],
+                "insertion order"
+            );
+
+            // Update = save at the stable Id; identity never changes.
+            let mut second = walked[1].1.clone();
+            second.pinned = false;
+            col.save(&store, b, &second).await.unwrap();
+            assert_eq!(col.get(&store, b).await.unwrap(), Some(second));
+
+            // Remove drops it from the walk; bytes stay (history).
+            assert!(col.remove(&store, a).await.unwrap());
+            let after: Vec<(wavedb_core::Id, Note)> =
+                col.all(&store).try_collect().await.unwrap();
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].0, b);
+            assert!(col.get(&store, a).await.unwrap().is_some());
+        });
+    }
 }

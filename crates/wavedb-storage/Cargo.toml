@@ -22,6 +22,8 @@ thiserror.workspace = true
 crc32fast.workspace = true
 # Runtime Id/page-routing hash (per-DB random seed).
 seahash.workspace = true
+# Page compression against per-STRUCT_HASH raw-content dictionaries.
+zstd.workspace = true
 # Streams for the search walk over the Store seam.
 futures.workspace = true
 

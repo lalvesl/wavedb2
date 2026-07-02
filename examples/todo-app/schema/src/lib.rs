@@ -1,7 +1,37 @@
 use futures::StreamExt;
 use wavedb::prelude::*;
 
-include!(concat!(env!("OUT_DIR"), "/wavedb_registry.rs"));
+// ── Exposure: what each side actually serves / can call ───────────────────────
+//
+// The lists ARE the registry — no `build.rs`, no scanner, no generated file.
+// `expose_server!` expands to the node's per-`STRUCT_HASH` dispatch `match`
+// over exactly the listed items (and emits `REGISTRY` for the node builder);
+// `expose_client!` expands the typed call bindings this client binary may use.
+//
+// This app's whole client surface is its `#[server]` functions, so ONLY the
+// functions are listed. Every struct stays unlisted — storage-only:
+//
+// - `Auth` holds credentials: it is read/written inside `register`/`login`
+//   bodies and must never be wire-addressable;
+// - `AllUserNamesToTenants` / `UserEntry` are the cross-tenant username
+//   registry: reachable only through `register`/`login`, never directly;
+// - `Profile` / `Todo` are reached through the todo functions, which enforce
+//   the profile→pivot path — a client command naming any of these hashes is
+//   refused as an unknown hash.
+//
+// Functions and structs share one hash space, so a single flat list declares
+// both kinds; adding e.g. `Todo { remove: never }` here would expose direct
+// typed ops with `remove` excluded.
+
+wavedb::expose_server! {
+    register, login,
+    add_todo, all_todos, complete_todo, delete_todo,
+}
+
+wavedb::expose_client! {
+    register, login,
+    add_todo, all_todos, complete_todo, delete_todo,
+}
 
 // ── Global username registry (system tenant = 0) ──────────────────────────────
 
