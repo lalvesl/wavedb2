@@ -22,6 +22,7 @@
 // `::wavedb_core::` paths; this lets the crate use its own derive.
 extern crate self as wavedb_core;
 
+pub mod collection;
 pub mod error;
 pub mod hooks;
 pub mod id;
@@ -34,6 +35,7 @@ pub mod traits;
 pub mod u48;
 pub mod wire;
 
+pub use collection::Collection;
 pub use error::{Error, Result};
 pub use hooks::LookupHooks;
 pub use id::Id;
@@ -44,6 +46,6 @@ pub use local_id::LocalId;
 pub use metadata::Metadata;
 pub use permission::PermissionRef;
 pub use store::{Store, Write};
-pub use traits::{Shape, WaveDbStruct};
+pub use traits::{NonUniqueStruct, Shape, WaveDbStruct};
 pub use u48::U48;
 pub use wire::{Cursor, WaveWire, from_wire, to_wire};

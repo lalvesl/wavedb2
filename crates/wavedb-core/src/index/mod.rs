@@ -11,7 +11,7 @@
 
 mod key;
 #[cfg(test)]
-mod mem_store;
+pub(crate) mod mem_store;
 mod node;
 mod stream;
 mod tree;
@@ -20,7 +20,7 @@ mod tree_insert;
 
 pub use key::IndexKey;
 pub use stream::{Except, IdStreamExt, Intersect, Union};
-pub use tree::BpTree;
+pub use tree::{BpTree, DEFAULT_INTERNAL_CAP, DEFAULT_LEAF_CAP};
 
 use crate::local_id::LocalId;
 use crate::permission::PermissionRef;
@@ -103,6 +103,11 @@ impl Bound {
 /// derivable). No element counter — the `Pivot` is rewritten only when a `BpTree`
 /// root moves or its default permission changes (a rare admin op).
 pub trait Pivot: WaveWire + Sized {
+    /// Identity stamped at the head of the stored pivot record (`[STRUCT_HASH]
+    /// [wire]`), routing all pivots of one collection type into one storage
+    /// directory. The macro derives it from the generated pivot's own shape.
+    const STRUCT_HASH: u64;
+
     /// Root of the living-records B+tree.
     fn current(&self) -> LocalId;
     /// Root of the deleted-records B+tree.
@@ -114,6 +119,11 @@ pub trait Pivot: WaveWire + Sized {
     /// `Metadata.permission` overrides it (authoritative per record).
     /// `None` = tenant-only.
     fn permission(&self) -> Option<&PermissionRef>;
+    /// A copy of this pivot with the `current` / `dead` roots replaced and
+    /// everything else (secondaries, permission) preserved — what the engine
+    /// writes back when a B+tree root moves.
+    #[must_use]
+    fn replace_roots(&self, current: LocalId, dead: LocalId) -> Self;
 }
 
 #[cfg(test)]

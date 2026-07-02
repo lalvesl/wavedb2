@@ -29,6 +29,28 @@ impl BpTree {
         store: &S,
         record_id: Id,
     ) -> Result<bool> {
+        match self.plan_remove(store, record_id).await? {
+            Some(batch) => {
+                store.apply(&batch).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Plan a removal of `record_id`: every node [`Write`] the removal needs,
+    /// **without applying** — so a caller can commit the index change and its
+    /// record in one atomic batch. Reads through `store`; updates
+    /// [`root`](Self::root) on a collapse (the handle assumes the batch will
+    /// be applied). `None` = key not present (nothing to write).
+    ///
+    /// # Errors
+    /// Propagates a [`Store`] read failure.
+    pub async fn plan_remove<S: Store>(
+        &mut self,
+        store: &S,
+        record_id: Id,
+    ) -> Result<Option<Vec<Write>>> {
         let target = LocalId::from_id(record_id);
 
         // Descend to the leaf, recording the internal path for rebalancing.
@@ -52,7 +74,7 @@ impl BpTree {
         };
 
         let Ok(pos) = keys.binary_search(&target) else {
-            return Ok(false);
+            return Ok(None);
         };
         keys.remove(pos);
 
@@ -81,8 +103,7 @@ impl BpTree {
             }
         }
 
-        store.apply(&batch).await?;
-        Ok(true)
+        Ok(Some(batch))
     }
 
     /// The reached node is the root: persist it, collapsing an internal root

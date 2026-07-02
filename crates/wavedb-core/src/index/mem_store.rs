@@ -15,11 +15,11 @@ use super::tree::BpTree;
 
 /// In-memory `Store` for exercising the index layer.
 #[derive(Default)]
-pub(super) struct MemStore(Mutex<BTreeMap<u128, Vec<u8>>>);
+pub(crate) struct MemStore(Mutex<BTreeMap<u128, Vec<u8>>>);
 
 impl MemStore {
     /// Number of stored values (in tree-only tests: the live node count).
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.0.lock().unwrap().len()
     }
 }
