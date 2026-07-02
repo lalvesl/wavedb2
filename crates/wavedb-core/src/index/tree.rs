@@ -72,17 +72,25 @@ impl BpTree {
         self
     }
 
+    /// Plan a fresh, empty tree: the handle plus the [`Write`] that persists its
+    /// empty root leaf. The caller commits the write (alone or inside a larger
+    /// atomic batch) and persists the root in its `Pivot`.
+    #[must_use]
+    pub fn plan_create(tenant: U48) -> (Self, Write) {
+        let root = mint_node_id();
+        let tree = Self::at(root, tenant);
+        let write = tree.put(root, &NodeBody::Leaf(Vec::new()));
+        (tree, write)
+    }
+
     /// Create a fresh, empty tree: writes an empty leaf root and returns the
     /// handle. The caller persists the returned root in its `Pivot`.
     ///
     /// # Errors
     /// Propagates a [`Store`] failure.
     pub async fn create<S: Store>(store: &S, tenant: U48) -> Result<Self> {
-        let root = mint_node_id();
-        let tree = Self::at(root, tenant);
-        store
-            .apply(&[tree.put(root, &NodeBody::Leaf(Vec::new()))])
-            .await?;
+        let (tree, write) = Self::plan_create(tenant);
+        store.apply(&[write]).await?;
         Ok(tree)
     }
 
@@ -125,7 +133,7 @@ impl BpTree {
         &self,
         store: &'a S,
         bound: Bound,
-    ) -> impl Stream<Item = Result<Id>> + 'a {
+    ) -> impl Stream<Item = Result<Id>> + use<'a, S> {
         let mut nodes: VecDeque<LocalId> = VecDeque::new();
         nodes.push_back(self.root);
         let init = WalkState {
