@@ -2,6 +2,7 @@
 
 use thiserror::Error;
 
+use crate::id::Id;
 use crate::local_id::LocalId;
 
 /// Errors raised by `wavedb-core`. Wire (de)serialization faults arrive through
@@ -29,6 +30,18 @@ pub enum Error {
     /// tag — the pointer resolved to some other kind of value.
     #[error("bptree node bad page-kind tag {0:#018x}")]
     BpTreeNodeBadTag(u64),
+    /// A collection handle's `Pivot` record was not in the [`Store`] — a stale
+    /// or foreign `PivotId`.
+    ///
+    /// [`Store`]: crate::Store
+    #[error("pivot record {0:?} missing")]
+    PivotMissing(LocalId),
+    /// An index pointed at a record the [`Store`] no longer holds — index out
+    /// of sync with the record space.
+    ///
+    /// [`Store`]: crate::Store
+    #[error("record {0:?} missing")]
+    RecordMissing(Id),
     /// A failure inside a [`Store`](crate::Store) backend — disk I/O, on-disk
     /// corruption, or similar. Core stays I/O-free, so the concrete cause is
     /// flattened to a message at the trait boundary.
