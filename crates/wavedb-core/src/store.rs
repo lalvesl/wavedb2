@@ -11,9 +11,14 @@
 
 use crate::error::Result;
 use crate::id::Id;
+use crate::wire::WaveWire;
 
 /// One write inside an atomic [`Store::apply`] batch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Derives [`WaveWire`], so a batch (`Vec<Write>`) is itself a wire value — the
+/// journal in `wavedb-storage` persists batches with the checked encoding
+/// instead of a hand-rolled format.
+#[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
 pub enum Write {
     /// Insert or overwrite `Id`'s wire bytes.
     Put(Id, Vec<u8>),

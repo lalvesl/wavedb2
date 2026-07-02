@@ -13,8 +13,10 @@
 )]
 // The `Store` / `BpTree` backend contracts use `async fn` in traits deliberately:
 // these are internal seams, not a public Send-bounded API, so the absence of an
-// auto `Send` bound is intended, not an oversight.
+// auto `Send` bound is intended, not an oversight. Same stance for the futures
+// `BpTree`'s methods return — they are only `Send` when the backing `Store` is.
 #![allow(async_fn_in_trait)]
+#![allow(clippy::future_not_send)]
 
 // The derive (once it lands in `wavedb-macros`) emits absolute
 // `::wavedb_core::` paths; this lets the crate use its own derive.
