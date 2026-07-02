@@ -13,7 +13,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Ident, parse_quote};
 
-use crate::wire_derive;
+use crate::{struct_hash, wire_derive};
 
 /// Emit the `PivotId` newtype and the `Pivot` roots holder for a NonUnique struct
 /// named `name` with `num_secondaries` secondary indexes.
@@ -23,6 +23,23 @@ pub fn nonunique_types(
 ) -> syn::Result<TokenStream> {
     let pivot_id = format_ident!("{}PivotId", name);
     let pivot = format_ident!("{}Pivot", name);
+
+    // The pivot record's own identity: hashed like any struct, under the
+    // reserved `Pivot` shape discriminator so it can never collide with a
+    // user-declared `Unique`/`NonUnique` type of the same name and fields.
+    let pivot_hash = struct_hash::compute(
+        &pivot.to_string(),
+        "Pivot",
+        &[
+            ("current".into(), "LocalId".into()),
+            ("dead".into(), "LocalId".into()),
+            (
+                "secondaries".into(),
+                format!("[LocalId;{num_secondaries}]"),
+            ),
+            ("permission".into(), "Option<PermissionRef>".into()),
+        ],
+    );
 
     // `struct {Name}PivotId(pub LocalId);` — WaveWire by delegation to LocalId.
     let pivot_id_def: syn::DeriveInput = parse_quote! {
@@ -69,12 +86,58 @@ pub fn nonunique_types(
         #pivot_def
         #pivot_wire
 
+        impl ::wavedb_core::NonUniqueStruct for #name {
+            type Pivot = #pivot;
+        }
+
+        impl #name {
+            /// The typed handle into an existing collection of this type,
+            /// referenced by the `PivotId` an owning record stores.
+            #[must_use]
+            pub const fn collection(
+                pivot: #pivot_id,
+                tenant: ::wavedb_core::U48,
+            ) -> ::wavedb_core::Collection<Self> {
+                ::wavedb_core::Collection::at(pivot.local_id(), tenant)
+            }
+
+            /// Create a new, empty collection of this type under `tenant` —
+            /// explicit, never automatic. Store the returned `PivotId` in an
+            /// owning record to keep the collection reachable.
+            ///
+            /// # Errors
+            /// Propagates a [`Store`](::wavedb_core::Store) failure.
+            #[allow(clippy::future_not_send)]
+            pub async fn create_pivot<S: ::wavedb_core::Store>(
+                store: &S,
+                tenant: ::wavedb_core::U48,
+            ) -> ::wavedb_core::Result<#pivot_id> {
+                ::wavedb_core::Collection::<Self>::create(store, tenant)
+                    .await
+                    .map(#pivot_id::new)
+            }
+        }
+
         impl ::wavedb_core::index::Pivot for #pivot {
+            const STRUCT_HASH: u64 = #pivot_hash;
+
             fn current(&self) -> ::wavedb_core::LocalId { self.current }
             fn dead(&self) -> ::wavedb_core::LocalId { self.dead }
             fn secondaries(&self) -> &[::wavedb_core::LocalId] { &self.secondaries }
             fn permission(&self) -> ::core::option::Option<&::wavedb_core::PermissionRef> {
                 self.permission.as_ref()
+            }
+            fn replace_roots(
+                &self,
+                current: ::wavedb_core::LocalId,
+                dead: ::wavedb_core::LocalId,
+            ) -> Self {
+                Self {
+                    current,
+                    dead,
+                    secondaries: self.secondaries,
+                    permission: ::core::clone::Clone::clone(&self.permission),
+                }
             }
         }
     })
