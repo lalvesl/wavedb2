@@ -15,7 +15,7 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 | `block`      | `BlockDescriptor` (u40·u20·u4) + `Run` + `BlockAllocator` — alloc/free/coalesce runs of 4 KiB blocks.       |
 | `block_file` | `data.bin` as a block-addressed file: superblock (block 0), positioned run I/O, grow/truncate, fsync.       |
 | `directory`  | The per-`STRUCT_HASH` `Vec<u64>` page directory + linear hashing + page-moving `split_next`.                |
-| `page`       | `SlotPage` — the homogeneous record page format (crc32, id list, blob).                                     |
+| `page`       | `SlotPage` — the homogeneous record page: `[len][to_wire_checked(PageBody)]`.                               |
 | `journal`    | Append-only WAL of `Write` batches (checked wire frames); fsync = durability; torn-tail-tolerant replay.    |
 | `page_store` | `PageStore` — the node's authoritative `Store`: journal-first → cache → settle into per-type pages.         |
 | `error`      | `StorageError` / `StorageResult`; flattens to `wavedb_core::Error::Backend` at the `Store` seam.            |
@@ -75,9 +75,10 @@ Layout (little-endian, zero-padded to the block):
 | 8      | `to_wire_checked(SuperblockBody)`    | 40 B    | `[crc32 (u32 LE)][wire]` of `{ version: u32, seed: [u64; 4] }`.                      |
 
 The body is the **checked wire encoding** of `SuperblockBody` — the format
-version (bumped on any incompatible change ⇒ `BadVersion` if it mismatches) and
-the per-database random SeaHash seed that `hash_of` routes every record with. A
-crc failure (including a pre-v2 file) surfaces as `Corrupt("superblock")`.
+version (`BadVersion` if it mismatches; pinned at 1 pre-release, see the
+[root README](../../readme.md)) and the per-database random SeaHash seed that
+`hash_of` routes every record with. A crc failure surfaces as
+`Corrupt("superblock")`.
 
 A fresh file mints a random seed and persists the superblock before anything
 else; opening an existing file validates magic + version and loads the seed.
@@ -96,8 +97,8 @@ layout language records use. No structure gets its own bespoke byte format:
   into one `u64` — see the table below) — wire-encodes as that `u64`;
 - **page / dictionary directories** (`Vec<u64>` of descriptors) — the standard
   `WaveWire` `Vec` encoding;
-- **per-page metadata** (the header: `struct_hash`, id list, blob layout) — a
-  `WaveWire` struct.
+- **page body** (`struct_hash` + the `(id, bytes)` entries) — a plain
+  `WaveWire` struct (`PageBody`).
 
 Where a structure must survive disk corruption — **pages, journal frames** —
 it uses the wire crate's [`validation` feature](../wavedb-wire/README.md#feature-validation--crc32-framed-encoding):
@@ -106,11 +107,11 @@ it uses the wire crate's [`validation` feature](../wavedb-wire/README.md#feature
 not a hand-patched CRC slot re-implemented in every format. A corrupted page
 surfaces as the wire `CrcMismatch` before any decode runs.
 
-> **Status.** The superblock body and journal frames are on checked `WaveWire`
-> (`FORMAT_VERSION` 2). `SlotPage` still hand-rolls its layout (a CRC
-> placeholder patched in `to_bytes`); moving it over is another
-> `FORMAT_VERSION` bump, absorbed by the journal-replay rebuild — no migration
-> machinery.
+> **Status.** Fully in effect: the superblock body, journal frames, **and
+> pages** are all on checked `WaveWire`. No engine structure hand-rolls its
+> byte layout anymore; the only raw prefixes left are the 8-byte superblock
+> magic (checkable before any decode) and the `u32` length that delimits a
+> payload inside a zero-padded run / append-only log.
 
 ---
 
@@ -224,39 +225,37 @@ written page.
 
 ## Page format
 
-A page is **homogeneous** — records of exactly one `STRUCT_HASH`. The
-`#[wavedb]` macro emits, via a `PageFormat` derive trait, the layout and the
-serialize/deserialize over `WaveWire`, separately for each of the four page kinds
-(`Unique`, `NonUnique`, `Pivot`, `BpTree`) so each gets its own optimal
-dictionary and compression.
+A page is **homogeneous** — records of exactly one `STRUCT_HASH`. `SlotPage` is
+the one page format today (`Unique` anchors, NonUnique records, Pivots, and
+`BpTree` nodes all ride it; per-kind dictionaries/compression come later), and
+its layout is the **checked wire encoding** — no page-private byte format:
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│ crc32 │ STRUCT_HASH (u64)                                  │
-│ ──────────────────────────────────────────────────────    │
-│ id list: [ (Id: u128, offset, size) … ]   ← dynamic sizes  │
-│ ──────────────────────────────────────────────────────    │
-│ blob: [ record bytes … ]                  ← Wire-encoded   │
-└──────────────────────────────────────────────────────────┘
+[ payload_len (u32 LE) ][ to_wire_checked(PageBody) ]   … zero-padded to the run
+                         └── [ crc32 (u32 LE) ][ wire bytes ] ──┘
+
+PageBody (plain WaveWire struct):
+    struct_hash: u64                  — identifies the type; selects the dictionary
+    records: Vec<(u128, Vec<u8>)>     — (Id.raw, record wire bytes), ascending Id
 ```
 
-- **`crc32`** — verified on read.
-- **`STRUCT_HASH`** — present in every page kind; identifies the type and selects
-  the dictionary.
-- **id list** — the `u128` IDs with each record's dynamic size and position in the
-  blob. Present for all four kinds (`Unique`, `NonUnique`, `Pivot`, `BpTree`).
-- **blob** — the `WaveWire`-encoded record bytes to parse.
+- **`payload_len`** — the only framing outside the codec: a page reads back
+  from a run of whole blocks padded with zeros, and `from_wire_checked` must
+  get the exact payload slice for its crc to hold (same pattern as a journal
+  frame).
+- **crc + decode** — both the codec's job (`CrcMismatch` before any decode
+  runs), surfaced as `StorageError::Corrupt`.
 
-The `PageFormat` trait also owns the **management of the `Vec<u64>` directory** —
-calling the block manager to allocate/free runs and driving the `WaveWire`
-serialize/deserialize. Page kinds:
+What a page's records hold, by the kind of `STRUCT_HASH` that routed them (the
+future per-kind split — own dictionaries, the dedicated 32 KiB node page —
+specialises these without changing the framing):
 
-| Kind          | What the blob holds                                                |
+| Kind          | What the records hold                                              |
 | ------------- | ------------------------------------------------------------------ |
 | **Unique**    | The single live record per tenant at its fixed anchor address.     |
 | **NonUnique** | The collection's records (timestamp-keyed).                        |
 | **Pivot**     | Collection handles: `current`/`dead` BpTree pointers (no counter). |
-| **BpTree**    | 32 KiB page; one B+tree node per page; 18-byte entries.            |
+| **BpTree**    | Serialised B+tree nodes (target: 32 KiB, one node per page).       |
 
 ### BpTree page layout — 32 KiB, one node per page
 

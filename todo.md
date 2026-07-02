@@ -195,10 +195,9 @@ code exists yet. Build order, roughly bottom-up:
   (nodes currently ride the generic `SlotPage` directory under a reserved
   page-kind `STRUCT_HASH`); per-`STRUCT_HASH` **dictionaries** + zstd
   compression; **background** settle / rebalance (settle is inline with `apply`
-  for now); move `SlotPage`'s header onto checked `WaveWire` framing (the
-  superblock body and journal frames are done — `FORMAT_VERSION` 2); secondary
-  indexes (`#[wavedb::pivot(...)]`) driven through `Collection` (`by_<field>`
-  walks, reindex on `save`); per-record `Metadata` written alongside records.
+  for now); secondary indexes (`#[wavedb::pivot(...)]`) driven through
+  `Collection` (`by_<field>` walks, reindex on `save`); per-record `Metadata`
+  written alongside records.
 - **Design note (M3):** `PageStore` is **cache + journal authoritative** for
   reads; `data.bin` is a deterministic projection rebuilt by journal replay on
   open. It settles a value into the per-`STRUCT_HASH` page directory by reading
@@ -289,10 +288,15 @@ code exists yet. Build order, roughly bottom-up:
     (underfull = <¼ cap; merge when the pair fits ¾ cap), all invariants
     checked by a test harness. Nodes encode via `WaveWire` behind a reserved
     page-kind tag and settle as ordinary `PageStore` values.
-  - **Checked wire framing (`FORMAT_VERSION` 2)** — `Write` derives `WaveWire`;
-    journal frames are `[len][to_wire_checked(Vec<Write>)]` and the superblock
-    body is `[magic][to_wire_checked(SuperblockBody)]` (version + seed inside
-    the crc) — no hand-rolled journal/superblock codecs left.
+  - **Checked wire framing** — the WaveWire rule is fully
+    in effect: `Write` derives `WaveWire` and journal frames are
+    `[len][to_wire_checked(Vec<Write>)]`; the superblock body is
+    `[magic][to_wire_checked(SuperblockBody)]` (version + seed inside the crc);
+    and `SlotPage` is `[len][to_wire_checked(PageBody)]` (`struct_hash` +
+    `(id, bytes)` entries — the hand-rolled header/id-list/offset format is
+    gone). No engine structure hand-rolls its byte layout anymore; the only
+    raw prefixes are the superblock magic and the `u32` payload length that
+    delimits a page in a zero-padded run / a frame in the log.
   - **Hygiene** — 350-line-per-file budget enforced by
     `scripts/check_file_length.sh` (CI step); `maybe_split` checks only the
     touched bucket (O(1)); `wavedb-build` removed from the workspace.

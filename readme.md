@@ -462,3 +462,11 @@ and browser (WASM via `wasm_bindgen_futures`, `fetch`, `gloo_net`, IndexedDB).
 🔬 **Research / rebuild phase.** The workspace is a clean reimplementation: the
 design below is being rebuilt from the ground up. These docs describe the
 **target** architecture, not shipped code.
+
+**No format versioning, no migrations — by policy.** WaveDB does not exist yet,
+so no energy goes into tracking on-disk history: the superblock's
+`FORMAT_VERSION` is **pinned at `1`** and every layout (superblock, journal
+frames, pages, wire encodings, `STRUCT_HASH` inputs) may change freely between
+commits with no bump, no changelog, and no migration path. A `data.bin` written
+by an older build is simply unsupported — delete it (journal replay rebuilds
+the pages) or start fresh. Version discipline begins at the first release.
