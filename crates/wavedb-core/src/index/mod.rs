@@ -10,6 +10,8 @@
 //! never named here.
 
 mod key;
+#[cfg(test)]
+mod mem_store;
 mod node;
 mod stream;
 mod tree;
@@ -70,8 +72,13 @@ impl Bound {
             }
             Self::Range { lo, hi } => {
                 let (lo, hi) = (as_u64(lo)?, as_u64(hi)?);
-                // Half-open [lo, hi) → inclusive; hi == 0 matches nothing.
-                Some((lo, hi.wrapping_sub(1)))
+                // Half-open [lo, hi) → inclusive. hi == 0 matches nothing;
+                // wrapping would turn it into the full range, so signal the
+                // empty range explicitly with lo > hi.
+                if hi == 0 {
+                    return Some((1, 0));
+                }
+                Some((lo, hi - 1))
             }
             Self::Prefix(p) => {
                 if p.len() > 8 {
