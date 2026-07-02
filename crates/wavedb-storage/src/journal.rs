@@ -10,34 +10,30 @@
 //! ## Frame format
 //!
 //! ```text
-//! [ payload_len (u32) ][ crc32(payload) (u32) ][ payload ]
+//! [ payload_len (u32 LE) ][ payload = to_wire_checked(Vec<Write>) ]
+//!                           └── [ crc32 (u32 LE) ][ wire bytes ] ──┘
 //! ```
 //!
-//! The payload is a batch of [`Write`]s — the same all-or-nothing unit
-//! [`Store::apply`](wavedb_core::Store::apply) commits:
+//! The payload is the **checked wire encoding** of one batch of [`Write`]s —
+//! the same all-or-nothing unit [`Store::apply`](wavedb_core::Store::apply)
+//! commits. `Write` derives `WaveWire`, so there is no journal-private record
+//! format: the log stores exactly what the codec defines, crc-framed.
 //!
-//! ```text
-//! payload = [ write_count (u32) ] then per write:
-//!   Put:    [ tag=0 (u8) ][ id (u128) ][ len (u32) ][ bytes ]
-//!   Remove: [ tag=1 (u8) ][ id (u128) ]
-//! ```
-//!
-//! All integers little-endian. Replay stops at the first frame whose length runs
-//! past EOF or whose crc fails — a torn tail from a crash mid-append — and
+//! Replay stops at the first frame whose length runs past EOF, whose crc fails,
+//! or whose payload does not decode — a torn tail from a crash mid-append — and
 //! truncates the file back to the last whole frame.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use wavedb_core::{Id, Write};
+use wavedb_core::Write;
+use wavedb_core::wire::{from_wire_checked, to_wire_checked};
 
-use crate::error::{StorageError, StorageResult};
+use crate::error::StorageResult;
 
-const TAG_PUT: u8 = 0;
-const TAG_REMOVE: u8 = 1;
-/// Per-frame prefix: `payload_len (u32) + crc32 (u32)`.
-const FRAME_PREFIX: usize = 8;
+/// Per-frame prefix: `payload_len (u32)`.
+const FRAME_PREFIX: usize = 4;
 
 /// An append-only write-ahead log of [`Write`] batches.
 #[derive(Debug)]
@@ -75,10 +71,9 @@ impl Journal {
     /// # Errors
     /// [`StorageError::Io`] if the write or sync fails.
     pub fn append(&mut self, batch: &[Write]) -> StorageResult<()> {
-        let payload = encode_batch(batch);
+        let payload = to_wire_checked(&batch.to_vec());
         let mut frame = Vec::with_capacity(FRAME_PREFIX + payload.len());
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
         frame.extend_from_slice(&payload);
 
         self.file.write_all_at(&frame, self.end)?;
@@ -107,17 +102,17 @@ impl Journal {
         while pos + FRAME_PREFIX <= buf.len() {
             let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap())
                 as usize;
-            let crc =
-                u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap());
             let body_start = pos + FRAME_PREFIX;
-            let body_end = body_start + len;
-            if body_end > buf.len() || crc32fast::hash(&buf[body_start..body_end]) != crc
-            {
-                break; // torn / corrupt tail
+            let Some(body_end) = body_start.checked_add(len) else {
+                break; // absurd length — torn tail
+            };
+            if body_end > buf.len() {
+                break; // frame overruns EOF — torn tail
             }
-            match decode_batch(&buf[body_start..body_end]) {
+            // crc verification + decode in one step; any fault = torn tail.
+            match from_wire_checked::<Vec<Write>>(&buf[body_start..body_end]) {
                 Ok(batch) => batches.push(batch),
-                Err(_) => break, // unparseable tail — treat as torn
+                Err(_) => break,
             }
             pos = body_end;
             good_end = body_end;
@@ -129,82 +124,6 @@ impl Journal {
             self.end = good_end as u64;
         }
         Ok(batches)
-    }
-}
-
-fn encode_batch(batch: &[Write]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(batch.len() as u32).to_le_bytes());
-    for w in batch {
-        match w {
-            Write::Put(id, bytes) => {
-                out.push(TAG_PUT);
-                out.extend_from_slice(&id.raw().to_le_bytes());
-                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                out.extend_from_slice(bytes);
-            }
-            Write::Remove(id) => {
-                out.push(TAG_REMOVE);
-                out.extend_from_slice(&id.raw().to_le_bytes());
-            }
-        }
-    }
-    out
-}
-
-fn decode_batch(payload: &[u8]) -> StorageResult<Vec<Write>> {
-    let mut c = Reader::new(payload);
-    let count = c.u32()? as usize;
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        let tag = c.u8()?;
-        let id = Id::from_raw(c.u128()?);
-        match tag {
-            TAG_PUT => {
-                let n = c.u32()? as usize;
-                out.push(Write::Put(id, c.bytes(n)?.to_vec()));
-            }
-            TAG_REMOVE => out.push(Write::Remove(id)),
-            _ => return Err(StorageError::Corrupt("journal write tag")),
-        }
-    }
-    Ok(out)
-}
-
-/// A tiny bounds-checked forward reader over a byte slice.
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    const fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-
-    fn bytes(&mut self, n: usize) -> StorageResult<&'a [u8]> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or(StorageError::Corrupt("journal length overflow"))?;
-        if end > self.buf.len() {
-            return Err(StorageError::Corrupt("journal frame truncated"));
-        }
-        let out = &self.buf[self.pos..end];
-        self.pos = end;
-        Ok(out)
-    }
-
-    fn u8(&mut self) -> StorageResult<u8> {
-        Ok(self.bytes(1)?[0])
-    }
-
-    fn u32(&mut self) -> StorageResult<u32> {
-        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
-    }
-
-    fn u128(&mut self) -> StorageResult<u128> {
-        Ok(u128::from_le_bytes(self.bytes(16)?.try_into().unwrap()))
     }
 }
 
@@ -230,7 +149,10 @@ mod tests {
         let (_d, p) = temp();
         {
             let mut j = Journal::open(&p)?;
-            j.append(&[Write::Put(id(1), vec![1, 2, 3]), Write::Put(id(2), vec![4])])?;
+            j.append(&[
+                Write::Put(id(1), vec![1, 2, 3]),
+                Write::Put(id(2), vec![4]),
+            ])?;
             j.append(&[Write::Remove(id(1))])?;
         }
         let mut j = Journal::open(&p)?;
@@ -238,7 +160,10 @@ mod tests {
         assert_eq!(
             batches,
             vec![
-                vec![Write::Put(id(1), vec![1, 2, 3]), Write::Put(id(2), vec![4])],
+                vec![
+                    Write::Put(id(1), vec![1, 2, 3]),
+                    Write::Put(id(2), vec![4])
+                ],
                 vec![Write::Remove(id(1))],
             ]
         );
@@ -299,7 +224,10 @@ mod tests {
         }
         // Flip a byte in the payload → crc fails → whole frame dropped.
         {
-            let f = std::fs::OpenOptions::new().read(true).write(true).open(&p)?;
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&p)?;
             let len = std::fs::metadata(&p)?.len();
             let last = len - 1;
             let mut b = [0u8];

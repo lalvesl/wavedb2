@@ -36,11 +36,13 @@ use crate::error::{StorageError, StorageResult};
 /// Magic at the head of every WaveDB `data.bin` superblock.
 const MAGIC: &[u8; 8] = b"WAVEDBIN";
 
-/// On-disk format version. Bump on any incompatible superblock/layout change.
-/// (v2: superblock body moved to the checked wire encoding; a v1 file fails the
-/// crc — [`StorageError::Corrupt`] rather than `BadVersion` — acceptable
-/// pre-1.0.)
-const FORMAT_VERSION: u32 = 2;
+/// On-disk format version.
+///
+/// **Pinned at 1 while WaveDB is pre-release**: the format changes freely with
+/// no bumps, no history, and no migrations — an old `data.bin` is simply not
+/// supported (delete it; the journal replay rebuilds pages). Versioning starts
+/// mattering at the first release.
+const FORMAT_VERSION: u32 = 1;
 
 /// Blocks reserved at the head of the file for engine metadata (the superblock).
 /// The allocator must never hand these out.

@@ -18,7 +18,7 @@
 //! **journal replay** — routes every record to the same bucket even if `data.bin`
 //! is opened on a different machine.
 
-use crate::block::{BlockAllocator, BlockDescriptor};
+use crate::block::{BLOCK_SIZE, BlockAllocator, BlockDescriptor};
 use crate::block_file::BlockFile;
 use crate::error::StorageResult;
 use crate::page::SlotPage;
@@ -303,7 +303,7 @@ fn place(
         return Ok(BlockDescriptor::EMPTY);
     }
     let bytes = page.to_bytes();
-    let run = alloc.alloc(page.blocks_needed());
+    let run = alloc.alloc(bytes.len().div_ceil(BLOCK_SIZE) as u64);
     file.write_run(run, &bytes)?;
     Ok(BlockDescriptor::from_run(
         run,

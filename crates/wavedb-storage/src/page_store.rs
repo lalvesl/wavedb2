@@ -74,7 +74,8 @@ impl PageStore {
         let mut alloc = BlockAllocator::new();
         alloc.alloc(RESERVED_BLOCKS); // reserve the superblock (block 0)
 
-        let mut journal = crate::journal::Journal::open(dir.join("journal.log"))?;
+        let mut journal =
+            crate::journal::Journal::open(dir.join("journal.log"))?;
         let batches = journal.replay()?;
 
         let mut inner = Inner {
@@ -159,7 +160,14 @@ fn settle(inner: &mut Inner, batch: &[Write]) -> StorageResult<()> {
                 let dir =
                     dirs.entry(sh).or_insert_with(|| Directory::new(*seed));
                 dir.upsert_record(sh, file, alloc, *id, bytes.clone())?;
-                maybe_split(dir, sh, file, alloc, *split_threshold_blocks)?;
+                maybe_split(
+                    dir,
+                    sh,
+                    file,
+                    alloc,
+                    *split_threshold_blocks,
+                    *id,
+                )?;
             }
             Write::Remove(id) => {
                 // Removal needs the record's STRUCT_HASH to find its directory;
@@ -176,17 +184,25 @@ fn settle(inner: &mut Inner, batch: &[Write]) -> StorageResult<()> {
     Ok(())
 }
 
-/// Split the directory's next round-robin bucket when its largest page has grown
-/// past the threshold, keeping page sizes bounded.
+/// Split the directory's next round-robin bucket when the page the write landed
+/// in has grown past the threshold, keeping page sizes bounded.
+///
+/// Only a `Put` grows a page, so checking just the touched bucket (O(1), not a
+/// scan of every slot) still catches every over-threshold page at the moment it
+/// crosses the line. Linear hashing splits round-robin, so the split may relieve
+/// a different bucket first — repeated puts into a fat bucket keep triggering
+/// splits until the round-robin pointer reaches it (same behaviour the full scan
+/// had).
 fn maybe_split(
     dir: &mut Directory,
     struct_hash: u64,
     file: &BlockFile,
     alloc: &mut BlockAllocator,
     threshold: u64,
+    id: Id,
 ) -> StorageResult<()> {
-    let widest = dir.slots().iter().map(|d| d.count()).max().unwrap_or(0);
-    if widest > threshold {
+    let touched = dir.bucket_of(id.raw());
+    if dir.descriptor(touched).count() > threshold {
         dir.split_next(struct_hash, file, alloc)?;
     }
     Ok(())
@@ -278,7 +294,9 @@ mod tests {
         block_on(async {
             {
                 let s = PageStore::open(d.path()).unwrap();
-                s.apply(&[Write::Put(nonunique(1), rec(SH, b"x"))]).await.unwrap();
+                s.apply(&[Write::Put(nonunique(1), rec(SH, b"x"))])
+                    .await
+                    .unwrap();
                 s.apply(&[Write::Remove(nonunique(1))]).await.unwrap();
             }
             let s = PageStore::open(d.path()).unwrap();
@@ -294,11 +312,17 @@ mod tests {
         block_on(async {
             // Each record ~1 KiB; enough of them overflow a bucket and split.
             for k in 0..400u64 {
-                s.apply(&[Write::Put(nonunique(k), rec(SH, &vec![k as u8; 1024]))])
-                    .await
-                    .unwrap();
+                s.apply(&[Write::Put(
+                    nonunique(k),
+                    rec(SH, &vec![k as u8; 1024]),
+                )])
+                .await
+                .unwrap();
             }
-            assert!(s.bucket_count(SH) > 1, "expected at least one bucket split");
+            assert!(
+                s.bucket_count(SH) > 1,
+                "expected at least one bucket split"
+            );
             for k in 0..400u64 {
                 assert_eq!(
                     s.get(nonunique(k)).await.unwrap(),
@@ -311,7 +335,10 @@ mod tests {
         let s = PageStore::open(d.path()).unwrap();
         block_on(async {
             assert_eq!(s.cache_len(), 400);
-            assert_eq!(s.get(nonunique(399)).await.unwrap().unwrap().len(), 8 + 1024);
+            assert_eq!(
+                s.get(nonunique(399)).await.unwrap().unwrap().len(),
+                8 + 1024
+            );
         });
     }
 }

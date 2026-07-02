@@ -45,8 +45,10 @@ fn collection_walk_and_durable_reopen() {
 
         let mut ids = Vec::new();
         for i in 0..n {
-            let id =
-                col.insert(&store, &todo(&format!("task-{i}"))).await.unwrap();
+            let id = col
+                .insert(&store, &todo(&format!("task-{i}")))
+                .await
+                .unwrap();
             ids.push(id);
         }
 
@@ -107,9 +109,6 @@ fn save_and_remove_survive_reopen() {
         assert!(walked[0].1.completed, "update must survive reopen");
 
         // The dead record's bytes are still resolvable (history navigable).
-        assert_eq!(
-            col.get(&store, dropped).await.unwrap(),
-            Some(todo("drop"))
-        );
+        assert_eq!(col.get(&store, dropped).await.unwrap(), Some(todo("drop")));
     });
 }
