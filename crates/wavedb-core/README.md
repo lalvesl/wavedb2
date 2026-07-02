@@ -361,17 +361,20 @@ pub trait IndexKey {
 }
 
 /// The collection's roots holder. `#[wavedb]` generates one per NonUnique type;
-/// this trait is the portable shape the engine reads. No element counter — the
-/// `Pivot` is rewritten only when a `BpTree` root moves or its default
-/// permission changes (a rare admin op, not a per-write cost).
+/// this trait is the portable shape the engine reads and rewrites. No element
+/// counter — the `Pivot` is rewritten only when a `BpTree` root moves or its
+/// default permission changes (rare, not a per-write cost).
 ///
 /// Root pointers are `LocalId` (80-bit): the tree is tenant-scoped so `TENANT`
 /// is derivable from context — no need to repeat 6 bytes per pointer.
 pub trait Pivot: Wire + Sized {
+    const STRUCT_HASH: u64;                       // identity of the stored pivot record
+
     fn current(&self)     -> LocalId;             // living-records B+tree root
     fn dead(&self)        -> LocalId;             // deleted-records B+tree root
     fn secondaries(&self) -> &[LocalId];          // one root per `#[wavedb::pivot(...)]`
     fn permission(&self)  -> Option<&PermissionRef>; // collection default; record metadata overrides
+    fn replace_roots(&self, current: LocalId, dead: LocalId) -> Self; // engine writes back moved roots
 }
 
 /// A search bound over the order-preserving key space.
@@ -382,25 +385,63 @@ pub enum Bound {
     Prefix(Vec<u8>),
 }
 
-/// A B+tree index over any `Store`. Nodes are records read by `LocalId`; all I/O
-/// is delegated to `Store`, so one impl serves native PageStore and web IndexedDB.
-/// `search` returns full record `Id`s (two-phase: index → `Id`s → fetch).
-pub trait BpTree<S: Store>: Sized {
-    fn at(root: LocalId) -> Self;                               // open a tree at a root
+/// A B+tree index over any `Store` — one **concrete** type (no trait): nodes are
+/// values read by `LocalId`, all I/O is delegated to `Store`, so the same type
+/// serves native PageStore and web IndexedDB. It carries `tenant` because node
+/// pointers are tenant-stripped `LocalId`s that must inflate to full `Id`s for
+/// `Store::get`. `search` returns full record `Id`s (two-phase: index → `Id`s →
+/// fetch).
+pub struct BpTree { /* root: LocalId, tenant: U48, caps */ }
 
-    fn search(&self, store: &S, bound: Bound)
-        -> impl Stream<Item = Result<Id>>;                      // walk → matching record Ids
+impl BpTree {
+    pub const fn at(root: LocalId, tenant: U48) -> Self;         // open a tree at a root
+    pub async fn create<S: Store>(store: &S, tenant: U48) -> Result<Self>; // empty tree
+    pub const fn root(&self) -> LocalId;                         // current root pointer
 
-    async fn insert(&self, store: &S, key: &[u8], id: Id) -> Result<LocalId>; // → (maybe moved) root
-    async fn remove(&self, store: &S, key: &[u8], id: Id) -> Result<LocalId>; // → (maybe moved) root
+    pub fn search<S: Store>(&self, store: &S, bound: Bound)
+        -> impl Stream<Item = Result<Id>>;                       // walk → matching record Ids
+
+    pub async fn insert<S: Store>(&mut self, store: &S, id: Id) -> Result<()>;
+    pub async fn remove<S: Store>(&mut self, store: &S, id: Id) -> Result<bool>;
 }
 ```
 
-`insert`/`remove` take a record `Id` (full 128-bit — external address) and return
-the (possibly moved) root as `LocalId` (tree-internal pointer, tenant stripped).
-When a root moves the holder rewrites the `Pivot`, otherwise the `Pivot` stays
-immutable. Comparison is `memcmp` on the `IndexKey`-encoded bytes
-(== `Ordering::{Less,Equal,Greater}`), never a typed decode.
+`insert`/`remove` take a record `Id` (full 128-bit — external address) and key it
+by its 10-byte `LocalId` (order = `CREATED_AT`); they update `root()` in place
+when a split or collapse moves it. When a root moves the holder rewrites the
+`Pivot`, otherwise the `Pivot` stays immutable. `remove` merges or redistributes
+underfull nodes (<¼ capacity) with a sibling and collapses an empty root, so
+deleted space is reclaimed. `search` prunes descent by the bound's `CREATED_AT`
+range. Comparison is byte order on the encoded key (== `Ordering`), never a
+typed decode; secondary indexes will key by `IndexKey`-encoded bytes on the
+same machinery. Each mutating op also has a `plan_*` variant returning the node
+`Write`s without applying, so a caller can fold index + record + `Pivot` into
+**one atomic batch**.
+
+### `Collection<T>` — the layer application code actually touches
+
+The `BpTree` is engine-internal. What `#[wavedb(NonUnique)]` hands application
+code is the **typed collection** (`wavedb_core::Collection<T>`), driven through
+generated wrappers — no raw tree, no raw `Id` minting, no pivot bookkeeping:
+
+```rust
+let todos = Todo::create_pivot(&store, tenant).await?; // explicit, never automatic
+let col   = Todo::collection(todos, tenant);           // cheap typed handle
+
+let id = col.insert(&store, &Todo { title, completed: false }).await?; // → stable Id
+col.save(&store, id, &updated).await?;    // update at the same Id (no reindex)
+col.remove(&store, id).await?;            // current → dead; bytes kept (history)
+col.get(&store, id).await?;               // direct address → Option<Todo>
+col.all(&store);                          // Stream<Item = Result<(Id, Todo)>>, CREATED_AT order
+```
+
+Every mutating op is **one `Store::apply` batch** (record + touched nodes +
+`Pivot` rewrite when a root moved); every stored value is enveloped as
+`[STRUCT_HASH (8 B LE)][wire]` and decode verifies the head, so a foreign `Id`
+can't mis-decode. `Unique` types instead get anchor ops — `T::get(store,
+tenant)` / `value.save(store, tenant)` (save **is** the upsert) — and since
+they don't implement `NonUniqueStruct`, driving one through a collection is a
+compile error.
 
 ### 32 KiB pages — fanout and I/O
 

@@ -10,14 +10,19 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 
 ## Module map
 
-| Module         | Responsibility                                                                                                                                                                        |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `block`        | `BlockFile` / block allocator — alloc/free/coalesce runs of 4 KiB blocks.                                                                                                             |
-| `directory`    | The per-`STRUCT_HASH` `Vec<u64>` page directory + linear hashing.                                                                                                                     |
-| `page`         | Page format + the `PageFormat` derive trait (crc32, id list, blob).                                                                                                                   |
-| `dictionary`   | Per-`STRUCT_HASH` compression dictionary + its block run.                                                                                                                             |
-| `pipeline`     | Journal, in-memory `BTreeMap` cache, background settle + rebalance.                                                                                                                   |
-| `node_storage` | `NodeStorage` — the node's **authoritative** engine: owns the files + all sub-modules, runs `Pivot`/`BpTree` + page writes. Reached over the network; not the client's local `Store`. |
+| Module       | Responsibility                                                                                              |
+| ------------ | ------------------------------------------------------------------------------------------------------------ |
+| `block`      | `BlockDescriptor` (u40·u20·u4) + `Run` + `BlockAllocator` — alloc/free/coalesce runs of 4 KiB blocks.       |
+| `block_file` | `data.bin` as a block-addressed file: superblock (block 0), positioned run I/O, grow/truncate, fsync.       |
+| `directory`  | The per-`STRUCT_HASH` `Vec<u64>` page directory + linear hashing + page-moving `split_next`.                |
+| `page`       | `SlotPage` — the homogeneous record page format (crc32, id list, blob).                                     |
+| `journal`    | Append-only WAL of `Write` batches (checked wire frames); fsync = durability; torn-tail-tolerant replay.    |
+| `page_store` | `PageStore` — the node's authoritative `Store`: journal-first → cache → settle into per-type pages.         |
+| `error`      | `StorageError` / `StorageResult`; flattens to `wavedb_core::Error::Backend` at the `Store` seam.            |
+
+Planned (not yet modules): per-`STRUCT_HASH` compression `dictionary`,
+background settle/rebalance (settle is inline with `apply` today). The
+`Pivot`/`BpTree` index layer lives in `wavedb_core::index`, not here.
 
 ---
 

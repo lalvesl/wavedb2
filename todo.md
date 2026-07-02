@@ -184,35 +184,37 @@ code exists yet. Build order, roughly bottom-up:
 
 - **Storage engine** (`wavedb-storage`): durable single-node `Store` landed
   (`BlockFile` + `SlotPage` page format + `directory` split + `Journal` +
-  `PageStore` cache/replay pipeline + `PageBpTree`). M2 NonUnique path proven
-  end-to-end (`tests/nonunique_collection.rs`: collection walk + durable reopen).
-  **Remaining for M2:** BpTree node **merge/rebalance on delete** (insert-side
-  split done; delete currently leaves underfull nodes — correct, just unreclaimed);
-  the dedicated **32 KiB one-node-per-page** BpTree format (nodes currently ride
-  the generic `SlotPage` directory under a reserved page-kind `STRUCT_HASH`);
-  per-`STRUCT_HASH` **dictionaries** + zstd compression; **background** settle /
-  rebalance (settle is inline with `apply` for now); migrate engine metadata
-  (superblock body, `SlotPage` header, journal frames) onto **`WaveWire` +
-  checked framing** (`wavedb-wire/validation`, `[crc32][wire]`) per the
-  README's WaveWire rule — a `FORMAT_VERSION` bump, journal replay absorbs it.
-- **Open design seams surfaced (need a call before M3):**
-  - core's `BpTree` trait `at(root)` carries no tenant, but reading nodes from a
-    tenant-scoped `Store` needs one — `PageBpTree` carries `tenant` explicitly
-    instead of implementing the trait verbatim. Reconcile the trait, or keep the
-    concrete type separate.
-  - `PageStore` is **cache + journal authoritative** for reads; `data.bin` is a
-    deterministic projection rebuilt by journal replay on open. It settles a value
-    into the per-`STRUCT_HASH` page directory by reading the `STRUCT_HASH` from the
-    value's first 8 bytes — so every stored value (records **and** BpTree nodes)
-    must be `STRUCT_HASH`-headed. Typed per-command settling (knowing record vs
-    index-node vs Pivot page kind) is the M3 node layer's job.
+  `PageStore` cache/replay pipeline) and the **`Store`-generic `BpTree` now
+  lives in core** (`wavedb_core::index`), including **merge/rebalance on
+  delete** and search-descent pruning. The **typed collection layer is in**
+  (core `Collection<T>` + macro-emitted `collection()`/`create_pivot()` and
+  Unique `get`/`save`) and the M2 NonUnique path is proven end-to-end through
+  it (`tests/nonunique_collection.rs`: derived API → PageStore → durable
+  reopen).
+  **Remaining for M2:** the dedicated **32 KiB one-node-per-page** BpTree format
+  (nodes currently ride the generic `SlotPage` directory under a reserved
+  page-kind `STRUCT_HASH`); per-`STRUCT_HASH` **dictionaries** + zstd
+  compression; **background** settle / rebalance (settle is inline with `apply`
+  for now); move `SlotPage`'s header onto checked `WaveWire` framing (the
+  superblock body and journal frames are done — `FORMAT_VERSION` 2); secondary
+  indexes (`#[wavedb::pivot(...)]`) driven through `Collection` (`by_<field>`
+  walks, reindex on `save`); per-record `Metadata` written alongside records.
+- **Design note (M3):** `PageStore` is **cache + journal authoritative** for
+  reads; `data.bin` is a deterministic projection rebuilt by journal replay on
+  open. It settles a value into the per-`STRUCT_HASH` page directory by reading
+  the `STRUCT_HASH` from the value's first 8 bytes — so every stored value
+  (records **and** BpTree nodes) must be `STRUCT_HASH`-headed. Typed
+  per-command settling (knowing record vs index-node vs Pivot page kind) is the
+  M3 node layer's job.
 
 # DOING (next after storage)
 
-- **Exposure**: remove `wavedb-build` (scanner + `Object` enum); emit the
-  execution steps from `#[wavedb]`/`#[server]`; implement `expose_server!` /
-  `expose_client!` (per-`STRUCT_HASH` `match`, per-op exclusion/override);
-  migrate `schema-smoke` off `build.rs`/`include!`.
+- **Exposure**: implement `expose_server!` / `expose_client!`
+  (per-`STRUCT_HASH` `match` over the listed items, per-op exclusion/override,
+  emitted `REGISTRY`). The execution steps now exist as derive-generated fns
+  (`get`/`save`, `collection()`'s op set) — exposure makes them
+  wire-reachable. `examples/todo-app` already shows the target: no `build.rs`,
+  functions-only allowlist, structs storage-only.
 - **M3 node**: exposure-linked `wavedb-quick-node` driving `PageStore` by typed
   command dispatch; HTTP POST transport; node-side gates.
 
@@ -248,16 +250,14 @@ code exists yet. Build order, roughly bottom-up:
   parsed/stripped → secondary-index count. `#[server]` deferred to M4 (needs `Db`).
   - **`STRUCT_HASH` uses SeaHash (pinned crate)** — portable across arch/endianness so
     client and server agree on identity; the crate is version-pinned so identity can't drift.
-- **`wavedb-build`** — `generate_registry()` scans `src/`, emits the dispatch
-  (`from_wire`/`to_wire`/`struct_hash` + a `STRUCT_HASH`-printing `Debug`), no
-  descriptor table. Generated code carries `#[allow(...)]` so it never lints the
-  user's crate. _(**Superseded — the crate is being removed**: the scanner and
-  its generated registry give way to derive-generated execution steps +
-  explicit `expose_server!`/`expose_client!` declaration — see the Exposure
-  section above.)_
-- **`examples/schema-smoke`** — end-to-end M1 proof: `#[wavedb]` + `build.rs` +
-  `include!` → registry resolves + round-trips. (Real example; `todo-app`
-  still needs M4 `#[server]`/`Db`.)
+- **`wavedb-build` removed** — the `src/`-scanner + generated registry are gone
+  from the workspace: derive-generated execution steps + explicit
+  `expose_server!`/`expose_client!` declaration replace them — see the Exposure
+  section above.
+- **`examples/schema-smoke`** — end-to-end M1 proof: `#[wavedb]` derive output
+  (`STRUCT_HASH`, roundtrip, shape consts, generated Pivot types) exercised
+  directly — no `build.rs`, no `include!`. (Real example; `todo-app` still
+  needs M4 `#[server]`/`Db`.)
 - **`wavedb-storage` foundations** — `block` (`BlockDescriptor` u40·u20·u4 packing,
   `Run`, `BlockAllocator`: best-fit alloc / coalescing free / tail truncate) and
   `directory` (linear-hashing `bucket_index`/`next_split_bucket`, `Directory`).
@@ -279,12 +279,50 @@ code exists yet. Build order, roughly bottom-up:
     → in-memory `BTreeMap` cache → inline settle into per-`STRUCT_HASH` pages, with
     split-on-growth. `open` rebuilds cache + pages + allocator by journal replay.
     `StorageError`→`Error::Backend` bridge added to core.
-  - **`PageBpTree`** — `Store`-generic B+tree, the NonUnique `current` index. Keys
-    by the record's unique 10-byte `LocalId` (order = `CREATED_AT`). Insert with
-    full leaf/internal split + cascade + root growth; idempotent; `search` streams
-    record `Id`s by a `CREATED_AT` `Bound`; `remove` (no merge yet). Nodes carry a
-    reserved page-kind `STRUCT_HASH` so they settle as ordinary `PageStore` values.
+  - **core `BpTree`** (moved from storage's `PageBpTree`; the `BpTree` *trait*
+    was deleted — one concrete `Store`-generic type in `wavedb_core::index`
+    carrying `tenant`, shared by `PageStore` and the future IndexedDB store).
+    Keys by the record's unique 10-byte `LocalId` (order = `CREATED_AT`).
+    Insert with full leaf/internal split + cascade + root growth; idempotent;
+    `search` streams record `Id`s by a `CREATED_AT` `Bound` **with descent
+    pruning**; `remove` with **merge / redistribute / root-collapse**
+    (underfull = <¼ cap; merge when the pair fits ¾ cap), all invariants
+    checked by a test harness. Nodes encode via `WaveWire` behind a reserved
+    page-kind tag and settle as ordinary `PageStore` values.
+  - **Checked wire framing (`FORMAT_VERSION` 2)** — `Write` derives `WaveWire`;
+    journal frames are `[len][to_wire_checked(Vec<Write>)]` and the superblock
+    body is `[magic][to_wire_checked(SuperblockBody)]` (version + seed inside
+    the crc) — no hand-rolled journal/superblock codecs left.
+  - **Hygiene** — 350-line-per-file budget enforced by
+    `scripts/check_file_length.sh` (CI step); `maybe_split` checks only the
+    touched bucket (O(1)); `wavedb-build` removed from the workspace.
+- **Typed collection layer** — the developer-facing surface over the (internal)
+  `BpTree`, in the exact target shape
+  (`Todo::collection(pivot, tenant).insert(&store, &todo)`):
+  - core **`Collection<T: NonUniqueStruct>`** — `create` / `insert` / `save` /
+    `remove` / `get` / `search` / `all`. Each mutating op is **one atomic
+    `Store::apply` batch** (record + touched B+tree nodes via the new `plan_*`
+    planners + `Pivot` rewrite when a root moved). Records/pivots are enveloped
+    `[STRUCT_HASH (8 B LE)][wire]`, decode-verified (`UnknownStructHash` on a
+    foreign id). Record `Id`s minted `KEY = CREATED_AT` nanos, `FLAG = 0`,
+    counter salt; `remove` moves `current` → `dead` keeping the bytes (history
+    navigable). New core errors: `PivotMissing`, `RecordMissing`.
+  - **trait seams** — `NonUniqueStruct { type Pivot }` (macro-implemented, so a
+    `Unique` type can't be collection-driven at compile time); `Pivot` gained
+    `const STRUCT_HASH` (own identity, hashed under a reserved `Pivot` shape
+    discriminator) and `replace_roots()`.
+  - **macro emission** — `#[wavedb(NonUnique)]` emits `collection(pivot_id,
+    tenant)` + `create_pivot(store, tenant)`; `#[wavedb]` (Unique) emits
+    anchor `get(store, tenant)` / `save(store, tenant)` (save = upsert, no
+    create). Proven end-to-end in `schema-smoke`
+    (`derived_collection_flow_end_to_end`) and over the durable engine in
+    storage's `nonunique_collection.rs` (insert/save/remove survive reopen).
+- **`examples/todo-app` on the exposure architecture** — the last
+  `build.rs`/`include!(registry)` remnant replaced with `expose_server!` /
+  `expose_client!` declaration modules (functions-only allowlist; all structs
+  storage-only — `Auth`, the username registry, `Profile`, `Todo` are never
+  wire-addressable; `REGISTRY` now comes from `expose_server!`). Aspirational
+  (workspace-excluded) but architecture-correct.
 
-_124 tests, clippy-clean (incl. 56 storage: 54 unit + 2 NonUnique-collection
-integration). Workspace members: wire, wire-derive, core, macros, build, storage,
-schema-smoke._
+_137 tests, clippy-clean (pedantic + nursery). Workspace members: wire,
+wire-derive, core, macros, storage, schema-smoke._
