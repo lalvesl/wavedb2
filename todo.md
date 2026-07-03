@@ -311,6 +311,26 @@ code exists yet. Build order, roughly bottom-up:
     `PageStore` disables zstd for hot `BpTree` node pages) plus automatic
     `Raw` fallback when zstd cannot shrink a body. `directory` split into
     container/math + `directory_pages` (page I/O) for the file budget.
+- **Per-type compile-time storage (`StructStorage`)** — the engine's runtime
+  `HashMap<STRUCT_HASH, Directory>` + store-wide mutex are gone:
+  - `#[wavedb]` emits (native only, `#[cfg(not(target_arch = "wasm32"))]`) one
+    `static wavedb_storage::StructStorage` per declared type **and** per
+    generated `{Name}Pivot` — the type's own cache (`RwLock<BTreeMap>`) and
+    `Directory` slot (`Mutex<Option<…>>`), reached as `T::struct_storage()` /
+    `T::storage_mem_cache()` / `T::storage_directory()`; schema crates gain a
+    target-gated `wavedb-storage` dep (wasm expansion omits the slots).
+  - `PageStore::open(dir, &[&'static StructStorage])` takes the slots as an
+    **explicit registry** (`T::storage_entries()` = record + Pivot slots; the
+    reserved BpTree-node slot auto-registers, compression off) — sorted-slice
+    binary search, allowlist semantics: an unlisted hash is refused
+    (`UnregisteredStructHash`) *before* journaling. One open store per process
+    (`EngineBusy` otherwise) since the slots are process-global statics.
+  - Locking split: journal `Mutex` (append + cache commit under it ⇒ cache
+    order == journal order), allocator `Mutex`, and per-type locks for
+    everything else — reads (`Store::get_of`, new trait method with a `get`
+    fallback default; `Collection`/`BpTree` pass their compile-time hashes)
+    touch only their own type's cache lock. Settle converges pages to the
+    cache's current bytes (idempotent, order-independent projection).
 - **Typed collection layer** — the developer-facing surface over the (internal)
   `BpTree`, in the exact target shape
   (`Todo::collection(pivot, tenant).insert(&store, &todo)`):
@@ -339,5 +359,5 @@ code exists yet. Build order, roughly bottom-up:
   wire-addressable; `REGISTRY` now comes from `expose_server!`). Aspirational
   (workspace-excluded) but architecture-correct.
 
-_137 tests, clippy-clean (pedantic + nursery). Workspace members: wire,
+_146 tests, clippy-clean (pedantic + nursery). Workspace members: wire,
 wire-derive, core, macros, storage, schema-smoke._
