@@ -67,6 +67,16 @@ because both compile this crate.
 6. **Wires up the schema-evolution hooks** — the optional `first_try` /
    `fallback_not_found` functions; see
    [`wavedb-core`](../wavedb-core/README.md#schema-evolution--lookup-hooks).
+7. **Emits the type's native storage slot** (`#[cfg(not(target_arch =
+   "wasm32"))]` only) — a `static wavedb_storage::StructStorage` carrying this
+   type's own cache and page directory, reached as `T::struct_storage()` /
+   `T::storage_mem_cache()` / `T::storage_directory()`, plus
+   `T::storage_entries()` (the slots — record + generated Pivot — to register
+   at `PageStore::open`). Compile-time per-type state instead of a runtime
+   `STRUCT_HASH → state` map; each type locks only itself. Consequence: on
+   non-wasm targets a schema crate needs `wavedb-storage` as a target-gated
+   dependency (the wasm expansion omits the slots — IndexedDB has no pages).
+   See [`wavedb-storage` § per-type state](../wavedb-storage/README.md#per-type-state-is-compile-time--structstorage).
 
 ```rust
 #[wavedb]                       // Unique by default

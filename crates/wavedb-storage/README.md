@@ -19,7 +19,8 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 | `directory_pages` | The directory's page I/O: read/rewrite/split bucket pages, per-type compression, dictionary persistence.    |
 | `page`            | `SlotPage` — the homogeneous record page: `[len][to_wire_checked(PageEnvelope)]`, body raw or zstd.         |
 | `journal`         | Append-only WAL of `Write` batches (checked wire frames); fsync = durability; torn-tail-tolerant replay.    |
-| `page_store`      | `PageStore` — the node's authoritative `Store`: journal-first → cache → settle into per-type pages.         |
+| `struct_storage`  | `StructStorage` — one type's own cache + directory slot (`#[wavedb]` emits one `static` per type).          |
+| `page_store`      | `PageStore` — the node's authoritative `Store`: journal-first → per-type caches → settle into pages.        |
 | `error`           | `StorageError` / `StorageResult`; flattens to `wavedb_core::Error::Backend` at the `Store` seam.            |
 
 Planned (not yet a module): background settle/rebalance (settle is inline with
@@ -441,7 +442,7 @@ CPU is free here — there is no join processing competing for it. Per-value
 ## Write pipeline & concurrency
 
 ```
-mutation → journal append → in-memory BTreeMap<Id> cache → (client confirmed)
+mutation → journal append → the type's own BTreeMap<Id> cache → (client confirmed)
                                           │
                                           └─ background: settle into data.bin,
                                              then rebalance (split_next)
@@ -450,9 +451,10 @@ mutation → journal append → in-memory BTreeMap<Id> cache → (client confirm
 1. **Journal first.** Every insert/save/remove — and every block alloc/free — is
    appended to the journal before anything else. This is what makes the durability
    guarantee and prevents leaks.
-2. **Cache as a `BTreeMap<Id, …>`.** Confirmed mutations live in an in-memory
-   `BTreeMap` keyed by `Id`; reads serve from it directly (and, because `Id` is
-   ordered by `KEY`, range/timeline reads are naturally ordered).
+2. **Cache as a `BTreeMap<Id, …>` per type.** Confirmed mutations live in the
+   type's own in-memory `BTreeMap` (its `StructStorage` slot, below); reads
+   serve from it directly (and, because `Id` is ordered by `KEY`,
+   range/timeline reads are naturally ordered).
 3. **Background settle.** A drain task writes cached pages down into `data.bin`
    at its own pace and can flush entries out of memory once persisted.
 4. **Background rebalance.** Because page grow happens in place without moving
@@ -461,15 +463,51 @@ mutation → journal append → in-memory BTreeMap<Id> cache → (client confirm
 
 On startup the directories and the block allocator rebuild by **journal replay**.
 
-### Atomicity is the in-memory cache
+### Per-type state is compile-time — `StructStorage`
+
+> **Status: in effect.** This replaced the engine's runtime
+> `HashMap<STRUCT_HASH, Directory>` + store-wide mutex.
+
+There is no runtime `STRUCT_HASH → state` map and no store-wide state lock.
+Each type's storage state — its cache `RwLock<BTreeMap<u128, Vec<u8>>>` and its
+`Directory` slot — is one **`static StructStorage`**, emitted by `#[wavedb]` on
+the declared type itself (native targets only; the wasm expansion omits it):
+
+```rust
+Todo::struct_storage()      // &'static StructStorage — the whole slot
+Todo::storage_mem_cache()   // this type's own cache lock, shared with no other
+Todo::storage_directory()   // this type's own directory lock
+Todo::storage_entries()     // the slots to register: [Todo's, TodoPivot's]
+```
+
+`PageStore::open(dir, &[…])` takes the slots as an **explicit registry** —
+declared, not discovered, the same allowlist stance as exposure. A write whose
+`STRUCT_HASH` has no listed slot is refused (`UnregisteredStructHash`); the
+reserved `BpTree`-node slot is always included (compression off). Because the
+slots are process-global statics, **one process runs one open `PageStore`**
+(the node model); a second concurrent open fails with `EngineBusy`.
+
+**Locking.** Reads (`get_of`, routed by the compile-time-known hash) take one
+binary search over the sorted registry plus that type's cache read lock —
+operations on different types never contend. The remaining shared locks are
+narrow: the journal mutex (append order; the cache commit runs under it so
+cache order always equals journal/replay order) and the allocator mutex (block
+space is one resource). Settling writes the **cache's current bytes** for each
+touched id, so it is idempotent and order-independent — `data.bin` stays a pure
+projection of the journal.
+
+### Atomicity is the journal entry + cache commit
 
 A single operation can touch several records (a NonUnique insert writes the data
-record **and** a `BpTree` node). These are committed as **one journal entry** and
-applied to the in-memory cache **atomically** — so readers see all-or-nothing, and
-a crash before the background settle replays the journal back into the cache. No
-separate transaction manager: the journal entry + cache update _is_ the atomic
-unit. (Multi-write **server-function** transactions — several operations as one
-unit — remain a separate, later concern.)
+record **and** a `BpTree` node). These are committed as **one journal entry**,
+and the cache commit runs under the journal lock — so commits are totally
+ordered, and a crash before the background settle replays the journal back into
+the caches, whole batches or nothing. No separate transaction manager: the
+journal entry + cache commit _is_ the atomic unit. Visibility is per-`get`
+(each read sees a fully committed value, never a torn one); a multi-`get` walk
+was never snapshot-isolated — an apply can land between two gets, exactly as
+under the old store-wide mutex. (Multi-write **server-function** transactions —
+several operations as one unit — remain a separate, later concern.)
 
 ### IO cost per operation
 

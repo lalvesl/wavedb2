@@ -325,6 +325,11 @@ commits all-or-nothing:
 ```rust
 pub trait Store {                  // key→value over Id + wire bytes
     async fn get(&self, id: Id) -> Result<Option<Vec<u8>>>;
+    // Type-directed fetch: the typed layers (Collection, BpTree) always know
+    // the value's STRUCT_HASH at compile time, so a backend with per-type
+    // storage (PageStore's StructStorage statics) routes straight to that
+    // type's slot. Default = plain `get` — flat backends need nothing extra.
+    async fn get_of(&self, struct_hash: u64, id: Id) -> Result<Option<Vec<u8>>>;
     async fn apply(&self, batch: &[Write]) -> Result<()>;  // atomic: all-or-nothing
 }
 pub enum Write { Put(Id, Vec<u8>), Remove(Id) }
