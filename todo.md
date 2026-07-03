@@ -326,11 +326,19 @@ code exists yet. Build order, roughly bottom-up:
     (`UnregisteredStructHash`) *before* journaling. One open store per process
     (`EngineBusy` otherwise) since the slots are process-global statics.
   - Locking split: journal `Mutex` (append + cache commit under it ⇒ cache
-    order == journal order), allocator `Mutex`, and per-type locks for
-    everything else — reads (`Store::get_of`, new trait method with a `get`
-    fallback default; `Collection`/`BpTree` pass their compile-time hashes)
-    touch only their own type's cache lock. Settle converges pages to the
-    cache's current bytes (idempotent, order-independent projection).
+    order == journal order), allocator `Mutex` — **journal + allocator stay
+    shared by design** (one log = total order, one block space) — and per-type
+    locks for everything else: reads (`Store::get_of`, new trait method with a
+    `get` fallback default; `Collection`/`BpTree` pass their compile-time
+    hashes) touch only their own type's cache lock. Settle converges pages to
+    the cache's current bytes (idempotent, order-independent projection).
+  - **Compression state is in the slot too** (`DictState` = zstd policy +
+    `Dictionary` + persisted-run descriptor, own `Mutex`;
+    `T::storage_dictionary()`): `Directory` is pure addressing again (no
+    dict/compress fields — page fns take `&/&mut DictState`), dictionary
+    persistence lives with `DictState::warm`, and the policy is declared on
+    the type — `#[wavedb(compress = false)]` (storage config, never folded
+    into `STRUCT_HASH`; generated Pivot slots always compress).
 - **Typed collection layer** — the developer-facing surface over the (internal)
   `BpTree`, in the exact target shape
   (`Todo::collection(pivot, tenant).insert(&store, &todo)`):
@@ -359,5 +367,5 @@ code exists yet. Build order, roughly bottom-up:
   wire-addressable; `REGISTRY` now comes from `expose_server!`). Aspirational
   (workspace-excluded) but architecture-correct.
 
-_146 tests, clippy-clean (pedantic + nursery). Workspace members: wire,
+_147 tests, clippy-clean (pedantic + nursery). Workspace members: wire,
 wire-derive, core, macros, storage, schema-smoke._

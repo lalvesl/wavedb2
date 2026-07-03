@@ -69,11 +69,14 @@ because both compile this crate.
    [`wavedb-core`](../wavedb-core/README.md#schema-evolution--lookup-hooks).
 7. **Emits the type's native storage slot** (`#[cfg(not(target_arch =
    "wasm32"))]` only) — a `static wavedb_storage::StructStorage` carrying this
-   type's own cache and page directory, reached as `T::struct_storage()` /
-   `T::storage_mem_cache()` / `T::storage_directory()`, plus
-   `T::storage_entries()` (the slots — record + generated Pivot — to register
-   at `PageStore::open`). Compile-time per-type state instead of a runtime
-   `STRUCT_HASH → state` map; each type locks only itself. Consequence: on
+   type's own cache, page directory, **and compression state** (zstd policy +
+   its raw-content dictionary), reached as `T::struct_storage()` /
+   `T::storage_mem_cache()` / `T::storage_directory()` /
+   `T::storage_dictionary()`, plus `T::storage_entries()` (the slots — record
+   + generated Pivot — to register at `PageStore::open`). Compile-time
+   per-type state instead of a runtime `STRUCT_HASH → state` map; each type
+   locks only itself. `#[wavedb(compress = false)]` opts the type's pages out
+   of zstd (storage policy — never folded into `STRUCT_HASH`). Consequence: on
    non-wasm targets a schema crate needs `wavedb-storage` as a target-gated
    dependency (the wasm expansion omits the slots — IndexedDB has no pages).
    See [`wavedb-storage` § per-type state](../wavedb-storage/README.md#per-type-state-is-compile-time--structstorage).

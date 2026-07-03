@@ -14,9 +14,9 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 | ----------------- | ------------------------------------------------------------------------------------------------------------ |
 | `block`           | `BlockDescriptor` (u40·u20·u4) + `Run` + `BlockAllocator` — alloc/free/coalesce runs of 4 KiB blocks.       |
 | `block_file`      | `data.bin` as a block-addressed file: superblock (block 0), positioned run I/O, grow/truncate, fsync.       |
-| `dictionary`      | Per-`STRUCT_HASH` raw-content zstd dictionary: capped append-only sample buffer, version = prefix length.   |
-| `directory`       | The per-`STRUCT_HASH` page directory container + the linear-hashing addressing math.                        |
-| `directory_pages` | The directory's page I/O: read/rewrite/split bucket pages, per-type compression, dictionary persistence.    |
+| `dictionary`      | Per-`STRUCT_HASH` raw-content zstd dictionary (`Dictionary` + `DictState`): capped append-only buffer, version = prefix length, own run persistence. |
+| `directory`       | The per-`STRUCT_HASH` page directory container + the linear-hashing addressing math (pure addressing).      |
+| `directory_pages` | The directory's page I/O: read/rewrite/split bucket pages, compressing against the passed-in `DictState`.   |
 | `page`            | `SlotPage` — the homogeneous record page: `[len][to_wire_checked(PageEnvelope)]`, body raw or zstd.         |
 | `journal`         | Append-only WAL of `Write` batches (checked wire frames); fsync = durability; torn-tail-tolerant replay.    |
 | `struct_storage`  | `StructStorage` — one type's own cache + directory slot (`#[wavedb]` emits one `static` per type).          |
@@ -412,8 +412,10 @@ trainer and naturally incremental.
 
 The dictionary is stored in `data.bin` like a page: a block run handed out by
 the block manager (`[len][to_wire_checked(buf)]`, same framing as everything
-else), tracked by a descriptor in its `Directory` and repointed with the same
-crash-safe write-then-free ordering pages use. A compression-off type never
+else), tracked by a descriptor in the type's `DictState` — the compression
+slot of its `StructStorage` static (`T::storage_dictionary()`) — and repointed
+with the same crash-safe write-then-free ordering pages use. A compression-off
+type (`#[wavedb(compress = false)]`, or the reserved `BpTree`-node slot) never
 samples and never allocates a run.
 
 ### Versioning (the one rule)
@@ -469,16 +471,24 @@ On startup the directories and the block allocator rebuild by **journal replay**
 > `HashMap<STRUCT_HASH, Directory>` + store-wide mutex.
 
 There is no runtime `STRUCT_HASH → state` map and no store-wide state lock.
-Each type's storage state — its cache `RwLock<BTreeMap<u128, Vec<u8>>>` and its
-`Directory` slot — is one **`static StructStorage`**, emitted by `#[wavedb]` on
-the declared type itself (native targets only; the wasm expansion omits it):
+Each type's storage state — its cache `RwLock<BTreeMap<u128, Vec<u8>>>`, its
+`Directory` slot, **and its compression state** (`DictState`: zstd policy +
+dictionary + persisted run — per-type by nature, since a page holds one type)
+— is one **`static StructStorage`**, emitted by `#[wavedb]` on the declared
+type itself (native targets only; the wasm expansion omits it):
 
 ```rust
 Todo::struct_storage()      // &'static StructStorage — the whole slot
 Todo::storage_mem_cache()   // this type's own cache lock, shared with no other
 Todo::storage_directory()   // this type's own directory lock
+Todo::storage_dictionary()  // this type's own compression slot (policy + dict)
 Todo::storage_entries()     // the slots to register: [Todo's, TodoPivot's]
 ```
+
+Compression policy is declared with the type — `#[wavedb(compress = false)]`
+opts a type's pages out of zstd (already-compressed media, hot rewrite
+patterns). Policy is storage config, **not** schema identity: it never feeds
+the `STRUCT_HASH`.
 
 `PageStore::open(dir, &[…])` takes the slots as an **explicit registry** —
 declared, not discovered, the same allowlist stance as exposure. A write whose
