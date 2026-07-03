@@ -100,7 +100,7 @@ where
     S: Store,
 {
     let anchor = Id::new(T::STRUCT_HASH, tenant, true, 0);
-    match store.get(anchor).await? {
+    match store.get_of(T::STRUCT_HASH, anchor).await? {
         Some(bytes) => Ok(Some(decode_envelope(T::STRUCT_HASH, &bytes)?)),
         None => Ok(None),
     }
@@ -207,7 +207,7 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// Load and decode the `Pivot` record.
     async fn load_pivot<S: Store>(&self, store: &S) -> Result<T::Pivot> {
         let bytes = store
-            .get(self.pivot.to_id(self.tenant))
+            .get_of(T::Pivot::STRUCT_HASH, self.pivot.to_id(self.tenant))
             .await?
             .ok_or(Error::PivotMissing(self.pivot))?;
         decode_envelope(T::Pivot::STRUCT_HASH, &bytes)
@@ -278,7 +278,7 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// Propagates a [`Store`] failure or a decode fault (including an `id`
     /// that resolves to a different type's record).
     pub async fn get<S: Store>(&self, store: &S, id: Id) -> Result<Option<T>> {
-        match store.get(id).await? {
+        match store.get_of(T::STRUCT_HASH, id).await? {
             Some(bytes) => Ok(Some(decode_envelope(T::STRUCT_HASH, &bytes)?)),
             None => Ok(None),
         }
@@ -322,7 +322,10 @@ impl<T: NonUniqueStruct> Collection<T> {
         })
         .try_flatten()
         .and_then(move |id| async move {
-            let bytes = store.get(id).await?.ok_or(Error::RecordMissing(id))?;
+            let bytes = store
+                .get_of(T::STRUCT_HASH, id)
+                .await?
+                .ok_or(Error::RecordMissing(id))?;
             Ok((id, decode_envelope::<T>(T::STRUCT_HASH, &bytes)?))
         })
     }

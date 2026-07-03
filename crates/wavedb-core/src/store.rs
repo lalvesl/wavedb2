@@ -46,6 +46,23 @@ pub trait Store {
     /// Fetch a record's wire bytes, or `None` if absent.
     async fn get(&self, id: Id) -> Result<Option<Vec<u8>>>;
 
+    /// Type-directed fetch: `struct_hash` names the value's type (the same
+    /// hash stamped at the head of its stored bytes). The typed layers above
+    /// (`Collection`, `BpTree`) always know it at compile time, so a backend
+    /// with per-type storage can route straight to one type's slot instead of
+    /// searching a shared keyspace. The default just falls back to [`get`]
+    /// — simple backends (one flat map, IndexedDB) need nothing extra.
+    ///
+    /// [`get`]: Store::get
+    async fn get_of(
+        &self,
+        struct_hash: u64,
+        id: Id,
+    ) -> Result<Option<Vec<u8>>> {
+        let _ = struct_hash;
+        self.get(id).await
+    }
+
     /// Apply a batch of writes atomically (all-or-nothing).
     async fn apply(&self, batch: &[Write]) -> Result<()>;
 }

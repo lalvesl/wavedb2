@@ -29,7 +29,7 @@ use crate::store::{Store, Write};
 use crate::u48::U48;
 
 use super::Bound;
-use super::node::{NodeBody, mint_node_id};
+use super::node::{BPTREE_NODE_STRUCT_HASH, NodeBody, mint_node_id};
 
 /// Max keys in a leaf before it splits. Sized so a node fits the storage
 /// engine's 32 KiB page with room to spare.
@@ -150,7 +150,10 @@ impl BpTree {
                     return Some((Ok(id), st));
                 }
                 let node = st.nodes.pop_front()?;
-                let bytes = match store.get(node.to_id(st.tenant)).await {
+                let bytes = match store
+                    .get_of(BPTREE_NODE_STRUCT_HASH, node.to_id(st.tenant))
+                    .await
+                {
                     Ok(Some(b)) => b,
                     Ok(None) => {
                         return Some((Err(Error::BpTreeNodeMissing(node)), st));
@@ -181,7 +184,7 @@ impl BpTree {
         node: LocalId,
     ) -> Result<NodeBody> {
         let bytes = store
-            .get(node.to_id(self.tenant))
+            .get_of(BPTREE_NODE_STRUCT_HASH, node.to_id(self.tenant))
             .await?
             .ok_or(Error::BpTreeNodeMissing(node))?;
         NodeBody::from_bytes(&bytes)

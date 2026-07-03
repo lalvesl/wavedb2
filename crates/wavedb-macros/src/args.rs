@@ -6,6 +6,7 @@
 //! #[wavedb]                                  // Unique (default)
 //! #[wavedb(NonUnique)]                       // NonUnique shape
 //! #[wavedb(validate = path, preprocess = p)] // hook fns (either shape)
+//! #[wavedb(compress = false)]                // opt this type's pages out of zstd
 //! ```
 
 use syn::punctuated::Punctuated;
@@ -39,6 +40,9 @@ pub struct WavedbArgs {
     pub shape: Shape,
     pub validate: Option<Path>,
     pub preprocess: Option<Path>,
+    /// Whether this type's pages run through zstd (storage policy — not part
+    /// of the schema, so it never feeds the `STRUCT_HASH`).
+    pub compress: bool,
 }
 
 impl Default for WavedbArgs {
@@ -47,6 +51,7 @@ impl Default for WavedbArgs {
             shape: Shape::Unique,
             validate: None,
             preprocess: None,
+            compress: true,
         }
     }
 }
@@ -72,11 +77,15 @@ impl WavedbArgs {
                 Meta::NameValue(nv) if nv.path.is_ident("preprocess") => {
                     args.preprocess = Some(expr_as_path(&nv.value)?);
                 }
+                Meta::NameValue(nv) if nv.path.is_ident("compress") => {
+                    args.compress = expr_as_bool(&nv.value)?;
+                }
                 other => {
                     return Err(syn::Error::new_spanned(
                         other,
                         "unsupported #[wavedb(...)] argument; expected `NonUnique`, \
-                         `Unique`, `validate = fn`, or `preprocess = fn`",
+                         `Unique`, `validate = fn`, `preprocess = fn`, or \
+                         `compress = bool`",
                     ));
                 }
             }
@@ -91,5 +100,18 @@ fn expr_as_path(expr: &syn::Expr) -> syn::Result<Path> {
         Ok(p.path.clone())
     } else {
         Err(syn::Error::new_spanned(expr, "expected a function path"))
+    }
+}
+
+/// Interpret a `name = value` value as a bool literal (`compress = false`).
+fn expr_as_bool(expr: &syn::Expr) -> syn::Result<bool> {
+    if let syn::Expr::Lit(syn::ExprLit {
+        lit: syn::Lit::Bool(b),
+        ..
+    }) = expr
+    {
+        Ok(b.value)
+    } else {
+        Err(syn::Error::new_spanned(expr, "expected `true` or `false`"))
     }
 }
