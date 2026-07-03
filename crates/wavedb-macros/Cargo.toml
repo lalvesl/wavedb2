@@ -21,3 +21,7 @@ seahash = { workspace = true }
 [dev-dependencies]
 trybuild.workspace = true
 wavedb-core = { path = "../wavedb-core" }
+# The attribute tests compile real expansions, which on native targets include
+# the generated `StructStorage` statics (dev-only; no build cycle — storage
+# only dev-depends on this crate).
+wavedb-storage = { path = "../wavedb-storage" }

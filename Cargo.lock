@@ -398,6 +398,7 @@ dependencies = [
  "futures",
  "wavedb-core",
  "wavedb-macros",
+ "wavedb-storage",
 ]
 
 [[package]]
@@ -683,6 +684,7 @@ dependencies = [
  "syn",
  "trybuild",
  "wavedb-core",
+ "wavedb-storage",
 ]
 
 [[package]]
