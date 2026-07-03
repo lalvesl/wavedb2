@@ -20,7 +20,9 @@
 
 pub mod block;
 pub mod block_file;
+pub mod dictionary;
 pub mod directory;
+mod directory_pages;
 pub mod error;
 pub mod journal;
 pub mod page;
@@ -28,6 +30,7 @@ pub mod page_store;
 
 pub use block::{BLOCK_SIZE, BlockAllocator, BlockDescriptor, Run};
 pub use block_file::{BlockFile, RESERVED_BLOCKS};
+pub use dictionary::Dictionary;
 pub use directory::{Directory, bucket_index, hash_of};
 pub use error::{StorageError, StorageResult};
 pub use journal::Journal;

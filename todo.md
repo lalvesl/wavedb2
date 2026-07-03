@@ -193,11 +193,11 @@ code exists yet. Build order, roughly bottom-up:
   reopen).
   **Remaining for M2:** the dedicated **32 KiB one-node-per-page** BpTree format
   (nodes currently ride the generic `SlotPage` directory under a reserved
-  page-kind `STRUCT_HASH`); per-`STRUCT_HASH` **dictionaries** + zstd
-  compression; **background** settle / rebalance (settle is inline with `apply`
-  for now); secondary indexes (`#[wavedb::pivot(...)]`) driven through
-  `Collection` (`by_<field>` walks, reindex on `save`); per-record `Metadata`
-  written alongside records.
+  page-kind `STRUCT_HASH`); **background** settle / rebalance (settle is inline
+  with `apply` for now); secondary indexes (`#[wavedb::pivot(...)]`) driven
+  through `Collection` (`by_<field>` walks, reindex on `save`); per-record
+  `Metadata` written alongside records; per-value (strings/blobs) heap
+  compression.
 - **Design note (M3):** `PageStore` is **cache + journal authoritative** for
   reads; `data.bin` is a deterministic projection rebuilt by journal replay on
   open. It settles a value into the per-`STRUCT_HASH` page directory by reading
@@ -300,6 +300,17 @@ code exists yet. Build order, roughly bottom-up:
   - **Hygiene** — 350-line-per-file budget enforced by
     `scripts/check_file_length.sh` (CI step); `maybe_split` checks only the
     touched bucket (O(1)); `wavedb-build` removed from the workspace.
+  - **Per-`STRUCT_HASH` dictionaries + zstd page compression** — raw-content
+    (no trainer) capped append-only sample buffer per type (`dictionary`
+    module); **version = prefix length** (append-only ⇒ every old state is a
+    prefix of the live buffer — old pages stay readable with no recompression
+    or superseded-run bookkeeping); persisted in `data.bin` as its own block
+    run via the shared allocator, rebuilt + re-persisted by journal replay.
+    Page bodies store as a `PagePayload` enum: `Zstd { dict_len, raw_len,
+    bytes }` or `Raw` — per-type opt-out (`Directory::with_compression`;
+    `PageStore` disables zstd for hot `BpTree` node pages) plus automatic
+    `Raw` fallback when zstd cannot shrink a body. `directory` split into
+    container/math + `directory_pages` (page I/O) for the file budget.
 - **Typed collection layer** — the developer-facing surface over the (internal)
   `BpTree`, in the exact target shape
   (`Todo::collection(pivot, tenant).insert(&store, &todo)`):

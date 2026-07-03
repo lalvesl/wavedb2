@@ -2,23 +2,32 @@
 //!
 //! A page holds records of **exactly one `STRUCT_HASH`** (Unique anchors, NonUnique
 //! records, Pivots, `BpTree` nodes — the node encoding lives in `wavedb_core`'s
-//! index layer and is stored here as ordinary bytes). The layout, little-endian
-//! throughout:
+//! index layer and is stored here as ordinary bytes).
+//!
+//! ## Layout — checked wire outside, optionally dictionary-zstd inside
 //!
 //! ```text
-//! ┌───────────────────────────────────────────────────────────┐
-//! │ crc32 (u32) │ struct_hash (u64) │ total_len (u32) │ N (u32) │  header (20 B)
-//! ├───────────────────────────────────────────────────────────┤
-//! │ id list:  [ id (u128) · offset (u32) · size (u32) ] × N     │  24 B / entry
-//! ├───────────────────────────────────────────────────────────┤
-//! │ blob:     [ record wire bytes … ]                           │
-//! └───────────────────────────────────────────────────────────┘
+//! [ payload_len (u32 LE) ][ to_wire_checked(PageEnvelope) ]  … zero-padded to the run
+//!                          └── [ crc32 ][ struct_hash · PagePayload ] ──┘
+//! PagePayload::Raw ( to_wire(PageBody) )                               — stored plain
+//! PagePayload::Zstd { dict_len, raw_len, zstd(to_wire(PageBody)) }     — dictionary-compressed
 //! ```
 //!
-//! `total_len` is the page's real byte length, so a page read back from a run of
-//! whole blocks (padded with zeros past `total_len`) knows where its data ends.
-//! `crc32` covers bytes `[4, total_len)` — struct_hash through blob — and is
-//! verified on read. `offset` is relative to the start of the blob section.
+//! The envelopes are plain `WaveWire` structs/enums — no page-private byte
+//! format. The order is deliberate: the crc covers the **stored** bytes, so
+//! corruption is caught by the codec before zstd ever runs; `struct_hash` and
+//! the payload kind sit outside the compressed body so a page is
+//! self-describing without decompression. The only framing outside the codec
+//! is the leading length — a page reads back from a run of whole zero-padded
+//! blocks, and the checked decoder needs the exact payload slice.
+//!
+//! **Not every page compresses.** The caller picks per write
+//! ([`Directory`](crate::directory::Directory) carries the per-type policy —
+//! e.g. hot, constantly-rewritten `BpTree` node pages skip zstd), and even
+//! with compression on, a body zstd cannot shrink is stored `Raw` — a page
+//! never grows for having been "compressed". `dict_len` pins a `Zstd` page to
+//! the [`Dictionary`] state (an append-only buffer, so a state is a prefix
+//! length) it was compressed against; see [`crate::dictionary`].
 //!
 //! In memory a page is a `BTreeMap<u128, Vec<u8>>` keyed by the record `Id`'s raw
 //! `u128`, so iteration is in `Id` order (which, `KEY`-first, is type/time order)
@@ -27,18 +36,53 @@
 use std::collections::BTreeMap;
 
 use wavedb_core::Id;
+use wavedb_core::wire::{
+    WaveWire, from_wire, from_wire_checked, to_wire, to_wire_checked,
+};
 
-use crate::block::BLOCK_SIZE;
+use crate::dictionary::Dictionary;
 use crate::error::{StorageError, StorageResult};
 
-/// Header: `crc32 (4) + struct_hash (8) + total_len (4) + entry_count (4)`.
-const HEADER_LEN: usize = 20;
-/// One id-list entry: `id (16) + offset (4) + size (4)`.
-const ENTRY_LEN: usize = 24;
+/// Per-page prefix: `payload_len (u32)`.
+const LEN_PREFIX: usize = 4;
 
-const OFF_STRUCT_HASH: usize = 4;
-const OFF_TOTAL_LEN: usize = 12;
-const OFF_COUNT: usize = 16;
+/// zstd compression level for page bodies (the crate's default; CPU is free
+/// here — no join processing competes for it).
+const LEVEL: i32 = 3;
+
+/// The stored envelope: everything needed to open the page, uncompressed.
+#[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
+struct PageEnvelope {
+    /// The `STRUCT_HASH` every record in this page shares — readable without
+    /// the dictionary.
+    struct_hash: u64,
+    /// The body, stored plain or dictionary-compressed.
+    payload: PagePayload,
+}
+
+/// How the page body is stored.
+#[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
+enum PagePayload {
+    /// `to_wire(PageBody)`, plain — compression off for this page's type, or
+    /// zstd could not shrink the body.
+    Raw(Vec<u8>),
+    /// `to_wire(PageBody)` compressed against `dictionary[..dict_len]`.
+    Zstd {
+        /// The [`Dictionary`] state (prefix length) the body binds.
+        dict_len: u32,
+        /// Decompressed body length (the decompressor's exact capacity).
+        raw_len: u32,
+        /// The zstd frame.
+        bytes: Vec<u8>,
+    },
+}
+
+/// The compressed body — the records themselves.
+#[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
+struct PageBody {
+    /// `(Id.raw(), record wire bytes)` in ascending `Id` order.
+    records: Vec<(u128, Vec<u8>)>,
+}
 
 /// A homogeneous in-memory page of records, all of one `STRUCT_HASH`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,111 +150,101 @@ impl SlotPage {
             .map(|(raw, bytes)| (Id::from_raw(raw), bytes))
     }
 
-    /// Serialised byte length of this page (header + id list + blob).
-    #[must_use]
-    pub fn byte_len(&self) -> usize {
-        let blob: usize = self.records.values().map(Vec::len).sum();
-        HEADER_LEN + self.records.len() * ENTRY_LEN + blob
-    }
-
-    /// Number of [`BLOCK_SIZE`] blocks this page needs (`ceil`).
-    #[must_use]
-    pub fn blocks_needed(&self) -> u64 {
-        self.byte_len().div_ceil(BLOCK_SIZE) as u64
-    }
-
-    /// Serialise to bytes, computing and prefixing the crc32.
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(self.byte_len());
-        buf.extend_from_slice(&[0u8; 4]); // crc32 placeholder
-        buf.extend_from_slice(&self.struct_hash.to_le_bytes());
-        buf.extend_from_slice(&[0u8; 4]); // total_len placeholder
-        buf.extend_from_slice(&(self.records.len() as u32).to_le_bytes());
-
-        // Id list: offsets are relative to the blob start, filled as we go.
-        let mut running = 0u32;
-        for (&raw, bytes) in &self.records {
-            buf.extend_from_slice(&raw.to_le_bytes());
-            buf.extend_from_slice(&running.to_le_bytes());
-            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            running += bytes.len() as u32;
-        }
-        // Blob, in the same Id order.
-        for bytes in self.records.values() {
-            buf.extend_from_slice(bytes);
-        }
-
-        let total_len = buf.len() as u32;
-        buf[OFF_TOTAL_LEN..OFF_TOTAL_LEN + 4]
-            .copy_from_slice(&total_len.to_le_bytes());
-        let crc = crc32fast::hash(&buf[4..]);
-        buf[..4].copy_from_slice(&crc.to_le_bytes());
-        buf
-    }
-
-    /// Parse a page from bytes, verifying the crc32 and all internal bounds.
+    /// Serialise, framed `[len][checked envelope]`. With `compress` the body
+    /// is zstd'd against `dict`'s **latest** state — but stored [`Raw`] anyway
+    /// when zstd cannot shrink it (a page never grows for having been
+    /// "compressed"). Without `compress` (a hot page type opting out), zstd
+    /// never runs.
+    ///
+    /// [`Raw`]: PagePayload::Raw
     ///
     /// # Errors
-    /// [`StorageError::Corrupt`] on a crc mismatch, a truncated buffer, or an
-    /// id-list entry that points outside the blob.
-    pub fn from_bytes(buf: &[u8]) -> StorageResult<Self> {
-        if buf.len() < HEADER_LEN {
-            return Err(StorageError::Corrupt("page header truncated"));
-        }
-        let total_len = u32::from_le_bytes(
-            buf[OFF_TOTAL_LEN..OFF_TOTAL_LEN + 4].try_into().unwrap(),
-        ) as usize;
-        if total_len < HEADER_LEN || total_len > buf.len() {
-            return Err(StorageError::Corrupt("page total_len out of range"));
-        }
-        let buf = &buf[..total_len]; // ignore run padding past the real page
-        let stored_crc = u32::from_le_bytes(buf[..4].try_into().unwrap());
-        if crc32fast::hash(&buf[4..]) != stored_crc {
-            return Err(StorageError::Corrupt("page crc mismatch"));
-        }
-        let struct_hash = u64::from_le_bytes(
-            buf[OFF_STRUCT_HASH..OFF_STRUCT_HASH + 8]
-                .try_into()
-                .unwrap(),
-        );
-        let count = u32::from_le_bytes(
-            buf[OFF_COUNT..OFF_COUNT + 4].try_into().unwrap(),
-        ) as usize;
+    /// [`StorageError::Io`] if zstd fails (allocation-class faults only).
+    pub fn to_bytes(
+        &self,
+        dict: &Dictionary,
+        compress: bool,
+    ) -> StorageResult<Vec<u8>> {
+        let body = PageBody {
+            records: self
+                .records
+                .iter()
+                .map(|(&raw, bytes)| (raw, bytes.clone()))
+                .collect(),
+        };
+        let raw = to_wire(&body);
 
-        let id_list_end =
-            HEADER_LEN
-                .checked_add(count.checked_mul(ENTRY_LEN).ok_or(
-                    StorageError::Corrupt("page entry count overflow"),
-                )?)
-                .ok_or(StorageError::Corrupt("page entry count overflow"))?;
-        if buf.len() < id_list_end {
-            return Err(StorageError::Corrupt("page id list truncated"));
-        }
-        let blob = &buf[id_list_end..];
-
-        let mut records = BTreeMap::new();
-        for i in 0..count {
-            let at = HEADER_LEN + i * ENTRY_LEN;
-            let raw = u128::from_le_bytes(buf[at..at + 16].try_into().unwrap());
-            let offset =
-                u32::from_le_bytes(buf[at + 16..at + 20].try_into().unwrap())
-                    as usize;
-            let size =
-                u32::from_le_bytes(buf[at + 20..at + 24].try_into().unwrap())
-                    as usize;
-            let end = offset
-                .checked_add(size)
-                .ok_or(StorageError::Corrupt("page entry size overflow"))?;
-            if end > blob.len() {
-                return Err(StorageError::Corrupt("page entry past blob"));
+        let payload = if compress {
+            let zstd =
+                zstd::bulk::Compressor::with_dictionary(LEVEL, dict.latest())?
+                    .compress(&raw)?;
+            if zstd.len() < raw.len() {
+                PagePayload::Zstd {
+                    dict_len: dict.len() as u32,
+                    raw_len: raw.len() as u32,
+                    bytes: zstd,
+                }
+            } else {
+                PagePayload::Raw(raw)
             }
-            records.insert(raw, blob[offset..end].to_vec());
-        }
+        } else {
+            PagePayload::Raw(raw)
+        };
+
+        let payload = to_wire_checked(&PageEnvelope {
+            struct_hash: self.struct_hash,
+            payload,
+        });
+        let mut out = Vec::with_capacity(LEN_PREFIX + payload.len());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&payload);
+        Ok(out)
+    }
+
+    /// Parse a page from bytes (typically a whole zero-padded run): length
+    /// prefix, crc + envelope decode through the checked codec, then — for a
+    /// [`Zstd`](PagePayload::Zstd) payload — decompress against the dictionary
+    /// state the page was written under.
+    ///
+    /// # Errors
+    /// [`StorageError::Corrupt`] on a truncated buffer, an out-of-range
+    /// length, a crc mismatch, an undecodable envelope/body, or a `dict_len`
+    /// stamping a state `dict` never reached.
+    pub fn from_bytes(buf: &[u8], dict: &Dictionary) -> StorageResult<Self> {
+        let len_bytes: [u8; LEN_PREFIX] = buf
+            .get(..LEN_PREFIX)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(StorageError::Corrupt("page length truncated"))?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        let end = LEN_PREFIX
+            .checked_add(len)
+            .filter(|&end| end <= buf.len())
+            .ok_or(StorageError::Corrupt("page length out of range"))?;
+
+        let envelope: PageEnvelope =
+            from_wire_checked(&buf[LEN_PREFIX..end])
+                .map_err(|_| StorageError::Corrupt("page envelope"))?;
+        let raw = match envelope.payload {
+            PagePayload::Raw(raw) => raw,
+            PagePayload::Zstd {
+                dict_len,
+                raw_len,
+                bytes,
+            } => {
+                let state = dict.state(dict_len as usize).ok_or(
+                    StorageError::Corrupt("page dictionary state unknown"),
+                )?;
+                zstd::bulk::Decompressor::with_dictionary(state)
+                    .and_then(|mut d| d.decompress(&bytes, raw_len as usize))
+                    .map_err(|_| StorageError::Corrupt("page decompress"))?
+            }
+        };
+        let body: PageBody =
+            from_wire(&raw).map_err(|_| StorageError::Corrupt("page body"))?;
 
         Ok(Self {
-            struct_hash,
-            records,
+            struct_hash: envelope.struct_hash,
+            records: body.records.into_iter().collect(),
         })
     }
 }
@@ -219,6 +253,7 @@ impl SlotPage {
 mod tests {
     use super::SlotPage;
     use crate::block::BLOCK_SIZE;
+    use crate::dictionary::Dictionary;
     use crate::error::StorageError;
     use wavedb_core::{Id, U48};
 
@@ -242,16 +277,65 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_through_bytes() {
+    fn roundtrip_with_empty_and_warm_dictionary() {
         let mut p = SlotPage::new(0x1122_3344_5566_7788);
         p.upsert(id(10), vec![0xAA; 5]);
         p.upsert(id(20), b"hello world".to_vec());
         p.upsert(id(30), vec![]); // empty record is legal
-        let bytes = p.to_bytes();
-        assert_eq!(bytes.len(), p.byte_len());
-        let back = SlotPage::from_bytes(&bytes).unwrap();
+
+        // Cold: no dictionary content yet.
+        let cold = Dictionary::new();
+        let back =
+            SlotPage::from_bytes(&p.to_bytes(&cold, true).unwrap(), &cold)
+                .unwrap();
         assert_eq!(back, p);
         assert_eq!(back.struct_hash(), 0x1122_3344_5566_7788);
+
+        // Warm: sampled content participates in the roundtrip.
+        let mut warm = Dictionary::new();
+        warm.sample(b"hello world");
+        warm.sample(&[0xAA; 5]);
+        let back =
+            SlotPage::from_bytes(&p.to_bytes(&warm, true).unwrap(), &warm)
+                .unwrap();
+        assert_eq!(back, p);
+    }
+
+    // The versioning rule: a page stamped at dictionary state N must stay
+    // readable after the dictionary grows — a state is a stable prefix.
+    #[test]
+    fn old_page_survives_dictionary_growth() {
+        let mut p = SlotPage::new(9);
+        p.upsert(id(1), b"record one".to_vec());
+
+        let mut dict = Dictionary::new();
+        dict.sample(b"record one");
+        let bytes = p.to_bytes(&dict, true).unwrap(); // stamped at len("record one")
+
+        dict.sample(b"record two arriving later");
+        dict.sample(&[0x55; 1000]);
+        let back = SlotPage::from_bytes(&bytes, &dict).unwrap();
+        assert_eq!(back, p, "grown dictionary broke an old page");
+    }
+
+    // A stamp beyond anything this dictionary ever held (foreign file, or a
+    // replay that diverged) is a typed corruption, not a zstd panic. The page
+    // must be compressible, or the Raw fallback would skip the stamp entirely.
+    #[test]
+    fn unknown_dictionary_state_detected() {
+        let mut p = SlotPage::new(9);
+        for i in 0..20u64 {
+            p.upsert(id(i + 1), vec![0xEE; 200]);
+        }
+        let mut big = Dictionary::new();
+        big.sample(&[7u8; 500]);
+        let bytes = p.to_bytes(&big, true).unwrap(); // dict_len = 500
+
+        let small = Dictionary::new(); // never reached state 500
+        assert!(matches!(
+            SlotPage::from_bytes(&bytes, &small),
+            Err(StorageError::Corrupt("page dictionary state unknown"))
+        ));
     }
 
     #[test]
@@ -266,54 +350,83 @@ mod tests {
 
     #[test]
     fn empty_page_roundtrips() {
+        let d = Dictionary::new();
         let p = SlotPage::new(7);
-        let back = SlotPage::from_bytes(&p.to_bytes()).unwrap();
+        let back =
+            SlotPage::from_bytes(&p.to_bytes(&d, true).unwrap(), &d).unwrap();
         assert!(back.is_empty());
         assert_eq!(back.struct_hash(), 7);
     }
 
     #[test]
     fn crc_mismatch_detected() {
+        let d = Dictionary::new();
         let mut p = SlotPage::new(1);
         p.upsert(id(1), vec![1, 2, 3]);
-        let mut bytes = p.to_bytes();
+        let mut bytes = p.to_bytes(&d, true).unwrap();
         let last = bytes.len() - 1;
-        bytes[last] ^= 0xFF; // corrupt the blob
+        bytes[last] ^= 0xFF; // corrupt the envelope
         assert!(matches!(
-            SlotPage::from_bytes(&bytes),
+            SlotPage::from_bytes(&bytes, &d),
             Err(StorageError::Corrupt(_))
         ));
     }
 
     #[test]
     fn truncated_buffer_detected() {
+        let d = Dictionary::new();
+        // Shorter than the length prefix itself.
         assert!(matches!(
-            SlotPage::from_bytes(&[0u8; 4]),
+            SlotPage::from_bytes(&[0u8; 2], &d),
             Err(StorageError::Corrupt(_))
+        ));
+        // A length that reaches past the buffer.
+        let mut p = SlotPage::new(1);
+        p.upsert(id(1), vec![1, 2, 3]);
+        let bytes = p.to_bytes(&d, true).unwrap();
+        assert!(matches!(
+            SlotPage::from_bytes(&bytes[..bytes.len() - 1], &d),
+            Err(StorageError::Corrupt("page length out of range"))
         ));
     }
 
     #[test]
     fn reads_from_padded_run() {
-        // A page on disk occupies whole blocks; the tail past total_len is zero
-        // padding. from_bytes must ignore it and still verify the crc.
+        // A page on disk occupies whole blocks; the tail past the payload is
+        // zero padding. from_bytes must ignore it and still verify the crc.
+        let d = Dictionary::new();
         let mut p = SlotPage::new(5);
         p.upsert(id(1), vec![1, 2, 3]);
         p.upsert(id(2), b"abc".to_vec());
-        let mut bytes = p.to_bytes();
+        let mut bytes = p.to_bytes(&d, true).unwrap();
         bytes.resize(BLOCK_SIZE * 2, 0);
-        let back = SlotPage::from_bytes(&bytes).unwrap();
+        let back = SlotPage::from_bytes(&bytes, &d).unwrap();
         assert_eq!(back, p);
     }
 
+    // Repetitive records must actually shrink on disk once the dictionary has
+    // seen their shape — the point of the whole mechanism.
     #[test]
-    fn blocks_needed_rounds_up() {
-        let mut p = SlotPage::new(1);
-        // Small page fits in one block.
-        p.upsert(id(1), vec![0u8; 10]);
-        assert_eq!(p.blocks_needed(), 1);
-        // Push it just past one block.
-        p.upsert(id(2), vec![0u8; BLOCK_SIZE]);
-        assert_eq!(p.blocks_needed(), 2);
+    fn similar_records_compress_well() {
+        let record = |i: u64| {
+            format!("{{\"kind\":\"invoice\",\"cents\":{i},\"paid\":false}}")
+                .into_bytes()
+        };
+        let mut dict = Dictionary::new();
+        dict.sample(&record(0));
+
+        let mut p = SlotPage::new(2);
+        let mut raw_total = 0usize;
+        for i in 0..200u64 {
+            let r = record(i);
+            raw_total += r.len();
+            p.upsert(id(i + 1), r);
+        }
+        let stored = p.to_bytes(&dict, true).unwrap();
+        assert!(
+            stored.len() < raw_total / 2,
+            "expected >2x compression on repetitive records: {} vs {raw_total}",
+            stored.len()
+        );
     }
 }

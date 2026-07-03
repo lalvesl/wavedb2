@@ -10,19 +10,21 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 
 ## Module map
 
-| Module       | Responsibility                                                                                              |
-| ------------ | ------------------------------------------------------------------------------------------------------------ |
-| `block`      | `BlockDescriptor` (u40·u20·u4) + `Run` + `BlockAllocator` — alloc/free/coalesce runs of 4 KiB blocks.       |
-| `block_file` | `data.bin` as a block-addressed file: superblock (block 0), positioned run I/O, grow/truncate, fsync.       |
-| `directory`  | The per-`STRUCT_HASH` `Vec<u64>` page directory + linear hashing + page-moving `split_next`.                |
-| `page`       | `SlotPage` — the homogeneous record page: `[len][to_wire_checked(PageBody)]`.                               |
-| `journal`    | Append-only WAL of `Write` batches (checked wire frames); fsync = durability; torn-tail-tolerant replay.    |
-| `page_store` | `PageStore` — the node's authoritative `Store`: journal-first → cache → settle into per-type pages.         |
-| `error`      | `StorageError` / `StorageResult`; flattens to `wavedb_core::Error::Backend` at the `Store` seam.            |
+| Module            | Responsibility                                                                                              |
+| ----------------- | ------------------------------------------------------------------------------------------------------------ |
+| `block`           | `BlockDescriptor` (u40·u20·u4) + `Run` + `BlockAllocator` — alloc/free/coalesce runs of 4 KiB blocks.       |
+| `block_file`      | `data.bin` as a block-addressed file: superblock (block 0), positioned run I/O, grow/truncate, fsync.       |
+| `dictionary`      | Per-`STRUCT_HASH` raw-content zstd dictionary: capped append-only sample buffer, version = prefix length.   |
+| `directory`       | The per-`STRUCT_HASH` page directory container + the linear-hashing addressing math.                        |
+| `directory_pages` | The directory's page I/O: read/rewrite/split bucket pages, per-type compression, dictionary persistence.    |
+| `page`            | `SlotPage` — the homogeneous record page: `[len][to_wire_checked(PageEnvelope)]`, body raw or zstd.         |
+| `journal`         | Append-only WAL of `Write` batches (checked wire frames); fsync = durability; torn-tail-tolerant replay.    |
+| `page_store`      | `PageStore` — the node's authoritative `Store`: journal-first → cache → settle into per-type pages.         |
+| `error`           | `StorageError` / `StorageResult`; flattens to `wavedb_core::Error::Backend` at the `Store` seam.            |
 
-Planned (not yet modules): per-`STRUCT_HASH` compression `dictionary`,
-background settle/rebalance (settle is inline with `apply` today). The
-`Pivot`/`BpTree` index layer lives in `wavedb_core::index`, not here.
+Planned (not yet a module): background settle/rebalance (settle is inline with
+`apply` today). The `Pivot`/`BpTree` index layer lives in
+`wavedb_core::index`, not here.
 
 ---
 
@@ -227,15 +229,22 @@ written page.
 
 A page is **homogeneous** — records of exactly one `STRUCT_HASH`. `SlotPage` is
 the one page format today (`Unique` anchors, NonUnique records, Pivots, and
-`BpTree` nodes all ride it; per-kind dictionaries/compression come later), and
-its layout is the **checked wire encoding** — no page-private byte format:
+`BpTree` nodes all ride it), and its layout is the **checked wire encoding** —
+no page-private byte format:
 
 ```
-[ payload_len (u32 LE) ][ to_wire_checked(PageBody) ]   … zero-padded to the run
+[ payload_len (u32 LE) ][ to_wire_checked(PageEnvelope) ]   … zero-padded to the run
                          └── [ crc32 (u32 LE) ][ wire bytes ] ──┘
 
-PageBody (plain WaveWire struct):
+PageEnvelope (plain WaveWire struct):
     struct_hash: u64                  — identifies the type; selects the dictionary
+    payload: PagePayload              — the body, raw or compressed
+
+PagePayload (plain WaveWire enum):
+    Raw( to_wire(PageBody) )          — compression off for this type, or zstd gained nothing
+    Zstd { dict_len, raw_len, bytes } — zstd(to_wire(PageBody)) against dictionary[..dict_len]
+
+PageBody (plain WaveWire struct):
     records: Vec<(u128, Vec<u8>)>     — (Id.raw, record wire bytes), ascending Id
 ```
 
@@ -244,7 +253,14 @@ PageBody (plain WaveWire struct):
   get the exact payload slice for its crc to hold (same pattern as a journal
   frame).
 - **crc + decode** — both the codec's job (`CrcMismatch` before any decode
-  runs), surfaced as `StorageError::Corrupt`.
+  runs), surfaced as `StorageError::Corrupt`. The crc covers the **stored**
+  bytes, so corruption is caught before zstd runs; `struct_hash` and the
+  payload kind stay readable without the dictionary.
+- **per-type compression policy** — each `Directory` decides whether its pages
+  compress (`with_compression`); `PageStore` turns it **off for `BpTree` node
+  pages** (hot, rewritten on every index mutation) and on for record/Pivot
+  pages. Even when on, a body zstd cannot shrink is stored `Raw` — a page
+  never grows for having been "compressed".
 
 What a page's records hold, by the kind of `STRUCT_HASH` that routed them (the
 future per-kind split — own dictionaries, the dedicated 32 KiB node page —
@@ -388,29 +404,37 @@ with nothing foreign to dilute it.
 ### Raw-content dictionary (no trainer)
 
 zstd accepts **any bytes** as a dictionary, not just a trained `ZDICT` — so the
-dictionary is simply a **growing buffer of representative records** for that
-`STRUCT_HASH`. No training pass: as inserts arrive, sample bytes are appended to
-the buffer and it grows. (`zstd::dict::{EncoderDictionary, DecoderDictionary}`
-take a raw byte slice.) Simpler than a trainer and naturally incremental.
+dictionary is simply a **capped, append-only buffer of record bytes** for that
+`STRUCT_HASH`. No training pass: as writes settle, record bytes are sampled
+into the buffer until the cap (`DICT_CAP`), then it freezes. Simpler than a
+trainer and naturally incremental.
 
-The dictionary is its own struct, stored in `data.bin` in block runs handed out
-by the block manager and tracked by a small **dictionary directory** — a
-`Vec<u64>` using the **same block descriptor** as the page directory
-(`u40 start · u20 count · u4 occupation`), so allocator and directory code is
-shared.
+The dictionary is stored in `data.bin` like a page: a block run handed out by
+the block manager (`[len][to_wire_checked(buf)]`, same framing as everything
+else), tracked by a descriptor in its `Directory` and repointed with the same
+crash-safe write-then-free ordering pages use. A compression-off type never
+samples and never allocates a run.
 
 ### Versioning (the one rule)
 
-A page compressed against dictionary state X **must** be decompressed against the
-exact same bytes — you never mutate the dictionary under existing pages. So the
-buffer carries a `dict_version`; the growing happens for **new** writes (they
-bind the latest version), while old pages keep the `dict_version` stamped in
-their header and stay readable. When the buffer has grown enough, a background
-task recompresses cold pages to the newer version; a superseded dictionary run is
-freed once no live page references it.
+A page compressed against dictionary state X **must** be decompressed against
+the exact same bytes — the dictionary never mutates under existing pages.
+Because the buffer is **append-only, a state is fully identified by its
+length**: each `Zstd` page stamps `dict_len` at compression time and
+decompresses against `buf[..dict_len]`. Every superseded state is a prefix of
+the same live buffer, so old pages stay readable forever with **no
+recompression and no superseded-run bookkeeping** — one stored buffer serves
+all versions. (A background recompress-cold-pages pass remains possible later
+as a pure space optimisation, not a correctness need.)
 
-Variable-length heap values (strings/blobs) are additionally zstd-compressed.
-CPU is free here — there is no join processing competing for it.
+On open the dictionary is rebuilt exactly, for free: `data.bin` is a
+journal-replay projection, and the settle path re-samples the same records in
+the same order — every `dict_len` a rebuilt page stamps resolves against the
+rebuilt buffer. Reading the persisted run back becomes load-bearing only when
+settling checkpoints.
+
+CPU is free here — there is no join processing competing for it. Per-value
+(strings/blobs) heap compression stays future work.
 
 ---
 

@@ -157,8 +157,14 @@ fn settle(inner: &mut Inner, batch: &[Write]) -> StorageResult<()> {
             Write::Put(id, bytes) => {
                 let sh = struct_hash_of(bytes)?;
                 cache.insert(id.raw(), bytes.clone());
-                let dir =
-                    dirs.entry(sh).or_insert_with(|| Directory::new(*seed));
+                let dir = dirs.entry(sh).or_insert_with(|| {
+                    // BpTree node pages are hot (rewritten on every index
+                    // mutation) — zstd there is CPU for nothing. Record and
+                    // Pivot pages compress.
+                    Directory::new(*seed).with_compression(
+                        sh != wavedb_core::index::BPTREE_NODE_STRUCT_HASH,
+                    )
+                });
                 dir.upsert_record(sh, file, alloc, *id, bytes.clone())?;
                 maybe_split(
                     dir,
@@ -305,28 +311,41 @@ mod tests {
         });
     }
 
+    /// ~1 KiB of pseudo-random (zstd-incompressible) bytes — pages must grow
+    /// past the split threshold by their **stored** (compressed) size, so
+    /// compressible filler would never trigger a split.
+    fn noise(k: u64) -> Vec<u8> {
+        let mut state = k.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..1024)
+            .map(|_| {
+                // xorshift64
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
     #[test]
     fn many_records_trigger_split_and_stay_readable() {
         let d = tempfile::tempdir().unwrap();
         let s = PageStore::open(d.path()).unwrap();
         block_on(async {
             // Each record ~1 KiB; enough of them overflow a bucket and split.
-            for k in 0..400u64 {
-                s.apply(&[Write::Put(
-                    nonunique(k),
-                    rec(SH, &vec![k as u8; 1024]),
-                )])
-                .await
-                .unwrap();
+            for k in 0..200u64 {
+                s.apply(&[Write::Put(nonunique(k), rec(SH, &noise(k)))])
+                    .await
+                    .unwrap();
             }
             assert!(
                 s.bucket_count(SH) > 1,
                 "expected at least one bucket split"
             );
-            for k in 0..400u64 {
+            for k in 0..200u64 {
                 assert_eq!(
                     s.get(nonunique(k)).await.unwrap(),
-                    Some(rec(SH, &vec![k as u8; 1024])),
+                    Some(rec(SH, &noise(k))),
                     "record {k} lost"
                 );
             }
@@ -334,9 +353,9 @@ mod tests {
         // And it all survives a rebuild from the journal.
         let s = PageStore::open(d.path()).unwrap();
         block_on(async {
-            assert_eq!(s.cache_len(), 400);
+            assert_eq!(s.cache_len(), 200);
             assert_eq!(
-                s.get(nonunique(399)).await.unwrap().unwrap().len(),
+                s.get(nonunique(199)).await.unwrap().unwrap().len(),
                 8 + 1024
             );
         });

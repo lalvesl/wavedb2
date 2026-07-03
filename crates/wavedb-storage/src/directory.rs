@@ -17,13 +17,9 @@
 //! portable across architecture and endianness, so the directory — rebuilt by
 //! **journal replay** — routes every record to the same bucket even if `data.bin`
 //! is opened on a different machine.
-
-use crate::block::{BLOCK_SIZE, BlockAllocator, BlockDescriptor};
-use crate::block_file::BlockFile;
-use crate::error::StorageResult;
-use crate::page::SlotPage;
+use crate::block::BlockDescriptor;
+use crate::dictionary::Dictionary;
 use seahash::hash_seeded;
-use wavedb_core::Id;
 
 /// A SeaHash of a 128-bit `Id` under a per-database seed.
 ///
@@ -69,19 +65,43 @@ pub const fn next_split_bucket(dir_len: u64) -> u64 {
 #[derive(Debug, Clone)]
 pub struct Directory {
     /// One descriptor per bucket (page).
-    slots: Vec<BlockDescriptor>,
+    pub(crate) slots: Vec<BlockDescriptor>,
     /// Per-database hash seed (from `data.bin` page 0).
     seed: [u64; 4],
+    /// This type's raw-content zstd dictionary; pages compress against it and
+    /// stamp the state (prefix length) they bound. Rebuilt deterministically
+    /// by journal replay, like the pages themselves.
+    pub(crate) dict: Dictionary,
+    /// The block run the dictionary is persisted in (repointed as it grows);
+    /// [`BlockDescriptor::EMPTY`] while nothing has been sampled.
+    pub(crate) dict_desc: BlockDescriptor,
+    /// Whether this type's pages run through zstd at all. Off for page kinds
+    /// where the CPU spend doesn't pay — hot, constantly-rewritten pages like
+    /// `BpTree` nodes.
+    pub(crate) compress: bool,
 }
 
 impl Directory {
-    /// A directory with a single empty bucket.
+    /// A directory with a single empty bucket (compression on).
     #[must_use]
     pub fn new(seed: [u64; 4]) -> Self {
         Self {
             slots: vec![BlockDescriptor::EMPTY],
             seed,
+            dict: Dictionary::new(),
+            dict_desc: BlockDescriptor::EMPTY,
+            compress: true,
         }
+    }
+
+    /// Set whether this type's pages compress. Pick once per directory: pages
+    /// written either way stay readable (the payload kind is stamped in the
+    /// page envelope), but a type that never compresses also never samples or
+    /// persists a dictionary.
+    #[must_use]
+    pub const fn with_compression(mut self, compress: bool) -> Self {
+        self.compress = compress;
+        self
     }
 
     /// Rebuild a directory from already-known descriptors (e.g. journal replay).
@@ -91,7 +111,20 @@ impl Directory {
     #[must_use]
     pub fn from_slots(slots: Vec<BlockDescriptor>, seed: [u64; 4]) -> Self {
         assert!(!slots.is_empty(), "directory needs at least one bucket");
-        Self { slots, seed }
+        Self {
+            slots,
+            seed,
+            dict: Dictionary::new(),
+            dict_desc: BlockDescriptor::EMPTY,
+            compress: true,
+        }
+    }
+
+    /// The block run the dictionary is persisted in
+    /// ([`BlockDescriptor::EMPTY`] while nothing has been sampled).
+    #[must_use]
+    pub const fn dict_descriptor(&self) -> BlockDescriptor {
+        self.dict_desc
     }
 
     /// Number of buckets.
@@ -161,162 +194,6 @@ impl Directory {
     pub fn slots(&self) -> &[BlockDescriptor] {
         &self.slots
     }
-
-    // ---- Page I/O: routing records into bucket pages ------------------------
-
-    /// Read the [`SlotPage`] backing `bucket`, or a fresh empty page if the slot
-    /// is unallocated.
-    ///
-    /// # Errors
-    /// [`StorageError::Io`](crate::StorageError::Io) on a read fault or
-    /// [`StorageError::Corrupt`](crate::StorageError::Corrupt) if the page fails
-    /// its crc / bounds checks.
-    pub fn read_page(
-        &self,
-        struct_hash: u64,
-        file: &BlockFile,
-        bucket: usize,
-    ) -> StorageResult<SlotPage> {
-        let desc = self.slots[bucket];
-        if !desc.is_allocated() {
-            return Ok(SlotPage::new(struct_hash));
-        }
-        let page = SlotPage::from_bytes(&file.read_run(desc.run())?)?;
-        debug_assert_eq!(page.struct_hash(), struct_hash);
-        Ok(page)
-    }
-
-    /// The record bytes stored at `id`, if present.
-    ///
-    /// # Errors
-    /// Propagates read / corruption faults from [`read_page`](Self::read_page).
-    pub fn get_record(
-        &self,
-        struct_hash: u64,
-        file: &BlockFile,
-        id: Id,
-    ) -> StorageResult<Option<Vec<u8>>> {
-        let bucket = self.bucket_of(id.raw());
-        Ok(self
-            .read_page(struct_hash, file, bucket)?
-            .get(id)
-            .map(<[u8]>::to_vec))
-    }
-
-    /// Route `id` to its bucket, upsert its bytes, and rewrite the page.
-    ///
-    /// Crash-safe ordering: the new page is allocated and written **before** the
-    /// directory slot is repointed, and the old run is freed only afterwards — so
-    /// the slot never names a half-written page.
-    ///
-    /// # Errors
-    /// Propagates read / write / corruption faults.
-    pub fn upsert_record(
-        &mut self,
-        struct_hash: u64,
-        file: &BlockFile,
-        alloc: &mut BlockAllocator,
-        id: Id,
-        bytes: Vec<u8>,
-    ) -> StorageResult<()> {
-        let bucket = self.bucket_of(id.raw());
-        let old = self.slots[bucket];
-        let mut page = self.read_page(struct_hash, file, bucket)?;
-        page.upsert(id, bytes);
-        self.slots[bucket] = place(file, alloc, &page)?;
-        if old.is_allocated() {
-            alloc.free(old.run());
-        }
-        Ok(())
-    }
-
-    /// Remove `id` from its bucket page. Returns whether it was present.
-    ///
-    /// # Errors
-    /// Propagates read / write / corruption faults.
-    pub fn remove_record(
-        &mut self,
-        struct_hash: u64,
-        file: &BlockFile,
-        alloc: &mut BlockAllocator,
-        id: Id,
-    ) -> StorageResult<bool> {
-        let bucket = self.bucket_of(id.raw());
-        let old = self.slots[bucket];
-        if !old.is_allocated() {
-            return Ok(false);
-        }
-        let mut page = self.read_page(struct_hash, file, bucket)?;
-        let existed = page.remove(id).is_some();
-        self.slots[bucket] = place(file, alloc, &page)?;
-        alloc.free(old.run());
-        Ok(existed)
-    }
-
-    /// Split the next bucket in round-robin order, repartitioning its records by
-    /// the next hash bit and appending one new bucket — the page-moving half of
-    /// linear-hashing growth.
-    ///
-    /// # Errors
-    /// Propagates read / write / corruption faults.
-    pub fn split_next(
-        &mut self,
-        struct_hash: u64,
-        file: &BlockFile,
-        alloc: &mut BlockAllocator,
-    ) -> StorageResult<()> {
-        let level = self.split_bit();
-        let s = self.next_split_bucket() as usize;
-        let old = self.slots[s];
-
-        let mut keep = SlotPage::new(struct_hash);
-        let mut moved = SlotPage::new(struct_hash);
-        for (id, bytes) in self.read_page(struct_hash, file, s)?.into_entries()
-        {
-            // Bit `level` decides: 0 stays in `s`, 1 moves to the new bucket.
-            if (self.hash(id.raw()) >> level) & 1 == 0 {
-                keep.upsert(id, bytes);
-            } else {
-                moved.upsert(id, bytes);
-            }
-        }
-
-        let keep_desc = place(file, alloc, &keep)?;
-        let moved_desc = place(file, alloc, &moved)?;
-        self.slots[s] = keep_desc;
-        self.slots.push(moved_desc); // new bucket at index M (= s + base)
-        if old.is_allocated() {
-            alloc.free(old.run());
-        }
-        Ok(())
-    }
-}
-
-/// Allocate a run sized to `page`, write it, and return its descriptor. An empty
-/// page allocates nothing and yields [`BlockDescriptor::EMPTY`].
-fn place(
-    file: &BlockFile,
-    alloc: &mut BlockAllocator,
-    page: &SlotPage,
-) -> StorageResult<BlockDescriptor> {
-    if page.is_empty() {
-        return Ok(BlockDescriptor::EMPTY);
-    }
-    let bytes = page.to_bytes();
-    let run = alloc.alloc(bytes.len().div_ceil(BLOCK_SIZE) as u64);
-    file.write_run(run, &bytes)?;
-    Ok(BlockDescriptor::from_run(
-        run,
-        occupation_of(bytes.len() as u64, run.byte_len()),
-    ))
-}
-
-/// Coarse 1/16th fill gauge: how full a page's bytes leave its allocated run.
-fn occupation_of(used: u64, capacity: u64) -> u8 {
-    if capacity == 0 {
-        return 0;
-    }
-    (used.saturating_mul(16) / capacity).min(15) as u8
 }
 
 #[cfg(test)]
@@ -437,86 +314,5 @@ mod tests {
         assert_eq!(dir.slots(), slots.as_slice());
         assert_eq!(dir.seed(), SEED);
         assert_eq!(dir.split_bit(), 1);
-    }
-
-    // ---- page-I/O over a real BlockFile -------------------------------------
-
-    use crate::block::BlockAllocator;
-    use crate::block_file::{BlockFile, RESERVED_BLOCKS};
-    use wavedb_core::{Id, U48};
-
-    /// A temp `data.bin` plus an allocator with block 0 (the superblock) reserved.
-    fn backed() -> (tempfile::TempDir, BlockFile, BlockAllocator) {
-        let dir = tempfile::tempdir().unwrap();
-        let bf = BlockFile::open(dir.path().join("data.bin")).unwrap();
-        let mut alloc = BlockAllocator::new();
-        alloc.alloc(RESERVED_BLOCKS); // never hand out the superblock
-        (dir, bf, alloc)
-    }
-
-    fn rec_id(key: u64) -> Id {
-        Id::new(key, U48::from(1u32), false, (key & 0x7FFF) as u16)
-    }
-
-    #[test]
-    fn upsert_get_remove_through_pages() {
-        let (_d, bf, mut alloc) = backed();
-        let mut dir = Directory::new(bf.seed());
-        let sh = 0xABCD;
-
-        dir.upsert_record(sh, &bf, &mut alloc, rec_id(1), vec![1, 2, 3])
-            .unwrap();
-        dir.upsert_record(sh, &bf, &mut alloc, rec_id(2), vec![4, 5])
-            .unwrap();
-        assert_eq!(
-            dir.get_record(sh, &bf, rec_id(1)).unwrap(),
-            Some(vec![1, 2, 3])
-        );
-        assert_eq!(
-            dir.get_record(sh, &bf, rec_id(2)).unwrap(),
-            Some(vec![4, 5])
-        );
-        assert_eq!(dir.get_record(sh, &bf, rec_id(9)).unwrap(), None);
-
-        // Overwrite, then remove.
-        dir.upsert_record(sh, &bf, &mut alloc, rec_id(1), vec![9])
-            .unwrap();
-        assert_eq!(dir.get_record(sh, &bf, rec_id(1)).unwrap(), Some(vec![9]));
-        assert!(dir.remove_record(sh, &bf, &mut alloc, rec_id(1)).unwrap());
-        assert_eq!(dir.get_record(sh, &bf, rec_id(1)).unwrap(), None);
-        assert!(!dir.remove_record(sh, &bf, &mut alloc, rec_id(1)).unwrap());
-    }
-
-    #[test]
-    fn split_preserves_all_records() {
-        let (_d, bf, mut alloc) = backed();
-        let mut dir = Directory::new(bf.seed());
-        let sh = 1;
-
-        for k in 0..200u64 {
-            dir.upsert_record(sh, &bf, &mut alloc, rec_id(k), vec![k as u8; 4])
-                .unwrap();
-        }
-        assert_eq!(dir.len(), 1);
-
-        dir.split_next(sh, &bf, &mut alloc).unwrap();
-        assert_eq!(dir.len(), 2);
-
-        // Every record still resolves after the repartition.
-        for k in 0..200u64 {
-            assert_eq!(
-                dir.get_record(sh, &bf, rec_id(k)).unwrap(),
-                Some(vec![k as u8; 4]),
-                "record {k} lost across split"
-            );
-        }
-    }
-
-    #[test]
-    fn split_empty_bucket_is_noop_growth() {
-        let (_d, bf, mut alloc) = backed();
-        let mut dir = Directory::new(bf.seed());
-        dir.split_next(1, &bf, &mut alloc).unwrap();
-        assert_eq!(dir.len(), 2);
     }
 }

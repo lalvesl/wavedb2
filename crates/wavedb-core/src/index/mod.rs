@@ -19,6 +19,7 @@ mod tree_delete;
 mod tree_insert;
 
 pub use key::IndexKey;
+pub use node::BPTREE_NODE_STRUCT_HASH;
 pub use stream::{Except, IdStreamExt, Intersect, Union};
 pub use tree::{BpTree, DEFAULT_INTERNAL_CAP, DEFAULT_LEAF_CAP};
 
