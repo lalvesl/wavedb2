@@ -54,6 +54,8 @@ pub use local_id::LocalId;
 pub use metadata::Metadata;
 pub use permission::PermissionRef;
 pub use store::{Store, Write};
-pub use traits::{NonUniqueStruct, Shape, WaveDbStruct};
+pub use traits::{
+    NonUniqueStruct, PivotHandle, Shape, UniqueStruct, WaveDbStruct,
+};
 pub use u48::U48;
 pub use wire::{Cursor, WaveWire, from_wire, to_wire};

@@ -185,24 +185,25 @@ The developer surface — what `examples/todo-app` is written against.
 
 # DOING
 
-- **M2 tail** (`wavedb-storage`): the durable engine and the typed
-  collection layer are in (see DONE) — remaining are the optimizations
-  above: the dedicated **32 KiB one-node-per-page** BpTree format,
-  **background** settle / rebalance + journal checkpointing, per-value heap
-  compression. None block M3.
-- **M3 node** is next: exposure-linked `wavedb-quick-node` driving
-  `PageStore` by typed command dispatch (`Exposure::execute` is the seam it
-  consumes); `wavedb-net` HTTP POST transport; node-side gates.
-- **Design note (M3):** `PageStore` is **cache + journal authoritative** for
-  reads; `data.bin` is a deterministic projection rebuilt by journal replay on
-  open. It settles a value into the per-`STRUCT_HASH` page directory by reading
-  the `STRUCT_HASH` from the value's first 8 bytes — so every stored value
-  (records **and** BpTree nodes) must be `STRUCT_HASH`-headed. Typed
-  per-command settling (knowing record vs index-node vs Pivot page kind) is the
-  M3 node layer's job.
+- **M3 node — LANDED** (`wavedb-net` + `wavedb-quick-node` now members):
+  `Request`/`Response`/`NodeError` wire envelopes, hand-rolled HTTP POST
+  dumb tunnel, `NetClient`, and the `Server`/`Bound` builder driving
+  `PageStore` through `Exposure::execute`. `expose_server!` also emits the new
+  `StorageRegistry` impl, so `.registry(REGISTRY)` opens the engine. Proven
+  end-to-end (`tests/node_http.rs`): Unique + NonUnique over the wire, uniform
+  unknown-hash refusal, durable reopen. Gates 4–6 (permission/validate/
+  preprocess) and typed per-command settling are the seams left for M8/later;
+  streaming reads (`All`/search over the transport) land with the M4 client
+  iterator.
+- **M4 is next** — the developer surface (`Db` + `#[server]`), what
+  `examples/todo-app` is written against. See the M4 section above.
+- **M2 tail** (`wavedb-storage`) stays open but blocks nothing: the dedicated
+  **32 KiB one-node-per-page** BpTree format, **background** settle / rebalance
+  + journal checkpointing, per-value heap compression.
 - **Target surface reference:** `examples/todo-app` (workspace-excluded,
   aspirational) is the M4 acceptance shape — functions-only allowlist, all
   structs storage-only, `db.as_tenant` bootstrap, profile→pivot path.
 
-_164 tests, clippy-clean (pedantic + nursery). Workspace members: wire,
-wire-derive, core, macros, storage, schema-smoke._
+_Workspace green: fmt + clippy (pedantic + nursery) clean, 20 test suites,
+file-length gate passing. Members: wire, wire-derive, core, macros, storage,
+net, quick-node, schema-smoke._

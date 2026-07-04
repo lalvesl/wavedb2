@@ -42,6 +42,13 @@ fn pivot_id_tokens(pivot_id: &Ident) -> syn::Result<TokenStream> {
                 self.0
             }
         }
+
+        impl ::wavedb_core::PivotHandle for #pivot_id {
+            fn local_id(self) -> ::wavedb_core::LocalId { self.0 }
+            fn from_local_id(local: ::wavedb_core::LocalId) -> Self {
+                Self(local)
+            }
+        }
     })
 }
 

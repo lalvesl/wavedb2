@@ -8,23 +8,19 @@ license.workspace = true
 [lints]
 workspace = true
 
-[features]
-default = ["native"]
-# Native (tokio-backed) build — HTTP/WebSocket transports, file storage.
-native = ["dep:tokio", "dep:wavedb-storage", "wavedb-net/native"]
-# WASM build — gloo-net + wasm-bindgen-futures (Phase 15).
-wasm = []
-
 [dependencies]
+# The client re-exports core types + the derive macros (so downstream schema
+# crates use one dependency, `wavedb`), and talks to a node over `wavedb-net`.
 wavedb-core = { path = "../wavedb-core" }
 wavedb-macros = { path = "../wavedb-macros" }
-wavedb-storage = { path = "../wavedb-storage", optional = true }
-# wavedb-net is always a dependency (provides request/response types for the
-# erased transport closures).  The `native` feature just adds tokio on top.
-wavedb-net = { path = "../wavedb-net", default-features = false }
-parking_lot.workspace = true
-tokio = { workspace = true, optional = true }
+wavedb-net = { path = "../wavedb-net" }
+thiserror.workspace = true
+# Stream/StreamExt re-exported through the prelude for collection iterators.
+futures.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "sync", "time"] }
 tempfile.workspace = true
+# End-to-end tests drive a real node with a real schema crate + REGISTRY.
+wavedb-quick-node = { path = "../wavedb-quick-node" }
+schema-smoke = { path = "../../examples/schema-smoke" }

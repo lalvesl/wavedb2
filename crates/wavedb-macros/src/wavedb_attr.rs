@@ -110,6 +110,14 @@ pub fn expand(
         Shape::NonUnique => TokenStream::new(),
     };
 
+    // The shape marker trait — `UniqueStruct` for the default shape (the
+    // NonUnique marker is emitted with the collection types). Client typed
+    // surfaces gate on these so `Unique` and `NonUnique` ops never overlap.
+    let shape_marker = match args.shape {
+        Shape::Unique => quote!(impl ::wavedb_core::UniqueStruct for #name {}),
+        Shape::NonUnique => TokenStream::new(),
+    };
+
     Ok(quote! {
         #input
 
@@ -132,6 +140,7 @@ pub fn expand(
             type PivotId = #pivot_id_ty;
         }
 
+        #shape_marker
         #storage_slot
         #storage_entries
         #exec_steps

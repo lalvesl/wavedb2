@@ -4,7 +4,22 @@
 //! Core only declares the surface; the macro fills in `STRUCT_HASH`, `SHAPE`, and
 //! the generated `PivotId` for each declared object.
 
+use crate::local_id::LocalId;
 use crate::wire::WaveWire;
+
+/// The shared surface of every generated `{Name}PivotId` — a [`LocalId`]
+/// newtype an owning record stores to reference a collection.
+///
+/// Lets code that is generic over a record type reach its collection handle's
+/// `LocalId` without naming the macro-generated concrete type (the typed
+/// client `collection()` builds an insert/update payload from it).
+pub trait PivotHandle: Copy {
+    /// The underlying collection-root `LocalId`.
+    fn local_id(self) -> LocalId;
+
+    /// Wrap a `LocalId` back into the typed handle.
+    fn from_local_id(local: LocalId) -> Self;
+}
 
 /// The cardinality discipline of a `#[wavedb]` object.
 ///
@@ -49,6 +64,16 @@ pub trait WaveDbStruct: WaveWire {
     /// `PivotId` is `()`.
     type PivotId;
 }
+
+/// Implemented (by the proc-macro) for every default `#[wavedb]` (`Unique`)
+/// struct — the compile-time counterpart to [`NonUniqueStruct`].
+///
+/// A `Unique` type has exactly one live record per tenant at its
+/// `STRUCT_HASH` anchor. This marker lets a client's typed `get`/`save`
+/// surface be gated to `Unique` types only (a `NonUnique` type is reached
+/// through its collection instead), the mirror of how `NonUniqueStruct`
+/// gates the collection surface — the two never overlap.
+pub trait UniqueStruct: WaveDbStruct {}
 
 /// Implemented (by the proc-macro) for every `#[wavedb(NonUnique)]` struct.
 ///

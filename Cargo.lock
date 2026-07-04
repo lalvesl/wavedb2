@@ -737,6 +737,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wavedb"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "schema-smoke",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "wavedb-core",
+ "wavedb-macros",
+ "wavedb-net",
+ "wavedb-quick-node",
+]
+
+[[package]]
 name = "wavedb-core"
 version = "0.1.0"
 dependencies = [
