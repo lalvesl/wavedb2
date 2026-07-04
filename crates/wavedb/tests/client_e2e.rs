@@ -105,6 +105,14 @@ async fn typed_db_surface_drives_a_live_node() {
         "Paris"
     );
 
+    // History walks the version chain newest-first (pillar 3).
+    let versions = db.history::<AboutUser>().await.expect("history");
+    assert_eq!(
+        versions.iter().map(|u| u.city.as_str()).collect::<Vec<_>>(),
+        vec!["Paris", "London"],
+        "timeline newest-first"
+    );
+
     // ── NonUnique: insert → get → save(update) → remove ───────────────────
     let notes = db.collection::<Note>(node.pivot);
 

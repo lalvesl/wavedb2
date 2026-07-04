@@ -26,7 +26,9 @@ use syn::{Ident, Path, Token, braced};
 
 /// The per-item ops an entry can override or exclude — one per wire
 /// [`Command`](wavedb_core::expose::Command).
-const OPS: [&str; 6] = ["get", "save", "insert", "update", "remove", "all"];
+const OPS: [&str; 7] = [
+    "get", "save", "insert", "update", "remove", "all", "history",
+];
 
 /// One declared item: its path plus any per-op overrides/exclusions.
 struct Entry {
@@ -65,7 +67,7 @@ impl Parse for OpOverride {
             return Err(syn::Error::new_spanned(
                 &op,
                 "unknown op; expected one of \
-                 get/save/insert/update/remove/all",
+                 get/save/insert/update/remove/all/history",
             ));
         }
         input.parse::<Token![:]>()?;

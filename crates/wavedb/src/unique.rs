@@ -40,4 +40,18 @@ impl Db {
             .await?;
         reply::done(&r)
     }
+
+    /// This tenant's `Unique` record versions, **newest-first** (the live
+    /// record, then each archived version along the modification chain).
+    /// Empty when never saved. Buffered for now — a streaming iterator lands
+    /// with the transport's stream frames.
+    ///
+    /// # Errors
+    /// A failed call, or a decode fault on any version.
+    pub async fn history<T: UniqueStruct>(&self) -> Result<Vec<T>> {
+        let r = self
+            .command(T::STRUCT_HASH, Command::History, Vec::new())
+            .await?;
+        reply::values(r)
+    }
 }

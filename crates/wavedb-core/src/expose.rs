@@ -43,6 +43,9 @@ pub enum Command {
     /// collection's `Pivot` `LocalId`). Buffered for now — streaming frames
     /// are a later transport refinement.
     All,
+    /// Unique version-chain walk, newest-first (empty payload → the tenant's
+    /// anchor). Buffered like `All`.
+    History,
 }
 
 /// What an executed command yields. Derives [`WaveWire`] so the transport
@@ -150,6 +153,32 @@ where
     let col = Collection::<T>::at(pivot, tenant);
     let items: Vec<(Id, T)> = col.all(store).try_collect().await?;
     let bodies = items.iter().map(|(_, v)| to_wire(v)).collect();
+    Ok(Reply::Values(bodies))
+}
+
+/// Walk a `Unique` record's version chain **newest-first** and buffer each
+/// version's body wire bytes — the shared tail of the generated `History`
+/// step. Empty when the record was never saved.
+///
+/// Buffered like [`all_values`]; the `Metadata` per version is dropped for now
+/// (the wire `Reply` carries bodies only).
+///
+/// # Errors
+/// Propagates a [`Store`] failure or a decode fault while walking.
+pub async fn unique_history_values<T, S>(
+    store: &S,
+    tenant: U48,
+) -> Result<Reply>
+where
+    T: WaveDbStruct,
+    S: Store,
+{
+    use futures::TryStreamExt;
+    let versions: Vec<(crate::metadata::Metadata, T)> =
+        record::unique_history::<T, S>(store, tenant)
+            .try_collect()
+            .await?;
+    let bodies = versions.iter().map(|(_, v)| to_wire(v)).collect();
     Ok(Reply::Values(bodies))
 }
 
