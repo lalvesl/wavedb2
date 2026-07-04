@@ -95,4 +95,18 @@ impl<T: NonUniqueStruct> ClientCollection<'_, T> {
             .await?;
         reply::removed(&r)
     }
+
+    /// Every living record in this collection, in `CREATED_AT` (insertion)
+    /// order. Buffered into a `Vec` for now — a streaming iterator lands with
+    /// the transport's stream frames.
+    ///
+    /// # Errors
+    /// A failed call, or a decode fault on any record.
+    pub async fn all(&self) -> Result<Vec<T>> {
+        let r = self
+            .db
+            .command(T::STRUCT_HASH, Command::All, to_wire(&self.pivot))
+            .await?;
+        reply::values(r)
+    }
 }

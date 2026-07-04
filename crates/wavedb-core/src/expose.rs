@@ -14,12 +14,13 @@
 //! deliberately indistinguishable from a type that never existed (the
 //! security surface leaks nothing about what storage holds).
 
+use crate::collection::Collection;
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::local_id::LocalId;
 use crate::record;
 use crate::store::Store;
-use crate::traits::WaveDbStruct;
+use crate::traits::{NonUniqueStruct, WaveDbStruct};
 use crate::u48::U48;
 use crate::wire::{WaveWire, from_wire, to_wire};
 
@@ -38,6 +39,10 @@ pub enum Command {
     Update,
     /// NonUnique move to the dead tree (payload = the `Id`).
     Remove,
+    /// NonUnique collection walk in `CREATED_AT` order (payload = the
+    /// collection's `Pivot` `LocalId`). Buffered for now — streaming frames
+    /// are a later transport refinement.
+    All,
 }
 
 /// What an executed command yields. Derives [`WaveWire`] so the transport
@@ -52,6 +57,9 @@ pub enum Reply {
     Removed(bool),
     /// A `Save`/`Update` completed.
     Done,
+    /// An `All` walk's results: each record's body wire bytes, in
+    /// `CREATED_AT` order.
+    Values(Vec<Vec<u8>>),
 }
 
 /// The declared registry surface.
@@ -118,6 +126,31 @@ where
         }
         None => Ok(Reply::Value(None)),
     }
+}
+
+/// Walk a NonUnique collection in `CREATED_AT` order and buffer each record's
+/// body wire bytes — the shared tail of the generated `All` step.
+///
+/// Buffered (not streamed) for now: the HTTP POST tunnel answers one request
+/// with one response, so a walk collects before replying. Streaming frames are
+/// a later transport refinement.
+///
+/// # Errors
+/// Propagates a [`Store`] failure or a decode fault while walking.
+pub async fn all_values<T, S>(
+    store: &S,
+    pivot: LocalId,
+    tenant: U48,
+) -> Result<Reply>
+where
+    T: NonUniqueStruct,
+    S: Store,
+{
+    use futures::TryStreamExt;
+    let col = Collection::<T>::at(pivot, tenant);
+    let items: Vec<(Id, T)> = col.all(store).try_collect().await?;
+    let bodies = items.iter().map(|(_, v)| to_wire(v)).collect();
+    Ok(Reply::Values(bodies))
 }
 
 /// The owning `Pivot` back-link stamped in the record at `id`'s metadata —

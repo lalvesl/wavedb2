@@ -24,8 +24,9 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{Ident, Path, Token, braced};
 
-/// The five per-item ops an entry can override or exclude.
-const OPS: [&str; 5] = ["get", "save", "insert", "update", "remove"];
+/// The per-item ops an entry can override or exclude — one per wire
+/// [`Command`](wavedb_core::expose::Command).
+const OPS: [&str; 6] = ["get", "save", "insert", "update", "remove", "all"];
 
 /// One declared item: its path plus any per-op overrides/exclusions.
 struct Entry {
@@ -63,7 +64,8 @@ impl Parse for OpOverride {
         if !OPS.contains(&op.to_string().as_str()) {
             return Err(syn::Error::new_spanned(
                 &op,
-                "unknown op; expected one of get/save/insert/update/remove",
+                "unknown op; expected one of \
+                 get/save/insert/update/remove/all",
             ));
         }
         input.parse::<Token![:]>()?;

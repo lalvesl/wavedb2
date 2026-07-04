@@ -49,3 +49,17 @@ pub const fn removed(reply: &Reply) -> Result<bool> {
         _ => Err(Error::UnexpectedReply),
     }
 }
+
+/// An `All`'s reply → each record's body decoded into `T`.
+pub fn values<T: WaveWire>(reply: Reply) -> Result<Vec<T>> {
+    match reply {
+        Reply::Values(bodies) => bodies
+            .iter()
+            .map(|b| {
+                from_wire::<T>(b)
+                    .map_err(|e| wavedb_core::Error::from(e).into())
+            })
+            .collect(),
+        _ => Err(Error::UnexpectedReply),
+    }
+}

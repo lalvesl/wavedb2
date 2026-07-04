@@ -72,6 +72,7 @@ pub fn unique_ops(name: &Ident) -> TokenStream {
         op_fn("update", &quote!(let _ = (store, tenant, payload); #refuse));
     let remove =
         op_fn("remove", &quote!(let _ = (store, tenant, payload); #refuse));
+    let all = op_fn("all", &quote!(let _ = (store, tenant, payload); #refuse));
     quote! {
         impl #name {
             #get
@@ -79,6 +80,7 @@ pub fn unique_ops(name: &Ident) -> TokenStream {
             #insert
             #update
             #remove
+            #all
         }
     }
 }
@@ -140,6 +142,15 @@ pub fn nonunique_ops(name: &Ident, pivot_id: &Ident) -> TokenStream {
     );
     let save =
         op_fn("save", &quote!(let _ = (store, tenant, payload); #refuse));
+    let all = op_fn(
+        "all",
+        &quote! {
+            let pivot: ::wavedb_core::LocalId =
+                ::wavedb_core::wire::from_wire(payload)?;
+            ::wavedb_core::expose::all_values::<#name, S>(store, pivot, tenant)
+                .await
+        },
+    );
     quote! {
         impl #name {
             #get
@@ -147,6 +158,7 @@ pub fn nonunique_ops(name: &Ident, pivot_id: &Ident) -> TokenStream {
             #update
             #remove
             #save
+            #all
         }
     }
 }

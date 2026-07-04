@@ -129,9 +129,30 @@ async fn typed_db_surface_drives_a_live_node() {
         .expect("update");
     assert!(notes.get(id).await.expect("get").unwrap().pinned);
 
+    // A second insert, then walk the whole collection in insertion order.
+    notes
+        .insert(Note {
+            body: "write docs".into(),
+            pinned: false,
+        })
+        .await
+        .expect("insert 2");
+    let all = notes.all().await.expect("all");
+    assert_eq!(
+        all.iter().map(|n| n.body.as_str()).collect::<Vec<_>>(),
+        vec!["buy milk", "write docs"],
+        "collection walk in CREATED_AT order"
+    );
+
     assert!(notes.remove(id).await.expect("remove"));
     // Removing again reports it was no longer in the living set.
     assert!(!notes.remove(id).await.expect("remove-again"));
+    // The walk now yields only the survivor.
+    let all = notes.all().await.expect("all after remove");
+    assert_eq!(
+        all.iter().map(|n| n.body.as_str()).collect::<Vec<_>>(),
+        vec!["write docs"]
+    );
 
     node.shutdown();
 }
