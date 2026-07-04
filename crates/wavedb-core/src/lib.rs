@@ -23,13 +23,16 @@
 extern crate self as wavedb_core;
 
 pub mod collection;
+mod collection_write;
 pub mod error;
+pub mod expose;
 pub mod hooks;
 pub mod id;
 pub mod index;
 pub mod local_id;
 pub mod metadata;
 pub mod permission;
+pub mod record;
 pub mod store;
 pub mod traits;
 pub mod u48;
@@ -37,10 +40,14 @@ pub mod wire;
 
 pub use collection::Collection;
 pub use error::{Error, Result};
+// Generated `by_<field>` lookups return `impl Stream`; re-exported so macro
+// expansions can name it without adding a `futures` dep to schema crates.
+pub use futures::Stream;
 pub use hooks::LookupHooks;
 pub use id::Id;
 pub use index::{
-    Bound, BpTree, Except, IdStreamExt, IndexKey, Intersect, Pivot, Union,
+    Bound, BpTree, Except, IdStreamExt, IndexKey, Intersect, NodeKey, Pivot,
+    SecKey, Union,
 };
 pub use local_id::LocalId;
 pub use metadata::Metadata;

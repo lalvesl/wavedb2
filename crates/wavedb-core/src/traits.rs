@@ -62,4 +62,19 @@ pub trait NonUniqueStruct: WaveDbStruct {
     ///
     /// [`Collection::create`]: crate::collection::Collection::create
     type Pivot: crate::index::Pivot + Clone + Default;
+
+    /// Number of `#[wavedb::pivot(...)]` secondary indexes, declaration order.
+    /// Must equal the generated pivot's `secondaries()` length.
+    const NUM_SECONDARIES: usize = 0;
+
+    /// The order-preserving ([`IndexKey`](crate::index::IndexKey)-encoded) key
+    /// of secondary index `index` for this record's current values. The macro
+    /// implements it as a `match` over the declared `#[wavedb::pivot(...)]`
+    /// fields; out-of-range indexes yield an empty key (never dispatched —
+    /// the engine loops `0..NUM_SECONDARIES`).
+    #[must_use]
+    fn secondary_key(&self, index: usize) -> Vec<u8> {
+        let _ = index;
+        Vec::new()
+    }
 }

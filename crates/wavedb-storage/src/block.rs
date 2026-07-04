@@ -102,6 +102,13 @@ impl BlockDescriptor {
         Self::new(run.start, run.count, occupation)
     }
 
+    /// Pack a descriptor from a [`Run`] and the bytes actually used of it —
+    /// the occupation gauge computed via [`occupation_of`].
+    #[must_use]
+    pub fn from_run_used(run: Run, used_bytes: u64) -> Self {
+        Self::from_run(run, occupation_of(used_bytes, run.byte_len()))
+    }
+
     /// Wrap a raw `u64` (as read from a directory `Vec<u64>`).
     #[must_use]
     pub const fn from_raw(raw: u64) -> Self {
@@ -149,6 +156,15 @@ impl BlockDescriptor {
     pub fn with_occupation(self, occupation: u8) -> Self {
         Self::new(self.start(), self.count(), occupation)
     }
+}
+
+/// Coarse 1/16th fill gauge: how full `used` bytes leave a `capacity`-byte run.
+#[must_use]
+pub fn occupation_of(used: u64, capacity: u64) -> u8 {
+    if capacity == 0 {
+        return 0;
+    }
+    (used.saturating_mul(16) / capacity).min(15) as u8
 }
 
 impl core::fmt::Debug for BlockDescriptor {

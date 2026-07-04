@@ -13,6 +13,7 @@ mod key;
 #[cfg(test)]
 pub(crate) mod mem_store;
 mod node;
+mod node_key;
 mod stream;
 mod tree;
 mod tree_delete;
@@ -20,6 +21,7 @@ mod tree_insert;
 
 pub use key::IndexKey;
 pub use node::BPTREE_NODE_STRUCT_HASH;
+pub use node_key::{NodeKey, SecKey};
 pub use stream::{Except, IdStreamExt, Intersect, Union};
 pub use tree::{BpTree, DEFAULT_INTERNAL_CAP, DEFAULT_LEAF_CAP};
 
@@ -120,11 +122,18 @@ pub trait Pivot: WaveWire + Sized {
     /// `Metadata.permission` overrides it (authoritative per record).
     /// `None` = tenant-only.
     fn permission(&self) -> Option<&PermissionRef>;
-    /// A copy of this pivot with the `current` / `dead` roots replaced and
-    /// everything else (secondaries, permission) preserved — what the engine
-    /// writes back when a B+tree root moves.
+    /// A copy of this pivot with every root replaced (`current`, `dead`, and
+    /// one entry per secondary index) and everything else (permission)
+    /// preserved — what the engine writes back when a B+tree root moves.
+    /// `secondaries` must hold exactly as many roots as
+    /// [`secondaries`](Self::secondaries) returns.
     #[must_use]
-    fn replace_roots(&self, current: LocalId, dead: LocalId) -> Self;
+    fn replace_roots(
+        &self,
+        current: LocalId,
+        dead: LocalId,
+        secondaries: &[LocalId],
+    ) -> Self;
 }
 
 #[cfg(test)]

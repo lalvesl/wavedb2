@@ -53,7 +53,15 @@ impl LocalId {
     pub fn to_id(self, tenant: U48) -> Id {
         Id::new(self.key, tenant, self.flag(), self.salt())
     }
+}
 
+impl From<Id> for LocalId {
+    fn from(id: Id) -> Self {
+        Self::from_id(id)
+    }
+}
+
+impl LocalId {
     #[must_use]
     pub const fn key(self) -> u64 {
         self.key

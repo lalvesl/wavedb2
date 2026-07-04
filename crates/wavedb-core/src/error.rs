@@ -42,6 +42,10 @@ pub enum Error {
     /// [`Store`]: crate::Store
     #[error("record {0:?} missing")]
     RecordMissing(Id),
+    /// A secondary-index lookup named an index this collection's `Pivot` does
+    /// not declare (out of `0..NUM_SECONDARIES`).
+    #[error("secondary index {0} out of range")]
+    SecondaryIndexOutOfRange(usize),
     /// A failure inside a [`Store`](crate::Store) backend — disk I/O, on-disk
     /// corruption, or similar. Core stays I/O-free, so the concrete cause is
     /// flattened to a message at the trait boundary.
