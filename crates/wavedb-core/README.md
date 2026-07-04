@@ -379,7 +379,8 @@ pub trait Pivot: Wire + Sized {
     fn dead(&self)        -> LocalId;             // deleted-records B+tree root
     fn secondaries(&self) -> &[LocalId];          // one root per `#[wavedb::pivot(...)]`
     fn permission(&self)  -> Option<&PermissionRef>; // collection default; record metadata overrides
-    fn replace_roots(&self, current: LocalId, dead: LocalId) -> Self; // engine writes back moved roots
+    // engine writes back every moved root (current, dead, one per secondary)
+    fn replace_roots(&self, current: LocalId, dead: LocalId, secondaries: &[LocalId]) -> Self;
 }
 
 /// A search bound over the order-preserving key space.
@@ -390,13 +391,18 @@ pub enum Bound {
     Prefix(Vec<u8>),
 }
 
-/// A B+tree index over any `Store` — one **concrete** type (no trait): nodes are
-/// values read by `LocalId`, all I/O is delegated to `Store`, so the same type
-/// serves native PageStore and web IndexedDB. It carries `tenant` because node
-/// pointers are tenant-stripped `LocalId`s that must inflate to full `Id`s for
-/// `Store::get`. `search` returns full record `Id`s (two-phase: index → `Id`s →
-/// fetch).
-pub struct BpTree { /* root: LocalId, tenant: U48, caps */ }
+/// A B+tree index over any `Store`, generic over its key (no trait objects):
+/// nodes are values read by `LocalId`, all I/O is delegated to `Store`, so the
+/// same type serves native PageStore and web IndexedDB. The **primary** tree
+/// is `BpTree<LocalId>` (the default — the record pointer is the key, order =
+/// `CREATED_AT`); a **secondary** index is `BpTree<SecKey>`, keyed by the
+/// record's `IndexKey`-encoded field bytes plus its `LocalId` (unique under
+/// duplicate values). It carries `tenant` because node pointers are
+/// tenant-stripped `LocalId`s that must inflate to full `Id`s for
+/// `Store::get`. `search` returns full record `Id`s (two-phase: index →
+/// `Id`s → fetch).
+pub struct BpTree<K: NodeKey = LocalId> { /* root: LocalId, tenant: U48, caps */ }
+pub struct SecKey { pub field: Vec<u8>, pub rec: LocalId }
 
 impl BpTree {
     pub const fn at(root: LocalId, tenant: U48) -> Self;         // open a tree at a root

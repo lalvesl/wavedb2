@@ -191,21 +191,23 @@ Per declared pivot the macro:
   iterator (`impl Stream<Item = Result<T>>`), resolved two-phase (index → `Id`s →
   fetch), exactly like the primary tree.
 
-**Maintenance cost.** `insert`, `save`, and `remove` all reindex through the
-`Pivot`. A `save` (update) **force-reindexes every live tree** — the `current`
-`BpTree` _and_ every secondary — removing the record's old entries and reinserting
-for the new version (uniform, always-consistent, no "did this field change?"
-diffing). It reaches the roots through **`Metadata.pivot`**, which `insert` stamps
-into the record from the collection handle's `PivotId`. The **`dead`** tree is
-**not** touched on update — history is the `Metadata` modification chain — so only
-`remove` writes `dead`. Cost is **insert-class**, scaling with the secondary-index
-count (see [`wavedb-storage`](../wavedb-storage/README.md#io-cost-per-operation)):
+**Maintenance cost.** `insert` and `remove` index / de-index the record in
+`current` **and every secondary**; a `save` (update) **re-keys each secondary
+whose field values changed** — the old key comes out, the new key goes in, all
+inside the op's one atomic batch (the old record's bytes supply the stale
+keys). The primary `current` tree never re-keys: its key is the record's
+immutable `CREATED_AT` identity. The **`dead`** tree is **not** touched on
+update — history is the `Metadata` modification chain — so only `remove`
+writes `dead`. Cost scales with the secondary-index count (see
+[`wavedb-storage`](../wavedb-storage/README.md#io-cost-per-operation)):
 secondary indexes are a write-amplification trade — faster lookups, costlier
 updates.
 
-> The primary `current` tree is keyed by the record's stable `CREATED_AT` anchor,
-> so its reindex usually lands in the same slot (cheap); secondary trees re-key by
-> the new field values. Forcing all of them keeps one uniform write path.
+> **Status: implemented** through `Collection` — `#[wavedb::pivot(...)]` emits
+> the key hooks (`NonUniqueStruct::secondary_key`) plus a typed lookup trait
+> `{Name}Secondaries` implemented for `Collection<{Name}>` (`by_amount`,
+> `by_customer_date`, … — `String` fields take `&str`). Range/prefix scans go
+> through `Collection::search_by(index, Bound)` directly.
 
 ---
 
@@ -301,6 +303,17 @@ The registry that lets **storage, server, and client "know the structs"** is
 **declared, not discovered**. There is no `build.rs` scanner (the former
 `wavedb-build` crate is removed); nothing becomes wire-reachable as a side
 effect of merely existing.
+
+> **Status: implemented for structs.** `expose_server!` emits a zero-sized
+> `ServerRegistry` + `REGISTRY` implementing `wavedb_core::expose::Exposure`
+> (`knows` / `decode_check` / `async execute` — one `match` per operation
+> over the listed items' generated `__wavedb_<op>` steps, with per-op
+> `never` exclusion and path overrides substituted inside the arm);
+> `expose_client!` emits `ClientRegistry` / `CLIENT_REGISTRY` with the
+> reachability half. Every refusal — unlisted type, excluded op, wrong-shape
+> command — is a uniform `UnknownStructHash`. `#[server]` functions join the
+> same lists in M4 (they need `Db`); streaming reads (`All`) join with the
+> transport.
 
 **Division of labor (the two halves).**
 

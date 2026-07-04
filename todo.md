@@ -194,10 +194,9 @@ code exists yet. Build order, roughly bottom-up:
   **Remaining for M2:** the dedicated **32 KiB one-node-per-page** BpTree format
   (nodes currently ride the generic `SlotPage` directory under a reserved
   page-kind `STRUCT_HASH`); **background** settle / rebalance (settle is inline
-  with `apply` for now); secondary indexes (`#[wavedb::pivot(...)]`) driven
-  through `Collection` (`by_<field>` walks, reindex on `save`); per-record
-  `Metadata` written alongside records; per-value (strings/blobs) heap
-  compression.
+  with `apply` for now); per-value (strings/blobs) heap compression.
+  (Secondary indexes and per-record `Metadata` + the version chain: **done** —
+  see DONE.)
 - **Design note (M3):** `PageStore` is **cache + journal authoritative** for
   reads; `data.bin` is a deterministic projection rebuilt by journal replay on
   open. It settles a value into the per-`STRUCT_HASH` page directory by reading
@@ -208,17 +207,116 @@ code exists yet. Build order, roughly bottom-up:
 
 # DOING (next after storage)
 
-- **Exposure**: implement `expose_server!` / `expose_client!`
-  (per-`STRUCT_HASH` `match` over the listed items, per-op exclusion/override,
-  emitted `REGISTRY`). The execution steps now exist as derive-generated fns
-  (`get`/`save`, `collection()`'s op set) — exposure makes them
-  wire-reachable. `examples/todo-app` already shows the target: no `build.rs`,
-  functions-only allowlist, structs storage-only.
+- **Exposure — struct surface DONE** (see DONE); remaining: `#[server]`
+  functions in the same hash space (M4 — needs `Db`), streaming reads
+  (`All`/search) over a transport, and `examples/todo-app`'s functions-only
+  allowlist (blocked on `#[server]`).
 - **M3 node**: exposure-linked `wavedb-quick-node` driving `PageStore` by typed
-  command dispatch; HTTP POST transport; node-side gates.
+  command dispatch (`Exposure::execute` is the seam it consumes); HTTP POST
+  transport; node-side gates.
 
 # DONE
 
+- **Exposure (struct surface): `expose_server!` / `expose_client!`** — the
+  declared registry is real:
+  - **core `expose` module** — `Command` (`Get`/`Save`/`Insert`/`Update`/
+    `Remove`, WaveWire), `Reply` (`Value`/`Inserted`/`Removed`/`Done`), and
+    the `Exposure` trait (`knows` / `decode_check` / `async execute<S: Store>`
+    — the node builder's `.registry(…)` bound; static dispatch, the client
+    default refuses). **Every refusal is `UnknownStructHash`**: unlisted
+    type, excluded op, and wrong-shape command are deliberately
+    indistinguishable.
+  - **`#[wavedb]` now emits the per-command execution steps** —
+    `__wavedb_{get,save,insert,update,remove}` with the uniform exposure-op
+    signature `async fn(&S, U48, &[u8]) -> Result<Reply>` on every type
+    (wrong-shape ops refuse), defined at the item, reachable only when
+    listed. NonUnique `update`/`remove` are **handle-less**: they reach the
+    collection through the record's `Metadata.pivot_id` back-link (payloads:
+    insert `(LocalId, body)`, update `(Id, body)`, remove/get `Id`, Unique
+    save = body, get = empty).
+  - **`expose_server!`** expands the list to a zero-sized `ServerRegistry` +
+    `REGISTRY` const implementing `Exposure`: one `match` on the hash per
+    operation, arms calling the generated steps — a per-op override
+    (`save: audited_save`) substitutes the path **inside the arm** at
+    expansion time, `never` yields the refusal arm. No `dyn`, no fn-pointer
+    tables, no runtime registration. **`expose_client!`** emits
+    `ClientRegistry`/`CLIENT_REGISTRY` with the reachability half only
+    (`knows` + `decode_check`; no overrides accepted, execute refuses) —
+    typed call stubs land with `#[server]`/`Db` (M4).
+  - Proven in `schema-smoke`: real declarations (submodule path entry,
+    audited-save override observed firing, `get: never` exclusion), Unique
+    save/get round-trip through the dispatch, the full NonUnique command set
+    driving a live collection (update re-keys the `pinned` secondary via the
+    metadata back-link), uniform unknown-hash refusals, client registry
+    engine-less.
+- **Per-record `Metadata` + the version chain (history)** — pillar 3 made
+  real: saving never destroys old bytes.
+  - **Record envelope v2** (`record.rs`): user records store as
+    `[STRUCT_HASH][meta_len (u32 LE)][WaveWire(Metadata)][WaveWire body]`;
+    `Pivot` records and BpTree nodes keep their meta-less forms. Decode splits
+    metadata and body independently (`split_record` reuses raw body bytes so
+    archiving never re-encodes a value).
+  - **The chain**: a `save` archives the superseded version at a freshly
+    minted id and links `Metadata` — live `old_modification_id` → newest
+    archive; each archive backward to its predecessor; each archive's
+    `new_modification_id` forward to the archive that superseded it (`None`
+    on the newest = "successor is the live record", repointed in the same
+    batch when the next save lands). One shared planner
+    (`record::plan_chained_save`) serves Unique and NonUnique; the whole
+    save — archive + relink + live write + secondary re-keys — is **one
+    atomic batch**. `insert` stamps `Metadata.pivot_id` (the future
+    handle-less `record.save` seam) and `user = tenant` (real authorship
+    arrives with node auth, M8); permission carries forward across saves.
+  - **Timeline API**: `Collection::history(store, id)` and the generated
+    Unique `T::history(store, tenant)` (over
+    `wavedb_core::record::unique_history`) stream `(Metadata, T)` versions
+    newest-first. Reads (`get`/walks) still yield the value alone.
+  - Proven: chain-shape assertions core-side
+    (`save_archives_versions_and_history_walks`,
+    `unique_save_chains_and_history_walks`), derived surface (schema-smoke
+    `derived_unique_history_walks_versions`), durable engine
+    (`version_history_survives_reopen` — the archives are ordinary journaled
+    writes, replay reproduces the timeline).
+- **Secondary indexes (`#[wavedb::pivot(...)]`) through `Collection`** — the
+  M2 item, end to end:
+  - **core `BpTree` generalised over its key** — `BpTree<K: NodeKey = LocalId>`
+    (`NodeKey: Clone + Ord + Debug + WaveWire` + `record()` / `matches(bound)`
+    / `may_intersect(bound, window)` for search + descent pruning). The
+    primary tree is `K = LocalId` (unchanged semantics, tests untouched);
+    secondaries use `SecKey { field: Vec<u8>, rec: LocalId }` — `IndexKey`
+    field bytes major, record id breaking ties, so duplicate field values
+    coexist and `Exact`/`Prefix`/`Range` bounds select by field. One
+    machinery, monomorphized, no `dyn`. Node values share the reserved
+    BpTree-node tag with a new `kind` byte (`[hash][kind][WaveWire payload]`,
+    composed from the generic `Vec`/tuple wire impls — no bespoke codec).
+  - **`Collection` maintains every tree**: `create` plans `current` + `dead` +
+    one secondary per index (roots in the pivot via the widened
+    `Pivot::replace_roots(current, dead, secondaries)`); `insert` indexes all;
+    `remove` de-indexes all (record bytes supply the old keys); `save` re-keys
+    only the indexes whose fields changed — old key out, new key in, **one
+    atomic batch**, planned against an `Overlay` view (a batch-pending read
+    layer in `record.rs`) so the second plan on the same tree sees the first's
+    node writes (bug found by test: without it the later node rewrite undid
+    the earlier). `search_by(index, bound)` walks a secondary two-phase;
+    unknown index = `Error::SecondaryIndexOutOfRange`. Seams:
+    `NonUniqueStruct::{NUM_SECONDARIES, secondary_key(i)}` (defaults keep
+    hand-rolled impls valid); `Store::get_of` used throughout. `collection`
+    split into `collection.rs` (handle + reads) + `collection_write.rs`
+    (mutations) + `record.rs` (envelope, mint, Overlay, unique anchors —
+    macro paths preserved via re-export) for the file budget.
+  - **macro surface**: `#[wavedb::pivot(field)]` / `#[wavedb::pivot((f1, f2))]`
+    (2–3 fields, validated against the struct, unknown field = compile error)
+    now emit the key hooks **and a typed lookup trait** `{Name}Secondaries`
+    implemented for `Collection<{Name}>` — `by_pinned(&store, &true)`,
+    `by_customer_date(&store, &c, &d)`; `String` fields take `&str`. Static
+    dispatch only. `save`'s semantics documented: re-key only changed indexes
+    (the "force reindex all" wording in older docs is superseded — primary
+    never re-keys, its key is the immutable `CREATED_AT`).
+  - Proven at every layer: core (`secondary_tree_indexes_by_field_bytes`,
+    `secondary_index_lifecycle`), derived surface (schema-smoke
+    `derived_secondary_index_by_field`), durable engine
+    (`secondary_index_survives_reopen`: re-key + remove survive journal
+    replay).
 - **`wavedb-wire`** — the `WaveWire` codec extracted into a standalone crate (only
   `thiserror`): trait + `Cursor` + builtin impls + `to_wire`/`from_wire` + its own
   `Error`. No `STRUCT_HASH`, registry, `Id`, or engine coupling — pure value ⇄
@@ -367,5 +465,5 @@ code exists yet. Build order, roughly bottom-up:
   wire-addressable; `REGISTRY` now comes from `expose_server!`). Aspirational
   (workspace-excluded) but architecture-correct.
 
-_147 tests, clippy-clean (pedantic + nursery). Workspace members: wire,
+_164 tests, clippy-clean (pedantic + nursery). Workspace members: wire,
 wire-derive, core, macros, storage, schema-smoke._
