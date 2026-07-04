@@ -74,7 +74,7 @@ pub(super) async fn check_invariants(
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("dangling node pointer {node_id:?}"));
-        match NodeBody::from_bytes(&bytes).unwrap() {
+        match NodeBody::<LocalId>::from_bytes(&bytes).unwrap() {
             NodeBody::Leaf(node_keys) => {
                 match leaf_depth {
                     None => leaf_depth = Some(depth),
