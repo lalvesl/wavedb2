@@ -13,14 +13,45 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Ident, parse_quote};
 
-use crate::{struct_hash, wire_derive};
+use crate::secondaries::{self, ResolvedPivot};
+use crate::{exec_ops, storage_statics, struct_hash, wire_derive};
+
+/// The `{Name}PivotId` newtype: `struct {Name}PivotId(pub LocalId);` with its
+/// `WaveWire` impl (delegating to `LocalId`) and wrap/unwrap accessors.
+fn pivot_id_tokens(pivot_id: &Ident) -> syn::Result<TokenStream> {
+    let pivot_id_def: syn::DeriveInput = parse_quote! {
+        #[derive(::core::clone::Clone, ::core::marker::Copy,
+                 ::core::cmp::PartialEq, ::core::cmp::Eq,
+                 ::core::fmt::Debug, ::core::default::Default)]
+        pub struct #pivot_id(pub ::wavedb_core::LocalId);
+    };
+    let pivot_id_wire = wire_derive::derive(&pivot_id_def)?;
+    Ok(quote! {
+        #pivot_id_def
+        #pivot_id_wire
+
+        impl #pivot_id {
+            /// Wrap a `LocalId` as this collection's handle.
+            #[must_use]
+            pub const fn new(local: ::wavedb_core::LocalId) -> Self {
+                Self(local)
+            }
+            /// The underlying `LocalId`.
+            #[must_use]
+            pub const fn local_id(self) -> ::wavedb_core::LocalId {
+                self.0
+            }
+        }
+    })
+}
 
 /// Emit the `PivotId` newtype and the `Pivot` roots holder for a NonUnique struct
-/// named `name` with `num_secondaries` secondary indexes.
+/// named `name` with the given resolved secondary indexes.
 pub fn nonunique_types(
     name: &Ident,
-    num_secondaries: usize,
+    secondaries_specs: &[ResolvedPivot],
 ) -> syn::Result<TokenStream> {
+    let num_secondaries = secondaries_specs.len();
     let pivot_id = format_ident!("{}PivotId", name);
     let pivot = format_ident!("{}Pivot", name);
 
@@ -38,18 +69,28 @@ pub fn nonunique_types(
         ],
     );
 
-    // `struct {Name}PivotId(pub LocalId);` — WaveWire by delegation to LocalId.
-    let pivot_id_def: syn::DeriveInput = parse_quote! {
-        #[derive(::core::clone::Clone, ::core::marker::Copy,
-                 ::core::cmp::PartialEq, ::core::cmp::Eq,
-                 ::core::fmt::Debug, ::core::default::Default)]
-        pub struct #pivot_id(pub ::wavedb_core::LocalId);
-    };
-    let pivot_id_wire = wire_derive::derive(&pivot_id_def)?;
+    let pivot_id_tokens = pivot_id_tokens(&pivot_id)?;
 
     // `struct {Name}Pivot { current, dead, secondaries: [LocalId; N], permission }`.
     // `#[repr(C)]` keeps a clean layout when `N == 0` (a trailing zero-sized array
     // is otherwise a lint footgun); WaveWire never depends on the repr.
+    // The pivot record is stored like any value, so it gets its own native
+    // storage slot too (always compressed — pivots are tiny, cold, uniform);
+    // the record type's `storage_entries()` bundles both.
+    let pivot_hash_expr =
+        quote!(<#pivot as ::wavedb_core::index::Pivot>::STRUCT_HASH);
+    let pivot_storage =
+        storage_statics::statics_for(&pivot, &pivot_hash_expr, true);
+    let storage_entries = storage_statics::entries_for(name, Some(&pivot));
+
+    // Secondary-index hooks + the typed `by_<field>` lookup surface.
+    let secondary_items = secondaries::trait_items(secondaries_specs);
+    let by_lookups = secondaries::by_lookups(name, secondaries_specs);
+
+    // The per-command execution steps (`__wavedb_<op>`) — defined here,
+    // wire-reachable only once listed in an exposure declaration.
+    let exec_steps = exec_ops::nonunique_ops(name, &pivot_id);
+
     let pivot_def: syn::DeriveInput = parse_quote! {
         #[repr(C)]
         #[derive(::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq,
@@ -64,28 +105,17 @@ pub fn nonunique_types(
     let pivot_wire = wire_derive::derive(&pivot_def)?;
 
     Ok(quote! {
-        #pivot_id_def
-        #pivot_id_wire
-
-        impl #pivot_id {
-            /// Wrap a `LocalId` as this collection's handle.
-            #[must_use]
-            pub const fn new(local: ::wavedb_core::LocalId) -> Self {
-                Self(local)
-            }
-            /// The underlying `LocalId`.
-            #[must_use]
-            pub const fn local_id(self) -> ::wavedb_core::LocalId {
-                self.0
-            }
-        }
+        #pivot_id_tokens
 
         #pivot_def
         #pivot_wire
 
         impl ::wavedb_core::NonUniqueStruct for #name {
             type Pivot = #pivot;
+            #secondary_items
         }
+
+        #by_lookups
 
         impl #name {
             /// The typed handle into an existing collection of this type,
@@ -115,6 +145,10 @@ pub fn nonunique_types(
             }
         }
 
+        #pivot_storage
+        #storage_entries
+        #exec_steps
+
         impl ::wavedb_core::index::Pivot for #pivot {
             const STRUCT_HASH: u64 = #pivot_hash;
 
@@ -128,11 +162,17 @@ pub fn nonunique_types(
                 &self,
                 current: ::wavedb_core::LocalId,
                 dead: ::wavedb_core::LocalId,
+                secondaries: &[::wavedb_core::LocalId],
             ) -> Self {
+                let mut secs = self.secondaries;
+                // The engine always passes exactly this pivot's root count
+                // (it derives the slice from `secondaries()`); a mismatch is
+                // a caller bug worth failing loudly on.
+                secs.copy_from_slice(secondaries);
                 Self {
                     current,
                     dead,
-                    secondaries: self.secondaries,
+                    secondaries: secs,
                     permission: ::core::clone::Clone::clone(&self.permission),
                 }
             }

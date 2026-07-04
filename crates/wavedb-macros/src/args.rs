@@ -10,7 +10,7 @@
 //! ```
 
 use syn::punctuated::Punctuated;
-use syn::{Meta, Path, Token, parse::ParseStream};
+use syn::{Ident, Meta, Path, Token, parse::ParseStream};
 
 /// The cardinality shape declared on a `#[wavedb]` struct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,5 +113,36 @@ fn expr_as_bool(expr: &syn::Expr) -> syn::Result<bool> {
         Ok(b.value)
     } else {
         Err(syn::Error::new_spanned(expr, "expected `true` or `false`"))
+    }
+}
+
+/// One `#[wavedb::pivot(...)]` declaration: the indexed field(s) in
+/// declaration order — `pivot(amount)` or a composite `pivot((customer, date))`
+/// of two or three fields (the `IndexKey` tuple arities).
+#[derive(Debug, Clone)]
+pub struct PivotSpec {
+    pub fields: Vec<Ident>,
+}
+
+impl syn::parse::Parse for PivotSpec {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        if input.peek(syn::token::Paren) {
+            let inner;
+            syn::parenthesized!(inner in input);
+            let idents =
+                Punctuated::<Ident, Token![,]>::parse_terminated(&inner)?;
+            let fields: Vec<Ident> = idents.into_iter().collect();
+            if !(2..=3).contains(&fields.len()) {
+                return Err(syn::Error::new(
+                    inner.span(),
+                    "a composite #[wavedb::pivot((..))] takes 2 or 3 fields",
+                ));
+            }
+            Ok(Self { fields })
+        } else {
+            Ok(Self {
+                fields: vec![input.parse()?],
+            })
+        }
     }
 }

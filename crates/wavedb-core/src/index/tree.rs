@@ -1,14 +1,16 @@
 //! [`BpTree`] — the `Store`-generic B+tree indexing a NonUnique collection,
-//! one node per [`Store`] value.
+//! one node per [`Store`] value, generic over its key type.
 //!
 //! ## What the tree keys on
 //!
-//! The tree is an ordered set of record [`LocalId`]s. A NonUnique record's
-//! `LocalId` is `CREATED_AT` (8 B, most significant) then `FLAG|SALT` (2 B), so
-//! ordering the `LocalId`s **is** chronological order, and the trailing salt
-//! makes every key unique — no duplicate-key ambiguity. A leaf entry is just
-//! the record's `LocalId`; that same value is both the search key and the
-//! record pointer.
+//! The key type `K` is a [`NodeKey`]. The **primary** tree uses `K =`
+//! [`LocalId`]: a NonUnique record's `LocalId` is `CREATED_AT` (8 B, most
+//! significant) then `FLAG|SALT` (2 B), so ordering the `LocalId`s **is**
+//! chronological order, the trailing salt makes every key unique, and the key
+//! doubles as the record pointer. A **secondary** index uses `K =`
+//! [`SecKey`](super::SecKey): the record's order-preserving field bytes plus
+//! its `LocalId` (unique under duplicate field values). Same machinery, fully
+//! monomorphized — no `dyn`.
 //!
 //! ## Where it runs
 //!
@@ -19,6 +21,7 @@
 //! [`tree_delete`](super::tree_delete).
 
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 
 use futures::Stream;
 
@@ -30,6 +33,7 @@ use crate::u48::U48;
 
 use super::Bound;
 use super::node::{BPTREE_NODE_STRUCT_HASH, NodeBody, mint_node_id};
+use super::node_key::NodeKey;
 
 /// Max keys in a leaf before it splits. Sized so a node fits the storage
 /// engine's 32 KiB page with room to spare.
@@ -37,21 +41,27 @@ pub const DEFAULT_LEAF_CAP: usize = 1819;
 /// Max `(separator, child)` entries in an internal node before it splits.
 pub const DEFAULT_INTERNAL_CAP: usize = 1630;
 
-/// A B+tree over a [`Store`], scoped to one tenant. Holds only its root pointer
-/// and its split/merge capacities; nodes live in the `Store` keyed by
-/// `LocalId::to_id(tenant)`.
+/// A B+tree over a [`Store`], scoped to one tenant, keyed by `K` (the
+/// primary [`LocalId`] tree by default).
 ///
-/// Use one capacity configuration for a tree's whole lifetime — capacities are
-/// a handle-side policy, not recorded in the nodes.
-#[derive(Debug, Clone, Copy)]
-pub struct BpTree {
+/// Holds only its root pointer and its split/merge capacities; nodes live in
+/// the `Store` keyed by `LocalId::to_id(tenant)`. Use one capacity
+/// configuration for a tree's whole lifetime — capacities are a handle-side
+/// policy, not recorded in the nodes.
+#[derive(Debug, Clone)]
+pub struct BpTree<K: NodeKey = LocalId> {
     pub(super) root: LocalId,
     pub(super) tenant: U48,
     pub(super) leaf_cap: usize,
     pub(super) internal_cap: usize,
+    pub(super) _key: PhantomData<fn() -> K>,
 }
 
-impl BpTree {
+// Manual: a `Copy` derive would demand `K: Copy` (a `SecKey` isn't), but the
+// handle holds only ids and caps (the `PhantomData` is `fn() -> K`, `Copy`).
+impl<K: NodeKey> Copy for BpTree<K> {}
+
+impl<K: NodeKey> BpTree<K> {
     /// Open an existing tree at `root` for `tenant` (default capacities).
     #[must_use]
     pub const fn at(root: LocalId, tenant: U48) -> Self {
@@ -60,6 +70,7 @@ impl BpTree {
             tenant,
             leaf_cap: DEFAULT_LEAF_CAP,
             internal_cap: DEFAULT_INTERNAL_CAP,
+            _key: PhantomData,
         }
     }
 
@@ -100,16 +111,16 @@ impl BpTree {
         self.root
     }
 
-    /// Whether `record_id` is present in the tree.
+    /// Whether `key` is present in the tree.
     ///
     /// # Errors
     /// Propagates a [`Store`] failure.
     pub async fn contains<S: Store>(
         &self,
         store: &S,
-        record_id: Id,
+        key: impl Into<K>,
     ) -> Result<bool> {
-        let target = LocalId::from_id(record_id);
+        let target = key.into();
         let mut node = self.root;
         loop {
             match self.load(store, node).await? {
@@ -117,31 +128,31 @@ impl BpTree {
                     return Ok(keys.binary_search(&target).is_ok());
                 }
                 NodeBody::Internal { leftmost, entries } => {
-                    node = child_for(leftmost, &entries, target);
+                    node = child_for(leftmost, &entries, &target);
                 }
             }
         }
     }
 
-    /// Stream the record `Id`s in key order whose `CREATED_AT` falls in `bound`.
+    /// Stream the record `Id`s in key order whose keys satisfy `bound`.
     ///
     /// Two-phase resolution (index → `Id`s → caller fetch) lives above this: the
     /// stream yields the record `Id`s; resolving them to bytes is the caller's
-    /// `Store::get`. The descent prunes subtrees whose separator range cannot
-    /// intersect the bound (see [`Bound::created_at_range`]).
+    /// `Store::get`. The descent prunes subtrees whose separator window cannot
+    /// intersect the bound (see [`NodeKey::may_intersect`]).
     pub fn search<'a, S: Store>(
         &self,
         store: &'a S,
         bound: Bound,
-    ) -> impl Stream<Item = Result<Id>> + use<'a, S> {
+    ) -> impl Stream<Item = Result<Id>> + use<'a, S, K> {
         let mut nodes: VecDeque<LocalId> = VecDeque::new();
         nodes.push_back(self.root);
-        let init = WalkState {
+        let init = WalkState::<K> {
             nodes,
             ready: VecDeque::new(),
-            prune: bound.created_at_range(),
             bound,
             tenant: self.tenant,
+            _key: PhantomData,
         };
 
         futures::stream::unfold(init, move |mut st| async move {
@@ -160,11 +171,11 @@ impl BpTree {
                     }
                     Err(e) => return Some((Err(e), st)),
                 };
-                match NodeBody::from_bytes(&bytes) {
+                match NodeBody::<K>::from_bytes(&bytes) {
                     Ok(NodeBody::Leaf(keys)) => {
                         for k in keys {
-                            if bound_matches(&st.bound, k) {
-                                st.ready.push_back(k.to_id(st.tenant));
+                            if k.matches(&st.bound) {
+                                st.ready.push_back(k.record().to_id(st.tenant));
                             }
                         }
                     }
@@ -182,7 +193,7 @@ impl BpTree {
         &self,
         store: &S,
         node: LocalId,
-    ) -> Result<NodeBody> {
+    ) -> Result<NodeBody<K>> {
         let bytes = store
             .get_of(BPTREE_NODE_STRUCT_HASH, node.to_id(self.tenant))
             .await?
@@ -191,7 +202,7 @@ impl BpTree {
     }
 
     /// A `Put` write for `node`'s serialised bytes under this tenant.
-    pub(super) fn put(&self, node: LocalId, n: &NodeBody) -> Write {
+    pub(super) fn put(&self, node: LocalId, n: &NodeBody<K>) -> Write {
         Write::Put(node.to_id(self.tenant), n.to_bytes())
     }
 
@@ -203,43 +214,39 @@ impl BpTree {
 
 /// One internal node on a descent path, kept so an upward split/merge knows
 /// where to insert or drop a separator.
-pub(super) struct PathFrame {
+pub(super) struct PathFrame<K: NodeKey> {
     pub node_id: LocalId,
     pub leftmost: LocalId,
-    pub entries: Vec<(LocalId, LocalId)>,
+    pub entries: Vec<(K, LocalId)>,
     /// Slot the descent took (`0` = leftmost, `i + 1` = `entries[i]`).
     pub child_idx: usize,
 }
 
 /// State threaded through the `search` walk.
-struct WalkState {
+struct WalkState<K: NodeKey> {
     nodes: VecDeque<LocalId>,
     ready: VecDeque<Id>,
     bound: Bound,
-    /// Inclusive `CREATED_AT` window for descent pruning (`None` = no pruning).
-    prune: Option<(u64, u64)>,
     tenant: U48,
+    _key: PhantomData<fn() -> K>,
 }
 
 /// Queue an internal node's children in key order, skipping subtrees whose
 /// key window cannot intersect the bound.
-fn expand_children(
-    st: &mut WalkState,
+fn expand_children<K: NodeKey>(
+    st: &mut WalkState<K>,
     leftmost: LocalId,
-    entries: &[(LocalId, LocalId)],
+    entries: &[(K, LocalId)],
 ) {
-    // Child i covers LocalIds in [sep_{i-1}, sep_i), so its CREATED_AT values
-    // lie within [sep_{i-1}.key(), sep_i.key()] inclusive.
-    let child_window = |i: usize| -> (u64, u64) {
-        let min = if i == 0 { 0 } else { entries[i - 1].0.key() };
-        let max = entries.get(i).map_or(u64::MAX, |(sep, _)| sep.key());
-        (min, max)
-    };
+    // Child i covers keys in [sep_{i-1}, sep_i) — probe the inclusive window.
     let keep = |i: usize| -> bool {
-        st.prune.is_none_or(|(lo, hi)| {
-            let (min, max) = child_window(i);
-            max >= lo && min <= hi
-        })
+        let min = if i == 0 {
+            None
+        } else {
+            Some(&entries[i - 1].0)
+        };
+        let max = entries.get(i).map(|(sep, _)| sep);
+        K::may_intersect(&st.bound, min, max)
     };
     // Push in reverse so the leftmost kept child ends up at the queue's front.
     for (i, (_, child)) in entries.iter().enumerate().rev() {
@@ -252,32 +259,23 @@ fn expand_children(
     }
 }
 
-/// Does a record `LocalId`'s `CREATED_AT` (its `key`) satisfy the bound?
-/// Bounds carry 8-byte big-endian `CREATED_AT` keys.
-fn bound_matches(bound: &Bound, key: LocalId) -> bool {
-    match bound {
-        Bound::All => true,
-        _ => bound.contains(&key.key().to_be_bytes()),
-    }
-}
-
 /// The child pointer a `target` routes to (without its index).
-pub(super) fn child_for(
+pub(super) fn child_for<K: NodeKey>(
     leftmost: LocalId,
-    entries: &[(LocalId, LocalId)],
-    target: LocalId,
+    entries: &[(K, LocalId)],
+    target: &K,
 ) -> LocalId {
     child_and_index(leftmost, entries, target).0
 }
 
 /// The child pointer and its slot index (`0` = leftmost, `i + 1` = `entries[i]`).
-pub(super) fn child_and_index(
+pub(super) fn child_and_index<K: NodeKey>(
     leftmost: LocalId,
-    entries: &[(LocalId, LocalId)],
-    target: LocalId,
+    entries: &[(K, LocalId)],
+    target: &K,
 ) -> (LocalId, usize) {
     // Last separator `<= target`; if none, the leftmost child.
-    match entries.binary_search_by(|(sep, _)| sep.cmp(&target)) {
+    match entries.binary_search_by(|(sep, _)| sep.cmp(target)) {
         Ok(i) => (entries[i].1, i + 1),
         Err(0) => (leftmost, 0),
         Err(i) => (entries[i - 1].1, i),
@@ -291,8 +289,10 @@ mod tests {
 
     use super::super::Bound;
     use super::super::mem_store::MemStore;
+    use super::super::node_key::SecKey;
     use super::BpTree;
     use crate::id::Id;
+    use crate::local_id::LocalId;
     use crate::u48::U48;
 
     const TENANT: u32 = 7;
@@ -317,7 +317,7 @@ mod tests {
     fn insert_and_search_in_order() {
         block_on(async {
             let store = MemStore::default();
-            let mut tree =
+            let mut tree: BpTree =
                 BpTree::create(&store, U48::from(TENANT)).await.unwrap();
             for k in [50u64, 10, 30, 20, 40] {
                 tree.insert(&store, rec(k)).await.unwrap();
@@ -330,7 +330,7 @@ mod tests {
     fn insert_is_idempotent() {
         block_on(async {
             let store = MemStore::default();
-            let mut tree =
+            let mut tree: BpTree =
                 BpTree::create(&store, U48::from(TENANT)).await.unwrap();
             tree.insert(&store, rec(5)).await.unwrap();
             tree.insert(&store, rec(5)).await.unwrap();
@@ -344,7 +344,7 @@ mod tests {
     fn grows_multiple_levels_and_stays_sorted() {
         block_on(async {
             let store = MemStore::default();
-            let mut tree = BpTree::create(&store, U48::from(TENANT))
+            let mut tree: BpTree = BpTree::create(&store, U48::from(TENANT))
                 .await
                 .unwrap()
                 .with_caps(16, 16);
@@ -377,7 +377,7 @@ mod tests {
     fn range_search_filters_by_created_at() {
         block_on(async {
             let store = MemStore::default();
-            let mut tree =
+            let mut tree: BpTree =
                 BpTree::create(&store, U48::from(TENANT)).await.unwrap();
             for k in 0..100u64 {
                 tree.insert(&store, rec(k)).await.unwrap();
@@ -399,7 +399,7 @@ mod tests {
     fn range_search_prunes_but_misses_nothing_on_deep_trees() {
         block_on(async {
             let store = MemStore::default();
-            let mut tree = BpTree::create(&store, U48::from(TENANT))
+            let mut tree: BpTree = BpTree::create(&store, U48::from(TENANT))
                 .await
                 .unwrap()
                 .with_caps(8, 8);
@@ -435,8 +435,80 @@ mod tests {
     fn empty_tree_searches_nothing() {
         block_on(async {
             let store = MemStore::default();
-            let tree = BpTree::create(&store, U48::from(TENANT)).await.unwrap();
+            let tree: BpTree =
+                BpTree::create(&store, U48::from(TENANT)).await.unwrap();
             assert!(all_keys(&tree, &store).await.is_empty());
+        });
+    }
+
+    // The same machinery serves a byte-keyed secondary tree: duplicate field
+    // values coexist (unique by record), exact/prefix bounds select by field,
+    // and splits keep everything reachable.
+    #[test]
+    fn secondary_tree_indexes_by_field_bytes() {
+        async fn by(
+            tree: BpTree<SecKey>,
+            store: &MemStore,
+            bound: Bound,
+        ) -> Vec<u64> {
+            let mut got: Vec<u64> = tree
+                .search(store, bound)
+                .map(|r| r.unwrap().key())
+                .collect()
+                .await;
+            got.sort_unstable();
+            got
+        }
+
+        block_on(async {
+            let store = MemStore::default();
+            let tenant = U48::from(TENANT);
+            let mut tree = BpTree::<SecKey>::create(&store, tenant)
+                .await
+                .unwrap()
+                .with_caps(4, 4);
+
+            let key = |f: &str, k: u64| SecKey {
+                field: {
+                    let mut out = f.as_bytes().to_vec();
+                    out.push(0); // the String IndexKey encoding
+                    out
+                },
+                rec: LocalId::from_id(rec(k)),
+            };
+            for (f, k) in [
+                ("pear", 1u64),
+                ("apple", 2),
+                ("apple", 3),
+                ("plum", 4),
+                ("apricot", 5),
+                ("banana", 6),
+                ("apple", 7),
+                ("peach", 8),
+            ] {
+                tree.insert(&store, key(f, k)).await.unwrap();
+            }
+
+            // Exact field value → every record holding it.
+            assert_eq!(
+                by(tree, &store, Bound::Exact(key("apple", 0).field)).await,
+                vec![2, 3, 7]
+            );
+            // Prefix over the field bytes.
+            assert_eq!(
+                by(tree, &store, Bound::Prefix(b"ap".to_vec())).await,
+                vec![2, 3, 5, 7]
+            );
+            assert_eq!(
+                by(tree, &store, Bound::Prefix(b"pe".to_vec())).await,
+                vec![1, 8]
+            );
+            // Remove one duplicate; the others stay.
+            assert!(tree.remove(&store, key("apple", 3)).await.unwrap());
+            assert_eq!(
+                by(tree, &store, Bound::Exact(key("apple", 0).field)).await,
+                vec![2, 7]
+            );
         });
     }
 }

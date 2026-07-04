@@ -18,7 +18,6 @@
 //! **journal replay** — routes every record to the same bucket even if `data.bin`
 //! is opened on a different machine.
 use crate::block::BlockDescriptor;
-use crate::dictionary::Dictionary;
 use seahash::hash_seeded;
 
 /// A SeaHash of a 128-bit `Id` under a per-database seed.
@@ -60,48 +59,28 @@ pub const fn next_split_bucket(dir_len: u64) -> u64 {
     dir_len - (1u64 << level)
 }
 
-/// A per-`STRUCT_HASH` page directory: a vector of [`BlockDescriptor`] slots plus
-/// the per-database hash seed.
+/// A per-`STRUCT_HASH` page directory: a vector of [`BlockDescriptor`] slots
+/// plus the per-database hash seed.
+///
+/// Pure addressing — the type's compression state
+/// ([`DictState`](crate::dictionary::DictState)) lives beside it in the type's
+/// `StructStorage` slot, not inside the directory.
 #[derive(Debug, Clone)]
 pub struct Directory {
     /// One descriptor per bucket (page).
     pub(crate) slots: Vec<BlockDescriptor>,
     /// Per-database hash seed (from `data.bin` page 0).
     seed: [u64; 4],
-    /// This type's raw-content zstd dictionary; pages compress against it and
-    /// stamp the state (prefix length) they bound. Rebuilt deterministically
-    /// by journal replay, like the pages themselves.
-    pub(crate) dict: Dictionary,
-    /// The block run the dictionary is persisted in (repointed as it grows);
-    /// [`BlockDescriptor::EMPTY`] while nothing has been sampled.
-    pub(crate) dict_desc: BlockDescriptor,
-    /// Whether this type's pages run through zstd at all. Off for page kinds
-    /// where the CPU spend doesn't pay — hot, constantly-rewritten pages like
-    /// `BpTree` nodes.
-    pub(crate) compress: bool,
 }
 
 impl Directory {
-    /// A directory with a single empty bucket (compression on).
+    /// A directory with a single empty bucket.
     #[must_use]
     pub fn new(seed: [u64; 4]) -> Self {
         Self {
             slots: vec![BlockDescriptor::EMPTY],
             seed,
-            dict: Dictionary::new(),
-            dict_desc: BlockDescriptor::EMPTY,
-            compress: true,
         }
-    }
-
-    /// Set whether this type's pages compress. Pick once per directory: pages
-    /// written either way stay readable (the payload kind is stamped in the
-    /// page envelope), but a type that never compresses also never samples or
-    /// persists a dictionary.
-    #[must_use]
-    pub const fn with_compression(mut self, compress: bool) -> Self {
-        self.compress = compress;
-        self
     }
 
     /// Rebuild a directory from already-known descriptors (e.g. journal replay).
@@ -111,20 +90,7 @@ impl Directory {
     #[must_use]
     pub fn from_slots(slots: Vec<BlockDescriptor>, seed: [u64; 4]) -> Self {
         assert!(!slots.is_empty(), "directory needs at least one bucket");
-        Self {
-            slots,
-            seed,
-            dict: Dictionary::new(),
-            dict_desc: BlockDescriptor::EMPTY,
-            compress: true,
-        }
-    }
-
-    /// The block run the dictionary is persisted in
-    /// ([`BlockDescriptor::EMPTY`] while nothing has been sampled).
-    #[must_use]
-    pub const fn dict_descriptor(&self) -> BlockDescriptor {
-        self.dict_desc
+        Self { slots, seed }
     }
 
     /// Number of buckets.

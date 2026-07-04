@@ -9,15 +9,15 @@
 //! redistribution never cascades).
 
 use crate::error::Result;
-use crate::id::Id;
 use crate::local_id::LocalId;
 use crate::store::{Store, Write};
 
 use super::node::NodeBody;
+use super::node_key::NodeKey;
 use super::tree::{BpTree, PathFrame, child_and_index};
 
-impl BpTree {
-    /// Remove `record_id`. Returns whether it was present. Underfull nodes
+impl<K: NodeKey> BpTree<K> {
+    /// Remove `key`. Returns whether it was present. Underfull nodes
     /// merge or redistribute with a sibling; the root collapses when it loses
     /// its last separator. All touched nodes commit in **one**
     /// [`Store::apply`] batch. Updates [`root`](Self::root) on a collapse.
@@ -27,9 +27,9 @@ impl BpTree {
     pub async fn remove<S: Store>(
         &mut self,
         store: &S,
-        record_id: Id,
+        key: impl Into<K>,
     ) -> Result<bool> {
-        match self.plan_remove(store, record_id).await? {
+        match self.plan_remove(store, key).await? {
             Some(batch) => {
                 store.apply(&batch).await?;
                 Ok(true)
@@ -38,7 +38,7 @@ impl BpTree {
         }
     }
 
-    /// Plan a removal of `record_id`: every node [`Write`] the removal needs,
+    /// Plan a removal of `key`: every node [`Write`] the removal needs,
     /// **without applying** — so a caller can commit the index change and its
     /// record in one atomic batch. Reads through `store`; updates
     /// [`root`](Self::root) on a collapse (the handle assumes the batch will
@@ -49,19 +49,19 @@ impl BpTree {
     pub async fn plan_remove<S: Store>(
         &mut self,
         store: &S,
-        record_id: Id,
+        key: impl Into<K>,
     ) -> Result<Option<Vec<Write>>> {
-        let target = LocalId::from_id(record_id);
+        let target: K = key.into();
 
         // Descend to the leaf, recording the internal path for rebalancing.
-        let mut path: Vec<PathFrame> = Vec::new();
+        let mut path: Vec<PathFrame<K>> = Vec::new();
         let mut node_id = self.root;
         let mut keys = loop {
             match self.load(store, node_id).await? {
                 NodeBody::Leaf(keys) => break keys,
                 NodeBody::Internal { leftmost, entries } => {
                     let (next, child_idx) =
-                        child_and_index(leftmost, &entries, target);
+                        child_and_index(leftmost, &entries, &target);
                     path.push(PathFrame {
                         node_id,
                         leftmost,
@@ -112,7 +112,7 @@ impl BpTree {
         &mut self,
         batch: &mut Vec<Write>,
         root_id: LocalId,
-        root: &NodeBody,
+        root: &NodeBody<K>,
     ) {
         if let NodeBody::Internal { leftmost, entries } = root
             && entries.is_empty()
@@ -131,9 +131,9 @@ impl BpTree {
         store: &S,
         batch: &mut Vec<Write>,
         node_id: LocalId,
-        current: NodeBody,
-        frame: PathFrame,
-    ) -> Result<Rebalanced> {
+        current: NodeBody<K>,
+        frame: PathFrame<K>,
+    ) -> Result<Rebalanced<K>> {
         let PathFrame {
             node_id: parent_id,
             leftmost,
@@ -164,9 +164,9 @@ impl BpTree {
         } else {
             (self.load(store, left_id).await?, current)
         };
-        let sep = entries[left_idx].0;
+        let sep = entries[left_idx].0.clone();
 
-        if let Some(merged) = self.merge(&left, &right, sep) {
+        if let Some(merged) = self.merge(&left, &right, sep.clone()) {
             batch.push(self.put(left_id, &merged));
             batch.push(self.remove_node(right_id));
             entries.remove(left_idx); // drops the separator + right child
@@ -187,7 +187,7 @@ impl BpTree {
     }
 
     /// `true` when a **non-root** node has fallen below ¼ of its capacity.
-    fn is_underfull(&self, node: &NodeBody) -> bool {
+    fn is_underfull(&self, node: &NodeBody<K>) -> bool {
         match node {
             NodeBody::Leaf(keys) => keys.len() < self.leaf_cap / 4,
             NodeBody::Internal { entries, .. } => {
@@ -200,15 +200,15 @@ impl BpTree {
     /// `None` means "too big — redistribute instead".
     fn merge(
         &self,
-        left: &NodeBody,
-        right: &NodeBody,
-        sep: LocalId,
-    ) -> Option<NodeBody> {
+        left: &NodeBody<K>,
+        right: &NodeBody<K>,
+        sep: K,
+    ) -> Option<NodeBody<K>> {
         match (left, right) {
             (NodeBody::Leaf(l), NodeBody::Leaf(r)) => {
                 (l.len() + r.len() <= self.leaf_cap * 3 / 4).then(|| {
                     let mut keys = l.clone();
-                    keys.extend_from_slice(r);
+                    keys.extend(r.iter().cloned());
                     NodeBody::Leaf(keys)
                 })
             }
@@ -227,7 +227,7 @@ impl BpTree {
                 (merged_len <= self.internal_cap * 3 / 4).then(|| {
                     let mut entries = l_e.clone();
                     entries.push((sep, *r_lm));
-                    entries.extend_from_slice(r_e);
+                    entries.extend(r_e.iter().cloned());
                     NodeBody::Internal {
                         leftmost: *l_lm,
                         entries,
@@ -246,27 +246,27 @@ impl BpTree {
 }
 
 /// A rebalance step's outcome.
-enum Rebalanced {
+enum Rebalanced<K: NodeKey> {
     /// A merge removed a separator from the parent; the parent (returned as
     /// the new current node) may itself need rebalancing.
-    ParentPending { id: LocalId, node: NodeBody },
+    ParentPending { id: LocalId, node: NodeBody<K> },
     /// A redistribution updated the parent in place; nothing propagates.
     Done,
 }
 
 /// Split the pair's combined entries evenly across both nodes, returning the
 /// rewritten `(left, right, separator)`.
-fn redistribute(
-    left: NodeBody,
-    right: NodeBody,
-    sep: LocalId,
-) -> (NodeBody, NodeBody, LocalId) {
+fn redistribute<K: NodeKey>(
+    left: NodeBody<K>,
+    right: NodeBody<K>,
+    sep: K,
+) -> (NodeBody<K>, NodeBody<K>, K) {
     match (left, right) {
         (NodeBody::Leaf(l), NodeBody::Leaf(r)) => {
             let mut combined = l;
-            combined.extend_from_slice(&r);
+            combined.extend(r);
             let right_keys = combined.split_off(combined.len() / 2);
-            let new_sep = right_keys[0];
+            let new_sep = right_keys[0].clone();
             (
                 NodeBody::Leaf(combined),
                 NodeBody::Leaf(right_keys),
@@ -287,7 +287,7 @@ fn redistribute(
             // re-split at the median, promoting its separator to the parent.
             let mut combined = l_e;
             combined.push((sep, r_lm));
-            combined.extend_from_slice(&r_e);
+            combined.extend(r_e);
             let mid = combined.len() / 2;
             let mut right_entries = combined.split_off(mid);
             let (new_sep, new_r_leftmost) = right_entries.remove(0);
@@ -341,7 +341,7 @@ mod tests {
     fn remove_takes_key_out() {
         block_on(async {
             let store = MemStore::default();
-            let mut tree =
+            let mut tree: BpTree =
                 BpTree::create(&store, U48::from(TENANT)).await.unwrap();
             for k in [1u64, 2, 3, 4, 5] {
                 tree.insert(&store, rec(k)).await.unwrap();
@@ -360,7 +360,7 @@ mod tests {
         block_on(async {
             let tenant = U48::from(TENANT);
             let store = MemStore::default();
-            let mut tree = BpTree::create(&store, tenant)
+            let mut tree: BpTree = BpTree::create(&store, tenant)
                 .await
                 .unwrap()
                 .with_caps(8, 8);
@@ -408,7 +408,7 @@ mod tests {
         block_on(async {
             let tenant = U48::from(TENANT);
             let store = MemStore::default();
-            let mut tree = BpTree::create(&store, tenant)
+            let mut tree: BpTree = BpTree::create(&store, tenant)
                 .await
                 .unwrap()
                 .with_caps(8, 8); // underfull < 2, merge cap 6
@@ -437,7 +437,7 @@ mod tests {
         block_on(async {
             let tenant = U48::from(TENANT);
             let store = MemStore::default();
-            let mut tree = BpTree::create(&store, tenant)
+            let mut tree: BpTree = BpTree::create(&store, tenant)
                 .await
                 .unwrap()
                 .with_caps(8, 8);

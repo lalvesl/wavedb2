@@ -1,18 +1,21 @@
-//! The `BpTree` node value: its `WaveWire` body, the reserved page-kind tag, and
+//! The `BpTree` node value: its byte form, the reserved page-kind tag, and
 //! node-id minting.
 //!
 //! ## Value format
 //!
 //! ```text
-//! [ BPTREE_NODE_STRUCT_HASH (8 B LE) ][ WaveWire(NodeBody) ]
+//! [ BPTREE_NODE_STRUCT_HASH (8 B LE) ][ kind (u8) ][ WaveWire payload ]
 //! ```
 //!
 //! The leading 8 bytes are the raw page-kind tag — storage backends route every
 //! stored value by the `STRUCT_HASH` in its first 8 bytes, and a node is an
-//! ordinary value to any [`Store`](crate::store::Store). The body itself is
-//! plain `WaveWire` (the workspace's one layout language): a canonical-form
-//! enum, `Leaf` holding the sorted record keys, `Internal` holding the leftmost
-//! child plus `(separator, child)` pairs.
+//! ordinary value to any [`Store`](crate::store::Store). `kind` picks the
+//! variant; the payload is plain `WaveWire` (the workspace's one layout
+//! language) composed from the generic `Vec` / tuple impls: a leaf is
+//! `Vec<K>`, an internal node is `LocalId` (the leftmost child, fixed
+//! [`STACK_SIZE`](WaveWire::STACK_SIZE)) followed by `Vec<(K, LocalId)>`.
+//! Primary ([`LocalId`]) and secondary ([`SecKey`](super::SecKey)) nodes share
+//! the tag: the tree opening a root knows its own key type.
 //!
 //! ## Node identity
 //!
@@ -29,6 +32,8 @@ use crate::error::{Error, Result};
 use crate::local_id::LocalId;
 use crate::wire::{WaveWire, from_wire, to_wire};
 
+use super::node_key::NodeKey;
+
 /// Reserved `STRUCT_HASH` stamped at the head of every BpTree node's bytes.
 ///
 /// Routes all nodes into one reserved storage directory. (A real struct hashing
@@ -36,8 +41,12 @@ use crate::wire::{WaveWire, from_wire, to_wire};
 /// harmlessly.)
 pub const BPTREE_NODE_STRUCT_HASH: u64 = 0x42_50_54_52_45_45_00_01; // "BPTREE\0\x01"
 
-/// Bytes before the wire body: the reserved `STRUCT_HASH` tag.
+/// Bytes before the kind byte: the reserved `STRUCT_HASH` tag.
 const NODE_PREFIX: usize = 8;
+
+/// `kind` byte values.
+const KIND_LEAF: u8 = 0;
+const KIND_INTERNAL: u8 = 1;
 
 /// Process-wide counter salting node ids, so two nodes minted in the same
 /// nanosecond still get distinct `LocalId`s.
@@ -48,22 +57,32 @@ static NODE_SALT: AtomicU64 = AtomicU64::new(0);
 /// An internal node with `n` separators has `n + 1` children: `leftmost` covers
 /// keys below `entries[0].0`, then one child per separator covering keys `≥`
 /// that separator.
-#[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
-pub(super) enum NodeBody {
-    /// Sorted record keys.
-    Leaf(Vec<LocalId>),
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NodeBody<K: NodeKey> {
+    /// Sorted keys.
+    Leaf(Vec<K>),
     /// `leftmost` child plus ascending `(separator, child)` pairs.
     Internal {
         leftmost: LocalId,
-        entries: Vec<(LocalId, LocalId)>,
+        entries: Vec<(K, LocalId)>,
     },
 }
 
-impl NodeBody {
-    /// Serialise: the reserved tag, then the `WaveWire` body.
+impl<K: NodeKey> NodeBody<K> {
+    /// Serialise: the reserved tag, the kind byte, then the `WaveWire` payload.
     pub(super) fn to_bytes(&self) -> Vec<u8> {
         let mut out = BPTREE_NODE_STRUCT_HASH.to_le_bytes().to_vec();
-        out.extend_from_slice(&to_wire(self));
+        match self {
+            Self::Leaf(keys) => {
+                out.push(KIND_LEAF);
+                out.extend_from_slice(&to_wire(keys));
+            }
+            Self::Internal { leftmost, entries } => {
+                out.push(KIND_INTERNAL);
+                out.extend_from_slice(&to_wire(leftmost));
+                out.extend_from_slice(&to_wire(entries));
+            }
+        }
         out
     }
 
@@ -71,8 +90,8 @@ impl NodeBody {
     ///
     /// # Errors
     /// [`Error::BpTreeNodeBadTag`] if the value's first 8 bytes are not the
-    /// reserved node tag (or the value is shorter than the tag);
-    /// [`Error::Wire`] if the body fails to decode.
+    /// reserved node tag (or the value is shorter than the tag + kind, or the
+    /// kind byte is unknown); [`Error::Wire`] if the payload fails to decode.
     pub(super) fn from_bytes(buf: &[u8]) -> Result<Self> {
         let tag_bytes: [u8; NODE_PREFIX] = buf
             .get(..NODE_PREFIX)
@@ -82,7 +101,24 @@ impl NodeBody {
         if tag != BPTREE_NODE_STRUCT_HASH {
             return Err(Error::BpTreeNodeBadTag(tag));
         }
-        Ok(from_wire::<Self>(&buf[NODE_PREFIX..])?)
+        let kind = *buf.get(NODE_PREFIX).ok_or(Error::BpTreeNodeBadTag(tag))?;
+        let payload = &buf[NODE_PREFIX + 1..];
+        match kind {
+            KIND_LEAF => Ok(Self::Leaf(from_wire::<Vec<K>>(payload)?)),
+            KIND_INTERNAL => {
+                // `LocalId` is stack-only (fixed size, no heap), so the
+                // leftmost child ends exactly at its STACK_SIZE.
+                let split = <LocalId as WaveWire>::STACK_SIZE;
+                if payload.len() < split {
+                    return Err(Error::Wire(wavedb_wire::Error::UnexpectedEof));
+                }
+                let leftmost = from_wire::<LocalId>(&payload[..split])?;
+                let entries =
+                    from_wire::<Vec<(K, LocalId)>>(&payload[split..])?;
+                Ok(Self::Internal { leftmost, entries })
+            }
+            _ => Err(Error::BpTreeNodeBadTag(tag)),
+        }
     }
 }
 
@@ -98,6 +134,7 @@ pub(super) fn mint_node_id() -> LocalId {
 
 #[cfg(test)]
 mod tests {
+    use super::super::node_key::SecKey;
     use super::{BPTREE_NODE_STRUCT_HASH, NodeBody, mint_node_id};
     use crate::error::Error;
     use crate::local_id::LocalId;
@@ -128,14 +165,33 @@ mod tests {
     }
 
     #[test]
+    fn secondary_key_nodes_roundtrip() {
+        let key = |f: &[u8], k: u64| SecKey {
+            field: f.to_vec(),
+            rec: lid(k),
+        };
+        let leaf = NodeBody::Leaf(vec![key(b"a", 1), key(b"bb", 2)]);
+        assert_eq!(NodeBody::from_bytes(&leaf.to_bytes()).unwrap(), leaf);
+
+        let internal = NodeBody::Internal {
+            leftmost: lid(9),
+            entries: vec![(key(b"m", 5), lid(6))],
+        };
+        assert_eq!(
+            NodeBody::from_bytes(&internal.to_bytes()).unwrap(),
+            internal
+        );
+    }
+
+    #[test]
     fn bad_tag_is_rejected_with_the_tag() {
-        let mut bytes = NodeBody::Leaf(vec![]).to_bytes();
+        let mut bytes = NodeBody::<LocalId>::Leaf(vec![]).to_bytes();
         bytes[0] ^= 0xFF;
-        let err = NodeBody::from_bytes(&bytes).unwrap_err();
+        let err = NodeBody::<LocalId>::from_bytes(&bytes).unwrap_err();
         assert!(matches!(err, Error::BpTreeNodeBadTag(t) if t != 0));
         // Shorter than the tag itself.
         assert!(matches!(
-            NodeBody::from_bytes(&[1, 2, 3]),
+            NodeBody::<LocalId>::from_bytes(&[1, 2, 3]),
             Err(Error::BpTreeNodeBadTag(0))
         ));
     }
@@ -144,7 +200,10 @@ mod tests {
     fn truncated_body_is_a_wire_fault() {
         let bytes = NodeBody::Leaf(vec![lid(1)]).to_bytes();
         let cut = &bytes[..bytes.len() - 3];
-        assert!(matches!(NodeBody::from_bytes(cut), Err(Error::Wire(_))));
+        assert!(matches!(
+            NodeBody::<LocalId>::from_bytes(cut),
+            Err(Error::Wire(_))
+        ));
     }
 
     #[test]

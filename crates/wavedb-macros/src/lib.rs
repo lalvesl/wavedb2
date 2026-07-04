@@ -13,7 +13,11 @@
 use proc_macro::TokenStream;
 
 mod args;
+mod exec_ops;
+mod expose;
 mod generated;
+mod secondaries;
+mod storage_statics;
 mod struct_hash;
 mod wavedb_attr;
 mod wire_derive;
@@ -43,6 +47,33 @@ pub fn wave_wire(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn wavedb(attr: TokenStream, item: TokenStream) -> TokenStream {
     wavedb_attr::expand(attr.into(), item.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Declare the node-side registry: exactly the listed items become
+/// wire-reachable, dispatched by a per-`STRUCT_HASH` `match` (emits
+/// `REGISTRY`). Entries take per-op exclusions and overrides:
+///
+/// ```ignore
+/// expose_server! {
+///     AboutUser,                                   // full generated op set
+///     Order { save: audited_save, remove: never }, // harden / exclude ops
+/// }
+/// ```
+#[proc_macro]
+pub fn expose_server(input: TokenStream) -> TokenStream {
+    expose::expand_server(input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Declare the client-side allowlist: which items this binary's typed stubs
+/// may route (emits `CLIENT_REGISTRY`). No per-op overrides — those shape
+/// the server surface.
+#[proc_macro]
+pub fn expose_client(input: TokenStream) -> TokenStream {
+    expose::expand_client(input.into())
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }

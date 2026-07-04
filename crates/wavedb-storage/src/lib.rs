@@ -27,12 +27,17 @@ pub mod error;
 pub mod journal;
 pub mod page;
 pub mod page_store;
+pub mod struct_storage;
 
 pub use block::{BLOCK_SIZE, BlockAllocator, BlockDescriptor, Run};
 pub use block_file::{BlockFile, RESERVED_BLOCKS};
-pub use dictionary::Dictionary;
+pub use dictionary::{DictState, Dictionary};
 pub use directory::{Directory, bucket_index, hash_of};
 pub use error::{StorageError, StorageResult};
 pub use journal::Journal;
 pub use page::SlotPage;
 pub use page_store::PageStore;
+pub use struct_storage::{
+    BPTREE_NODE_STORAGE, StructDictionary, StructDirectory, StructMemCache,
+    StructStorage,
+};

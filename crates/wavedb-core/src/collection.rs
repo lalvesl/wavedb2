@@ -14,112 +14,42 @@
 //! col.all(&store)                                           // Stream<Result<Todo>>
 //! ```
 //!
-//! ## Record envelope
+//! ## Record envelope & history
 //!
-//! Every stored value is `[STRUCT_HASH (8 B LE)][WaveWire bytes]` — storage
-//! backends route by those first 8 bytes, and decode verifies them, so a stale
-//! or foreign `Id` can't silently decode as the wrong type.
+//! Every stored value starts `[STRUCT_HASH (8 B LE)]` (backends route by it,
+//! decode verifies it); user records additionally carry their [`Metadata`]
+//! (see [`crate::record`]). Saving never destroys old bytes — `save` archives
+//! the superseded version and links the modification chain;
+//! [`history`](Collection::history) walks it newest-first.
 //!
 //! ## Atomicity
 //!
-//! Each mutating op commits **one** [`Store::apply`] batch: the record write,
-//! every touched B+tree node (via the tree's `plan_*` planners), and — when a
-//! root moved — the rewritten `Pivot` record. A crash replays the whole batch
-//! or none of it.
+//! Each mutating op commits **one** [`Store::apply`] batch: the record write
+//! (plus its archived predecessor and chain relinks on a save), every touched
+//! B+tree node (via the tree's `plan_*` planners), and — when a root moved —
+//! the rewritten `Pivot` record. A crash replays the whole batch or none of
+//! it.
 
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::{Stream, TryStreamExt};
 
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::{Bound, BpTree, Pivot};
+use crate::index::{Bound, BpTree, Pivot, SecKey};
 use crate::local_id::LocalId;
+use crate::metadata::Metadata;
+use crate::record::{
+    decode_envelope, decode_record, encode_envelope, history_stream,
+    mint_timestamped_id,
+};
 use crate::store::{Store, Write};
 use crate::traits::NonUniqueStruct;
 use crate::u48::U48;
-use crate::wire::{from_wire, to_wire};
 
-/// Bytes before the wire body: the `STRUCT_HASH` head.
-const ENVELOPE_PREFIX: usize = 8;
-
-/// Process-wide counter salting minted record ids, so two records minted in
-/// the same nanosecond still get distinct ids.
-static RECORD_SALT: AtomicU64 = AtomicU64::new(0);
-
-/// Serialise a value as a stored record: `[hash (8 B LE)][WaveWire bytes]`.
-fn encode_envelope<V: crate::wire::WaveWire>(hash: u64, value: &V) -> Vec<u8> {
-    let mut out = hash.to_le_bytes().to_vec();
-    out.extend_from_slice(&to_wire(value));
-    out
-}
-
-/// Decode a stored record, verifying its `STRUCT_HASH` head first.
-///
-/// # Errors
-/// [`Error::UnknownStructHash`] if the head is not `hash` (or the value is
-/// shorter than the head); [`Error::Wire`] if the body fails to decode.
-fn decode_envelope<V: crate::wire::WaveWire>(
-    hash: u64,
-    bytes: &[u8],
-) -> Result<V> {
-    let head: [u8; ENVELOPE_PREFIX] = bytes
-        .get(..ENVELOPE_PREFIX)
-        .and_then(|s| s.try_into().ok())
-        .ok_or(Error::UnknownStructHash(0))?;
-    let got = u64::from_le_bytes(head);
-    if got != hash {
-        return Err(Error::UnknownStructHash(got));
-    }
-    Ok(from_wire::<V>(&bytes[ENVELOPE_PREFIX..])?)
-}
-
-/// Mint a fresh timestamp-keyed id under `tenant`: `KEY = CREATED_AT` (nanos),
-/// `FLAG = 0` (the record namespace), and a per-process counter salt so ids
-/// minted in the same nanosecond stay distinct.
-fn mint_timestamped_id(tenant: U48) -> Id {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    let salt = (RECORD_SALT.fetch_add(1, Ordering::Relaxed) & 0x7FFF) as u16;
-    Id::new(nanos, tenant, false, salt)
-}
-
-// ---- Unique anchors -----------------------------------------------------------
-
-/// Fetch a `Unique` record from its anchor (`KEY = STRUCT_HASH`, `FLAG = 1`,
-/// `SALT = 0`) under `tenant`. `None` = never saved.
-///
-/// # Errors
-/// Propagates a [`Store`] failure or a decode fault.
-pub async fn get_unique<T, S>(store: &S, tenant: U48) -> Result<Option<T>>
-where
-    T: crate::traits::WaveDbStruct,
-    S: Store,
-{
-    let anchor = Id::new(T::STRUCT_HASH, tenant, true, 0);
-    match store.get_of(T::STRUCT_HASH, anchor).await? {
-        Some(bytes) => Ok(Some(decode_envelope(T::STRUCT_HASH, &bytes)?)),
-        None => Ok(None),
-    }
-}
-
-/// Save (insert-or-overwrite) a `Unique` record at its anchor under `tenant`.
-/// `save` **is** the upsert — `Unique` types have no separate create.
-///
-/// # Errors
-/// Propagates a [`Store`] failure.
-pub async fn save_unique<T, S>(store: &S, tenant: U48, value: &T) -> Result<()>
-where
-    T: crate::traits::WaveDbStruct,
-    S: Store,
-{
-    let anchor = Id::new(T::STRUCT_HASH, tenant, true, 0);
-    let record = encode_envelope(T::STRUCT_HASH, value);
-    store.apply(&[Write::Put(anchor, record)]).await
-}
+// The `#[wavedb]` macro reaches the Unique-anchor ops through this module's
+// path; the implementation lives with the envelope in [`crate::record`].
+pub use crate::record::{get_unique, save_unique, unique_history};
 
 // ---- Collection ---------------------------------------------------------------
 
@@ -169,32 +99,69 @@ impl<T: NonUniqueStruct> Collection<T> {
         self
     }
 
+    /// The tenant this handle is scoped to.
+    pub(crate) const fn tenant(&self) -> U48 {
+        self.tenant
+    }
+
     /// A tree handle at `root` with this collection's capacities.
-    fn tree(&self, root: LocalId) -> BpTree {
+    pub(crate) fn tree(&self, root: LocalId) -> BpTree {
         BpTree::at(root, self.tenant)
             .with_caps(self.leaf_cap, self.internal_cap)
     }
 
-    /// Create a new, empty collection under `tenant`: two empty B+trees
-    /// (`current` + `dead`) and the `Pivot` record pointing at them, committed
-    /// in one atomic batch. Returns the pivot's `LocalId` — the caller stores
-    /// it (via the generated `{Name}PivotId`) in an owning record.
+    /// A secondary-index tree handle at `root` with the same capacities.
+    pub(crate) fn sec_tree(&self, root: LocalId) -> BpTree<SecKey> {
+        BpTree::at(root, self.tenant)
+            .with_caps(self.leaf_cap, self.internal_cap)
+    }
+
+    /// The secondary-index trees this pivot declares, in declaration order.
+    pub(crate) fn sec_trees(&self, pivot: &T::Pivot) -> Vec<BpTree<SecKey>> {
+        pivot
+            .secondaries()
+            .iter()
+            .map(|root| self.sec_tree(*root))
+            .collect()
+    }
+
+    /// Secondary index `i`'s key for `value` stored at `id`.
+    pub(crate) fn sec_key(value: &T, i: usize, id: Id) -> SecKey {
+        SecKey {
+            field: value.secondary_key(i),
+            rec: LocalId::from_id(id),
+        }
+    }
+
+    /// Create a new, empty collection under `tenant`: the `current` + `dead`
+    /// B+trees, one secondary tree per `#[wavedb::pivot(...)]`, and the
+    /// `Pivot` record pointing at them all, committed in one atomic batch.
+    /// Returns the pivot's `LocalId` — the caller stores it (via the generated
+    /// `{Name}PivotId`) in an owning record.
     ///
     /// # Errors
     /// Propagates a [`Store`] failure.
     pub async fn create<S: Store>(store: &S, tenant: U48) -> Result<LocalId> {
-        let (current, current_write) = BpTree::plan_create(tenant);
-        let (dead, dead_write) = BpTree::plan_create(tenant);
-        let pivot_record =
-            T::Pivot::default().replace_roots(current.root(), dead.root());
+        let (current, current_write) = BpTree::<LocalId>::plan_create(tenant);
+        let (dead, dead_write) = BpTree::<LocalId>::plan_create(tenant);
+        let mut batch = vec![current_write, dead_write];
+        let mut sec_roots = Vec::with_capacity(T::NUM_SECONDARIES);
+        for _ in 0..T::NUM_SECONDARIES {
+            let (tree, write) = BpTree::<SecKey>::plan_create(tenant);
+            sec_roots.push(tree.root());
+            batch.push(write);
+        }
+        let pivot_record = T::Pivot::default().replace_roots(
+            current.root(),
+            dead.root(),
+            &sec_roots,
+        );
         let pivot_id = mint_timestamped_id(tenant);
-        let pivot_write = Write::Put(
+        batch.push(Write::Put(
             pivot_id,
             encode_envelope(T::Pivot::STRUCT_HASH, &pivot_record),
-        );
-        store
-            .apply(&[current_write, dead_write, pivot_write])
-            .await?;
+        ));
+        store.apply(&batch).await?;
         Ok(LocalId::from_id(pivot_id))
     }
 
@@ -205,7 +172,10 @@ impl<T: NonUniqueStruct> Collection<T> {
     }
 
     /// Load and decode the `Pivot` record.
-    async fn load_pivot<S: Store>(&self, store: &S) -> Result<T::Pivot> {
+    pub(crate) async fn load_pivot<S: Store>(
+        &self,
+        store: &S,
+    ) -> Result<T::Pivot> {
         let bytes = store
             .get_of(T::Pivot::STRUCT_HASH, self.pivot.to_id(self.tenant))
             .await?
@@ -214,60 +184,25 @@ impl<T: NonUniqueStruct> Collection<T> {
     }
 
     /// A `Put` rewriting the `Pivot` record with moved roots.
-    fn pivot_rewrite(&self, pivot: &T::Pivot) -> Write {
+    pub(crate) fn pivot_rewrite(&self, pivot: &T::Pivot) -> Write {
         Write::Put(
             self.pivot.to_id(self.tenant),
             encode_envelope(T::Pivot::STRUCT_HASH, pivot),
         )
     }
 
-    /// Insert `value` as a new record: mints its timestamp-keyed [`Id`] (the
-    /// stable identity for the record's whole life), writes the record, indexes
-    /// it in `current`, and rewrites the `Pivot` if the root moved — one atomic
-    /// batch. Returns the minted `Id`.
-    ///
-    /// # Errors
-    /// Propagates a [`Store`] failure, [`Error::PivotMissing`] on a stale
-    /// handle, or a decode fault on a corrupt pivot.
-    pub async fn insert<S: Store>(&self, store: &S, value: &T) -> Result<Id> {
-        let pivot = self.load_pivot(store).await?;
-        let mut current = self.tree(pivot.current());
-
-        let id = mint_timestamped_id(self.tenant);
-        let mut batch =
-            vec![Write::Put(id, encode_envelope(T::STRUCT_HASH, value))];
-        batch.extend(current.plan_insert(store, id).await?);
-        if current.root() != pivot.current() {
-            let moved = pivot.replace_roots(current.root(), pivot.dead());
-            batch.push(self.pivot_rewrite(&moved));
-        }
-        store.apply(&batch).await?;
-        Ok(id)
-    }
-
-    /// Remove the record at `id` from the living set: de-indexes it from
-    /// `current` and indexes it in `dead` — one atomic batch. The record
-    /// **bytes stay** (history stays navigable); only `remove` ever writes the
-    /// `dead` tree. Returns whether the record was in `current`.
-    ///
-    /// # Errors
-    /// Propagates a [`Store`] failure, [`Error::PivotMissing`] on a stale
-    /// handle, or a decode fault on a corrupt pivot.
-    pub async fn remove<S: Store>(&self, store: &S, id: Id) -> Result<bool> {
-        let pivot = self.load_pivot(store).await?;
-        let mut current = self.tree(pivot.current());
-        let mut dead = self.tree(pivot.dead());
-
-        let Some(mut batch) = current.plan_remove(store, id).await? else {
-            return Ok(false);
-        };
-        batch.extend(dead.plan_insert(store, id).await?);
-        if current.root() != pivot.current() || dead.root() != pivot.dead() {
-            let moved = pivot.replace_roots(current.root(), dead.root());
-            batch.push(self.pivot_rewrite(&moved));
-        }
-        store.apply(&batch).await?;
-        Ok(true)
+    /// Load and decode the record at `id` (metadata + body), failing if it is
+    /// gone.
+    pub(crate) async fn load_record<S: Store>(
+        &self,
+        store: &S,
+        id: Id,
+    ) -> Result<(Metadata, T)> {
+        let bytes = store
+            .get_of(T::STRUCT_HASH, id)
+            .await?
+            .ok_or(Error::RecordMissing(id))?;
+        decode_record(T::STRUCT_HASH, &bytes)
     }
 
     /// Fetch and decode the record at `id`. `None` = no such record. Resolves
@@ -279,28 +214,58 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// that resolves to a different type's record).
     pub async fn get<S: Store>(&self, store: &S, id: Id) -> Result<Option<T>> {
         match store.get_of(T::STRUCT_HASH, id).await? {
-            Some(bytes) => Ok(Some(decode_envelope(T::STRUCT_HASH, &bytes)?)),
+            Some(bytes) => Ok(Some(decode_record(T::STRUCT_HASH, &bytes)?.1)),
             None => Ok(None),
         }
     }
 
-    /// Overwrite the record at `id` with `value` — the NonUnique *update*. The
-    /// `Id` (and so the record's place in `current`) is unchanged, so no
-    /// reindex is needed. The caller supplies an `id` it got from
-    /// [`insert`](Self::insert) or a walk; writing to a never-inserted `id`
-    /// stores an unindexed orphan.
-    ///
-    /// # Errors
-    /// Propagates a [`Store`] failure.
-    pub async fn save<S: Store>(
+    /// Stream the record at `id`'s versions **newest-first**: the live
+    /// version, then each archived one along the modification chain that
+    /// [`save`](Self::save) maintains. Saving never destroys old bytes — this
+    /// is the walk over them.
+    pub fn history<'a, S: Store>(
         &self,
-        store: &S,
+        store: &'a S,
         id: Id,
-        value: &T,
-    ) -> Result<()> {
-        store
-            .apply(&[Write::Put(id, encode_envelope(T::STRUCT_HASH, value))])
-            .await
+    ) -> impl Stream<Item = Result<(Metadata, T)>> + 'a
+    where
+        T: 'a,
+    {
+        history_stream::<T, S>(store, T::STRUCT_HASH, id, self.tenant)
+    }
+
+    /// Stream the living records secondary index `index` selects under
+    /// `bound` (a bound over the index's [`IndexKey`](crate::index::IndexKey)
+    /// encoding — `Exact` for one value, `Prefix`/`Range` for scans), resolved
+    /// two-phase like [`search`](Self::search). Ordered by the indexed field.
+    /// The generated `by_<field>` wrappers call this with the field's exact
+    /// encoding.
+    pub fn search_by<'a, S: Store>(
+        &self,
+        store: &'a S,
+        index: usize,
+        bound: Bound,
+    ) -> impl Stream<Item = Result<(Id, T)>> + 'a
+    where
+        T: 'a,
+    {
+        let handle = *self;
+        futures::stream::once(async move {
+            let pivot = handle.load_pivot(store).await?;
+            let root = *pivot
+                .secondaries()
+                .get(index)
+                .ok_or(Error::SecondaryIndexOutOfRange(index))?;
+            Ok::<_, Error>(handle.sec_tree(root).search(store, bound))
+        })
+        .try_flatten()
+        .and_then(move |id| async move {
+            let bytes = store
+                .get_of(T::STRUCT_HASH, id)
+                .await?
+                .ok_or(Error::RecordMissing(id))?;
+            Ok((id, decode_record::<T>(T::STRUCT_HASH, &bytes)?.1))
+        })
     }
 
     /// Stream the living records whose `CREATED_AT` falls in `bound`, in
@@ -326,7 +291,7 @@ impl<T: NonUniqueStruct> Collection<T> {
                 .get_of(T::STRUCT_HASH, id)
                 .await?
                 .ok_or(Error::RecordMissing(id))?;
-            Ok((id, decode_envelope::<T>(T::STRUCT_HASH, &bytes)?))
+            Ok((id, decode_record::<T>(T::STRUCT_HASH, &bytes)?.1))
         })
     }
 
@@ -393,7 +358,12 @@ mod tests {
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
-        fn replace_roots(&self, current: LocalId, dead: LocalId) -> Self {
+        fn replace_roots(
+            &self,
+            current: LocalId,
+            dead: LocalId,
+            _secondaries: &[LocalId],
+        ) -> Self {
             Self {
                 current,
                 dead,
@@ -404,6 +374,70 @@ mod tests {
 
     impl NonUniqueStruct for Doc {
         type Pivot = DocPivot;
+    }
+
+    // A record with one secondary index (on `label`) — exactly the shape the
+    // macro generates for `#[wavedb::pivot(label)]`.
+    #[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
+    struct Tagged {
+        label: String,
+        n: u64,
+    }
+
+    impl WaveDbStruct for Tagged {
+        const STRUCT_HASH: u64 = 0x7A6_0001;
+        const SHAPE: Shape = Shape::NonUnique;
+        type PivotId = ();
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
+    struct TaggedPivot {
+        current: LocalId,
+        dead: LocalId,
+        secondaries: [LocalId; 1],
+        permission: Option<PermissionRef>,
+    }
+
+    impl Pivot for TaggedPivot {
+        const STRUCT_HASH: u64 = 0x7A6_0002;
+        fn current(&self) -> LocalId {
+            self.current
+        }
+        fn dead(&self) -> LocalId {
+            self.dead
+        }
+        fn secondaries(&self) -> &[LocalId] {
+            &self.secondaries
+        }
+        fn permission(&self) -> Option<&PermissionRef> {
+            self.permission.as_ref()
+        }
+        fn replace_roots(
+            &self,
+            current: LocalId,
+            dead: LocalId,
+            secondaries: &[LocalId],
+        ) -> Self {
+            let mut s = self.secondaries;
+            s.copy_from_slice(secondaries);
+            Self {
+                current,
+                dead,
+                secondaries: s,
+                permission: self.permission.clone(),
+            }
+        }
+    }
+
+    impl NonUniqueStruct for Tagged {
+        type Pivot = TaggedPivot;
+        const NUM_SECONDARIES: usize = 1;
+        fn secondary_key(&self, index: usize) -> Vec<u8> {
+            match index {
+                0 => crate::index::IndexKey::key_bytes(&self.label),
+                _ => Vec::new(),
+            }
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
@@ -525,6 +559,203 @@ mod tests {
             let empty: Vec<(crate::id::Id, Doc)> =
                 reopened.all(&store).try_collect().await.unwrap();
             assert!(empty.is_empty());
+        });
+    }
+
+    // Saving never destroys old bytes: each save archives the superseded
+    // version and links the chain; `history` walks it newest-first, and the
+    // forward pointers land where the design says.
+    #[test]
+    fn save_archives_versions_and_history_walks() {
+        block_on(async {
+            let store = MemStore::default();
+            let pivot =
+                Collection::<Doc>::create(&store, tenant()).await.unwrap();
+            let col = Collection::<Doc>::at(pivot, tenant());
+
+            let id = col.insert(&store, &Doc { n: 1 }).await.unwrap();
+            col.save(&store, id, &Doc { n: 2 }).await.unwrap();
+            col.save(&store, id, &Doc { n: 3 }).await.unwrap();
+
+            let versions: Vec<(crate::metadata::Metadata, Doc)> =
+                col.history(&store, id).try_collect().await.unwrap();
+            assert_eq!(
+                versions.iter().map(|(_, d)| d.n).collect::<Vec<_>>(),
+                vec![3, 2, 1],
+                "history must walk newest-first"
+            );
+
+            // Chain shape: live → a2 → a1; forward links a1 → a2 → (live).
+            let (live_meta, _) = &versions[0];
+            let (v2_meta, _) = &versions[1];
+            let (v1_meta, _) = &versions[2];
+            let a2 = live_meta.old_modification_id.expect("live chains back");
+            assert!(live_meta.new_modification_id.is_none(), "live = None");
+            assert_eq!(
+                live_meta.pivot_id,
+                Some(pivot),
+                "insert stamps the pivot back-link, saves carry it"
+            );
+            assert!(
+                v2_meta.new_modification_id.is_none(),
+                "newest archive's successor is the live record"
+            );
+            assert_eq!(
+                v1_meta.new_modification_id,
+                Some(a2),
+                "older archive forward-links the archive that superseded it"
+            );
+            assert!(v1_meta.old_modification_id.is_none(), "first version");
+
+            // The live read is unaffected; `get` still yields the value only.
+            assert_eq!(col.get(&store, id).await.unwrap(), Some(Doc { n: 3 }));
+        });
+    }
+
+    // Unique anchors chain the same way through save_unique/unique_history.
+    #[test]
+    fn unique_save_chains_and_history_walks() {
+        use crate::record::unique_history;
+
+        block_on(async {
+            let store = MemStore::default();
+            // Never saved: empty history, no error.
+            let none: Vec<(crate::metadata::Metadata, Settings)> =
+                unique_history(&store, tenant())
+                    .try_collect()
+                    .await
+                    .unwrap();
+            assert!(none.is_empty());
+
+            for volume in [1u64, 2, 3] {
+                save_unique(&store, tenant(), &Settings { volume })
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                get_unique::<Settings, _>(&store, tenant()).await.unwrap(),
+                Some(Settings { volume: 3 })
+            );
+            let versions: Vec<(crate::metadata::Metadata, Settings)> =
+                unique_history(&store, tenant())
+                    .try_collect()
+                    .await
+                    .unwrap();
+            assert_eq!(
+                versions.iter().map(|(_, s)| s.volume).collect::<Vec<_>>(),
+                vec![3, 2, 1]
+            );
+            assert!(versions[0].1.volume == 3);
+            assert!(versions.last().unwrap().0.old_modification_id.is_none());
+        });
+    }
+
+    // The whole secondary-index lifecycle over the derived-equivalent shape:
+    // insert indexes, save re-keys only changed fields, remove de-indexes,
+    // duplicates coexist, root moves land in the rewritten pivot.
+    #[test]
+    fn secondary_index_lifecycle() {
+        use crate::index::IndexKey;
+
+        async fn by_label(
+            col: Collection<Tagged>,
+            store: &MemStore,
+            label: &str,
+        ) -> Vec<u64> {
+            let mut ns: Vec<u64> = col
+                .search_by(
+                    store,
+                    0,
+                    crate::index::Bound::Exact(label.key_bytes()),
+                )
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, t)| t.n)
+                .collect();
+            ns.sort_unstable();
+            ns
+        }
+
+        block_on(async {
+            let store = MemStore::default();
+            let pivot = Collection::<Tagged>::create(&store, tenant())
+                .await
+                .unwrap();
+            let col = Collection::<Tagged>::at(pivot, tenant()).with_caps(4, 4);
+
+            let mut ids = Vec::new();
+            for (label, n) in
+                [("red", 1u64), ("blue", 2), ("red", 3), ("green", 4)]
+            {
+                let t = Tagged {
+                    label: label.into(),
+                    n,
+                };
+                ids.push(col.insert(&store, &t).await.unwrap());
+            }
+            assert_eq!(by_label(col, &store, "red").await, vec![1, 3]);
+            assert_eq!(by_label(col, &store, "blue").await, vec![2]);
+
+            // save with a changed field re-keys that index.
+            col.save(
+                &store,
+                ids[0],
+                &Tagged {
+                    label: "blue".into(),
+                    n: 1,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(by_label(col, &store, "red").await, vec![3]);
+            assert_eq!(by_label(col, &store, "blue").await, vec![1, 2]);
+
+            // save with the field unchanged only rewrites the record.
+            col.save(
+                &store,
+                ids[1],
+                &Tagged {
+                    label: "blue".into(),
+                    n: 22,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(by_label(col, &store, "blue").await, vec![1, 22]);
+
+            // remove de-indexes the record from its secondary too.
+            assert!(col.remove(&store, ids[2]).await.unwrap());
+            assert_eq!(by_label(col, &store, "red").await, Vec::<u64>::new());
+
+            // Undeclared index = typed error, not a panic.
+            let err = col
+                .search_by(&store, 1, crate::index::Bound::All)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::SecondaryIndexOutOfRange(1)));
+
+            // Enough inserts to split the secondary tree's root; a fresh
+            // handle (same PivotId) sees them through the rewritten pivot.
+            for n in 0..40u64 {
+                col.insert(
+                    &store,
+                    &Tagged {
+                        label: "bulk".into(),
+                        n,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let fresh =
+                Collection::<Tagged>::at(pivot, tenant()).with_caps(4, 4);
+            assert_eq!(
+                by_label(fresh, &store, "bulk").await,
+                (0..40).collect::<Vec<u64>>()
+            );
         });
     }
 

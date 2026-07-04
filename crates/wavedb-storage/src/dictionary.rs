@@ -28,6 +28,8 @@
 
 use wavedb_core::wire::{from_wire_checked, to_wire_checked};
 
+use crate::block::{BLOCK_SIZE, BlockAllocator, BlockDescriptor};
+use crate::block_file::BlockFile;
 use crate::error::{StorageError, StorageResult};
 
 /// Per-run prefix: `payload_len (u32)`.
@@ -121,9 +123,127 @@ impl Dictionary {
     }
 }
 
+/// One type's whole compression state.
+///
+/// The policy (on/off, fixed per type at compile time), the append-only
+/// [`Dictionary`], and the block run it is persisted in. This is the third
+/// slot of a type's `StructStorage` static — compression is per-type, so its
+/// state lives with the type.
+#[derive(Debug)]
+pub struct DictState {
+    enabled: bool,
+    dict: Dictionary,
+    desc: BlockDescriptor,
+}
+
+impl DictState {
+    /// Fresh state. `enabled = false` never samples, never persists a run —
+    /// that type's pages are always stored `Raw`.
+    #[must_use]
+    pub const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            dict: Dictionary::new(),
+            desc: BlockDescriptor::EMPTY,
+        }
+    }
+
+    /// Whether this type's pages run through zstd at all.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// The dictionary itself (what pages (de)compress against).
+    #[must_use]
+    pub const fn dictionary(&self) -> &Dictionary {
+        &self.dict
+    }
+
+    /// The block run the dictionary is persisted in
+    /// ([`BlockDescriptor::EMPTY`] while nothing has been sampled).
+    #[must_use]
+    pub const fn descriptor(&self) -> BlockDescriptor {
+        self.desc
+    }
+
+    /// Warm the dictionary with a settling record (append-only, capped) and —
+    /// when the buffer actually grew — re-persist it to its own block run:
+    /// allocate + write the new run, repoint, then free the old one (the same
+    /// crash-safe ordering pages use). A disabled state is a no-op.
+    ///
+    /// # Errors
+    /// Propagates a write fault from persisting the grown buffer.
+    pub fn warm(
+        &mut self,
+        record: &[u8],
+        file: &BlockFile,
+        alloc: &mut BlockAllocator,
+    ) -> StorageResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let before = self.dict.len();
+        self.dict.sample(record);
+        if self.dict.len() == before {
+            return Ok(());
+        }
+        let bytes = self.dict.to_bytes();
+        let run = alloc.alloc(bytes.len().div_ceil(BLOCK_SIZE) as u64);
+        file.write_run(run, &bytes)?;
+        let old = self.desc;
+        self.desc = BlockDescriptor::from_run_used(run, bytes.len() as u64);
+        if old.is_allocated() {
+            alloc.free(old.run());
+        }
+        Ok(())
+    }
+
+    /// Drop the sampled buffer and its run pointer, keeping the policy — the
+    /// open path resets before a journal replay rebuilds the same state.
+    pub(crate) fn reset(&mut self) {
+        self.dict = Dictionary::new();
+        self.desc = BlockDescriptor::EMPTY;
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DICT_CAP, Dictionary};
+    use super::{DICT_CAP, DictState, Dictionary};
+    use crate::block::BlockAllocator;
+    use crate::block_file::{BlockFile, RESERVED_BLOCKS};
+
+    // The dictionary lives in `data.bin` too: warming allocates and repoints
+    // its own block run, round-tripping byte-identically; a disabled state
+    // never samples, never allocates.
+    #[test]
+    fn warm_persists_own_run_and_disabled_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let bf = BlockFile::open(dir.path().join("data.bin")).unwrap();
+        let mut alloc = BlockAllocator::new();
+        alloc.alloc(RESERVED_BLOCKS);
+
+        let mut on = DictState::new(true);
+        assert!(!on.descriptor().is_allocated());
+        on.warm(&[0xAB; 100], &bf, &mut alloc).unwrap();
+        assert!(
+            on.descriptor().is_allocated(),
+            "sampling must persist the dictionary"
+        );
+        let stored = Dictionary::from_bytes(
+            &bf.read_run(on.descriptor().run()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.latest(), &[0xAB; 100][..]);
+
+        let mut off = DictState::new(false);
+        off.warm(&[0xCD; 100], &bf, &mut alloc).unwrap();
+        assert!(
+            !off.descriptor().is_allocated(),
+            "compression off ⇒ no dictionary run"
+        );
+        assert!(off.dictionary().is_empty());
+    }
 
     #[test]
     fn samples_append_only_and_cap() {

@@ -38,6 +38,19 @@ pub enum StorageError {
     /// An on-disk structure failed an integrity check on read (crc, bounds, tag).
     #[error("corrupt {0}")]
     Corrupt(&'static str),
+    /// A write named a `STRUCT_HASH` with no registered [`StructStorage`] slot
+    /// — the type was not listed at [`PageStore::open`]. Registration is an
+    /// explicit allowlist (like exposure): unlisted types fail loudly here.
+    ///
+    /// [`StructStorage`]: crate::struct_storage::StructStorage
+    /// [`PageStore::open`]: crate::page_store::PageStore::open
+    #[error("no StructStorage registered for STRUCT_HASH {0:#018x}")]
+    UnregisteredStructHash(u64),
+    /// Another [`PageStore`](crate::page_store::PageStore) is already open in
+    /// this process. The per-struct storage slots are process-global statics,
+    /// so one process drives one store at a time (the node model).
+    #[error("a PageStore is already open in this process")]
+    EngineBusy,
     /// A core/codec fault surfaced inside the engine.
     #[error(transparent)]
     Core(#[from] wavedb_core::Error),
