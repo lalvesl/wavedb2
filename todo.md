@@ -195,15 +195,32 @@ The developer surface — what `examples/todo-app` is written against.
   preprocess) and typed per-command settling are the seams left for M8/later;
   streaming reads (`All`/search over the transport) land with the M4 client
   iterator.
-- **M4 is next** — the developer surface (`Db` + `#[server]`), what
-  `examples/todo-app` is written against. See the M4 section above.
+- **M4 client core — LANDED** (`wavedb` now a member): the `Db` handle
+  (`connect` / `as_tenant` / `tenant`), the typed CRUD surface, and
+  `wavedb::Error` with the `not_found` / `already_exists` / `unauthorized`
+  helpers. Unique `db.get::<T>()` / `db.save(&v)` and NonUnique
+  `db.collection::<T>(pivot)` → `insert` / `get` / `save` / `remove` /
+  `all`, all over HTTP POST into a live node (`tests/client_e2e.rs`). New
+  core markers `UniqueStruct` + `PivotHandle` (macro-emitted) gate the two
+  shapes. Collection walk lands as `Command::All` → buffered `Vec` (streaming
+  frames deferred).
+  - **Spelling note:** the client surface is `db.get::<T>()`, **not** the
+    documented `T::get(&db)` — the macro already emits the `Store`-generic
+    `T::get(store, tenant)` inherent methods, and inherent wins method
+    resolution, so the two can't share a name yet. Unifying them means
+    re-plumbing those inherent methods onto the `__WaveDbDb` generic.
+- **M4 remaining — `#[server]` functions + streaming.** The big piece: a
+  server-side execution context (a node-side `Db` running typed ops against
+  the **local** `PageStore`, not the network), the fn `STRUCT_HASH`
+  composition, the client stub, the in-body auth guard, and streamed returns.
+  The clean target is one `Db<B: Backend>` (client backend = send a frame,
+  server backend = run the core fn) so the same typed surface resolves on
+  both sides. Until this lands, `examples/todo-app` (functions-only) cannot
+  compile.
 - **M2 tail** (`wavedb-storage`) stays open but blocks nothing: the dedicated
   **32 KiB one-node-per-page** BpTree format, **background** settle / rebalance
   + journal checkpointing, per-value heap compression.
-- **Target surface reference:** `examples/todo-app` (workspace-excluded,
-  aspirational) is the M4 acceptance shape — functions-only allowlist, all
-  structs storage-only, `db.as_tenant` bootstrap, profile→pivot path.
 
-_Workspace green: fmt + clippy (pedantic + nursery) clean, 20 test suites,
+_Workspace green: fmt + clippy (pedantic + nursery) clean, 25 test suites,
 file-length gate passing. Members: wire, wire-derive, core, macros, storage,
-net, quick-node, schema-smoke._
+net, quick-node, wavedb, schema-smoke._
