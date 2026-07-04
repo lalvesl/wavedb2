@@ -209,18 +209,34 @@ The developer surface — what `examples/todo-app` is written against.
     `T::get(store, tenant)` inherent methods, and inherent wins method
     resolution, so the two can't share a name yet. Unifying them means
     re-plumbing those inherent methods onto the `__WaveDbDb` generic.
-- **M4 remaining — `#[server]` functions + streaming.** The big piece: a
-  server-side execution context (a node-side `Db` running typed ops against
-  the **local** `PageStore`, not the network), the fn `STRUCT_HASH`
-  composition, the client stub, the in-body auth guard, and streamed returns.
-  The clean target is one `Db<B: Backend>` (client backend = send a frame,
-  server backend = run the core fn) so the same typed surface resolves on
-  both sides. Until this lands, `examples/todo-app` (functions-only) cannot
-  compile.
+- **`#[server]` functions — LANDED.** A function declared once runs on the
+  node against the local store and is called from the client over the wire.
+  The macro emits a fn-type (identity + `__wavedb_dispatch`), the body retyped
+  onto a node-side `ServerDb`, and a client stub; `expose_server!` gains
+  `fn`-marked entries dispatched through the same registry. Proven E2E
+  (`tests/server_fn_e2e.rs`).
+- **M4 remaining refinements:**
+  - **The `T::get(&db)` unification.** Client/server both use `db.get::<T>()`
+    today, not the documented `T::get(&db)` — the macro's inherent
+    `T::get(store, tenant)` wins resolution. Re-plumbing those inherent
+    methods onto a shared `DbHandle` (the `__WaveDbDb` generic; a `LocalHandle`
+    over a `Store`, the client `Db`, and `ServerDb` all implement it) unifies
+    the spelling and lets `examples/todo-app` compile. Touches
+    `generated.rs` / `wavedb_attr.rs` / `exec_ops.rs` + the schema-smoke /
+    storage tests.
+  - **Storage-only registration.** A storage-only type (used inside a
+    `#[server]` body, never wire-exposed) still needs its `StructStorage` slot
+    registered; today only *listed struct* entries register, so it must be
+    listed as a struct entry. Add a `store`-only entry kind to
+    `expose_server!` for the functions-only app shape.
+  - **Streaming returns** (collection-returning fns stream item frames instead
+    of a buffered `Vec`) and the **arg-`STRUCT_HASH`-composed** function
+    identity (today it hashes the signature string).
 - **M2 tail** (`wavedb-storage`) stays open but blocks nothing: the dedicated
   **32 KiB one-node-per-page** BpTree format, **background** settle / rebalance
   + journal checkpointing, per-value heap compression.
 
-_Workspace green: fmt + clippy (pedantic + nursery) clean, 25 test suites,
+_Workspace green: fmt + clippy (pedantic + nursery) clean, 24 test suites,
 file-length gate passing. Members: wire, wire-derive, core, macros, storage,
-net, quick-node, wavedb, schema-smoke._
+net, quick-node, wavedb, schema-smoke. Still excluded: wasm, bench,
+test-cluster, todo-app._
