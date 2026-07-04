@@ -63,6 +63,8 @@ pub enum Reply {
     /// An `All` walk's results: each record's body wire bytes, in
     /// `CREATED_AT` order.
     Values(Vec<Vec<u8>>),
+    /// A `#[server]` function's wire-encoded return value.
+    Returned(Vec<u8>),
 }
 
 /// The declared registry surface.

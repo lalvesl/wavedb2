@@ -749,6 +749,7 @@ dependencies = [
  "wavedb-macros",
  "wavedb-net",
  "wavedb-quick-node",
+ "wavedb-storage",
 ]
 
 [[package]]

@@ -92,4 +92,22 @@ impl Db {
             .await?
             .map_err(Error::Node)
     }
+
+    /// Call a `#[server]` function by its hash, decoding the wire-encoded
+    /// return. The generated client stub is a thin wrapper over this. A
+    /// function ignores the frame `command` (its hash *is* the operation), so
+    /// a filler is sent.
+    ///
+    /// # Errors
+    /// [`Error::Transport`] / [`Error::Node`] on a failed call, or a decode
+    /// fault on the return; [`Error::UnexpectedReply`] if the node did not
+    /// answer with a function return.
+    pub async fn call_fn<R: wavedb_core::WaveWire>(
+        &self,
+        struct_hash: u64,
+        payload: Vec<u8>,
+    ) -> Result<R> {
+        let reply = self.command(struct_hash, Command::Get, payload).await?;
+        crate::reply::returned(reply)
+    }
 }

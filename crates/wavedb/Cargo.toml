@@ -21,6 +21,10 @@ futures.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "sync", "time"] }
 tempfile.workspace = true
+futures.workspace = true
 # End-to-end tests drive a real node with a real schema crate + REGISTRY.
 wavedb-quick-node = { path = "../wavedb-quick-node" }
 schema-smoke = { path = "../../examples/schema-smoke" }
+# The #[server]/#[wavedb]/expose_server! expansions in the server-fn E2E test
+# emit `::wavedb_storage::` paths (the per-type storage slots + registry).
+wavedb-storage = { path = "../wavedb-storage" }

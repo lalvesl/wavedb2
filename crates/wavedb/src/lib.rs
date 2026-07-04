@@ -38,18 +38,24 @@ mod collection;
 mod db;
 mod error;
 mod reply;
+mod server_db;
 mod unique;
 
 pub use collection::ClientCollection;
 pub use db::Db;
 pub use error::{Error, Result};
+pub use server_db::{ServerCollection, ServerDb};
+
+// The compile-time front door, re-exported so a schema crate names one
+// dependency: `wavedb::wavedb` / `wavedb::server` / `wavedb::expose_*!`.
+pub use wavedb_macros::{expose_client, expose_server, server, wavedb};
 
 /// Everything an application touches, in one glob.
 pub mod prelude {
-    pub use crate::{ClientCollection, Db, Error, Result};
+    pub use crate::{ClientCollection, Db, Error, Result, ServerDb};
 
     // The declaration + object macros (one import surface for schema crates).
-    pub use wavedb_macros::{expose_client, expose_server, wavedb};
+    pub use wavedb_macros::{expose_client, expose_server, server, wavedb};
 
     // Core value types and the traits generated code and app code name.
     pub use wavedb_core::{

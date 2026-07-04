@@ -17,6 +17,7 @@ mod exec_ops;
 mod expose;
 mod generated;
 mod secondaries;
+mod server;
 mod storage_statics;
 mod struct_hash;
 mod wavedb_attr;
@@ -74,6 +75,26 @@ pub fn expose_server(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn expose_client(input: TokenStream) -> TokenStream {
     expose::expand_client(input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Turn an `async fn` into a server-only body plus a client call binding.
+///
+/// ```ignore
+/// #[server]                         // login-required (default; guard is M8)
+/// async fn pinned(db: &Db) -> Result<Vec<Note>> { /* runs on the node */ }
+///
+/// #[server(public)]                 // reachable before login
+/// async fn login(db: &Db, user: U48, pw: String) -> Result<Tokens> { /* … */ }
+/// ```
+///
+/// The body's `db` is retyped to the node-side `ServerDb`; the client sees a
+/// stub with the same signature that ships `WaveWire`-encoded args. List the
+/// function in `expose_server!` (as `fn name`) to make it reachable.
+#[proc_macro_attribute]
+pub fn server(attr: TokenStream, item: TokenStream) -> TokenStream {
+    server::expand(attr.into(), item.into())
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }

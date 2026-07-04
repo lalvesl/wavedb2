@@ -30,8 +30,10 @@ const OPS: [&str; 7] = [
     "get", "save", "insert", "update", "remove", "all", "history",
 ];
 
-/// One declared item: its path plus any per-op overrides/exclusions.
+/// One declared item: a struct (with optional per-op overrides) or, when
+/// prefixed with `fn`, a `#[server]` function (uniform dispatch, no overrides).
 struct Entry {
+    is_fn: bool,
     path: Path,
     /// `(op, None)` = excluded (`never`); `(op, Some(path))` = override.
     overrides: Vec<(Ident, Option<Path>)>,
@@ -39,9 +41,19 @@ struct Entry {
 
 impl Parse for Entry {
     fn parse(input: ParseStream) -> syn::Result<Self> {
+        let is_fn = input.peek(Token![fn]);
+        if is_fn {
+            input.parse::<Token![fn]>()?;
+        }
         let path: Path = input.parse()?;
         let mut overrides = Vec::new();
         if input.peek(syn::token::Brace) {
+            if is_fn {
+                return Err(input.error(
+                    "a `fn` entry takes no per-op overrides — its hash is \
+                     the whole operation",
+                ));
+            }
             let inner;
             braced!(inner in input);
             for pair in
@@ -50,7 +62,11 @@ impl Parse for Entry {
                 overrides.push((pair.op, pair.target));
             }
         }
-        Ok(Self { path, overrides })
+        Ok(Self {
+            is_fn,
+            path,
+            overrides,
+        })
     }
 }
 
@@ -117,13 +133,77 @@ fn op_call(entry: &Entry, op: &str) -> TokenStream {
     }
 }
 
+/// The `STRUCT_HASH` expression for an entry (structs read it off
+/// `WaveDbStruct`, `#[server]` fn-types carry it inherently).
+fn hash_expr(entry: &Entry) -> TokenStream {
+    let path = &entry.path;
+    if entry.is_fn {
+        quote!(#path::STRUCT_HASH)
+    } else {
+        quote!(<#path as ::wavedb_core::WaveDbStruct>::STRUCT_HASH)
+    }
+}
+
+/// The `StorageRegistry` impl for `ServerRegistry` — native only, flattening
+/// each listed struct's `storage_entries()` (functions hold no storage; the
+/// reserved BpTree-node slot is added by `PageStore::open`).
+fn storage_registry_impl(struct_paths: &[&Path]) -> TokenStream {
+    quote! {
+        #[cfg(not(target_arch = "wasm32"))]
+        impl ::wavedb_storage::StorageRegistry for ServerRegistry {
+            fn storage_entries(
+                &self,
+            ) -> ::std::vec::Vec<&'static ::wavedb_storage::StructStorage>
+            {
+                let mut slots = ::std::vec::Vec::new();
+                #(
+                    slots.extend_from_slice(&#struct_paths::storage_entries());
+                )*
+                slots
+            }
+        }
+    }
+}
+
 /// Expand `expose_server!`: the full [`Exposure`] impl + `REGISTRY`.
 pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
     let decl: Declaration = syn::parse2(input)?;
-    let paths: Vec<&Path> = decl.entries.iter().map(|e| &e.path).collect();
+    let struct_paths: Vec<&Path> = decl
+        .entries
+        .iter()
+        .filter(|e| !e.is_fn)
+        .map(|e| &e.path)
+        .collect();
+    let hashes: Vec<TokenStream> = decl.entries.iter().map(hash_expr).collect();
+    let storage_impl = storage_registry_impl(&struct_paths);
+
+    let decode_arms = decl.entries.iter().map(|entry| {
+        let path = &entry.path;
+        let h = hash_expr(entry);
+        if entry.is_fn {
+            // A function payload is an args tuple, not a struct body — the
+            // header gate only proves the hash is served.
+            quote!(h if h == #h => ::core::result::Result::Ok(()),)
+        } else {
+            quote! {
+                h if h == #h => {
+                    ::wavedb_core::expose::decode_check::<#path>(bytes)
+                }
+            }
+        }
+    });
 
     let execute_arms = decl.entries.iter().map(|entry| {
         let path = &entry.path;
+        let h = hash_expr(entry);
+        if entry.is_fn {
+            return quote! {
+                h if h == #h => {
+                    #path::__wavedb_dispatch(store, tenant, command, payload)
+                        .await
+                }
+            };
+        }
         let ops = OPS.iter().map(|op| {
             let variant =
                 format_ident!("{}{}", op[..1].to_uppercase(), &op[1..]);
@@ -131,7 +211,7 @@ pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
             quote!(::wavedb_core::expose::Command::#variant => #call,)
         });
         quote! {
-            h if h == <#path as ::wavedb_core::WaveDbStruct>::STRUCT_HASH => {
+            h if h == #h => {
                 match command {
                     #(#ops)*
                 }
@@ -150,8 +230,7 @@ pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
 
         impl ::wavedb_core::expose::Exposure for ServerRegistry {
             fn knows(&self, struct_hash: u64) -> bool {
-                [#(<#paths as ::wavedb_core::WaveDbStruct>::STRUCT_HASH),*]
-                    .contains(&struct_hash)
+                [#(#hashes),*].contains(&struct_hash)
             }
 
             fn decode_check(
@@ -160,11 +239,7 @@ pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
                 bytes: &[u8],
             ) -> ::wavedb_core::Result<()> {
                 match struct_hash {
-                    #(
-                        h if h == <#paths as ::wavedb_core::WaveDbStruct>::STRUCT_HASH => {
-                            ::wavedb_core::expose::decode_check::<#paths>(bytes)
-                        }
-                    )*
+                    #(#decode_arms)*
                     other => ::core::result::Result::Err(
                         ::wavedb_core::Error::UnknownStructHash(other),
                     ),
@@ -191,25 +266,7 @@ pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
             }
         }
 
-        // The storage half of the registry: the `StructStorage` slots the
-        // node registers at `PageStore::open`. Native only — the wasm client
-        // has no page engine (IndexedDB), and `#[wavedb]` omits the slots
-        // there. Flattens each listed type's `storage_entries()` (record +
-        // any generated Pivot); the reserved BpTree-node slot is added by
-        // `PageStore::open`.
-        #[cfg(not(target_arch = "wasm32"))]
-        impl ::wavedb_storage::StorageRegistry for ServerRegistry {
-            fn storage_entries(
-                &self,
-            ) -> ::std::vec::Vec<&'static ::wavedb_storage::StructStorage>
-            {
-                let mut slots = ::std::vec::Vec::new();
-                #(
-                    slots.extend_from_slice(&#paths::storage_entries());
-                )*
-                slots
-            }
-        }
+        #storage_impl
     })
 }
 
@@ -227,7 +284,20 @@ pub fn expand_client(input: TokenStream) -> syn::Result<TokenStream> {
             ));
         }
     }
-    let paths: Vec<&Path> = decl.entries.iter().map(|e| &e.path).collect();
+    let hashes: Vec<TokenStream> = decl.entries.iter().map(hash_expr).collect();
+    let decode_arms = decl.entries.iter().map(|entry| {
+        let path = &entry.path;
+        let h = hash_expr(entry);
+        if entry.is_fn {
+            quote!(h if h == #h => ::core::result::Result::Ok(()),)
+        } else {
+            quote! {
+                h if h == #h => {
+                    ::wavedb_core::expose::decode_check::<#path>(bytes)
+                }
+            }
+        }
+    });
 
     Ok(quote! {
         /// The client-side allowlist `expose_client!` declared: which items
@@ -240,8 +310,7 @@ pub fn expand_client(input: TokenStream) -> syn::Result<TokenStream> {
 
         impl ::wavedb_core::expose::Exposure for ClientRegistry {
             fn knows(&self, struct_hash: u64) -> bool {
-                [#(<#paths as ::wavedb_core::WaveDbStruct>::STRUCT_HASH),*]
-                    .contains(&struct_hash)
+                [#(#hashes),*].contains(&struct_hash)
             }
 
             fn decode_check(
@@ -250,11 +319,7 @@ pub fn expand_client(input: TokenStream) -> syn::Result<TokenStream> {
                 bytes: &[u8],
             ) -> ::wavedb_core::Result<()> {
                 match struct_hash {
-                    #(
-                        h if h == <#paths as ::wavedb_core::WaveDbStruct>::STRUCT_HASH => {
-                            ::wavedb_core::expose::decode_check::<#paths>(bytes)
-                        }
-                    )*
+                    #(#decode_arms)*
                     other => ::core::result::Result::Err(
                         ::wavedb_core::Error::UnknownStructHash(other),
                     ),

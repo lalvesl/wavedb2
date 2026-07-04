@@ -63,3 +63,15 @@ pub fn values<T: WaveWire>(reply: Reply) -> Result<Vec<T>> {
         _ => Err(Error::UnexpectedReply),
     }
 }
+
+/// A `#[server]` function's reply → its decoded return value.
+pub fn returned<R: WaveWire>(reply: Reply) -> Result<R> {
+    match reply {
+        Reply::Returned(bytes) => {
+            let value =
+                from_wire::<R>(&bytes).map_err(wavedb_core::Error::from)?;
+            Ok(value)
+        }
+        _ => Err(Error::UnexpectedReply),
+    }
+}
