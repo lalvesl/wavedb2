@@ -9,12 +9,12 @@ members = [
   "crates/wavedb-core",
   "crates/wavedb-macros",
   "crates/wavedb-storage",
+  "crates/wavedb-net",
+  "crates/wavedb-quick-node",
   "examples/schema-smoke",
 ]
 exclude = [
   "crates/wavedb",
-  "crates/wavedb-quick-node",
-  "crates/wavedb-net",
   "crates/wavedb-wasm",
   "crates/wavedb-bench",
   "crates/wavedb-test-cluster",

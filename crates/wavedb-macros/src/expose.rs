@@ -186,6 +186,26 @@ pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
                 }
             }
         }
+
+        // The storage half of the registry: the `StructStorage` slots the
+        // node registers at `PageStore::open`. Native only — the wasm client
+        // has no page engine (IndexedDB), and `#[wavedb]` omits the slots
+        // there. Flattens each listed type's `storage_entries()` (record +
+        // any generated Pivot); the reserved BpTree-node slot is added by
+        // `PageStore::open`.
+        #[cfg(not(target_arch = "wasm32"))]
+        impl ::wavedb_storage::StorageRegistry for ServerRegistry {
+            fn storage_entries(
+                &self,
+            ) -> ::std::vec::Vec<&'static ::wavedb_storage::StructStorage>
+            {
+                let mut slots = ::std::vec::Vec::new();
+                #(
+                    slots.extend_from_slice(&#paths::storage_entries());
+                )*
+                slots
+            }
+        }
     })
 }
 

@@ -135,6 +135,28 @@ impl StructStorage {
     }
 }
 
+/// The storage half of a node registry — the [`StructStorage`] slots a node
+/// must register at [`PageStore::open`].
+///
+/// `expose_server!` emits this impl for its zero-sized `ServerRegistry`
+/// (native targets only), flattening every listed type's
+/// `storage_entries()`. So a node's `.registry(REGISTRY)` alone carries both
+/// halves: the dispatch surface ([`Exposure`]) *and* the storage surface —
+/// declared once, not discovered.
+///
+/// The reserved [`BPTREE_NODE_STORAGE`] slot is **not** returned here;
+/// [`PageStore::open`] adds it automatically.
+///
+/// [`Exposure`]: wavedb_core::expose::Exposure
+/// [`PageStore::open`]: crate::page_store::PageStore::open
+pub trait StorageRegistry {
+    /// The slots for every declared type (record + any generated Pivot),
+    /// flattened into one registry list for [`PageStore::open`].
+    ///
+    /// [`PageStore::open`]: crate::page_store::PageStore::open
+    fn storage_entries(&self) -> Vec<&'static StructStorage>;
+}
+
 /// The reserved slot every `BpTree` node value settles into.
 ///
 /// Compression off: node pages are rewritten on every index mutation, so zstd

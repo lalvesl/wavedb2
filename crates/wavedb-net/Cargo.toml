@@ -8,39 +8,20 @@ license.workspace = true
 [lints]
 workspace = true
 
-[features]
-default = ["native"]
-# Native (tokio-backed) build — HTTP/WebSocket transports and notification bus.
-native = [
-  "dep:tokio",
-  "dep:tokio-tungstenite",
-  "dep:axum",
-  "dep:reqwest",
-  "dep:futures-util",
-]
-
 [dependencies]
+# Frames wrap the core command/reply surface (Command, Reply, Id, U48).
 wavedb-core = { path = "../wavedb-core" }
-wavedb-macros = { path = "../wavedb-macros" }
+# Direct dep (not just via core): `#[derive(WaveWire)]` expands to absolute
+# `::wavedb_wire::` paths, so any crate deriving it must name the crate itself.
+wavedb-wire.workspace = true
 thiserror.workspace = true
-parking_lot.workspace = true
-bytes.workspace = true
-fastbloom.workspace = true
-hmac.workspace = true
-sha2.workspace = true
-# Native-only transports
-tokio = { workspace = true, optional = true }
-tokio-tungstenite = { workspace = true, optional = true }
-axum = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true }
-futures-util = { workspace = true, optional = true }
+
+# The HTTP POST tunnel is a hand-rolled HTTP/1.1 exchange over a TcpStream:
+# WaveDB uses no HTTP semantics (no headers-as-API, no status codes, no
+# routing), so a full HTTP stack would be dead weight. Native only — the
+# browser build (M5) speaks `fetch` instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
 
 [dev-dependencies]
-tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
-proptest.workspace = true
-criterion.workspace = true
-
-[[bench]]
-name = "network"
-harness = false
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util"] }

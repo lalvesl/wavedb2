@@ -40,8 +40,9 @@ pub enum Command {
     Remove,
 }
 
-/// What an executed command yields, before any transport encoding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What an executed command yields. Derives [`WaveWire`] so the transport
+/// layer ships it verbatim — the node's reply envelope wraps this value.
+#[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
 pub enum Reply {
     /// A `Get`'s result: the record's body wire bytes (`None` = absent).
     Value(Option<Vec<u8>>),
@@ -155,6 +156,23 @@ mod tests {
             Command::Remove,
         ] {
             assert_eq!(from_wire::<Command>(&to_wire(&c)).unwrap(), c);
+        }
+    }
+
+    #[test]
+    fn reply_roundtrips_on_the_wire() {
+        use super::Reply;
+        use crate::id::Id;
+        use crate::u48::U48;
+
+        for r in [
+            Reply::Value(None),
+            Reply::Value(Some(vec![1, 2, 3])),
+            Reply::Inserted(Id::new(7, U48::from(9u32), false, 3)),
+            Reply::Removed(true),
+            Reply::Done,
+        ] {
+            assert_eq!(from_wire::<Reply>(&to_wire(&r)).unwrap(), r);
         }
     }
 

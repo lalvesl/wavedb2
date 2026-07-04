@@ -38,6 +38,6 @@ pub use journal::Journal;
 pub use page::SlotPage;
 pub use page_store::PageStore;
 pub use struct_storage::{
-    BPTREE_NODE_STORAGE, StructDictionary, StructDirectory, StructMemCache,
-    StructStorage,
+    BPTREE_NODE_STORAGE, StorageRegistry, StructDictionary, StructDirectory,
+    StructMemCache, StructStorage,
 };

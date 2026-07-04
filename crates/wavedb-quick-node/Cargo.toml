@@ -12,28 +12,19 @@ workspace = true
 name = "wavedb_quick_node"
 path = "src/lib.rs"
 
-[[bin]]
-name = "wavedb-quick-node"
-path = "src/main.rs"
-
 [dependencies]
+# The node owns the storage engine and dispatches through the core exposure
+# surface; net supplies the request/response envelopes and HTTP framing.
 wavedb-core = { path = "../wavedb-core" }
 wavedb-storage = { path = "../wavedb-storage" }
 wavedb-net = { path = "../wavedb-net" }
-wavedb-macros = { path = "../wavedb-macros" }
-tokio.workspace = true
-parking_lot.workspace = true
-bytes.workspace = true
-futures-util.workspace = true
-axum = { workspace = true, features = ["ws"] }
-clap = { workspace = true }
-reqwest = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros"] }
+thiserror.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
-reqwest = { workspace = true }
-# Schema-aware handle_write tests declare real #[wave_db] structs.
-wavedb = { path = "../wavedb" }
-tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "sync", "time"] }
+futures.workspace = true
+tempfile.workspace = true
+wavedb-net = { path = "../wavedb-net" }
+# Integration tests drive the node with real `#[wavedb]` structs + a REGISTRY.
+schema-smoke = { path = "../../examples/schema-smoke" }

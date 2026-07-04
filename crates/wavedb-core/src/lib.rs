@@ -31,6 +31,7 @@ pub mod id;
 pub mod index;
 pub mod local_id;
 pub mod metadata;
+pub mod overlay;
 pub mod permission;
 pub mod record;
 pub mod store;
