@@ -341,14 +341,14 @@
               name = "fmt";
               runtimeInputs = with pkgs; [
                 rustToolchain
-                nixpkgs-fmt
+                nixfmt
                 taplo
                 prettier
                 jq
               ];
               text = ''
+                nixfmt .
                 cargo fmt --all
-                nixpkgs-fmt .
                 taplo fmt
                 prettier --write "**/*.md"
                 while IFS= read -r -d "" f; do
