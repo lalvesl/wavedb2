@@ -11,11 +11,12 @@
   };
 
   outputs =
-    { self
-    , nixpkgs
-    , flake-utils
-    , rust-overlay
-    , ...
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      rust-overlay,
+      ...
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -221,7 +222,10 @@
           program = "${
             pkgs.writeShellApplication {
               name = "real_example_gui";
-              runtimeInputs = [ rustToolchain pkgs.coreutils ];
+              runtimeInputs = [
+                rustToolchain
+                pkgs.coreutils
+              ];
               text = ''
                 set -euo pipefail
 
@@ -261,7 +265,10 @@
           program = "${
             pkgs.writeShellApplication {
               name = "monitor_gui_demo";
-              runtimeInputs = [ rustToolchain pkgs.coreutils ];
+              runtimeInputs = [
+                rustToolchain
+                pkgs.coreutils
+              ];
               text = ''
                 set -euo pipefail
 
@@ -334,14 +341,14 @@
               name = "fmt";
               runtimeInputs = with pkgs; [
                 rustToolchain
-                nixpkgs-fmt
+                nixfmt
                 taplo
                 prettier
                 jq
               ];
               text = ''
+                nixfmt .
                 cargo fmt --all
-                nixpkgs-fmt .
                 taplo fmt
                 prettier --write "**/*.md"
                 while IFS= read -r -d "" f; do
