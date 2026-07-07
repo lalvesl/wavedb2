@@ -11,12 +11,13 @@
 use std::future::Future;
 use std::rc::Rc;
 
+use tokio::io::AsyncWrite;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{LocalSet, spawn_local};
 use wavedb_core::Store;
-use wavedb_core::expose::Exposure;
+use wavedb_core::expose::{Exposure, Reply};
 use wavedb_core::wire::{from_wire, to_wire};
-use wavedb_net::frame::Request;
+use wavedb_net::frame::{Request, Response, StreamFrame};
 use wavedb_net::http;
 
 use crate::dispatch;
@@ -58,7 +59,7 @@ where
         .await
 }
 
-/// Read one request, dispatch it, write the response.
+/// Read one request, dispatch it, write the framed response.
 async fn serve_connection<E, S>(
     mut sock: TcpStream,
     registry: &E,
@@ -75,11 +76,39 @@ where
     match from_wire::<Request>(&body) {
         Ok(request) => {
             let response = dispatch::handle(registry, store, request).await;
-            http::write_ok(&mut writer, &to_wire(&response)).await?;
+            write_response(&mut writer, response).await?;
         }
         // The envelope itself is malformed — a transport-level client error,
         // not a WaveDB refusal (there is no struct_hash to refuse yet).
         Err(_) => http::write_bad_request(&mut writer).await?,
     }
     Ok(())
+}
+
+/// Write one response as its frame sequence: a `Values` reply (a walk)
+/// unpacks into one `Item` frame per record — flushed as written, so the
+/// client streams them — then an `End`; everything else is a bare `End`.
+///
+/// (The walk itself is still buffered inside `execute` for now; when the
+/// engine goes streaming only this seam's producer changes — the wire and
+/// the clients already speak frames.)
+async fn write_response<W>(
+    w: &mut W,
+    response: Response,
+) -> wavedb_net::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    http::write_ok_head(w).await?;
+    let end = match response {
+        Response::Ok(Reply::Values(entries)) => {
+            for entry in entries {
+                let item = to_wire(&StreamFrame::Item(entry));
+                http::write_frame(w, &item).await?;
+            }
+            Response::Ok(Reply::Done)
+        }
+        other => other,
+    };
+    http::write_frame(w, &to_wire(&StreamFrame::End(end))).await
 }

@@ -4,6 +4,8 @@
 //! expose_server! {
 //!     AboutUser,                                   // full generated op set
 //!     Order { save: audited_save, remove: never }, // per-op override / exclusion
+//!     fn login,                                    // #[server] function
+//!     store Credentials,                           // storage-only: engine slot, no wire
 //! }
 //! ```
 //!
@@ -11,105 +13,22 @@
 //! each arm calling the item's `#[wavedb]`-generated `__wavedb_<op>` step (or
 //! the override path, substituted **inside the arm** at expansion time; a
 //! `never` arm refuses). Static dispatch only — no `dyn`, no fn-pointer
-//! tables, no runtime registration. The server emission implements the full
-//! [`Exposure`] trait (`REGISTRY`); the client one implements only the
-//! reachability half (`CLIENT_REGISTRY`) — typed call stubs arrive with
-//! `#[server]`/`Db` (M4).
+//! tables, no runtime registration. A `store` entry contributes **only** its
+//! `StructStorage` slots to the emitted `StorageRegistry` — the type stays
+//! wire-unaddressable (its hash refuses like one that never existed), which
+//! is the functions-only app shape: every struct storage-only, reached inside
+//! `#[server]` bodies. The server emission implements the full [`Exposure`]
+//! trait (`REGISTRY`); the client one implements only the reachability half
+//! (`CLIENT_REGISTRY`). The declaration grammar lives in
+//! [`crate::expose_parse`].
 //!
 //! [`Exposure`]: wavedb_core::expose::Exposure
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::parse::{Parse, ParseStream};
-use syn::punctuated::Punctuated;
-use syn::{Ident, Path, Token, braced};
+use syn::Path;
 
-/// The per-item ops an entry can override or exclude — one per wire
-/// [`Command`](wavedb_core::expose::Command).
-const OPS: [&str; 7] = [
-    "get", "save", "insert", "update", "remove", "all", "history",
-];
-
-/// One declared item: a struct (with optional per-op overrides) or, when
-/// prefixed with `fn`, a `#[server]` function (uniform dispatch, no overrides).
-struct Entry {
-    is_fn: bool,
-    path: Path,
-    /// `(op, None)` = excluded (`never`); `(op, Some(path))` = override.
-    overrides: Vec<(Ident, Option<Path>)>,
-}
-
-impl Parse for Entry {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let is_fn = input.peek(Token![fn]);
-        if is_fn {
-            input.parse::<Token![fn]>()?;
-        }
-        let path: Path = input.parse()?;
-        let mut overrides = Vec::new();
-        if input.peek(syn::token::Brace) {
-            if is_fn {
-                return Err(input.error(
-                    "a `fn` entry takes no per-op overrides — its hash is \
-                     the whole operation",
-                ));
-            }
-            let inner;
-            braced!(inner in input);
-            for pair in
-                Punctuated::<OpOverride, Token![,]>::parse_terminated(&inner)?
-            {
-                overrides.push((pair.op, pair.target));
-            }
-        }
-        Ok(Self {
-            is_fn,
-            path,
-            overrides,
-        })
-    }
-}
-
-/// `op: never` or `op: path`.
-struct OpOverride {
-    op: Ident,
-    target: Option<Path>,
-}
-
-impl Parse for OpOverride {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let op: Ident = input.parse()?;
-        if !OPS.contains(&op.to_string().as_str()) {
-            return Err(syn::Error::new_spanned(
-                &op,
-                "unknown op; expected one of \
-                 get/save/insert/update/remove/all/history",
-            ));
-        }
-        input.parse::<Token![:]>()?;
-        let target: Path = input.parse()?;
-        let target = if target.is_ident("never") {
-            None
-        } else {
-            Some(target)
-        };
-        Ok(Self { op, target })
-    }
-}
-
-/// The whole declaration: a comma-separated entry list.
-struct Declaration {
-    entries: Vec<Entry>,
-}
-
-impl Parse for Declaration {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let entries = Punctuated::<Entry, Token![,]>::parse_terminated(input)?
-            .into_iter()
-            .collect();
-        Ok(Self { entries })
-    }
-}
+use crate::expose_parse::{Declaration, Entry, Kind, OPS};
 
 /// The call expression for one entry's one op: the generated step, the
 /// override path, or the `never` refusal — resolved at expansion time.
@@ -137,16 +56,61 @@ fn op_call(entry: &Entry, op: &str) -> TokenStream {
 /// `WaveDbStruct`, `#[server]` fn-types carry it inherently).
 fn hash_expr(entry: &Entry) -> TokenStream {
     let path = &entry.path;
-    if entry.is_fn {
+    if entry.kind == Kind::Fn {
         quote!(#path::STRUCT_HASH)
     } else {
         quote!(<#path as ::wavedb_core::WaveDbStruct>::STRUCT_HASH)
     }
 }
 
+/// One `decode_check` arm: a struct body must parse as the declared type; a
+/// function payload is an args tuple, so the header gate only proves the
+/// hash is served.
+fn decode_arm(entry: &Entry) -> TokenStream {
+    let path = &entry.path;
+    let h = hash_expr(entry);
+    if entry.kind == Kind::Fn {
+        quote!(h if h == #h => ::core::result::Result::Ok(()),)
+    } else {
+        quote! {
+            h if h == #h => {
+                ::wavedb_core::expose::decode_check::<#path>(bytes)
+            }
+        }
+    }
+}
+
+/// One `execute` arm: a struct dispatches `match command` over its (possibly
+/// overridden) steps; a function runs its uniform dispatch.
+fn execute_arm(entry: &Entry) -> TokenStream {
+    let path = &entry.path;
+    let h = hash_expr(entry);
+    if entry.kind == Kind::Fn {
+        return quote! {
+            h if h == #h => {
+                #path::__wavedb_dispatch(store, tenant, command, payload)
+                    .await
+            }
+        };
+    }
+    let ops = OPS.iter().map(|op| {
+        let variant = format_ident!("{}{}", op[..1].to_uppercase(), &op[1..]);
+        let call = op_call(entry, op);
+        quote!(::wavedb_core::expose::Command::#variant => #call,)
+    });
+    quote! {
+        h if h == #h => {
+            match command {
+                #(#ops)*
+            }
+        }
+    }
+}
+
 /// The `StorageRegistry` impl for `ServerRegistry` — native only, flattening
-/// each listed struct's `storage_entries()` (functions hold no storage; the
-/// reserved BpTree-node slot is added by `PageStore::open`).
+/// each listed struct **and `store` entry**'s `storage_entries()` (functions
+/// hold no storage; the reserved BpTree-node slot is added by
+/// `PageStore::open`).
 fn storage_registry_impl(struct_paths: &[&Path]) -> TokenStream {
     quote! {
         #[cfg(not(target_arch = "wasm32"))]
@@ -166,58 +130,29 @@ fn storage_registry_impl(struct_paths: &[&Path]) -> TokenStream {
 }
 
 /// Expand `expose_server!`: the full [`Exposure`] impl + `REGISTRY`.
+///
+/// [`Exposure`]: wavedb_core::expose::Exposure
 pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
     let decl: Declaration = syn::parse2(input)?;
+    // Storage flattens structs AND `store` entries; the wire surface (knows /
+    // decode / execute) sees structs and fns only — a `store` type's hash
+    // must refuse exactly like one that never existed.
     let struct_paths: Vec<&Path> = decl
         .entries
         .iter()
-        .filter(|e| !e.is_fn)
+        .filter(|e| e.kind != Kind::Fn)
         .map(|e| &e.path)
         .collect();
-    let hashes: Vec<TokenStream> = decl.entries.iter().map(hash_expr).collect();
+    let wire_entries: Vec<&Entry> = decl
+        .entries
+        .iter()
+        .filter(|e| e.kind != Kind::Store)
+        .collect();
+    let hashes: Vec<TokenStream> =
+        wire_entries.iter().copied().map(hash_expr).collect();
     let storage_impl = storage_registry_impl(&struct_paths);
-
-    let decode_arms = decl.entries.iter().map(|entry| {
-        let path = &entry.path;
-        let h = hash_expr(entry);
-        if entry.is_fn {
-            // A function payload is an args tuple, not a struct body — the
-            // header gate only proves the hash is served.
-            quote!(h if h == #h => ::core::result::Result::Ok(()),)
-        } else {
-            quote! {
-                h if h == #h => {
-                    ::wavedb_core::expose::decode_check::<#path>(bytes)
-                }
-            }
-        }
-    });
-
-    let execute_arms = decl.entries.iter().map(|entry| {
-        let path = &entry.path;
-        let h = hash_expr(entry);
-        if entry.is_fn {
-            return quote! {
-                h if h == #h => {
-                    #path::__wavedb_dispatch(store, tenant, command, payload)
-                        .await
-                }
-            };
-        }
-        let ops = OPS.iter().map(|op| {
-            let variant =
-                format_ident!("{}{}", op[..1].to_uppercase(), &op[1..]);
-            let call = op_call(entry, op);
-            quote!(::wavedb_core::expose::Command::#variant => #call,)
-        });
-        quote! {
-            h if h == #h => {
-                match command {
-                    #(#ops)*
-                }
-            }
-        }
-    });
+    let decode_arms = wire_entries.iter().copied().map(decode_arm);
+    let execute_arms = wire_entries.iter().copied().map(execute_arm);
 
     Ok(quote! {
         /// The node-side registry `expose_server!` declared: exactly the
@@ -283,21 +218,16 @@ pub fn expand_client(input: TokenStream) -> syn::Result<TokenStream> {
                  overrides shape the server surface",
             ));
         }
+        if entry.kind == Kind::Store {
+            return Err(syn::Error::new_spanned(
+                &entry.path,
+                "`store` entries shape the node's storage surface — a \
+                 client registry has no engine to register into",
+            ));
+        }
     }
     let hashes: Vec<TokenStream> = decl.entries.iter().map(hash_expr).collect();
-    let decode_arms = decl.entries.iter().map(|entry| {
-        let path = &entry.path;
-        let h = hash_expr(entry);
-        if entry.is_fn {
-            quote!(h if h == #h => ::core::result::Result::Ok(()),)
-        } else {
-            quote! {
-                h if h == #h => {
-                    ::wavedb_core::expose::decode_check::<#path>(bytes)
-                }
-            }
-        }
-    });
+    let decode_arms = decl.entries.iter().map(decode_arm);
 
     Ok(quote! {
         /// The client-side allowlist `expose_client!` declared: which items

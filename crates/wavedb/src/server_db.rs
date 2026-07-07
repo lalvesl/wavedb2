@@ -1,156 +1,126 @@
 //! `ServerDb` — the node-side execution context a `#[server]` function body
 //! runs against.
 //!
-//! It mirrors the client [`Db`](crate::Db) typed surface (`get` / `save` /
-//! `history` / `collection` / `create_pivot` / `as_tenant`) but resolves every
-//! call **locally**, against the node's `Store`, instead of over the network.
-//! The `#[server]` macro retypes a body's `db: &Db` parameter to
-//! `db: &ServerDb<S>`, so the same body source drives both sides.
+//! It implements [`DbHandle`] over the node's local [`Store`], so the same
+//! generated spelling a client uses — `T::get(db)`, `T::collection(pivot)`,
+//! `col.insert(db, v)` — resolves inside a server body without touching the
+//! network. The `#[server]` macro retypes a body's `db: &Db` parameter to
+//! `db: &ServerDb<S>`, so one body source drives both sides.
+//!
+//! Every op delegates to core's [`LocalHandle`], re-wrapping the error into
+//! the client-facing [`Error`](crate::Error) so a body's `?` and the typed
+//! helpers (`Error::not_found`, …) compose.
 
+use futures::{Stream, TryStreamExt};
 use wavedb_core::{
-    Collection, Id, NonUniqueStruct, PivotHandle, Store, U48, UniqueStruct,
+    Bound, DbHandle, Id, LocalHandle, LocalId, Metadata, NonUniqueStruct,
+    Store, U48, UniqueStruct,
 };
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// A node-side handle: a borrowed [`Store`] plus the bound tenant. Cheap to
-/// re-scope with [`as_tenant`](Self::as_tenant).
+/// re-scope with [`as_tenant`](DbHandle::as_tenant).
 pub struct ServerDb<'a, S> {
-    store: &'a S,
-    tenant: U48,
+    local: LocalHandle<'a, S>,
 }
 
 impl<'a, S: Store> ServerDb<'a, S> {
     /// Wrap a store + tenant as an execution context.
     pub const fn new(store: &'a S, tenant: U48) -> Self {
-        Self { store, tenant }
-    }
-
-    /// The tenant this context is bound to.
-    pub const fn tenant(&self) -> U48 {
-        self.tenant
-    }
-
-    /// The same store, scoped to a different tenant — the cross-tenant seam a
-    /// `register`-style function uses to bootstrap a new tenant's records.
-    #[must_use]
-    pub const fn as_tenant(&self, tenant: U48) -> Self {
         Self {
-            store: self.store,
-            tenant,
-        }
-    }
-
-    /// Fetch this tenant's `Unique` record of type `T`.
-    ///
-    /// # Errors
-    /// A store failure or a decode fault.
-    pub async fn get<T: UniqueStruct>(&self) -> Result<Option<T>> {
-        Ok(
-            wavedb_core::collection::get_unique(self.store, self.tenant)
-                .await?,
-        )
-    }
-
-    /// Save (upsert) this tenant's `Unique` record.
-    ///
-    /// # Errors
-    /// A store failure.
-    pub async fn save<T: UniqueStruct>(&self, value: &T) -> Result<()> {
-        wavedb_core::collection::save_unique(self.store, self.tenant, value)
-            .await?;
-        Ok(())
-    }
-
-    /// This tenant's `Unique` record versions, newest-first.
-    ///
-    /// # Errors
-    /// A store failure or a decode fault.
-    pub async fn history<T: UniqueStruct>(&self) -> Result<Vec<T>> {
-        use futures::TryStreamExt;
-        let versions: Vec<(wavedb_core::Metadata, T)> =
-            wavedb_core::collection::unique_history(self.store, self.tenant)
-                .try_collect()
-                .await?;
-        Ok(versions.into_iter().map(|(_, v)| v).collect())
-    }
-
-    /// Create a new, empty collection of `T` under this tenant, returning its
-    /// handle (store it in an owning record).
-    ///
-    /// # Errors
-    /// A store failure.
-    pub async fn create_pivot<T>(&self) -> Result<T::PivotId>
-    where
-        T: NonUniqueStruct,
-        T::PivotId: PivotHandle,
-    {
-        let root = Collection::<T>::create(self.store, self.tenant).await?;
-        Ok(T::PivotId::from_local_id(root))
-    }
-
-    /// Open the collection of `T` referenced by `pivot`.
-    pub fn collection<T>(&self, pivot: T::PivotId) -> ServerCollection<'a, S, T>
-    where
-        T: NonUniqueStruct,
-        T::PivotId: PivotHandle,
-    {
-        ServerCollection {
-            col: Collection::at(pivot.local_id(), self.tenant),
-            store: self.store,
+            local: LocalHandle::new(store, tenant),
         }
     }
 }
 
-/// A node-side collection handle — the local counterpart of the client's
-/// `ClientCollection`, driving the core [`Collection`] against the store.
-pub struct ServerCollection<'a, S, T: NonUniqueStruct> {
-    col: Collection<T>,
-    store: &'a S,
-}
+impl<S: Store> DbHandle for ServerDb<'_, S> {
+    type Error = Error;
 
-impl<S: Store, T: NonUniqueStruct> ServerCollection<'_, S, T> {
-    /// Insert `value`, returning its stable identity `Id`.
-    ///
-    /// # Errors
-    /// A store failure.
-    pub async fn insert(&self, value: T) -> Result<Id> {
-        Ok(self.col.insert(self.store, &value).await?)
+    fn tenant(&self) -> U48 {
+        self.local.tenant()
     }
 
-    /// Fetch the record at `id`.
-    ///
-    /// # Errors
-    /// A store failure or a decode fault.
-    pub async fn get(&self, id: Id) -> Result<Option<T>> {
-        Ok(self.col.get(self.store, id).await?)
+    fn as_tenant(&self, tenant: U48) -> Self {
+        Self {
+            local: self.local.as_tenant(tenant),
+        }
     }
 
-    /// Update the record at `id` to `value`.
-    ///
-    /// # Errors
-    /// A store failure.
-    pub async fn save(&self, id: Id, value: T) -> Result<()> {
-        self.col.save(self.store, id, &value).await?;
-        Ok(())
+    async fn get_unique<T: UniqueStruct>(&self) -> Result<Option<T>> {
+        Ok(self.local.get_unique().await?)
     }
 
-    /// Remove the record at `id`; returns whether it was in the living set.
-    ///
-    /// # Errors
-    /// A store failure.
-    pub async fn remove(&self, id: Id) -> Result<bool> {
-        Ok(self.col.remove(self.store, id).await?)
+    async fn save_unique<T: UniqueStruct>(&self, value: &T) -> Result<()> {
+        Ok(self.local.save_unique(value).await?)
     }
 
-    /// Every living record, in `CREATED_AT` order.
-    ///
-    /// # Errors
-    /// A store failure or a decode fault.
-    pub async fn all(&self) -> Result<Vec<T>> {
-        use futures::TryStreamExt;
-        let items: Vec<(Id, T)> =
-            self.col.all(self.store).try_collect().await?;
-        Ok(items.into_iter().map(|(_, v)| v).collect())
+    fn unique_history<T: UniqueStruct + 'static>(
+        &self,
+    ) -> impl Stream<Item = Result<(Metadata, T)>> {
+        self.local.unique_history().map_err(Error::from)
+    }
+
+    async fn create_pivot<T: NonUniqueStruct>(&self) -> Result<LocalId> {
+        Ok(self.local.create_pivot::<T>().await?)
+    }
+
+    async fn insert<T: NonUniqueStruct>(
+        &self,
+        pivot: LocalId,
+        value: &T,
+    ) -> Result<Id> {
+        Ok(self.local.insert(pivot, value).await?)
+    }
+
+    async fn get_record<T: NonUniqueStruct>(
+        &self,
+        pivot: LocalId,
+        id: Id,
+    ) -> Result<Option<T>> {
+        Ok(self.local.get_record(pivot, id).await?)
+    }
+
+    async fn update<T: NonUniqueStruct>(
+        &self,
+        pivot: LocalId,
+        id: Id,
+        value: &T,
+    ) -> Result<()> {
+        Ok(self.local.update(pivot, id, value).await?)
+    }
+
+    async fn remove<T: NonUniqueStruct>(
+        &self,
+        pivot: LocalId,
+        id: Id,
+    ) -> Result<bool> {
+        Ok(self.local.remove::<T>(pivot, id).await?)
+    }
+
+    fn all<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+    ) -> impl Stream<Item = Result<T>> {
+        self.local.all(pivot).map_err(Error::from)
+    }
+
+    fn search_by<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+        index: usize,
+        bound: Bound,
+    ) -> impl Stream<Item = Result<T>> {
+        self.local
+            .search_by(pivot, index, bound)
+            .map_err(Error::from)
+    }
+
+    fn record_history<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+        id: Id,
+    ) -> impl Stream<Item = Result<(Metadata, T)>> {
+        self.local.record_history(pivot, id).map_err(Error::from)
     }
 }

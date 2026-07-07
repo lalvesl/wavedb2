@@ -172,6 +172,20 @@ impl<T: WaveWire, const N: usize> WaveWire for [T; N] {
     }
 }
 
+// The unit type: zero bytes both sections — how a `Result<()>`-returning
+// `#[server]` function wires its return.
+impl WaveWire for () {
+    const STACK_SIZE: usize = 0;
+    fn heap_size(&self) -> usize {
+        0
+    }
+    fn encode_stack(&self, _stack: &mut Vec<u8>) {}
+    fn encode_heap(&self, _heap: &mut Vec<u8>) {}
+    fn decode(_stack: &mut Cursor, _heap: &mut Cursor) -> Result<Self> {
+        Ok(())
+    }
+}
+
 macro_rules! wire_tuple {
     ($($name:ident $idx:tt),+) => {
         impl<$($name: WaveWire),+> WaveWire for ($($name,)+) {

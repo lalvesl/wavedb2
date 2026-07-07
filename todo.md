@@ -2,9 +2,11 @@
 
 Clean reimplementation of WaveDB. The docs describe the **target** design;
 everything that has landed is in [`todo_done.md`](todo_done.md). Workspace
-members today: wire, wire-derive, core, macros, storage, schema-smoke.
-Excluded (not built yet): wavedb, wavedb-net, wavedb-quick-node, wavedb-wasm,
-bench, test-cluster, todo-app. Remaining work, bottom-up:
+members today: wire, wire-derive, core, macros, storage, net, quick-node,
+wavedb, schema-smoke, todo-app (schema/server/client). Excluded (not built
+yet): wasm, bench, test-cluster. Remaining work, bottom-up (the task log is
+in [PLAN — M4 completion](#plan--m4-completion) at the end; all tasks
+T1–T7 landed):
 
 ## M2 tail — storage engine optimizations (`wavedb-storage`)
 
@@ -215,28 +217,207 @@ The developer surface — what `examples/todo-app` is written against.
   onto a node-side `ServerDb`, and a client stub; `expose_server!` gains
   `fn`-marked entries dispatched through the same registry. Proven E2E
   (`tests/server_fn_e2e.rs`).
-- **M4 remaining refinements:**
-  - **The `T::get(&db)` unification.** Client/server both use `db.get::<T>()`
-    today, not the documented `T::get(&db)` — the macro's inherent
-    `T::get(store, tenant)` wins resolution. Re-plumbing those inherent
-    methods onto a shared `DbHandle` (the `__WaveDbDb` generic; a `LocalHandle`
-    over a `Store`, the client `Db`, and `ServerDb` all implement it) unifies
-    the spelling and lets `examples/todo-app` compile. Touches
-    `generated.rs` / `wavedb_attr.rs` / `exec_ops.rs` + the schema-smoke /
-    storage tests.
-  - **Storage-only registration.** A storage-only type (used inside a
-    `#[server]` body, never wire-exposed) still needs its `StructStorage` slot
-    registered; today only *listed struct* entries register, so it must be
-    listed as a struct entry. Add a `store`-only entry kind to
-    `expose_server!` for the functions-only app shape.
-  - **Streaming returns** (collection-returning fns stream item frames instead
-    of a buffered `Vec`) and the **arg-`STRUCT_HASH`-composed** function
-    identity (today it hashes the signature string).
+- **M4 COMPLETE (2026-07-06)** — the exit criterion holds: `examples/todo-app`
+  is a workspace member and runs its full flow against a live node (test +
+  real binaries). What landed, one line each (details per task in
+  [PLAN — M4 completion](#plan--m4-completion)): the **`DbHandle` seam**
+  (core trait + `LocalHandle`, T1); the **macro re-plumb** to the unified
+  `T::get(&db)` / `T::collection(pivot)` + `CollectionHandle` spelling (T2);
+  **`Db` + `ServerDb` implementing the trait** and the interim
+  `db.get::<T>()` surfaces deleted (T3); the **`store`-only exposure entry**
+  for storage-only types (T4); **todo-app end-to-end** (T5); **streaming
+  reads + stream-returning `#[server]` fns over framed wire** (T6); the
+  **composed function identity** (`fn_identity::compose`, T7). The PLAN is
+  fully landed — details in `todo_done.md`.
 - **M2 tail** (`wavedb-storage`) stays open but blocks nothing: the dedicated
   **32 KiB one-node-per-page** BpTree format, **background** settle / rebalance
   + journal checkpointing, per-value heap compression.
 
-_Workspace green: fmt + clippy (pedantic + nursery) clean, 24 test suites,
+_Workspace green: fmt + clippy (pedantic + nursery) clean, 29 test suites,
 file-length gate passing. Members: wire, wire-derive, core, macros, storage,
-net, quick-node, wavedb, schema-smoke. Still excluded: wasm, bench,
-test-cluster, todo-app._
+net, quick-node, wavedb, schema-smoke, todo-app (schema/server/client).
+Still excluded: wasm, bench, test-cluster._
+
+# PLAN — M4 completion
+
+The ordered tasks to the M4 exit (**`examples/todo-app` compiles as a
+workspace member and runs its full flow against a live node**), grounded in
+the code as of 2026-07-06. Dependency chain: T1 → T2 → T3 → T5, with T4
+slotting in anywhere after T2; T6/T7 were post-exit refinements. Each task
+lands green (fmt + clippy + tests + file gate) and moves here to
+`todo_done.md` prose when done.
+
+## T1 — core `DbHandle` seam — **DONE (2026-07-06)**
+
+The one trait all three execution contexts implement, so generated methods
+can say `T::get(&db)` regardless of what `db` is.
+
+- [x] New `wavedb-core/src/handle.rs`: trait `DbHandle: Sized` with
+      `type Error: From<core::Error>` (the client's error is richer than
+      core's — an associated error keeps the node/transport variants without
+      polluting `core::Error`), `fn tenant(&self) -> U48`,
+      `fn as_tenant(&self, U48) -> Self` (the `register` bootstrap seam), and
+      the op set: `get_unique<T: UniqueStruct>` / `save_unique` /
+      `unique_history`, `create_pivot<T: NonUniqueStruct>`, and the
+      record ops `insert` / `get_record` / `update` / `remove` / `all` /
+      `search_by` (pivot passed as `LocalId`).
+- [x] Walk-shaped ops (`unique_history`, `all`, `search_by`) return
+      `impl Stream` **in the trait signature** even though the client impl
+      buffers today (wraps its `Vec` in `stream::iter`) — T6 then changes the
+      client's internals, not the surface. They carry `T: 'static` (free:
+      `WaveWire` values are always owned) so the yielded items aren't tied to
+      the handle borrow.
+- [x] `LocalHandle<'a, S: Store>` in the same module: `{ store, tenant }`,
+      `Error = core::Error`, pure delegation to `collection` / `record` fns.
+      This is what core/storage/schema-smoke tests drive.
+- [x] Unit tests: `LocalHandle` behaves identically to the direct core calls
+      (insert/get/save/remove/all + unique round-trip + history).
+- [x] Fallout fix: `Collection`'s read methods (`history` / `search` /
+      `search_by` / `all`) now take `self` by value (the handle is `Copy`) —
+      under edition-2024 RPIT capture rules a borrowed receiver tied the
+      returned stream to a temporary at `T::collection(..).all(store)` call
+      shapes.
+
+## T2 — macro re-plumb onto `DbHandle` — **DONE (2026-07-06)**
+
+Retire the store-based inherent methods; same names, handle-based
+signatures. This is the breaking rename — one commit, all call sites.
+
+- [x] `wavedb_attr.rs` `unique_ops`: `T::get<D: DbHandle>(db: &D) ->
+      Result<Option<Self>, D::Error>`, `value.save(db)`, `T::history(db)`.
+- [x] `generated.rs`: `T::collection(pivot: {N}PivotId) ->
+      CollectionHandle<Self>` (still `const`; **no `db` arg** — the handle
+      is pivot-only and a context parameter with zero semantics was API
+      debt, so the todo-app spelling adjusts by one argument) and
+      `T::create_pivot<D>(db: &D)`. New core `CollectionHandle<T>` (own file
+      `collection_handle.rs`, budget): carries `pivot: LocalId` only;
+      methods take `&D` per call — `col.insert(db, v)`, `col.get(db, id)`,
+      `col.save(db, id, v)`, `col.remove(db, id)`, `col.all(db)`,
+      `col.search_by(db, i, bound)`, `col.history(db, id)` (the trait gained
+      `record_history` for that last one).
+- [x] `secondaries.rs` `by_lookups`: `col.by_username(db, &str)` — the
+      `{Name}Secondaries` trait now implemented for `CollectionHandle<T>`,
+      methods take `&D`, items yield `T` (no `(Id, T)` tuple — walk-shaped
+      ops yield values; ids come from `insert`).
+- [x] `exec_ops.rs` decoupled first: the steps now drive
+      `::wavedb_core::Collection::<#name>::at(pivot, tenant)` directly, so
+      the wire ops never depend on the generated wrappers' shape.
+- [x] Migrated every call site: schema-smoke tests, storage's
+      `nonunique_collection.rs`, the node-side pivot seeding in
+      `node_http.rs` / `client_e2e.rs` — spelling is
+      `T::get(&LocalHandle::new(&store, tenant))` etc.
+- [x] Deliberate non-goal: `record.save(&db)` on a NonUnique **value** (the
+      README's spelling) stays out — a decoded value carries no `Id`, so
+      handle-based `col.save(db, id, v)` is the M4 surface; identity-carrying
+      records are a later design.
+
+## T3 — `Db` + `ServerDb` implement `DbHandle` — **DONE (2026-07-06)**
+
+- [x] `wavedb/src/client_handle.rs` (new): `impl DbHandle for Db`
+      (`Error = wavedb::Error`) — frame sends moved in from
+      `unique.rs` / `collection.rs`; walks fetch the buffered reply then
+      replay as a stream per T1. Wire-less ops (`create_pivot`, `search_by`,
+      `record_history`) refuse with the node's uniform
+      `UnknownStructHash`. New `wire::to_wire_pair(&a, &b)` encodes the
+      `(pivot, value)` / `(id, value)` payload tuples from borrows
+      (byte-identical to the tuple encoding — no `Clone` bound on `T`).
+- [x] `wavedb/src/server_db.rs`: `impl DbHandle for ServerDb<'_, S>`,
+      internally a wrapped `LocalHandle`. `#[server]`'s `&Db → &ServerDb<S>`
+      retyping stays; the generated body now also imports `DbHandle as _`
+      so `db.as_tenant(..)` / `db.tenant()` trait spellings work inside.
+- [x] Retired the interim surfaces: `db.get::<T>()` / `db.save::<T>()` /
+      `db.collection::<T>()` / `ClientCollection` / `ServerCollection`
+      deleted (`unique.rs` / `collection.rs` removed). `prelude` re-exports
+      `DbHandle` + `CollectionHandle`.
+- [x] `tests/client_e2e.rs` + `tests/server_fn_e2e.rs` rewritten to the
+      unified spelling (`AboutUser::get(&db)`, `me.save(db)`,
+      `Note::collection(pivot)` + `col.insert(&db, v)`), proving one body
+      text works against `Db`, `ServerDb`, and `LocalHandle`. The `History`
+      wire entries now carry `(Metadata, T)` pairs (core
+      `unique_history_values` + client `reply::pairs`), so the remote
+      timeline sees the chain, not just bodies.
+
+## T4 — `store`-only exposure entries — **DONE (2026-07-06)**
+
+- [x] `expose.rs`: new entry kind `store Path` (contextual keyword — a
+      struct literally named `store` still parses) — contributes the type's
+      `storage_entries()` to the emitted `StorageRegistry` impl and nothing
+      else (no dispatch arms, `knows` = false, wire refusal unchanged);
+      `expose_client!` rejects `store` entries (no engine client-side).
+      Declaration grammar split into `expose_parse.rs` for the file budget.
+- [x] schema-smoke proof: `store Attachment` — its slot rides
+      `REGISTRY.storage_entries()`, `knows` stays false, and an execute
+      naming its hash refuses `UnknownStructHash` like a type that never
+      existed. (The fn-body read/write over a store-entry engine is T5's
+      todo-app integration.)
+
+## T5 — todo-app end-to-end (the M4 exit) — **DONE (2026-07-06)**
+
+- [x] `examples/todo-app` is in the workspace (three member crates; the
+      nested `[workspace]` and the root `exclude` entry are gone).
+- [x] Schema against the real surface: `expose_server!` lists the six `fn`s
+      + five `store` entries; `complete_todo` uses `col.save(db, id, &todo)`
+      (T2 non-goal); `all_todos` returns `Result<Vec<Todo>>` buffered until
+      T6 (`async_stream` dep dropped); helpers (`ensure_registry`,
+      `get_profile`) are **`DbHandle`-generic** — the seam working as
+      designed; sha256/timestamp auth stays (real auth = M8). New wire-crate
+      impl: `()` is `WaveWire` (zero bytes) so `Result<()>`-returning fns
+      wire their return.
+- [x] Server main = `Server::new(REGISTRY).data_dir(dir).serve(addr)` (the
+      aspirational `QuickNode::builder()` spelling is dead).
+- [x] Client main: `127.0.0.1:7700` over HTTP POST, `U48` tenants,
+      register → login → reconnect-as-tenant → add/list/complete/delete.
+- [x] Integration proof (`examples/todo-app/schema/tests/e2e.rs`, single
+      `#[tokio::test]`, node on its own thread): register + duplicate-name
+      refusal, login + wrong-password refusal via the username secondary,
+      `as_tenant` bootstrap, the profile→pivot path, tenant isolation, and
+      the whole state surviving a node restart. The real server + client
+      binaries also run the printed flow end-to-end.
+- [x] Docs settle: this file's intro/DOING updated; exit recorded in
+      `todo_done.md`.
+
+## T6 — streaming reads over the transport — **DONE (2026-07-06)**
+
+- [x] The response is now a sequence of length-prefixed frames
+      (`[len u32 LE][StreamFrame wire]`; `Item(bytes)* End(Response)`)
+      written progressively into the one POST body — no `content-length`,
+      `connection: close` delimits, no chunked encoding. `http::FrameReader`
+      reads them incrementally; `NetClient::call` (scalar: bare `End`) +
+      `call_stream` (items as the node flushes them; a mid-walk fault
+      arrives as a trailing `Error::Node` after the items already shipped).
+- [x] Node side: `serve` unpacks a `Reply::Values` into one flushed `Item`
+      frame per record + `End`. (`execute` still buffers internally — a
+      later engine change behind the same wire.) Client
+      `DbHandle::all`/`unique_history` decode item frames as they arrive
+      (T1 signatures unchanged — internals only, as designed);
+      `reply::values`/`pairs` deleted.
+- [x] **Stream-returning `#[server]` fns**: `-> impl Stream<Item =
+      Result<T>>` is detected (`server_stream.rs`); the body returns the
+      stream against `ServerDb`, dispatch collects + ships items, and the
+      client stub re-exposes the same async iterator over
+      `Db::call_fn_stream`. The return hashes as its whole shape (a scalar
+      and a stream of the same item are different functions).
+- [x] `all_todos` returns `impl Stream<Item = Result<Todo>>` again — e2e +
+      the real binaries run over the framed wire. Fallout fix:
+      `CollectionHandle`'s stream methods use precise capture
+      (`+ use<'d, D, T>`) so `T::collection(p).all(db)` works on a
+      temporary handle under edition-2024 capture rules.
+
+## T7 — composed function identity — **DONE (2026-07-07)**
+
+- [x] Replaced the signature-string fn hash with the designed composition:
+      `core::fn_identity::compose(name_seed, [arg tags…, return tag])` — an
+      argument `#[wavedb]` struct tags as its `STRUCT_HASH` (macro-emitted
+      `FnArgTag`), so a schema change to it transitively renames every
+      function whose signature carries it. A stream return composes under
+      `STREAM_KIND` (scalar vs stream of the same item = different fns).
+- [x] The `const` composition path: `fn_identity` — a documented distinct
+      const mixer (SplitMix64 folds, **not** seahash: must run in `const`
+      context from other crates' consts; identity-load-bearing all the
+      same, pinned by tests), `FnArgTag` fixed tags for the builtins
+      (`u64`, `String`, `Id`, `U48`, …) and composing impls for
+      `Vec`/`Option`/arrays/tuples. Decision documented at the module head
+      and in `server.rs::composed_identity`.
+- [x] Test `wavedb/tests/fn_identity.rs`: name seed, arg type, arity/order,
+      scalar-vs-stream all separate identities; `Payload::TAG ==
+      Payload::STRUCT_HASH` proves the transitivity contract.

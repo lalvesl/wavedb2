@@ -172,6 +172,23 @@ pub fn to_wire<T: WaveWire>(value: &T) -> Vec<u8> {
     buf
 }
 
+/// Serialise two borrowed values as the tuple `(A, B)`.
+///
+/// Byte-identical to `to_wire(&(a, b))` — a tuple encodes its members' stacks
+/// in order, then their heaps in order — without requiring owned values to
+/// build the tuple.
+#[must_use]
+pub fn to_wire_pair<A: WaveWire, B: WaveWire>(a: &A, b: &B) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(
+        A::STACK_SIZE + B::STACK_SIZE + a.heap_size() + b.heap_size(),
+    );
+    a.encode_stack(&mut buf);
+    b.encode_stack(&mut buf);
+    a.encode_heap(&mut buf);
+    b.encode_heap(&mut buf);
+    buf
+}
+
 /// Deserialise a value from a `[stack][heap]` byte slice.
 ///
 /// No type tag is consulted — the caller picks `T`, and decode just tries to read

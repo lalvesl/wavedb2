@@ -96,7 +96,7 @@ pub fn nonunique_types(
 
     // The per-command execution steps (`__wavedb_<op>`) — defined here,
     // wire-reachable only once listed in an exposure declaration.
-    let exec_steps = exec_ops::nonunique_ops(name, &pivot_id);
+    let exec_steps = exec_ops::nonunique_ops(name);
 
     let pivot_def: syn::DeriveInput = parse_quote! {
         #[repr(C)]
@@ -126,29 +126,28 @@ pub fn nonunique_types(
 
         impl #name {
             /// The typed handle into an existing collection of this type,
-            /// referenced by the `PivotId` an owning record stores.
+            /// referenced by the `PivotId` an owning record stores. Methods
+            /// take the [`DbHandle`](::wavedb_core::DbHandle) per call, so
+            /// one handle value works against every execution context.
             #[must_use]
             pub const fn collection(
                 pivot: #pivot_id,
-                tenant: ::wavedb_core::U48,
-            ) -> ::wavedb_core::Collection<Self> {
-                ::wavedb_core::Collection::at(pivot.local_id(), tenant)
+            ) -> ::wavedb_core::CollectionHandle<Self> {
+                ::wavedb_core::CollectionHandle::at(pivot.local_id())
             }
 
-            /// Create a new, empty collection of this type under `tenant` —
-            /// explicit, never automatic. Store the returned `PivotId` in an
-            /// owning record to keep the collection reachable.
+            /// Create a new, empty collection of this type under the
+            /// context's tenant — explicit, never automatic. Store the
+            /// returned `PivotId` in an owning record to keep the collection
+            /// reachable.
             ///
             /// # Errors
-            /// Propagates a [`Store`](::wavedb_core::Store) failure.
+            /// The context's failure (backend/transport).
             #[allow(clippy::future_not_send)]
-            pub async fn create_pivot<S: ::wavedb_core::Store>(
-                store: &S,
-                tenant: ::wavedb_core::U48,
-            ) -> ::wavedb_core::Result<#pivot_id> {
-                ::wavedb_core::Collection::<Self>::create(store, tenant)
-                    .await
-                    .map(#pivot_id::new)
+            pub async fn create_pivot<D: ::wavedb_core::DbHandle>(
+                db: &D,
+            ) -> ::core::result::Result<#pivot_id, D::Error> {
+                db.create_pivot::<Self>().await.map(#pivot_id::new)
             }
         }
 

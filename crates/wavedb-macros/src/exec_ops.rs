@@ -100,7 +100,11 @@ pub fn unique_ops(name: &Ident) -> TokenStream {
 /// handle-less `update`/`remove` reaches the collection through the record's
 /// `Metadata.pivot_id` back-link), `save` refuses (NonUnique updates ride
 /// `Update`).
-pub fn nonunique_ops(name: &Ident, pivot_id: &Ident) -> TokenStream {
+///
+/// The steps drive the engine-facing `Collection` directly (`Store` in hand)
+/// — never the generated `DbHandle`-based wrappers, so the wrappers' shape
+/// can evolve without touching the wire ops.
+pub fn nonunique_ops(name: &Ident) -> TokenStream {
     let refuse = refuse(name);
     let get = op_fn(
         "get",
@@ -116,7 +120,7 @@ pub fn nonunique_ops(name: &Ident, pivot_id: &Ident) -> TokenStream {
         &quote! {
             let (pivot, value): (::wavedb_core::LocalId, #name) =
                 ::wavedb_core::wire::from_wire(payload)?;
-            let col = #name::collection(#pivot_id::new(pivot), tenant);
+            let col = ::wavedb_core::Collection::<#name>::at(pivot, tenant);
             let id = col.insert(store, &value).await?;
             ::core::result::Result::Ok(
                 ::wavedb_core::expose::Reply::Inserted(id),
@@ -131,7 +135,7 @@ pub fn nonunique_ops(name: &Ident, pivot_id: &Ident) -> TokenStream {
             let pivot =
                 ::wavedb_core::expose::record_pivot::<#name, S>(store, id)
                     .await?;
-            let col = #name::collection(#pivot_id::new(pivot), tenant);
+            let col = ::wavedb_core::Collection::<#name>::at(pivot, tenant);
             col.save(store, id, &value).await?;
             ::core::result::Result::Ok(::wavedb_core::expose::Reply::Done)
         },
@@ -144,7 +148,7 @@ pub fn nonunique_ops(name: &Ident, pivot_id: &Ident) -> TokenStream {
             let pivot =
                 ::wavedb_core::expose::record_pivot::<#name, S>(store, id)
                     .await?;
-            let col = #name::collection(#pivot_id::new(pivot), tenant);
+            let col = ::wavedb_core::Collection::<#name>::at(pivot, tenant);
             let removed = col.remove(store, id).await?;
             ::core::result::Result::Ok(
                 ::wavedb_core::expose::Reply::Removed(removed),

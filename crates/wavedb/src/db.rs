@@ -93,6 +93,33 @@ impl Db {
             .map_err(Error::Node)
     }
 
+    /// Send a walk-shaped command and stream its item frames back as the
+    /// node writes them; each item is one record's wire bytes.
+    ///
+    /// # Errors
+    /// [`Error::Transport`] establishing the exchange; later faults (and a
+    /// node-side refusal, which arrives as the stream's final word) ride
+    /// the stream's items.
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) async fn command_stream(
+        &self,
+        struct_hash: u64,
+        command: Command,
+        payload: Vec<u8>,
+    ) -> Result<impl futures::Stream<Item = Result<Vec<u8>>> + use<>> {
+        use futures::TryStreamExt;
+        let items = self
+            .client
+            .call_stream(self.tenant, struct_hash, command, payload)
+            .await?;
+        // Keep the failure classes apart: a node refusal riding the stream
+        // is `Error::Node`, not a transport fault.
+        Ok(items.map_err(|e| match e {
+            wavedb_net::Error::Node(n) => Error::Node(n),
+            other => Error::Transport(other),
+        }))
+    }
+
     /// Call a `#[server]` function by its hash, decoding the wire-encoded
     /// return. The generated client stub is a thin wrapper over this. A
     /// function ignores the frame `command` (its hash *is* the operation), so
@@ -109,5 +136,16 @@ impl Db {
     ) -> Result<R> {
         let reply = self.command(struct_hash, Command::Get, payload).await?;
         crate::reply::returned(reply)
+    }
+
+    /// Call a **stream-returning** `#[server]` function by its hash,
+    /// decoding each item frame as the node writes it. The generated client
+    /// stub for an `impl Stream`-returning fn is a thin wrapper over this.
+    pub fn call_fn_stream<R: wavedb_core::WaveWire + 'static>(
+        &self,
+        struct_hash: u64,
+        payload: Vec<u8>,
+    ) -> impl futures::Stream<Item = Result<R>> {
+        crate::client_handle::streamed(self, struct_hash, Command::Get, payload)
     }
 }

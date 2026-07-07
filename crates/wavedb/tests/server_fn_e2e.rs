@@ -2,8 +2,8 @@
 //! the node against the local store, called from the client over the wire.
 //!
 //! `set_city` / `get_city` take + return `WaveWire` values; their bodies use
-//! the node-side `db` (a `ServerDb`) to drive typed Unique ops. The client
-//! sees stubs with the same signature.
+//! the **unified generated spelling** (`Profile::get(db)` / `me.save(db)`) —
+//! the same call sites a client or an engine test writes.
 
 #![allow(clippy::future_not_send)]
 
@@ -28,16 +28,16 @@ pub struct Profile {
 /// Set the tenant's city (upsert), returning the stored value.
 #[server]
 pub async fn set_city(db: &Db, city: String) -> Result<String> {
-    let mut me = db.get::<Profile>().await?.unwrap_or_default();
+    let mut me = Profile::get(db).await?.unwrap_or_default();
     me.city = city;
-    db.save(&me).await?;
+    me.save(db).await?;
     Ok(me.city)
 }
 
 /// Read the tenant's city (empty when unset).
 #[server]
 pub async fn get_city(db: &Db) -> Result<String> {
-    let me = db.get::<Profile>().await?.unwrap_or_default();
+    let me = Profile::get(db).await?.unwrap_or_default();
     Ok(me.city)
 }
 

@@ -22,6 +22,8 @@ thiserror.workspace = true
 # browser build (M5) speaks `fetch` instead.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time"] }
+# `call_stream` surfaces a walk's item frames as a `Stream`.
+futures.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "net", "io-util"] }

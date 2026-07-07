@@ -126,6 +126,23 @@ impl Response {
     }
 }
 
+/// One frame of a response body.
+///
+/// Every response is a **sequence** of these (`[len u32 LE][wire]` each):
+/// zero or more [`Item`](Self::Item)s — a walk's records, written as the
+/// node produces them — then exactly one [`End`](Self::End) carrying the
+/// exchange's final word. A scalar command is the degenerate case: no items,
+/// just the `End`. A fault mid-walk ends the stream early with
+/// `End(Err(..))` after the items already shipped.
+#[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
+pub enum StreamFrame {
+    /// One walk item's wire bytes (a record body, or a `(Metadata, body)`
+    /// pair for a history walk).
+    Item(Vec<u8>),
+    /// The final word; nothing follows on the connection.
+    End(Response),
+}
+
 #[cfg(test)]
 mod tests {
     use wavedb_core::expose::{Command, Reply};

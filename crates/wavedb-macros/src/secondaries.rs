@@ -78,8 +78,9 @@ pub fn trait_items(specs: &[ResolvedPivot]) -> TokenStream {
     }
 }
 
-/// The `{Name}Secondaries` trait + its `Collection<{Name}>` impl: one typed
-/// `by_<field>` lookup per declared index.
+/// The `{Name}Secondaries` trait + its `CollectionHandle<{Name}>` impl: one
+/// typed `by_<field>` lookup per declared index, generic over the
+/// [`DbHandle`](wavedb_core::DbHandle) like every collection method.
 pub fn by_lookups(name: &Ident, specs: &[ResolvedPivot]) -> TokenStream {
     if specs.is_empty() {
         return TokenStream::new();
@@ -96,13 +97,13 @@ pub fn by_lookups(name: &Ident, specs: &[ResolvedPivot]) -> TokenStream {
             /// Stream the living records whose indexed field value(s) equal
             /// the given one(s), in index order — resolved two-phase
             /// (index → ids → fetch), like `all`.
-            fn #by<'a, S: ::wavedb_core::Store>(
+            fn #by<D: ::wavedb_core::DbHandle>(
                 &self,
-                store: &'a S,
+                db: &D,
                 #(#params),*
             ) -> impl ::wavedb_core::Stream<
-                Item = ::wavedb_core::Result<(::wavedb_core::Id, #name)>,
-            > + 'a;
+                Item = ::core::result::Result<#name, D::Error>,
+            >;
         }
     });
 
@@ -120,15 +121,15 @@ pub fn by_lookups(name: &Ident, specs: &[ResolvedPivot]) -> TokenStream {
             quote!(::wavedb_core::IndexKey::key_bytes(&(#(#names),*)))
         };
         quote! {
-            fn #by<'a, S: ::wavedb_core::Store>(
+            fn #by<D: ::wavedb_core::DbHandle>(
                 &self,
-                store: &'a S,
+                db: &D,
                 #(#params),*
             ) -> impl ::wavedb_core::Stream<
-                Item = ::wavedb_core::Result<(::wavedb_core::Id, #name)>,
-            > + 'a {
+                Item = ::core::result::Result<#name, D::Error>,
+            > {
                 self.search_by(
-                    store,
+                    db,
                     #i,
                     ::wavedb_core::Bound::Exact(#key_expr),
                 )
@@ -143,7 +144,7 @@ pub fn by_lookups(name: &Ident, specs: &[ResolvedPivot]) -> TokenStream {
             #(#decls)*
         }
 
-        impl #trait_ident for ::wavedb_core::Collection<#name> {
+        impl #trait_ident for ::wavedb_core::CollectionHandle<#name> {
             #(#impls)*
         }
     }

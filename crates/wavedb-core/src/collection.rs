@@ -223,8 +223,11 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// version, then each archived one along the modification chain that
     /// [`save`](Self::save) maintains. Saving never destroys old bytes — this
     /// is the walk over them.
+    // The read methods take `self` by value (the handle is `Copy`): they
+    // return streams, and a borrowed receiver would tie the opaque type to a
+    // temporary when called as `T::collection(..).all(store)`.
     pub fn history<'a, S: Store>(
-        &self,
+        self,
         store: &'a S,
         id: Id,
     ) -> impl Stream<Item = Result<(Metadata, T)>> + 'a
@@ -241,7 +244,7 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// The generated `by_<field>` wrappers call this with the field's exact
     /// encoding.
     pub fn search_by<'a, S: Store>(
-        &self,
+        self,
         store: &'a S,
         index: usize,
         bound: Bound,
@@ -249,7 +252,7 @@ impl<T: NonUniqueStruct> Collection<T> {
     where
         T: 'a,
     {
-        let handle = *self;
+        let handle = self;
         futures::stream::once(async move {
             let pivot = handle.load_pivot(store).await?;
             let root = *pivot
@@ -272,14 +275,14 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// chronological order — the two-phase walk (index → `Id`s → fetch +
     /// decode) fused into one stream.
     pub fn search<'a, S: Store>(
-        &self,
+        self,
         store: &'a S,
         bound: Bound,
     ) -> impl Stream<Item = Result<(Id, T)>> + 'a
     where
         T: 'a,
     {
-        let handle = *self;
+        let handle = self;
         futures::stream::once(async move {
             let pivot = handle.load_pivot(store).await?;
             let tree = handle.tree(pivot.current());
@@ -297,7 +300,7 @@ impl<T: NonUniqueStruct> Collection<T> {
 
     /// Stream every living record in insertion (`CREATED_AT`) order.
     pub fn all<'a, S: Store>(
-        &self,
+        self,
         store: &'a S,
     ) -> impl Stream<Item = Result<(Id, T)>> + 'a
     where

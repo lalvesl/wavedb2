@@ -140,6 +140,13 @@ pub fn expand(
             type PivotId = #pivot_id_ty;
         }
 
+        // As a `#[server]` signature type this struct tags as its own
+        // schema identity — evolving it transitively renames every function
+        // whose signature carries it.
+        impl ::wavedb_core::FnArgTag for #name {
+            const TAG: u64 = #hash;
+        }
+
         #shape_marker
         #storage_slot
         #storage_entries
@@ -149,8 +156,10 @@ pub fn expand(
     })
 }
 
-/// The `Unique` anchor ops: `get` / `save` inherent fns over any `Store`.
-/// `save` **is** the upsert — a `Unique` type has no separate create.
+/// The `Unique` anchor ops: `get` / `save` / `history` inherent fns over any
+/// [`DbHandle`](wavedb_core::DbHandle) — the same spelling resolves against a
+/// `LocalHandle`, the client `Db`, and a node-side `ServerDb`. `save` **is**
+/// the upsert — a `Unique` type has no separate create.
 fn unique_ops(name: &Ident) -> TokenStream {
     quote! {
         impl #name {
@@ -158,14 +167,13 @@ fn unique_ops(name: &Ident) -> TokenStream {
             /// `None` = never saved.
             ///
             /// # Errors
-            /// Propagates a [`Store`](::wavedb_core::Store) failure or a
-            /// decode fault.
+            /// The context's failure (backend/transport) or a decode fault.
             #[allow(clippy::future_not_send)]
-            pub async fn get<S: ::wavedb_core::Store>(
-                store: &S,
-                tenant: ::wavedb_core::U48,
-            ) -> ::wavedb_core::Result<::core::option::Option<Self>> {
-                ::wavedb_core::collection::get_unique(store, tenant).await
+            pub async fn get<D: ::wavedb_core::DbHandle>(
+                db: &D,
+            ) -> ::core::result::Result<::core::option::Option<Self>, D::Error>
+            {
+                db.get_unique::<Self>().await
             }
 
             /// Save (insert-or-overwrite) this tenant's record at its anchor.
@@ -173,29 +181,27 @@ fn unique_ops(name: &Ident) -> TokenStream {
             /// — the timeline stays walkable via [`history`](Self::history).
             ///
             /// # Errors
-            /// Propagates a [`Store`](::wavedb_core::Store) failure.
+            /// The context's failure (backend/transport).
             #[allow(clippy::future_not_send)]
-            pub async fn save<S: ::wavedb_core::Store>(
+            pub async fn save<D: ::wavedb_core::DbHandle>(
                 &self,
-                store: &S,
-                tenant: ::wavedb_core::U48,
-            ) -> ::wavedb_core::Result<()> {
-                ::wavedb_core::collection::save_unique(store, tenant, self).await
+                db: &D,
+            ) -> ::core::result::Result<(), D::Error> {
+                db.save_unique(self).await
             }
 
             /// Stream this tenant's record versions **newest-first** (the
             /// live record, then each archived version along the
             /// modification chain). Empty when never saved.
-            pub fn history<S: ::wavedb_core::Store>(
-                store: &S,
-                tenant: ::wavedb_core::U48,
+            pub fn history<D: ::wavedb_core::DbHandle>(
+                db: &D,
             ) -> impl ::wavedb_core::Stream<
-                Item = ::wavedb_core::Result<(
-                    ::wavedb_core::Metadata,
-                    Self,
-                )>,
-            > + '_ {
-                ::wavedb_core::collection::unique_history(store, tenant)
+                Item = ::core::result::Result<
+                    (::wavedb_core::Metadata, Self),
+                    D::Error,
+                >,
+            > {
+                db.unique_history::<Self>()
             }
         }
     }

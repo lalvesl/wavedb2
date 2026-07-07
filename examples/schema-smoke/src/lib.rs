@@ -16,6 +16,7 @@ expose_server! {
     AboutUser,
     Note,
     billing::Invoice { save: audited_invoice_save, get: never },
+    store Attachment,
 }
 
 expose_client! { AboutUser, Note }
@@ -205,6 +206,17 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(std::ptr::eq(entries[0], Note::struct_storage()));
         assert!(std::ptr::eq(entries[1], NotePivot::struct_storage()));
+
+        // The exposure's StorageRegistry flattens struct entries AND the
+        // `store` entry — Attachment's slot registers with no wire surface.
+        let slots =
+            wavedb_storage::StorageRegistry::storage_entries(&super::REGISTRY);
+        assert!(
+            slots
+                .iter()
+                .any(|s| std::ptr::eq(*s, crate::Attachment::struct_storage())),
+            "`store Attachment` must contribute its engine slot"
+        );
     }
 
     /// `true` when a dispatch refused as an unknown hash.
@@ -232,10 +244,24 @@ mod tests {
             assert!(REGISTRY.knows(AboutUser::STRUCT_HASH));
             assert!(REGISTRY.knows(Invoice::STRUCT_HASH));
             assert!(!REGISTRY.knows(0xDEAD_BEEF));
+            // A `store` entry has NO wire surface: its hash refuses exactly
+            // like a type that never existed, while its engine slots ride
+            // the StorageRegistry (asserted in the native storage test).
             assert!(
                 !REGISTRY.knows(super::Attachment::STRUCT_HASH),
-                "unlisted"
+                "storage-only"
             );
+            assert!(unknown(
+                &REGISTRY
+                    .execute(
+                        &store,
+                        tenant,
+                        super::Attachment::STRUCT_HASH,
+                        Command::Get,
+                        &[],
+                    )
+                    .await
+            ));
 
             // Wire gate: bodies must decode as the declared type.
             let ada = AboutUser {
@@ -380,8 +406,9 @@ mod tests {
         block_on(async {
             let store = mem::MemStore::default();
             let tenant = U48::from(11u32);
-            let pivot = Note::create_pivot(&store, tenant).await.unwrap();
-            let col = Note::collection(pivot, tenant);
+            let db = wavedb_core::LocalHandle::new(&store, tenant);
+            let pivot = Note::create_pivot(&db).await.unwrap();
+            let col = Note::collection(pivot);
 
             // Insert via the wire shape: (pivot LocalId, body).
             let note = Note {
@@ -433,11 +460,12 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let pinned: Vec<(wavedb_core::Id, Note)> =
-                col.by_pinned(&store, &true).try_collect().await.unwrap();
+            let pinned: Vec<Note> =
+                col.by_pinned(&db, &true).try_collect().await.unwrap();
             assert_eq!(
-                pinned.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
-                vec![id]
+                pinned.iter().map(|n| n.pinned).collect::<Vec<_>>(),
+                vec![true],
+                "the update must land in the secondary index"
             );
 
             // Remove moves it out of the living walk.
@@ -454,8 +482,7 @@ mod tests {
                     .unwrap(),
                 Reply::Removed(true)
             );
-            let live: Vec<(wavedb_core::Id, Note)> =
-                col.all(&store).try_collect().await.unwrap();
+            let live: Vec<Note> = col.all(&db).try_collect().await.unwrap();
             assert!(live.is_empty());
         });
     }
@@ -470,21 +497,18 @@ mod tests {
 
         block_on(async {
             let store = mem::MemStore::default();
-            let tenant = U48::from(3u32);
+            let db = wavedb_core::LocalHandle::new(&store, U48::from(3u32));
             for city in ["Rome", "Oslo", "Lima"] {
                 AboutUser {
                     name: "Ada".into(),
                     city: city.into(),
                 }
-                .save(&store, tenant)
+                .save(&db)
                 .await
                 .unwrap();
             }
             let versions: Vec<(wavedb_core::Metadata, AboutUser)> =
-                AboutUser::history(&store, tenant)
-                    .try_collect()
-                    .await
-                    .unwrap();
+                AboutUser::history(&db).try_collect().await.unwrap();
             assert_eq!(
                 versions
                     .iter()
@@ -494,7 +518,7 @@ mod tests {
                 "newest-first timeline"
             );
             assert_eq!(
-                AboutUser::get(&store, tenant).await.unwrap().unwrap().city,
+                AboutUser::get(&db).await.unwrap().unwrap().city,
                 "Lima"
             );
         });
@@ -513,13 +537,13 @@ mod tests {
 
         block_on(async {
             let store = mem::MemStore::default();
-            let tenant = U48::from(7u32);
-            let notes = Note::create_pivot(&store, tenant).await.unwrap();
-            let col = Note::collection(notes, tenant);
+            let db = wavedb_core::LocalHandle::new(&store, U48::from(7u32));
+            let notes = Note::create_pivot(&db).await.unwrap();
+            let col = Note::collection(notes);
 
             let a = col
                 .insert(
-                    &store,
+                    &db,
                     &Note {
                         body: "keep".into(),
                         pinned: true,
@@ -529,7 +553,7 @@ mod tests {
                 .unwrap();
             let b = col
                 .insert(
-                    &store,
+                    &db,
                     &Note {
                         body: "later".into(),
                         pinned: false,
@@ -538,16 +562,16 @@ mod tests {
                 .await
                 .unwrap();
 
-            let pinned: Vec<(wavedb_core::Id, Note)> =
-                col.by_pinned(&store, &true).try_collect().await.unwrap();
-            assert_eq!(
-                pinned.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-                vec![a]
-            );
+            let by_body = |notes: Vec<Note>| {
+                notes.into_iter().map(|n| n.body).collect::<Vec<_>>()
+            };
+            let pinned: Vec<Note> =
+                col.by_pinned(&db, &true).try_collect().await.unwrap();
+            assert_eq!(by_body(pinned), vec!["keep"]);
 
             // save with a changed indexed field re-keys the record.
             col.save(
-                &store,
+                &db,
                 b,
                 &Note {
                     body: "later".into(),
@@ -556,18 +580,15 @@ mod tests {
             )
             .await
             .unwrap();
-            let pinned: Vec<(wavedb_core::Id, Note)> =
-                col.by_pinned(&store, &true).try_collect().await.unwrap();
+            let pinned: Vec<Note> =
+                col.by_pinned(&db, &true).try_collect().await.unwrap();
             assert_eq!(pinned.len(), 2);
 
             // remove de-indexes from the secondary too.
-            assert!(col.remove(&store, a).await.unwrap());
-            let pinned: Vec<(wavedb_core::Id, Note)> =
-                col.by_pinned(&store, &true).try_collect().await.unwrap();
-            assert_eq!(
-                pinned.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-                vec![b]
-            );
+            assert!(col.remove(&db, a).await.unwrap());
+            let pinned: Vec<Note> =
+                col.by_pinned(&db, &true).try_collect().await.unwrap();
+            assert_eq!(by_body(pinned), vec!["later"]);
         });
     }
 
@@ -582,25 +603,22 @@ mod tests {
 
         block_on(async {
             let store = mem::MemStore::default();
-            let tenant = U48::from(42u32);
+            let db = wavedb_core::LocalHandle::new(&store, U48::from(42u32));
 
             // A Unique record holds the collection handle (the owning record).
-            let notes = Note::create_pivot(&store, tenant).await.unwrap();
+            let notes = Note::create_pivot(&db).await.unwrap();
             let about = AboutUser {
                 name: "Ada".into(),
                 city: "London".into(),
             };
-            about.save(&store, tenant).await.unwrap();
-            assert_eq!(
-                AboutUser::get(&store, tenant).await.unwrap(),
-                Some(about)
-            );
+            about.save(&db).await.unwrap();
+            assert_eq!(AboutUser::get(&db).await.unwrap(), Some(about));
 
             // Drive the collection through the typed handle.
-            let col = Note::collection(notes, tenant);
+            let col = Note::collection(notes);
             let a = col
                 .insert(
-                    &store,
+                    &db,
                     &Note {
                         body: "first".into(),
                         pinned: false,
@@ -610,7 +628,7 @@ mod tests {
                 .unwrap();
             let b = col
                 .insert(
-                    &store,
+                    &db,
                     &Note {
                         body: "second".into(),
                         pinned: true,
@@ -619,27 +637,25 @@ mod tests {
                 .await
                 .unwrap();
 
-            let walked: Vec<(wavedb_core::Id, Note)> =
-                col.all(&store).try_collect().await.unwrap();
+            let walked: Vec<Note> = col.all(&db).try_collect().await.unwrap();
             assert_eq!(
-                walked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-                vec![a, b],
+                walked.iter().map(|n| n.body.as_str()).collect::<Vec<_>>(),
+                vec!["first", "second"],
                 "insertion order"
             );
 
             // Update = save at the stable Id; identity never changes.
-            let mut second = walked[1].1.clone();
+            let mut second = walked[1].clone();
             second.pinned = false;
-            col.save(&store, b, &second).await.unwrap();
-            assert_eq!(col.get(&store, b).await.unwrap(), Some(second));
+            col.save(&db, b, &second).await.unwrap();
+            assert_eq!(col.get(&db, b).await.unwrap(), Some(second));
 
             // Remove drops it from the walk; bytes stay (history).
-            assert!(col.remove(&store, a).await.unwrap());
-            let after: Vec<(wavedb_core::Id, Note)> =
-                col.all(&store).try_collect().await.unwrap();
+            assert!(col.remove(&db, a).await.unwrap());
+            let after: Vec<Note> = col.all(&db).try_collect().await.unwrap();
             assert_eq!(after.len(), 1);
-            assert_eq!(after[0].0, b);
-            assert!(col.get(&store, a).await.unwrap().is_some());
+            assert_eq!(after[0].body, "second");
+            assert!(col.get(&db, a).await.unwrap().is_some());
         });
     }
 }

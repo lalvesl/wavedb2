@@ -12,7 +12,9 @@
 //! [`U48`](crate::U48), [`Metadata`](crate::Metadata),
 //! [`PermissionRef`](crate::PermissionRef)) live next to those types.
 
-pub use wavedb_wire::{Cursor, Error, Result, WaveWire, from_wire, to_wire};
+pub use wavedb_wire::{
+    Cursor, Error, Result, WaveWire, from_wire, to_wire, to_wire_pair,
+};
 
 // The crc32-framed checked encoding, behind the same-named `validation`
 // feature (forwarded to `wavedb-wire/validation` in Cargo.toml).

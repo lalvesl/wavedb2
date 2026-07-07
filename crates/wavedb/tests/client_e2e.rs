@@ -1,10 +1,11 @@
-//! M4 end-to-end: the typed `Db` client surface against a live node.
+//! M4 end-to-end: the unified typed surface against a live node.
 //!
-//! Drives the M4 client API — `db.get::<AboutUser>()` / `db.save(&value)` for
-//! Unique, `db.collection::<Note>(pivot)` + `insert`/`get`/`save`/`remove` for
-//! NonUnique — all over HTTP POST into a real `PageStore`. The collection
-//! `Pivot` is seeded node-side (`create_pivot` is not wire-reachable until the
-//! `#[server]` layer lands).
+//! The exact spelling the docs promise — `AboutUser::get(&db)` /
+//! `value.save(&db)` for Unique, `Note::collection(pivot)` +
+//! `col.insert(&db, v)` for NonUnique — driven over HTTP POST into a real
+//! `PageStore`, through the same generated methods engine tests run against a
+//! `LocalHandle`. The collection `Pivot` is seeded node-side (`create_pivot`
+//! is not wire-reachable; apps bootstrap inside `#[server]` bodies).
 
 // The typed client futures hold `&Db` across awaits (non-Send by design on the
 // current-thread test runtime).
@@ -52,9 +53,9 @@ fn start(dir: PathBuf) -> Node {
                 .await
                 .expect("open + bind");
             let addr = bound.local_addr().expect("local addr");
-            let pivot = Note::create_pivot(bound.store(), U48::from(TENANT))
-                .await
-                .expect("seed pivot");
+            let seed =
+                wavedb_core::LocalHandle::new(bound.store(), U48::from(TENANT));
+            let pivot = Note::create_pivot(&seed).await.expect("seed pivot");
             info_tx.send((addr, pivot)).expect("test dropped");
             bound
                 .run_with_shutdown(async move {
@@ -74,7 +75,7 @@ fn start(dir: PathBuf) -> Node {
 }
 
 #[tokio::test]
-async fn typed_db_surface_drives_a_live_node() {
+async fn typed_surface_drives_a_live_node() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
     let node = start(path);
@@ -87,80 +88,114 @@ async fn typed_db_surface_drives_a_live_node() {
     .await
     .expect("connect");
 
-    // ── Unique: get (empty) → save → get (present) ────────────────────────
-    assert_eq!(db.get::<AboutUser>().await.expect("get"), None);
+    unique_phase(&db).await;
+    nonunique_phase(&db, node.pivot).await;
+
+    // ── ops without a wire command refuse uniformly ────────────────────────
+    let err = Note::create_pivot(&db).await.expect_err("must refuse");
+    assert!(
+        matches!(err, Error::Core(wavedb_core::Error::UnknownStructHash(_))),
+        "create_pivot is not wire-reachable: {err}"
+    );
+
+    node.shutdown();
+}
+
+/// Unique: get (empty) → save → upsert → history over the wire.
+async fn unique_phase(db: &Db) {
+    assert_eq!(AboutUser::get(db).await.expect("get"), None);
 
     let mut me = AboutUser {
         name: "Ada".into(),
         city: "London".into(),
     };
-    db.save(&me).await.expect("save");
-    assert_eq!(db.get::<AboutUser>().await.expect("get"), Some(me.clone()));
+    me.save(db).await.expect("save");
+    assert_eq!(AboutUser::get(db).await.expect("get"), Some(me.clone()));
 
     // save is an upsert — a second save overwrites the live record.
     me.city = "Paris".into();
-    db.save(&me).await.expect("resave");
+    me.save(db).await.expect("resave");
     assert_eq!(
-        db.get::<AboutUser>().await.expect("get").unwrap().city,
+        AboutUser::get(db).await.expect("get").unwrap().city,
         "Paris"
     );
 
-    // History walks the version chain newest-first (pillar 3).
-    let versions = db.history::<AboutUser>().await.expect("history");
+    // History walks the version chain newest-first (pillar 3) — with each
+    // version's metadata riding the wire.
+    let versions: Vec<(Metadata, AboutUser)> =
+        AboutUser::history(db).try_collect().await.expect("history");
     assert_eq!(
-        versions.iter().map(|u| u.city.as_str()).collect::<Vec<_>>(),
+        versions
+            .iter()
+            .map(|(_, u)| u.city.as_str())
+            .collect::<Vec<_>>(),
         vec!["Paris", "London"],
         "timeline newest-first"
     );
+    assert!(
+        versions[0].0.new_modification_id.is_none(),
+        "the live version has no successor"
+    );
+}
 
-    // ── NonUnique: insert → get → save(update) → remove ───────────────────
-    let notes = db.collection::<Note>(node.pivot);
+/// NonUnique: insert → get → save(update) → walk → remove.
+async fn nonunique_phase(db: &Db, pivot: NotePivotId) {
+    let notes = Note::collection(pivot);
 
     let id = notes
-        .insert(Note {
-            body: "buy milk".into(),
-            pinned: false,
-        })
+        .insert(
+            db,
+            &Note {
+                body: "buy milk".into(),
+                pinned: false,
+            },
+        )
         .await
         .expect("insert");
-    assert_eq!(notes.get(id).await.expect("get").unwrap().body, "buy milk");
+    assert_eq!(
+        notes.get(db, id).await.expect("get").unwrap().body,
+        "buy milk"
+    );
 
     notes
         .save(
+            db,
             id,
-            Note {
+            &Note {
                 body: "buy milk".into(),
                 pinned: true,
             },
         )
         .await
         .expect("update");
-    assert!(notes.get(id).await.expect("get").unwrap().pinned);
+    assert!(notes.get(db, id).await.expect("get").unwrap().pinned);
 
     // A second insert, then walk the whole collection in insertion order.
     notes
-        .insert(Note {
-            body: "write docs".into(),
-            pinned: false,
-        })
+        .insert(
+            db,
+            &Note {
+                body: "write docs".into(),
+                pinned: false,
+            },
+        )
         .await
         .expect("insert 2");
-    let all = notes.all().await.expect("all");
+    let all: Vec<Note> = notes.all(db).try_collect().await.expect("all");
     assert_eq!(
         all.iter().map(|n| n.body.as_str()).collect::<Vec<_>>(),
         vec!["buy milk", "write docs"],
         "collection walk in CREATED_AT order"
     );
 
-    assert!(notes.remove(id).await.expect("remove"));
+    assert!(notes.remove(db, id).await.expect("remove"));
     // Removing again reports it was no longer in the living set.
-    assert!(!notes.remove(id).await.expect("remove-again"));
+    assert!(!notes.remove(db, id).await.expect("remove-again"));
     // The walk now yields only the survivor.
-    let all = notes.all().await.expect("all after remove");
+    let all: Vec<Note> =
+        notes.all(db).try_collect().await.expect("all after remove");
     assert_eq!(
         all.iter().map(|n| n.body.as_str()).collect::<Vec<_>>(),
         vec!["write docs"]
     );
-
-    node.shutdown();
 }

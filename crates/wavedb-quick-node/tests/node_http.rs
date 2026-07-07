@@ -63,9 +63,9 @@ fn start(dir: PathBuf) -> Node {
                 .expect("open + bind");
             let addr = bound.local_addr().expect("local addr");
             // create_pivot is node-side only in M3 (no server fns yet).
-            let pivot = Note::create_pivot(bound.store(), U48::from(TENANT))
-                .await
-                .expect("seed pivot");
+            let seed =
+                wavedb_core::LocalHandle::new(bound.store(), U48::from(TENANT));
+            let pivot = Note::create_pivot(&seed).await.expect("seed pivot");
             info_tx
                 .send((addr, pivot.local_id()))
                 .expect("test dropped");

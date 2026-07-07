@@ -26,14 +26,9 @@ use syn::{FnArg, GenericArgument, ItemFn, PathArguments, Type, parse2};
 use crate::struct_hash;
 
 /// One argument: its binding pattern and its type.
-struct Arg {
-    pat: Box<syn::Pat>,
-    ty: Box<Type>,
-}
-
-/// Normalise a type to a stable string for the identity hash (whitespace out).
-fn type_string(ty: &Type) -> String {
-    quote!(#ty).to_string().split_whitespace().collect()
+pub struct Arg {
+    pub pat: Box<syn::Pat>,
+    pub ty: Box<Type>,
 }
 
 /// The `Ok` type of a `Result<Ok, …>` return; the whole type otherwise.
@@ -42,6 +37,39 @@ fn ok_type(output: &syn::ReturnType) -> Type {
         return parse2(quote!(())).expect("unit parses");
     };
     result_ok_arg(ty).unwrap_or_else(|| (**ty).clone())
+}
+
+/// The item type `T` of a stream-shaped return
+/// `impl Stream<Item = Result<T>>`, if the return is one. A stream-returning
+/// function ships its items one frame at a time; anything else is a scalar
+/// wired as one `Returned`.
+fn stream_item_type(output: &syn::ReturnType) -> Option<Type> {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return None;
+    };
+    let Type::ImplTrait(imp) = &**ty else {
+        return None;
+    };
+    for bound in &imp.bounds {
+        let syn::TypeParamBound::Trait(t) = bound else {
+            continue;
+        };
+        let seg = t.path.segments.last()?;
+        if seg.ident != "Stream" {
+            continue;
+        }
+        let PathArguments::AngleBracketed(a) = &seg.arguments else {
+            continue;
+        };
+        for arg in &a.args {
+            if let GenericArgument::AssocType(assoc) = arg
+                && assoc.ident == "Item"
+            {
+                return result_ok_arg(&assoc.ty);
+            }
+        }
+    }
+    None
 }
 
 /// The first generic argument of a `Result<…>` type, if `ty` is one.
@@ -90,7 +118,7 @@ fn split_inputs(f: &ItemFn) -> syn::Result<(Box<syn::Pat>, Vec<Arg>)> {
 }
 
 /// `(let-bindings decoding `payload` into the args, the arg idents to pass on)`.
-fn decode_and_forward(args: &[Arg]) -> (TokenStream, Vec<&syn::Pat>) {
+pub fn decode_and_forward(args: &[Arg]) -> (TokenStream, Vec<&syn::Pat>) {
     let pats: Vec<&syn::Pat> = args.iter().map(|a| a.pat.as_ref()).collect();
     let decode = match args.len() {
         0 => quote!(let _ = payload;),
@@ -114,7 +142,7 @@ fn decode_and_forward(args: &[Arg]) -> (TokenStream, Vec<&syn::Pat>) {
 }
 
 /// The client stub's payload expression (args → wire bytes).
-fn encode_payload(args: &[Arg]) -> TokenStream {
+pub fn encode_payload(args: &[Arg]) -> TokenStream {
     let pats = args.iter().map(|a| a.pat.as_ref());
     match args.len() {
         0 => quote!(::std::vec::Vec::new()),
@@ -123,6 +151,46 @@ fn encode_payload(args: &[Arg]) -> TokenStream {
             quote!(::wavedb_core::wire::to_wire(&#p))
         }
         _ => quote!(::wavedb_core::wire::to_wire(&( #(#pats),* ))),
+    }
+}
+
+/// The identity `const` expression:
+/// `compose(name-seed, [arg tags…, return tag])` — an argument object's
+/// `STRUCT_HASH` folds in, so a schema change to it transitively renames the
+/// function. The name seed rides the reserved `fn` discriminator so a
+/// function can't collide with a struct of the same name; a stream return
+/// tags under its own kind (a scalar and a stream of the same item are
+/// different functions).
+fn composed_identity(
+    name: &syn::Ident,
+    args: &[Arg],
+    stream_item: Option<&Type>,
+    ret: &Type,
+) -> TokenStream {
+    let name_seed = struct_hash::compute(&name.to_string(), "fn", &[]);
+    let arg_tags: Vec<TokenStream> = args
+        .iter()
+        .map(|a| {
+            let t = &a.ty;
+            quote!(<#t as ::wavedb_core::FnArgTag>::TAG)
+        })
+        .collect();
+    let ret_tag = stream_item.map_or_else(
+        || quote!(<#ret as ::wavedb_core::FnArgTag>::TAG),
+        |item| {
+            quote! {
+                ::wavedb_core::fn_identity::container(
+                    ::wavedb_core::fn_identity::STREAM_KIND,
+                    <#item as ::wavedb_core::FnArgTag>::TAG,
+                )
+            }
+        },
+    );
+    quote! {
+        ::wavedb_core::fn_identity::compose(
+            #name_seed,
+            &[#(#arg_tags,)* #ret_tag],
+        )
     }
 }
 
@@ -135,23 +203,19 @@ pub fn expand(
     let name = func.sig.ident.clone();
     let vis = func.vis.clone();
     let (db_pat, args) = split_inputs(&func)?;
+    let stream_item = stream_item_type(&func.sig.output);
     let ret = ok_type(&func.sig.output);
+
+    let hash = composed_identity(&name, &args, stream_item.as_ref(), &ret);
+
+    if let Some(item_ty) = stream_item {
+        return Ok(crate::server_stream::expand(
+            &func, &name, &vis, &db_pat, &args, &item_ty, &hash,
+        ));
+    }
+
     let output = func.sig.output.clone();
     let body = func.block;
-
-    // Identity: hash the name, the arg (name, type) pairs, and the return
-    // type, under the reserved `fn` discriminator so it can't collide with a
-    // struct of the same name and fields.
-    let mut fields: Vec<(String, String)> = args
-        .iter()
-        .map(|a| {
-            let pat = &a.pat;
-            (quote!(#pat).to_string(), type_string(&a.ty))
-        })
-        .collect();
-    fields.push(("->".into(), type_string(&ret)));
-    let hash = struct_hash::compute(&name.to_string(), "fn", &fields);
-
     let body_fn = format_ident!("__{}_body", name);
     let (decode, forward) = decode_and_forward(&args);
     let payload = encode_payload(&args);
@@ -164,12 +228,19 @@ pub fn expand(
         .collect();
 
     Ok(quote! {
-        // The server body: the user's block, `db` retyped to the node context.
+        // The server body: the user's block, `db` retyped to the node
+        // context. `DbHandle` is imported so the body may use the trait
+        // spellings (`db.as_tenant(..)`, `db.tenant()`) alongside the
+        // generated inherent ones (`T::get(db)`).
         #[allow(clippy::future_not_send, non_snake_case)]
         async fn #body_fn<S: ::wavedb_core::Store>(
             #db_pat: &::wavedb::ServerDb<'_, S>,
             #(#arg_sig),*
-        ) #output #body
+        ) #output {
+            #[allow(unused_imports)]
+            use ::wavedb_core::DbHandle as _;
+            #body
+        }
 
         // The fn-type: identity + the node dispatch step.
         #[allow(non_camel_case_types)]

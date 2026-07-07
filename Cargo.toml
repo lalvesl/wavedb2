@@ -13,12 +13,14 @@ members = [
   "crates/wavedb-quick-node",
   "crates/wavedb",
   "examples/schema-smoke",
+  "examples/todo-app/schema",
+  "examples/todo-app/server",
+  "examples/todo-app/client",
 ]
 exclude = [
   "crates/wavedb-wasm",
   "crates/wavedb-bench",
   "crates/wavedb-test-cluster",
-  "examples/todo-app",
 ]
 
 [workspace.package]

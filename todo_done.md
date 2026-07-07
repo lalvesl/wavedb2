@@ -1,5 +1,82 @@
 # DONE
 
+- **Streaming wire + composed function identity — T6/T7 (2026-07-06/07)**:
+  the post-M4 refinements, closing the PLAN.
+  - **Framed streaming responses (T6)**: the HTTP response body is a
+    sequence of `[len u32 LE][StreamFrame wire]` frames —
+    `Item(bytes)* End(Response)` — written progressively (no
+    `content-length`; `connection: close` delimits). `http::FrameReader`
+    reads incrementally; `NetClient::call` (scalar = bare `End`) +
+    `call_stream` (a mid-walk fault ships as a trailing `Error::Node`
+    after items already sent). `serve` unpacks `Reply::Values` into one
+    flushed `Item` per record; `execute` still buffers internally — a
+    later engine change behind the same wire. Client `DbHandle::all` /
+    `unique_history` decode frames as they arrive; `reply::values`/`pairs`
+    deleted.
+  - **Stream-returning `#[server]` fns (T6)**: `-> impl Stream<Item =
+    Result<T>>` detected (`server_stream.rs`); the body *returns* the
+    stream against `ServerDb`, dispatch collects and ships items, the
+    client stub re-exposes the same async iterator via
+    `Db::call_fn_stream`. `CollectionHandle` stream methods use precise
+    capture (`+ use<'d, D, T>`) so walks on a temporary handle compile
+    under edition-2024 capture rules.
+  - **Composed function identity (T7)** (`core::fn_identity`): a fn's
+    `STRUCT_HASH` = `compose(name_seed, [arg tags…, return tag])`. The
+    `FnArgTag` trait gives every signature type a `const` 64-bit tag:
+    `#[wavedb]` structs tag as their `STRUCT_HASH` (schema evolution
+    transitively renames the function), builtins carry fixed tags,
+    `Vec`/`Option`/arrays/tuples compose their element's, a stream return
+    composes under `STREAM_KIND` (scalar ≠ stream of the same item). The
+    mixer is a documented distinct `const fn` (SplitMix64 folds — seahash
+    is not `const`); identity-load-bearing, pinned by
+    `wavedb/tests/fn_identity.rs` (name/arg/order/arity/stream-vs-scalar
+    all separate; `Payload::TAG == Payload::STRUCT_HASH`).
+
+- **M4 COMPLETE — the `T::get(&db)` unification + todo-app end-to-end
+  (2026-07-06)**: the documented spelling is real and one body text runs
+  against every execution context.
+  - **core `DbHandle` seam** (`handle.rs`): the trait all three contexts
+    implement — `type Error: From<core::Error>`, `tenant`/`as_tenant`, the
+    full op set (`get_unique`/`save_unique`/`unique_history`,
+    `create_pivot`, `insert`/`get_record`/`update`/`remove`/`all`/
+    `search_by`/`record_history`). Walk-shaped ops return `impl Stream` in
+    the trait signature with `T: 'static` (free — `WaveWire` values are
+    owned), so the buffered M4 client can go streaming later without
+    touching call sites. `LocalHandle<'a, S: Store>` = the engine-local
+    impl. Fallout fix: `Collection`'s read methods take `self` by value
+    (`Copy` handle; edition-2024 RPIT capture rules tied streams to
+    temporaries under `&self`).
+  - **macro re-plumb**: `#[wavedb]` now emits `T::get(&db)` / `value.save(&db)`
+    / `T::history(&db)` (Unique) and `T::collection(pivot) ->
+    CollectionHandle<T>` / `T::create_pivot(&db)` (NonUnique) — all generic
+    over `DbHandle`; `{Name}Secondaries` (`by_<field>(db, ..)`) is
+    implemented for `CollectionHandle`; walk-shaped surfaces yield values
+    (ids come from `insert`). The exec steps decoupled onto
+    `Collection::at` first, so wire ops never depend on the wrappers' shape.
+    Non-goal recorded: `record.save(&db)` on a decoded value stays out (no
+    identity on the value) — `col.save(db, id, v)` is the surface.
+  - **`Db` + `ServerDb` implement `DbHandle`**: the client turns ops into
+    command frames (`to_wire_pair` encodes payload tuples from borrows —
+    byte-identical to tuple encoding, no `Clone` bound); wire-less ops
+    (`create_pivot`, `search_by`, `record_history`) refuse with the uniform
+    `UnknownStructHash`. `ServerDb` wraps a `LocalHandle`; the `#[server]`
+    body gains a `use DbHandle as _` so trait spellings work inside. The
+    interim `db.get::<T>()` / `ClientCollection` / `ServerCollection`
+    surfaces are deleted. `History` wire entries now carry `(Metadata, T)`
+    pairs, so a remote timeline sees the chain.
+  - **`store` exposure entries**: `expose_server! { …, store Credentials }`
+    registers a type's engine slots with **zero** wire surface (hash refuses
+    like a type that never existed); `expose_client!` rejects them. The
+    functions-only app shape needs nothing else.
+  - **todo-app = M4 exit, proven**: three workspace member crates; the six
+    `#[server]` functions are the whole wire API, every struct a `store`
+    entry; helpers are `DbHandle`-generic; `()` gained a `WaveWire` impl for
+    `Result<()>` returns. E2E test: register (+ duplicate refusal via the
+    username secondary), login (+ wrong-password refusal), `as_tenant`
+    bootstrap, profile→pivot todos, tenant isolation, and full state
+    surviving a node restart — plus the real server + client binaries
+    running the printed flow.
+
 - **Exposure (struct surface): `expose_server!` / `expose_client!`** — the
   declared registry is real:
   - **core `expose` module** — `Command` (`Get`/`Save`/`Insert`/`Update`/

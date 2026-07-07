@@ -21,12 +21,13 @@
 //! ```
 //!
 //! **M4 scope.** The transport is HTTP POST (`wavedb-net`); there is no local
-//! write-through cache yet (`Db::open`, M6) and no `#[server]` call stubs yet
-//! (the derive is a separate step). Collection reads are point `get` by `Id`;
-//! streaming walks land with the transport's stream frames. The typed surface
-//! lives on [`Db`] (`db.get::<T>()`) because the macro already emits the
-//! `Store`-generic `T::get(store, tenant)` inherent methods — unifying the two
-//! spellings is a later macro re-plumb.
+//! write-through cache yet (`Db::open`, M6). The typed surface is the
+//! generated one — `T::get(&db)` / `value.save(&db)` for Unique,
+//! `T::collection(pivot)` + `col.insert(&db, v)` for NonUnique — resolved
+//! through the [`DbHandle`](wavedb_core::DbHandle) this crate implements for
+//! [`Db`] (command frames) and [`ServerDb`] (node-local store). Walk-shaped
+//! reads are buffered under the hood; streaming frames are a transport
+//! refinement that won't change the call sites.
 
 // Typed calls hold `&Db` across awaits: their futures are only `Send` when the
 // transport is, which the current-thread client path never requires. The typed
@@ -34,17 +35,15 @@
 // seam, not a `Send`-bounded API. Same stance the core engine seams take.
 #![allow(clippy::future_not_send, async_fn_in_trait)]
 
-mod collection;
+mod client_handle;
 mod db;
 mod error;
 mod reply;
 mod server_db;
-mod unique;
 
-pub use collection::ClientCollection;
 pub use db::Db;
 pub use error::{Error, Result};
-pub use server_db::{ServerCollection, ServerDb};
+pub use server_db::ServerDb;
 
 // The compile-time front door, re-exported so a schema crate names one
 // dependency: `wavedb::wavedb` / `wavedb::server` / `wavedb::expose_*!`.
@@ -52,15 +51,17 @@ pub use wavedb_macros::{expose_client, expose_server, server, wavedb};
 
 /// Everything an application touches, in one glob.
 pub mod prelude {
-    pub use crate::{ClientCollection, Db, Error, Result, ServerDb};
+    pub use crate::{Db, Error, Result, ServerDb};
 
     // The declaration + object macros (one import surface for schema crates).
     pub use wavedb_macros::{expose_client, expose_server, server, wavedb};
 
-    // Core value types and the traits generated code and app code name.
+    // Core value types and the traits generated code and app code name —
+    // `DbHandle` in particular, so `db.as_tenant(..)` and the generated
+    // methods' bounds resolve from the one glob import.
     pub use wavedb_core::{
-        Id, LocalId, Metadata, NonUniqueStruct, PermissionRef, PivotHandle,
-        U48, UniqueStruct, WaveDbStruct, WaveWire,
+        CollectionHandle, DbHandle, Id, LocalId, Metadata, NonUniqueStruct,
+        PermissionRef, PivotHandle, U48, UniqueStruct, WaveDbStruct, WaveWire,
     };
 
     // Collection iterators are async streams.

@@ -2,11 +2,16 @@
 name = "todo-app-client"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+publish = false
+
+[lints]
+workspace = true
 
 [dependencies]
-todo-app-schema.workspace = true
-wavedb.workspace = true
+todo-app-schema = { path = "../schema" }
+wavedb = { path = "../../../crates/wavedb" }
 tokio.workspace = true
-futures.workspace = true
+# Binary-level error reporting (apps aren't layers; anyhow is fine here).
 anyhow = "1"

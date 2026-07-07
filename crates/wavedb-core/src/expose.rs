@@ -158,12 +158,13 @@ where
     Ok(Reply::Values(bodies))
 }
 
-/// Walk a `Unique` record's version chain **newest-first** and buffer each
-/// version's body wire bytes — the shared tail of the generated `History`
-/// step. Empty when the record was never saved.
+/// Walk a `Unique` record's version chain **newest-first**, buffered.
 ///
-/// Buffered like [`all_values`]; the `Metadata` per version is dropped for now
-/// (the wire `Reply` carries bodies only).
+/// Each version rides as the wire tuple `(Metadata, T)` — the shared tail of
+/// the generated `History` step. Empty when the record was never saved.
+///
+/// Buffered like [`all_values`]; each `Values` entry carries the version's
+/// metadata alongside its body so a remote timeline walk sees the chain.
 ///
 /// # Errors
 /// Propagates a [`Store`] failure or a decode fault while walking.
@@ -180,8 +181,8 @@ where
         record::unique_history::<T, S>(store, tenant)
             .try_collect()
             .await?;
-    let bodies = versions.iter().map(|(_, v)| to_wire(v)).collect();
-    Ok(Reply::Values(bodies))
+    let entries = versions.into_iter().map(|pair| to_wire(&pair)).collect();
+    Ok(Reply::Values(entries))
 }
 
 /// The owning `Pivot` back-link stamped in the record at `id`'s metadata —

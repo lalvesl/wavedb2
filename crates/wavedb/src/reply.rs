@@ -50,20 +50,6 @@ pub const fn removed(reply: &Reply) -> Result<bool> {
     }
 }
 
-/// An `All`'s reply → each record's body decoded into `T`.
-pub fn values<T: WaveWire>(reply: Reply) -> Result<Vec<T>> {
-    match reply {
-        Reply::Values(bodies) => bodies
-            .iter()
-            .map(|b| {
-                from_wire::<T>(b)
-                    .map_err(|e| wavedb_core::Error::from(e).into())
-            })
-            .collect(),
-        _ => Err(Error::UnexpectedReply),
-    }
-}
-
 /// A `#[server]` function's reply → its decoded return value.
 pub fn returned<R: WaveWire>(reply: Reply) -> Result<R> {
     match reply {
