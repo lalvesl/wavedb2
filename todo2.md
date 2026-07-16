@@ -1,5 +1,6 @@
 # TODO
 - Permit Send trait on all structs in the project. (this makes more easy the concurrency and multithreading and development);
+- Reduce cache default size to 128MiB;
 
 ## Not Urgent
  - Custom Debug trait for all structs in the project. (making possible hidden all information of internals structs of this project);

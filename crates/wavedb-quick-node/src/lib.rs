@@ -56,6 +56,26 @@ pub use error::{Result, ServerError};
 pub struct Server<E> {
     registry: E,
     data_dir: PathBuf,
+    maintenance: Maintenance,
+}
+
+/// The background maintenance policy: how the node settles, checkpoints,
+/// and bounds its caches while serving.
+#[derive(Debug, Clone, Copy)]
+struct Maintenance {
+    /// Journal bytes that trigger a checkpoint (journal truncates to zero).
+    checkpoint_after_bytes: u64,
+    /// Cache bytes the settle task evicts down to (settled entries only).
+    cache_budget_bytes: usize,
+}
+
+impl Default for Maintenance {
+    fn default() -> Self {
+        Self {
+            checkpoint_after_bytes: 64 * 1024 * 1024, // 64 MiB of journal
+            cache_budget_bytes: 1024 * 1024 * 1024,   // 1 GiB — generous
+        }
+    }
 }
 
 /// A node that has opened its engine and bound its socket — ready to
@@ -65,6 +85,7 @@ pub struct Bound<E> {
     registry: E,
     listener: TcpListener,
     store: Rc<PageStore>,
+    maintenance: Maintenance,
 }
 
 impl<E> Server<E>
@@ -78,6 +99,7 @@ where
         Self {
             registry,
             data_dir: PathBuf::from("data"),
+            maintenance: Maintenance::default(),
         }
     }
 
@@ -85,6 +107,22 @@ where
     #[must_use]
     pub fn data_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.data_dir = dir.into();
+        self
+    }
+
+    /// Checkpoint (persist the pages' metadata and truncate the journal)
+    /// once the journal exceeds `bytes`. Default 64 MiB.
+    #[must_use]
+    pub const fn checkpoint_after_bytes(mut self, bytes: u64) -> Self {
+        self.maintenance.checkpoint_after_bytes = bytes;
+        self
+    }
+
+    /// Evict settled cache entries down to `bytes` (reads then serve from
+    /// the pages). Default 1 GiB.
+    #[must_use]
+    pub const fn cache_budget_bytes(mut self, bytes: usize) -> Self {
+        self.maintenance.cache_budget_bytes = bytes;
         self
     }
 
@@ -101,6 +139,7 @@ where
             registry: self.registry,
             listener,
             store: Rc::new(store),
+            maintenance: self.maintenance,
         })
     }
 
@@ -134,25 +173,59 @@ where
     }
 
     /// Accept and serve connections until the listener faults (runs forever
-    /// under normal operation).
+    /// under normal operation). A background maintenance task settles
+    /// queued writes into pages, checkpoints past the journal threshold,
+    /// and holds the caches to budget.
     ///
     /// # Errors
     /// [`ServerError::Net`] on a fatal accept fault.
     pub async fn run(self) -> Result<()> {
-        serve::run(self.listener, self.registry, self.store, pending()).await?;
-        Ok(())
+        self.run_with_shutdown(pending()).await
     }
 
-    /// Accept and serve connections until `shutdown` resolves, then return
-    /// (dropping the engine, which releases the process-wide store claim).
+    /// Accept and serve connections until `shutdown` resolves, then settle
+    /// and checkpoint (a clean restart replays nothing) and return —
+    /// dropping the engine, which releases the process-wide store claim.
     ///
     /// # Errors
-    /// [`ServerError::Net`] on a fatal accept fault.
+    /// [`ServerError::Net`] on a fatal accept fault; [`ServerError::Storage`]
+    /// if the final checkpoint fails.
     pub async fn run_with_shutdown(
         self,
         shutdown: impl Future<Output = ()>,
     ) -> Result<()> {
-        serve::run(self.listener, self.registry, self.store, shutdown).await?;
+        let store = Rc::clone(&self.store);
+        serve::run(
+            self.listener,
+            self.registry,
+            Rc::clone(&store),
+            maintain(store, self.maintenance),
+            shutdown,
+        )
+        .await?;
+        // Clean shutdown: everything settled + checkpointed, journal empty.
+        self.store.checkpoint()?;
         Ok(())
+    }
+}
+
+/// The background maintenance loop: periodically settle the pending queue,
+/// checkpoint once the journal crosses the threshold, and evict settled
+/// cache entries down to budget. An engine fault stops maintenance (acked
+/// writes stay safe in the journal); serving continues.
+async fn maintain(store: Rc<PageStore>, policy: Maintenance) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        if store.drain().is_err() {
+            return;
+        }
+        if store.journal_len() > policy.checkpoint_after_bytes
+            && store.checkpoint().is_err()
+        {
+            return;
+        }
+        store.evict_settled(policy.cache_budget_bytes);
     }
 }
