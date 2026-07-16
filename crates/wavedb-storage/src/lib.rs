@@ -18,8 +18,10 @@
 // takes with `async_fn_in_trait`.
 #![allow(clippy::future_not_send)]
 
+pub mod alloc;
 pub mod block;
 pub mod block_file;
+mod checkpoint;
 pub mod dictionary;
 pub mod directory;
 mod directory_pages;
@@ -27,6 +29,7 @@ pub mod error;
 pub mod journal;
 pub mod page;
 pub mod page_store;
+mod read_through;
 mod settle;
 pub mod struct_storage;
 

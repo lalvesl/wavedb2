@@ -82,6 +82,19 @@ impl Journal {
         Ok(())
     }
 
+    /// Drop every committed frame — called **after** a checkpoint's
+    /// superblock pointer is durable, so the log restarts empty (the
+    /// checkpoint now carries everything the frames did).
+    ///
+    /// # Errors
+    /// [`StorageError::Io`] if the truncate or sync fails.
+    pub fn truncate(&mut self) -> StorageResult<()> {
+        self.file.set_len(0)?;
+        self.file.sync_all()?;
+        self.end = 0;
+        Ok(())
+    }
+
     /// Read every committed batch back, in append order.
     ///
     /// A torn tail (a frame whose length overruns EOF, or whose crc mismatches —
