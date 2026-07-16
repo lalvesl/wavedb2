@@ -199,6 +199,14 @@ impl DictState {
         Ok(())
     }
 
+    /// Adopt a checkpoint-persisted dictionary and the run it lives in —
+    /// the open-from-checkpoint path, where the buffer is loaded instead of
+    /// re-sampled by replay.
+    pub(crate) fn load(&mut self, dict: Dictionary, desc: BlockDescriptor) {
+        self.dict = dict;
+        self.desc = desc;
+    }
+
     /// Drop the sampled buffer and its run pointer, keeping the policy — the
     /// open path resets before a journal replay rebuilds the same state.
     pub(crate) fn reset(&mut self) {

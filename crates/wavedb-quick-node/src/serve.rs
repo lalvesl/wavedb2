@@ -24,29 +24,39 @@ use crate::dispatch;
 
 /// Serve `store` under `registry` on an already-bound `listener` until either
 /// the `shutdown` future resolves or an accept fault. Each connection is
-/// handled on its own local task (current-thread, no `Send` bound).
+/// handled on its own local task (current-thread, no `Send` bound);
+/// `maintenance` runs alongside on the same [`LocalSet`] (cancelled when
+/// serving stops).
 ///
 /// # Errors
 /// A fatal accept fault (the listener socket broke).
-pub async fn run<E, S, F>(
+pub async fn run<E, S, F, M>(
     listener: TcpListener,
     registry: E,
     store: Rc<S>,
+    maintenance: M,
     shutdown: F,
 ) -> wavedb_net::Result<()>
 where
     E: Exposure + Copy + 'static,
     S: Store + 'static,
     F: Future<Output = ()>,
+    M: Future<Output = ()> + 'static,
 {
     let local = LocalSet::new();
     local
         .run_until(async move {
+            let upkeep = spawn_local(maintenance);
             tokio::pin!(shutdown);
             loop {
                 let sock = tokio::select! {
                     accepted = listener.accept() => accepted?.0,
-                    () = &mut shutdown => return Ok(()),
+                    () = &mut shutdown => {
+                        // Stop maintaining before the caller's final
+                        // drain + checkpoint takes over.
+                        upkeep.abort();
+                        return Ok(());
+                    }
                 };
                 let store = Rc::clone(&store);
                 spawn_local(async move {
