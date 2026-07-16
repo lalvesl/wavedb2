@@ -421,3 +421,99 @@ signatures. This is the breaking rename — one commit, all call sites.
 - [x] Test `wavedb/tests/fn_identity.rs`: name seed, arg type, arity/order,
       scalar-vs-stream all separate identities; `Payload::TAG ==
       Payload::STRUCT_HASH` proves the transitivity contract.
+
+# PLAN — M2 tail (storage engine)
+
+Grounded in the code as of 2026-07-07. Today's model: reads serve **only**
+from the per-type caches (the whole dataset lives in RAM); every `open`
+truncates `data.bin` to its superblock and replays the **entire** journal
+through the live commit+settle path. Correct, but the journal grows
+unbounded and startup is O(history). The goal: `data.bin` becomes an
+authoritative checkpoint so the journal truncates and open replays only the
+tail. Dependency chain: S1 → S2 → S3 → S4; S5/S6 independent after S1.
+Each task lands green (fmt + clippy + tests + file gate) and moves to
+`todo_done.md` prose when done.
+
+## S1 — page-backed reads (cache becomes a cache) — **DONE (2026-07-07)**
+
+- [x] `PageStore::read_from_pages` (needs the `BlockFile`, so it lives on
+      the store, not the slot): `get_of` serves the cache and falls through
+      to `Directory::get_record` on a miss; untyped `get` probes every
+      slot's cache first, then every slot's pages. An absent id costs one
+      page probe — noted as fine until a keyed filter earns its place.
+- [x] `Write::Remove` owner routing survives eviction: `owner_of` probes
+      caches, then settled pages, under the journal lock (probe-then-mutate
+      can't race — writers serialised). `commit_to_caches` is now fallible;
+      a page-probe fault after the durability point under-applies live
+      state but the journal holds the batch whole (documented). Lock order
+      extended: `journal → dir → cache` on commit — still acyclic.
+- [x] Tests: `evicted_records_read_through_from_pages` (typed + untyped +
+      absent), `remove_of_evicted_record_reaches_its_page` (live + replay).
+      Settle path split to `settle.rs` for the file budget (the S4 drain
+      task lands there).
+
+## S2 — checkpoint: persist the projection, truncate the journal
+
+- [ ] A checkpoint block run in `data.bin` (superblock points at it):
+      `to_wire_checked(CheckpointBody)` = per-registered-type
+      `(struct_hash, directory slots Vec<BlockDescriptor>, dict run
+      descriptor + version)` + allocator watermark + journal length at
+      checkpoint. Written via the normal run-alloc path; superblock update
+      is the atomic commit point (old checkpoint stays valid until the new
+      pointer lands).
+- [ ] `PageStore::checkpoint()`: settle is inline today so pages are
+      already current — sync `data.bin`, write the checkpoint run, repoint
+      the superblock, fsync, then truncate `journal.log` to zero. Crash
+      between any two steps must recover: journal not yet truncated ⇒
+      replay from the recorded offset is idempotent (settle writes cache
+      state, order-free).
+- [ ] Tests: checkpoint → reopen serves everything with an empty journal;
+      kill between checkpoint write and journal truncate → replay converges;
+      checkpoint with a stale prior checkpoint run (space reuse).
+
+## S3 — fast open: load the checkpoint, replay the tail
+
+- [ ] `open` stops truncating `data.bin` when a valid checkpoint exists:
+      load directories/dicts/allocator from the checkpoint run, leave the
+      caches **empty** (S1 serves reads), replay only journal frames past
+      the recorded offset through the normal commit+settle path.
+- [ ] No checkpoint (fresh or pre-checkpoint file) ⇒ today's full-rebuild
+      path unchanged. A corrupt checkpoint run ⇒ refuse (`Corrupt`), no
+      silent fallback — FORMAT_VERSION policy: old files are unsupported,
+      not migrated.
+- [ ] Durability tests: write → checkpoint → write more → kill → reopen has
+      all; startup no longer O(full history) (assert replayed-frame count).
+
+## S4 — background settle + checkpoint policy
+
+- [ ] Settle moves off the `apply` hot path: `apply` = route → journal
+      fsync → cache commit → push touched onto a settle queue; a drain task
+      (current-thread `spawn_local`, same non-`Send` stance) writes cached
+      pages at its own pace. Reads stay correct — cache holds anything not
+      yet settled (eviction only after settle).
+- [ ] `split_next` runs in the drain task, off the hot path.
+- [ ] Checkpoint policy: journal length threshold (tunable on the builder)
+      triggers `checkpoint()` from the drain task once the queue is empty.
+      Shutdown drains then checkpoints, so a clean restart replays nothing.
+- [ ] Cache eviction after settle (budget-based) becomes possible here —
+      land the mechanism (evict settled entries over a byte budget), keep
+      the default budget generous.
+- [ ] Tests: acked writes survive kill with an unsettled queue (journal
+      covers them); auto-checkpoint fires past the threshold; reads during
+      concurrent settle.
+
+## S5 — dedicated 32 KiB one-node-per-page BpTree format
+
+- [ ] BpTree node pages leave the generic `SlotPage` directory: one node
+      per 8-block run, 18-byte entries (`key 8 B + LocalId 10 B`),
+      ≈1 819 entries/page, height ≤3 for ≤6.03 B records (layout in the
+      `wavedb-storage` README). `BPTREE_NODE_STORAGE` swaps its settle path;
+      the core `BpTree` is untouched (it only sees `Store`).
+- [ ] Node caps in core (`caps`) align with the page capacity so a split
+      lands exactly at page granularity.
+
+## S6 — per-value heap compression (last, optional)
+
+- [ ] Large string/blob heap segments compress individually inside the
+      record envelope; page-level zstd already covers the common case —
+      only worth landing if measured wins on real payloads.
