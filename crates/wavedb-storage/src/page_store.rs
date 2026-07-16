@@ -16,15 +16,28 @@
 //!
 //! There is no store-wide state lock. Each type's cache is its own `RwLock`
 //! and its directory its own `Mutex`, so operations on different types run
-//! concurrently and reads never wait on the settle path. The narrow globals:
+//! concurrently and a cached read never waits on the settle path. The narrow
+//! globals:
 //!
 //! - `journal` (`Mutex`) — appends must be ordered; the cache commit happens
 //!   under it so cache order always equals journal (= replay) order;
 //! - `alloc` (`Mutex`) — block space is one shared resource.
 //!
-//! Lock order: `journal → cache(write)` on the commit path;
-//! `dir → cache(read) → alloc` on the settle path. No path takes them in a
-//! conflicting order, so the graph is acyclic.
+//! Lock order: `journal → dir → cache` on the commit path (the directory is
+//! only taken to route a `Remove` whose owner is no longer cached);
+//! `dir → cache(read) → alloc` on the settle path; `dir → dict` on the
+//! read-through path. No path takes them in a conflicting order, so the
+//! graph is acyclic.
+//!
+//! ## Reads
+//!
+//! The cache is a **cache**, not the dataset: a read serves from the type's
+//! cache when it holds the id and falls back to the settled page
+//! ([`Directory::get_record`]) otherwise. Settle writes the cache's current
+//! bytes before anything is evicted, so the fallback can only ever see the
+//! newest settled state — never a version the cache has superseded. An
+//! absent id costs one page probe; that's fine until a keyed filter earns
+//! its place.
 //!
 //! ## Recovery model
 //!
@@ -55,21 +68,21 @@ use crate::struct_storage::{BPTREE_NODE_STORAGE, EngineClaim, StructStorage};
 const DEFAULT_SPLIT_THRESHOLD_BLOCKS: u64 = 8; // 32 KiB
 
 /// Ids one batch touched, grouped by registry slot — what the settle consumes.
-type Touched = Vec<(usize, Vec<Id>)>;
+pub(crate) type Touched = Vec<(usize, Vec<Id>)>;
 
 /// The native, page-backed [`Store`]. One instance per process (the node
 /// model: one process, one `data.bin`); state lives in the per-type
 /// [`StructStorage`] statics registered at [`open`](Self::open).
 #[derive(Debug)]
 pub struct PageStore {
-    file: BlockFile,
+    pub(crate) file: BlockFile,
     journal: Mutex<crate::journal::Journal>,
-    alloc: Mutex<BlockAllocator>,
+    pub(crate) alloc: Mutex<BlockAllocator>,
     /// The registered slots, sorted by `STRUCT_HASH` (deduped) — a lock-free,
     /// read-only route table after open.
-    types: Vec<&'static StructStorage>,
-    seed: [u64; 4],
-    split_threshold_blocks: u64,
+    pub(crate) types: Vec<&'static StructStorage>,
+    pub(crate) seed: [u64; 4],
+    pub(crate) split_threshold_blocks: u64,
     _claim: EngineClaim,
 }
 
@@ -127,7 +140,7 @@ impl PageStore {
         };
         for batch in &batches {
             store.route_batch(batch)?; // rebuild caches + pages, no re-journal
-            let touched = store.commit_to_caches(batch);
+            let touched = store.commit_to_caches(batch)?;
             store.settle(&touched)?;
         }
         Ok(store)
@@ -170,7 +183,7 @@ impl PageStore {
             let mut journal = self.journal.lock();
             journal.append(batch)?; // durability point
             // Commit under the journal lock: cache order == journal order.
-            self.commit_to_caches(batch)
+            self.commit_to_caches(batch)?
         };
         self.settle(&touched)
     }
@@ -191,7 +204,13 @@ impl PageStore {
     /// Apply `batch` to the per-type caches (routing validated beforehand),
     /// returning the touched ids per slot. Runs under the journal lock, so
     /// commits are ordered and each type's write guard is held only briefly.
-    fn commit_to_caches(&self, batch: &[Write]) -> Touched {
+    ///
+    /// A page probe (routing a `Remove` whose owner is not cached) can fail
+    /// on a disk fault — *after* the durability point. The live state then
+    /// under-applies the batch, but the journal holds it whole: a reopen
+    /// replays it correctly, which is the strongest promise a broken disk
+    /// leaves available.
+    fn commit_to_caches(&self, batch: &[Write]) -> StorageResult<Touched> {
         let mut touched: Touched = Vec::new();
         for w in batch {
             match w {
@@ -209,76 +228,69 @@ impl PageStore {
                     note_touched(&mut touched, idx, *id);
                 }
                 Write::Remove(id) => {
-                    // The id alone names no type: the owning slot is whichever
-                    // cache holds it (writers are serialised by the journal
-                    // lock, so the check-then-remove pair can't race).
-                    let owner = self.types.iter().position(|s| {
-                        s.mem_cache().read().contains_key(&id.raw())
-                    });
-                    if let Some(idx) = owner {
+                    if let Some(idx) = self.owner_of(*id)? {
                         self.types[idx].mem_cache().write().remove(&id.raw());
                         note_touched(&mut touched, idx, *id);
                     }
                 }
             }
         }
-        touched
+        Ok(touched)
     }
 
-    /// Converge the touched ids' pages to the caches' current state: present
-    /// in cache ⇒ upsert those bytes, absent ⇒ remove. Writing cache state
-    /// (not batch state) makes settling idempotent and order-independent.
-    // The directory + dictionary guards must span one slot's whole settle
-    // loop — both are read and rewritten across every id; the lint's "merge
-    // into single usage" would drop them mid-mutation.
-    #[allow(clippy::significant_drop_tightening)]
-    fn settle(&self, touched: &Touched) -> StorageResult<()> {
-        for (idx, ids) in touched {
-            let slot = self.types[*idx];
-            let mut dir_guard = slot.directory().lock();
-            let dir =
-                dir_guard.get_or_insert_with(|| Directory::new(self.seed));
-            let mut dict = slot.dictionary().lock();
-            let mut alloc = self.alloc.lock();
-            for id in ids {
-                let bytes = slot.get(*id);
-                match bytes {
-                    Some(b) => {
-                        let sh = slot.struct_hash();
-                        dir.upsert_record(
-                            sh, &self.file, &mut alloc, *id, b, &mut dict,
-                        )?;
-                        maybe_split(
-                            dir,
-                            sh,
-                            &self.file,
-                            &mut alloc,
-                            self.split_threshold_blocks,
-                            *id,
-                            &dict,
-                        )?;
-                    }
-                    None => {
-                        dir.remove_record(
-                            slot.struct_hash(),
-                            &self.file,
-                            &mut alloc,
-                            *id,
-                            &dict,
-                        )?;
-                    }
-                }
+    /// The slot index owning `id`, if any. The id alone names no type: the
+    /// owner is whichever cache holds it, falling back to the settled pages
+    /// for a record the cache no longer carries. Writers are serialised by
+    /// the journal lock, so the probe-then-mutate pair can't race.
+    fn owner_of(&self, id: Id) -> StorageResult<Option<usize>> {
+        let cached = self
+            .types
+            .iter()
+            .position(|s| s.mem_cache().read().contains_key(&id.raw()));
+        if let Some(idx) = cached {
+            return Ok(Some(idx));
+        }
+        for (idx, slot) in self.types.iter().enumerate() {
+            if self.read_from_pages(slot, id)?.is_some() {
+                return Ok(Some(idx));
             }
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// Read `id` from `slot`'s settled pages — the read-through half of the
+    /// cache-or-page read path. `None` when the type has never settled
+    /// anything or the page does not hold the id.
+    // The directory guard must span the page read — `dir` borrows from it.
+    #[allow(clippy::significant_drop_tightening)]
+    fn read_from_pages(
+        &self,
+        slot: &'static StructStorage,
+        id: Id,
+    ) -> StorageResult<Option<Vec<u8>>> {
+        let dir_guard = slot.directory().lock();
+        let Some(dir) = dir_guard.as_ref() else {
+            return Ok(None);
+        };
+        let dict = slot.dictionary().lock();
+        dir.get_record(slot.struct_hash(), &self.file, id, &dict)
     }
 }
 
 impl Store for PageStore {
     async fn get(&self, id: Id) -> CoreResult<Option<Vec<u8>>> {
-        // Untyped fallback: the id alone names no type, so probe every slot.
-        // Typed callers use `get_of` and skip this scan entirely.
-        Ok(self.types.iter().find_map(|s| s.get(id)))
+        // Untyped fallback: the id alone names no type, so probe every slot —
+        // caches first (cheap), then settled pages. Typed callers use
+        // `get_of` and skip this scan entirely.
+        if let Some(bytes) = self.types.iter().find_map(|s| s.get(id)) {
+            return Ok(Some(bytes));
+        }
+        for slot in &self.types {
+            if let Some(bytes) = self.read_from_pages(slot, id)? {
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
     }
 
     async fn get_of(
@@ -286,9 +298,16 @@ impl Store for PageStore {
         struct_hash: u64,
         id: Id,
     ) -> CoreResult<Option<Vec<u8>>> {
-        // One binary search on the route table, then only this type's own
-        // cache read lock — reads of different types never contend.
-        Ok(self.slot_of(struct_hash).and_then(|s| s.get(id)))
+        // One binary search on the route table, then this type's own cache
+        // read lock — a cached read of one type never contends with another
+        // type's. A miss reads through to the settled page.
+        let Some(slot) = self.slot_of(struct_hash) else {
+            return Ok(None);
+        };
+        if let Some(bytes) = slot.get(id) {
+            return Ok(Some(bytes));
+        }
+        Ok(self.read_from_pages(slot, id)?)
     }
 
     async fn apply(&self, batch: &[Write]) -> CoreResult<()> {
@@ -303,31 +322,6 @@ fn note_touched(touched: &mut Touched, idx: usize, id: Id) {
         Some((_, ids)) => ids.push(id),
         None => touched.push((idx, vec![id])),
     }
-}
-
-/// Split the directory's next round-robin bucket when the page the write landed
-/// in has grown past the threshold, keeping page sizes bounded.
-///
-/// Only a `Put` grows a page, so checking just the touched bucket (O(1), not a
-/// scan of every slot) still catches every over-threshold page at the moment it
-/// crosses the line. Linear hashing splits round-robin, so the split may relieve
-/// a different bucket first — repeated puts into a fat bucket keep triggering
-/// splits until the round-robin pointer reaches it (same behaviour the full scan
-/// had).
-fn maybe_split(
-    dir: &mut Directory,
-    struct_hash: u64,
-    file: &BlockFile,
-    alloc: &mut BlockAllocator,
-    threshold: u64,
-    id: Id,
-    dict: &crate::dictionary::DictState,
-) -> StorageResult<()> {
-    let touched = dir.bucket_of(id.raw());
-    if dir.descriptor(touched).count() > threshold {
-        dir.split_next(struct_hash, file, alloc, dict)?;
-    }
-    Ok(())
 }
 
 /// The `STRUCT_HASH` at the head of a wire-encoded record (`[STRUCT_HASH][…]`).
@@ -470,6 +464,59 @@ mod tests {
         drop(s);
         let s = open(d.path());
         assert_eq!(s.cache_len(), 0, "refused write must not reach the log");
+    }
+
+    #[test]
+    fn evicted_records_read_through_from_pages() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let s = open(d.path());
+        block_on(async {
+            s.apply(&[
+                Write::Put(nonunique(1), rec(SH, b"settled")),
+                Write::Put(nonunique(2), rec(SH, b"also")),
+            ])
+            .await
+            .unwrap();
+            // Simulate eviction: drop the cache; the settled pages must serve.
+            TEST_SLOT.mem_cache().write().clear();
+            assert_eq!(
+                s.get_of(SH, nonunique(1)).await.unwrap(),
+                Some(rec(SH, b"settled")),
+                "typed read must fall through to the page"
+            );
+            assert_eq!(
+                s.get(nonunique(2)).await.unwrap(),
+                Some(rec(SH, b"also")),
+                "untyped read must fall through to the page"
+            );
+            // Absent ids stay absent through the fallback.
+            assert_eq!(s.get(nonunique(99)).await.unwrap(), None);
+            assert_eq!(s.get_of(SH, nonunique(99)).await.unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn remove_of_evicted_record_reaches_its_page() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        block_on(async {
+            {
+                let s = open(d.path());
+                s.apply(&[Write::Put(nonunique(3), rec(SH, b"gone soon"))])
+                    .await
+                    .unwrap();
+                // Evict, then remove: the owner must be found on the page.
+                TEST_SLOT.mem_cache().write().clear();
+                s.apply(&[Write::Remove(nonunique(3))]).await.unwrap();
+                assert_eq!(s.get(nonunique(3)).await.unwrap(), None);
+                assert_eq!(s.get_of(SH, nonunique(3)).await.unwrap(), None);
+            }
+            // And the journal agrees on replay.
+            let s = open(d.path());
+            assert_eq!(s.get(nonunique(3)).await.unwrap(), None);
+            assert_eq!(s.cache_len(), 0);
+        });
     }
 
     #[test]
