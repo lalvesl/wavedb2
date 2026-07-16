@@ -27,6 +27,7 @@ pub mod error;
 pub mod journal;
 pub mod page;
 pub mod page_store;
+mod settle;
 pub mod struct_storage;
 
 pub use block::{BLOCK_SIZE, BlockAllocator, BlockDescriptor, Run};
