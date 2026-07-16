@@ -109,6 +109,12 @@ The developer surface — what `examples/todo-app` is written against.
   already does block management + crash safety);
 - `wavedb` + `wavedb-net` compile for `wasm32`: browser `fetch` POST
   transport, `wasm_bindgen_futures` runtime — same async API;
+- **no tokio inside wasm** (user constraint, 2026-07-07): tokio stays
+  behind `cfg(not(target_arch = "wasm32"))` everywhere (it already is —
+  net gates it, client/schema carry it as dev-deps only); the wasm build
+  runs on `wasm_bindgen_futures`, keeping the binary small. The wasm side
+  has **no journal and no `data.bin`** — IndexedDB `Id → Vec<u8>` is the
+  whole store (the `Store` trait absorbs the difference);
 - the `Store`-generic `BpTree`/`Collection` already run over any backend —
   serverless mode (engine in-browser over IndexedDB) falls out;
 - **measure the per-struct wasm cost** of the registry `match` (M1 risk
@@ -452,55 +458,67 @@ Each task lands green (fmt + clippy + tests + file gate) and moves to
       Settle path split to `settle.rs` for the file budget (the S4 drain
       task lands there).
 
-## S2 — checkpoint: persist the projection, truncate the journal
+## S2 — checkpoint: persist the projection, truncate the journal — **DONE (2026-07-07)**
 
-- [ ] A checkpoint block run in `data.bin` (superblock points at it):
-      `to_wire_checked(CheckpointBody)` = per-registered-type
-      `(struct_hash, directory slots Vec<BlockDescriptor>, dict run
-      descriptor + version)` + allocator watermark + journal length at
-      checkpoint. Written via the normal run-alloc path; superblock update
-      is the atomic commit point (old checkpoint stays valid until the new
-      pointer lands).
-- [ ] `PageStore::checkpoint()`: settle is inline today so pages are
-      already current — sync `data.bin`, write the checkpoint run, repoint
-      the superblock, fsync, then truncate `journal.log` to zero. Crash
-      between any two steps must recover: journal not yet truncated ⇒
-      replay from the recorded offset is idempotent (settle writes cache
-      state, order-free).
-- [ ] Tests: checkpoint → reopen serves everything with an empty journal;
-      kill between checkpoint write and journal truncate → replay converges;
-      checkpoint with a stale prior checkpoint run (space reuse).
+- [x] `checkpoint.rs`: a checkpoint block run holds
+      `[len u32][to_wire_checked(CheckpointBody)]` — per settled type
+      `(struct_hash, directory slots, dict run descriptor)` + the
+      allocator's `total_blocks`. The superblock gained a `checkpoint:
+      BlockDescriptor` field; repointing it (one durable block-0 rewrite)
+      is the atomic commit. No journal offset needed: a checkpoint always
+      covers the *whole* journal and truncates it to zero — a crash before
+      the truncate replays covered frames over checkpoint state, which
+      converges (settle writes cache state, idempotent; proven by test).
+- [x] `PageStore::checkpoint()`: journal lock held throughout (writers
+      quiesce, reads proceed); pages already current (settle inline) —
+      sync data, write run, sync, repoint superblock, retire the old run,
+      truncate journal. **Allocator protection** (`alloc.rs`, split from
+      `block.rs` for budget): runs the durable checkpoint points at defer
+      their frees (`set_protected` + pending list) so a crash mid-window
+      never reopens onto overwritten pages; `from_layout` rebuilds the free
+      map as the complement of the persisted runs.
+- [x] Tests: checkpoint → cold reopen serves all + journal empty; stale
+      (un-truncated) journal converges; corrupt checkpoint refuses;
+      dictionary-compressed pages readable after restore; post-checkpoint
+      writes replay over it; allocator protection + layout-rebuild units.
 
-## S3 — fast open: load the checkpoint, replay the tail
+## S3 — fast open: load the checkpoint, replay the tail — **DONE (2026-07-07)**
 
-- [ ] `open` stops truncating `data.bin` when a valid checkpoint exists:
-      load directories/dicts/allocator from the checkpoint run, leave the
-      caches **empty** (S1 serves reads), replay only journal frames past
-      the recorded offset through the normal commit+settle path.
-- [ ] No checkpoint (fresh or pre-checkpoint file) ⇒ today's full-rebuild
-      path unchanged. A corrupt checkpoint run ⇒ refuse (`Corrupt`), no
-      silent fallback — FORMAT_VERSION policy: old files are unsupported,
-      not migrated.
-- [ ] Durability tests: write → checkpoint → write more → kill → reopen has
-      all; startup no longer O(full history) (assert replayed-frame count).
+- [x] `open` skips the `data.bin` truncate when `checkpoint::restore`
+      finds a committed checkpoint: directories/dicts load into the slots,
+      allocator from `from_layout` + protected set, caches stay **empty**
+      (S1 read-through serves), and the (post-truncate) journal replays
+      through the normal commit+settle path.
+- [x] No checkpoint ⇒ the full-rebuild path unchanged. Corrupt checkpoint
+      run ⇒ `Corrupt`, refuse — no silent fallback (FORMAT_VERSION
+      policy). A checkpoint naming an unregistered type ⇒
+      `UnregisteredStructHash` (allowlist holds at restore too).
+- [x] Cold-open assertions: `cache_len() == 0` after a checkpointed
+      reopen while every record reads; startup replay is just the tail.
 
-## S4 — background settle + checkpoint policy
+## S4 — background settle + checkpoint policy — **DONE (2026-07-07)**
 
-- [ ] Settle moves off the `apply` hot path: `apply` = route → journal
-      fsync → cache commit → push touched onto a settle queue; a drain task
-      (current-thread `spawn_local`, same non-`Send` stance) writes cached
-      pages at its own pace. Reads stay correct — cache holds anything not
-      yet settled (eviction only after settle).
-- [ ] `split_next` runs in the drain task, off the hot path.
-- [ ] Checkpoint policy: journal length threshold (tunable on the builder)
-      triggers `checkpoint()` from the drain task once the queue is empty.
-      Shutdown drains then checkpoints, so a clean restart replays nothing.
-- [ ] Cache eviction after settle (budget-based) becomes possible here —
-      land the mechanism (evict settled entries over a byte budget), keep
-      the default budget generous.
-- [ ] Tests: acked writes survive kill with an unsettled queue (journal
-      covers them); auto-checkpoint fires past the threshold; reads during
-      concurrent settle.
+- [x] Settle off the `apply` hot path: `apply` = route → journal fsync →
+      cache commit → merge touched into a `pending` queue (push under the
+      journal lock, so "queue empty" is race-free); `PageStore::drain`
+      settles rounds until empty (a failed round re-queues — idempotent).
+      `split_next` rides the drain. **Unsettled-remove tombstones**: a
+      `Remove` marks the id dead in its slot until the page rewrite lands,
+      so the read fallback never resurrects stale page bytes (a re-`Put`
+      clears it) — the hazard deferred settle introduces, caught + tested.
+- [x] Node maintenance task (`quick-node::maintain`, spawned on the serve
+      `LocalSet`): every 200 ms drain → checkpoint if
+      `journal_len() > checkpoint_after_bytes` (builder, default 64 MiB) →
+      `evict_settled(cache_budget_bytes)` (builder, default 1 GiB). Clean
+      shutdown drains + checkpoints, so a restart replays nothing.
+- [x] Eviction mechanism: `evict_settled` quiesces writers (journal lock),
+      refuses while anything is pending, then evicts settled entries down
+      to budget (`StructStorage::evict_up_to`); evicted reads fall through
+      to pages.
+- [x] Tests: unsettled write reads from cache + survives reopen
+      (journal); tombstone hides stale page until settle + re-put
+      supersedes; eviction refuses while pending, evicts to budget after;
+      checkpoint drains first (existing checkpoint tests exercise it).
 
 ## S5 — dedicated 32 KiB one-node-per-page BpTree format
 
