@@ -15,7 +15,7 @@
 //! [`PageStore`]: crate::page_store::PageStore
 //! [`PageStore::open`]: crate::page_store::PageStore::open
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::{Mutex, RwLock};
@@ -49,6 +49,10 @@ pub struct StructStorage {
     cache: StructMemCache,
     dir: StructDirectory,
     dict: StructDictionary,
+    /// Ids removed from the cache whose page write hasn't settled yet — the
+    /// read path must not fall through to the (stale) page for these. Marked
+    /// at commit, cleared when the settle rewrites the page.
+    dead: RwLock<BTreeSet<u128>>,
 }
 
 impl StructStorage {
@@ -60,6 +64,7 @@ impl StructStorage {
             cache: RwLock::new(BTreeMap::new()),
             dir: Mutex::new(None),
             dict: Mutex::new(DictState::new(true)),
+            dead: RwLock::new(BTreeSet::new()),
         }
     }
 
@@ -73,6 +78,7 @@ impl StructStorage {
             cache: RwLock::new(BTreeMap::new()),
             dir: Mutex::new(None),
             dict: Mutex::new(DictState::new(false)),
+            dead: RwLock::new(BTreeSet::new()),
         }
     }
 
@@ -125,6 +131,48 @@ impl StructStorage {
         self.cache.read().len()
     }
 
+    /// Total bytes of cached record values for this type.
+    #[must_use]
+    pub fn cached_bytes(&self) -> usize {
+        self.cache.read().values().map(Vec::len).sum()
+    }
+
+    /// Evict cached entries until at least `target` bytes are freed (or the
+    /// cache empties), returning the bytes actually freed. Only called on
+    /// **settled** entries (the store's eviction path guarantees it) — an
+    /// evicted read falls through to the type's pages.
+    // The write guard spans the whole eviction loop by design.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn evict_up_to(&self, target: usize) -> usize {
+        let mut cache = self.cache.write();
+        let mut freed = 0usize;
+        while freed < target {
+            let Some((_, bytes)) = cache.pop_first() else {
+                break;
+            };
+            freed += bytes.len();
+        }
+        freed
+    }
+
+    /// Mark `id` removed-but-unsettled: its page still holds the old bytes,
+    /// so the read fallback must answer `None` until the settle lands.
+    pub(crate) fn mark_removed(&self, id: Id) {
+        self.dead.write().insert(id.raw());
+    }
+
+    /// Clear `id`'s removal tombstone — its page now agrees (settled), or a
+    /// newer `Put` superseded the remove.
+    pub(crate) fn clear_removed(&self, id: Id) {
+        self.dead.write().remove(&id.raw());
+    }
+
+    /// Whether `id` is removed but its page write hasn't settled yet.
+    #[must_use]
+    pub(crate) fn is_removed(&self, id: Id) -> bool {
+        self.dead.read().contains(&id.raw())
+    }
+
     /// Drop all state (policy kept) — the open path calls this before a
     /// journal replay so a prior run's cache/directory/dictionary (same
     /// process, e.g. tests) can't leak in.
@@ -132,6 +180,7 @@ impl StructStorage {
         self.cache.write().clear();
         *self.dir.lock() = None;
         self.dict.lock().reset();
+        self.dead.write().clear();
     }
 }
 
