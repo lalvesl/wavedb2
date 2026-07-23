@@ -12,22 +12,20 @@ T1–T7 landed):
 
 Correctness is in (durable single-node `Store`, journal replay, B+tree with
 merge/rebalance, secondary indexes, version chain, per-type `StructStorage`,
-zstd dictionaries). What remains is performance shape, not behaviour:
+zstd dictionaries). The tail is now largely landed (task log in
+[PLAN — M2 tail](#plan--m2-tail-storage-engine)):
 
-- **dedicated 32 KiB one-node-per-page BpTree format** — nodes currently ride
-  the generic `SlotPage` directory under the reserved page-kind `STRUCT_HASH`;
-  target: one node per 8-block run, 18-byte entries (`key 8 B + LocalId 10 B`),
-  ≈1 819 entries/page, height ≤3 for ≤6.03 B records (layout specced in
-  `wavedb-storage` README);
-- **background settle + rebalance** — settle is inline with `apply` today:
-  move to a drain task that writes cached pages into `data.bin` at its own
-  pace, evicts settled entries from the cache budget, and runs `split_next`
-  off the hot path; then **journal checkpointing** (truncate replayed frames
-  once settled — today the journal grows unbounded and replay is full-history;
-  this is also the point where `DictState::warm` persistence becomes
-  load-bearing);
+- **background settle + checkpointing — LANDED (S1–S4, 2026-07-07)**:
+  page-backed read-through (cache is a cache), checkpoint run + superblock
+  pointer + journal truncation (the journal no longer grows unbounded;
+  open replays only the tail), deferred settle behind a `pending` queue
+  with unsettled-remove tombstones, node maintenance task (drain →
+  threshold checkpoint → cache eviction to budget);
+- **dedicated 32 KiB one-node-per-page BpTree format — DROPPED
+  (2026-07-07)**: trees are per tenant; B2C = millions of small trees, so
+  a page per node wastes exactly the dominant case (see S5 in the PLAN);
 - **per-value (strings/blobs) heap compression** — page-level zstd exists;
-  per-value is future work.
+  per-value is future work, measure first (S6).
 
 ## M3 — registry-aware node (`wavedb-net` + `wavedb-quick-node` → members)
 
@@ -520,15 +518,17 @@ Each task lands green (fmt + clippy + tests + file gate) and moves to
       supersedes; eviction refuses while pending, evicts to budget after;
       checkpoint drains first (existing checkpoint tests exercise it).
 
-## S5 — dedicated 32 KiB one-node-per-page BpTree format
+## S5 — dedicated 32 KiB one-node-per-page BpTree format — **DROPPED (2026-07-07, user decision)**
 
-- [ ] BpTree node pages leave the generic `SlotPage` directory: one node
-      per 8-block run, 18-byte entries (`key 8 B + LocalId 10 B`),
-      ≈1 819 entries/page, height ≤3 for ≤6.03 B records (layout in the
-      `wavedb-storage` README). `BPTREE_NODE_STORAGE` swaps its settle path;
-      the core `BpTree` is untouched (it only sees `Store`).
-- [ ] Node caps in core (`caps`) align with the page capacity so a split
-      lands exactly at page granularity.
+The README spec predates tenant partitioning of the trees. A `BpTree` is
+**per tenant**, so a B2C node hosts millions of *small* trees — one 32 KiB
+page per node wastes ~32 KiB for a tenant with a handful of records,
+exactly the dominant case. The shared linear-hash `SlotPage` path packs
+many tenants' small nodes into common buckets and the split threshold
+bounds page size; node values also rewrite on every index mutation, so any
+one-tree-co-location scheme churns immediately. Revisit only if a
+measured workload shows single huge trees dominating cold reads. (README
+spec section needs a matching `> Status:` note.)
 
 ## S6 — per-value heap compression (last, optional)
 

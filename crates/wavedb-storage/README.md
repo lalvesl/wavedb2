@@ -276,6 +276,14 @@ specialises these without changing the framing):
 
 ### BpTree page layout — 32 KiB, one node per page
 
+> Status: **dropped (2026-07-07).** This layout predates tenant
+> partitioning: a `BpTree` exists per tenant, so a B2C node hosts millions
+> of *small* trees and a dedicated 32 KiB page per node wastes space in
+> exactly the dominant case. Nodes ride the shared linear-hash `SlotPage`
+> directory instead — many tenants' small nodes pack into common buckets.
+> Revisit only if a measured workload shows single huge trees dominating
+> cold reads.
+
 BpTree pages are **32 KiB** (8 × 4 KiB blocks). Each page holds exactly **one**
 B+tree node (either an internal node or a leaf node). Both node kinds use the
 same 18-byte entry format — no special-casing:
