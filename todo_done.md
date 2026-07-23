@@ -1,5 +1,37 @@
 # DONE
 
+- **M2 tail — background settle + checkpointing (S1–S4, 2026-07-07)**: the
+  journal no longer grows unbounded; `data.bin` is a real recovery source.
+  - **S1 page-backed reads**: the cache is a cache — `get`/`get_of` fall
+    through to `Directory::get_record` on a miss (`read_through.rs`);
+    `Remove` owner routing probes pages when no cache holds the id.
+  - **S2 checkpoint** (`checkpoint.rs`): one block run persists every
+    settled type's directory slots + dictionary run + `total_blocks`; the
+    superblock gained a `checkpoint: BlockDescriptor` — repointing block 0
+    is the atomic commit, then the journal truncates to zero (a checkpoint
+    always covers the whole log; replaying a stale log over checkpoint
+    state converges). Allocator protection (`alloc.rs`): the durable
+    checkpoint's runs defer their frees until the next commit, so a crash
+    mid-window never reopens onto overwritten pages.
+  - **S3 fast open**: with a checkpoint, no `data.bin` truncate — restore
+    directories/dicts/allocator (`from_layout` = complement of persisted
+    runs), caches start cold, replay only the journal tail. Corrupt
+    checkpoint refuses (`Corrupt`); unregistered type refuses
+    (`UnregisteredStructHash`).
+  - **S4 deferred settle + policy**: `apply` = journal fsync → cache
+    commit → `pending` queue (pushed under the journal lock);
+    `PageStore::drain` settles rounds idempotently; unsettled removes
+    tombstone their id so read-through never resurrects stale page bytes.
+    quick-node `maintain` task (200 ms on the serve `LocalSet`): drain →
+    checkpoint past `checkpoint_after_bytes` (64 MiB default) →
+    `evict_settled` to `cache_budget_bytes` (1 GiB default); clean
+    shutdown drains + checkpoints so a restart replays nothing.
+  - **S5 dropped (user decision)**: 32 KiB one-node-per-page BpTree format
+    predates tenant partitioning — trees are per tenant, B2C = millions of
+    small trees, a page per node wastes the dominant case; nodes stay in
+    the shared linear-hash `SlotPage` buckets. README carries the Status
+    note. S6 (per-value compression) deferred pending measurement.
+
 - **Streaming wire + composed function identity — T6/T7 (2026-07-06/07)**:
   the post-M4 refinements, closing the PLAN.
   - **Framed streaming responses (T6)**: the HTTP response body is a
