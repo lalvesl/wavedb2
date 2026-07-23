@@ -68,7 +68,7 @@ use parking_lot::Mutex;
 use wavedb_core::{Id, Result as CoreResult, Store, Write};
 
 use crate::block::BlockAllocator;
-use crate::block_file::{BlockFile, RESERVED_BLOCKS};
+use crate::block_file::BlockFile;
 use crate::directory::Directory;
 use crate::error::{StorageError, StorageResult};
 use crate::struct_storage::{BPTREE_NODE_STORAGE, EngineClaim, StructStorage};
@@ -86,6 +86,9 @@ pub(crate) type Touched = Vec<(usize, Vec<Id>)>;
 #[derive(Debug)]
 pub struct PageStore {
     pub(crate) file: BlockFile,
+    /// The directory holding `data.bin` + the journal chain (rotation
+    /// creates new journal files here).
+    pub(crate) data_dir: std::path::PathBuf,
     pub(crate) journal: Mutex<crate::journal::Journal>,
     pub(crate) alloc: Mutex<BlockAllocator>,
     /// The registered slots, sorted by `STRUCT_HASH` (deduped) — a lock-free,
@@ -120,12 +123,9 @@ impl PageStore {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
 
+        let data_bin_existed = dir.join("data.bin").exists();
         let file = BlockFile::open(dir.join("data.bin"))?;
         let seed = file.seed();
-
-        let mut journal =
-            crate::journal::Journal::open(dir.join("journal.log"))?;
-        let batches = journal.replay()?;
 
         // Generated Pivot types of identical shape may share a STRUCT_HASH;
         // they also share pages today, so one slot serves the hash — dedup.
@@ -137,33 +137,24 @@ impl PageStore {
             slot.reset(); // a prior run's state (same process) must not leak in
         }
 
-        // A committed checkpoint makes `data.bin` authoritative: load the
-        // directories/dictionaries/allocator from it, leave the caches empty
-        // (reads fall through to the pages), and replay only the journal's
-        // post-checkpoint frames. Without one, rebuild everything from the
-        // full journal as before.
-        let alloc =
-            if let Some(alloc) = crate::checkpoint::restore(&file, &types)? {
-                alloc
-            } else {
-                // Rebuild pages from the journal: drop any prior page layout.
-                file.truncate_to_blocks(RESERVED_BLOCKS)?;
-                let mut alloc = BlockAllocator::new();
-                alloc.alloc(RESERVED_BLOCKS); // reserve the superblock
-                alloc
-            };
+        // Recover from the journal chain: the newest `Commit` frame roots
+        // the directories/dictionaries/allocator (caches stay empty — reads
+        // fall through to the pages); every uncovered `Batch` replays below.
+        let recovered =
+            crate::commit::restore(dir, data_bin_existed, &file, &types)?;
 
         let store = Self {
             file,
-            journal: Mutex::new(journal),
-            alloc: Mutex::new(alloc),
+            data_dir: dir.to_path_buf(),
+            journal: Mutex::new(recovered.journal),
+            alloc: Mutex::new(recovered.alloc),
             types,
             seed,
             split_threshold_blocks: DEFAULT_SPLIT_THRESHOLD_BLOCKS,
             pending: Mutex::new(Vec::new()),
             _claim: claim,
         };
-        for batch in &batches {
+        for batch in &recovered.replay {
             store.route_batch(batch)?; // rebuild caches + pages, no re-journal
             let touched = store.commit_to_caches(batch)?;
             store.settle(&touched)?;
@@ -209,7 +200,7 @@ impl PageStore {
         // log never holds a batch replay would choke on.
         self.route_batch(batch)?;
         let mut journal = self.journal.lock();
-        journal.append(batch)?; // durability point
+        journal.append(&crate::journal::JournalFrame::Batch(batch.to_vec()))?; // durability point
         // Commit under the journal lock: cache order == journal order.
         let touched = self.commit_to_caches(batch)?;
         merge_touched(&mut self.pending.lock(), touched);
@@ -625,8 +616,17 @@ mod tests {
         });
     }
 
+    /// The journal files under a store dir, sorted by ts.
+    fn journals(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        crate::journal::scan(dir)
+            .unwrap()
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect()
+    }
+
     #[test]
-    fn checkpoint_empties_journal_and_reopen_is_cold() {
+    fn commit_retires_the_old_journal_and_reopen_is_cold() {
         let _g = engine_gate();
         let d = tempfile::tempdir().unwrap();
         block_on(async {
@@ -642,17 +642,15 @@ mod tests {
                 .await
                 .unwrap();
                 s.apply(&[Write::Remove(nonunique(2))]).await.unwrap();
-                s.checkpoint().unwrap();
+                s.commit_journal().unwrap();
+                assert_eq!(
+                    journals(d.path()).len(),
+                    1,
+                    "the retired journal must be deleted"
+                );
             }
-            assert_eq!(
-                std::fs::metadata(d.path().join("journal.log"))
-                    .unwrap()
-                    .len(),
-                0,
-                "a committed checkpoint must truncate the journal"
-            );
             let s = open(d.path());
-            assert_eq!(s.cache_len(), 0, "a checkpointed open starts cold");
+            assert_eq!(s.cache_len(), 0, "a committed open starts cold");
             assert_eq!(
                 s.get(nonunique(1)).await.unwrap(),
                 Some(rec(SH, b"kept"))
@@ -664,13 +662,13 @@ mod tests {
             assert_eq!(
                 s.get(nonunique(2)).await.unwrap(),
                 None,
-                "a pre-checkpoint remove must hold after restore"
+                "a pre-commit remove must hold after restore"
             );
         });
     }
 
     #[test]
-    fn writes_after_checkpoint_replay_over_it() {
+    fn writes_after_commit_replay_over_it() {
         let _g = engine_gate();
         let d = tempfile::tempdir().unwrap();
         block_on(async {
@@ -679,8 +677,8 @@ mod tests {
                 s.apply(&[Write::Put(nonunique(1), rec(SH, b"old"))])
                     .await
                     .unwrap();
-                s.checkpoint().unwrap();
-                // Post-checkpoint traffic lands in the (fresh) journal.
+                s.commit_journal().unwrap();
+                // Post-commit traffic lands in the fresh journal.
                 s.apply(&[Write::Put(nonunique(1), rec(SH, b"new"))])
                     .await
                     .unwrap();
@@ -692,7 +690,7 @@ mod tests {
             assert_eq!(
                 s.get(nonunique(1)).await.unwrap(),
                 Some(rec(SH, b"new")),
-                "the journal tail must win over checkpoint state"
+                "the journal tail must win over committed state"
             );
             assert_eq!(
                 s.get(nonunique(4)).await.unwrap(),
@@ -702,15 +700,14 @@ mod tests {
     }
 
     #[test]
-    fn stale_journal_replays_over_checkpoint_and_converges() {
-        // Simulates a crash between the superblock repoint and the journal
-        // truncate: the checkpoint already covers every frame, and replaying
-        // them again must converge, not corrupt.
+    fn covered_journal_left_behind_is_skipped_and_cleaned() {
+        // Simulates a crash between the Commit frame and the old journal's
+        // delete: the covered journal is still on disk; recovery must skip
+        // it (its frames are already in data.bin) and clean it up.
         let _g = engine_gate();
         let d = tempfile::tempdir().unwrap();
-        let journal_path = d.path().join("journal.log");
         block_on(async {
-            let stale = {
+            let (old_path, old_bytes) = {
                 let s = open(d.path());
                 s.apply(&[Write::Put(nonunique(1), rec(SH, b"v1"))])
                     .await
@@ -722,23 +719,68 @@ mod tests {
                     .await
                     .unwrap();
                 s.apply(&[Write::Remove(nonunique(5))]).await.unwrap();
-                let stale = std::fs::read(&journal_path).unwrap();
-                s.checkpoint().unwrap();
-                stale
+                let old = journals(d.path()).pop().unwrap();
+                let bytes = std::fs::read(&old).unwrap();
+                s.commit_journal().unwrap();
+                (old, bytes)
             };
-            // Un-truncate: put the covered frames back.
-            std::fs::write(&journal_path, &stale).unwrap();
+            // "Un-delete" the covered journal.
+            std::fs::write(&old_path, &old_bytes).unwrap();
+            assert_eq!(journals(d.path()).len(), 2);
             let s = open(d.path());
             assert_eq!(
                 s.get(nonunique(1)).await.unwrap(),
                 Some(rec(SH, b"v2"))
             );
             assert_eq!(s.get(nonunique(5)).await.unwrap(), None);
+            assert_eq!(
+                journals(d.path()).len(),
+                1,
+                "recovery must clean the covered leftover"
+            );
         });
     }
 
     #[test]
-    fn corrupt_checkpoint_refuses_to_open() {
+    fn torn_commit_frame_falls_back_to_the_old_journal() {
+        // Simulates a crash mid-Commit-append: the frame is torn (crc
+        // fails) and the retired journal was never deleted — recovery must
+        // ignore the torn commit and rebuild from the old journal's frames.
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        block_on(async {
+            let (old_path, old_bytes) = {
+                let s = open(d.path());
+                s.apply(&[Write::Put(nonunique(7), rec(SH, b"survives"))])
+                    .await
+                    .unwrap();
+                let old = journals(d.path()).pop().unwrap();
+                let bytes = std::fs::read(&old).unwrap();
+                s.commit_journal().unwrap();
+                (old, bytes)
+            };
+            // Tear the Commit frame (drop its last byte) and un-delete the
+            // old journal — the exact crash-mid-append disk state.
+            let new_path = journals(d.path()).pop().unwrap();
+            let len = std::fs::metadata(&new_path).unwrap().len();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&new_path)
+                .unwrap()
+                .set_len(len - 1)
+                .unwrap();
+            std::fs::write(&old_path, &old_bytes).unwrap();
+            let s = open(d.path());
+            assert_eq!(
+                s.get(nonunique(7)).await.unwrap(),
+                Some(rec(SH, b"survives")),
+                "the old journal must rule when the commit is torn"
+            );
+        });
+    }
+
+    #[test]
+    fn missing_journal_with_data_refuses_to_open() {
         let _g = engine_gate();
         let d = tempfile::tempdir().unwrap();
         block_on(async {
@@ -746,15 +788,9 @@ mod tests {
             s.apply(&[Write::Put(nonunique(1), rec(SH, b"x"))])
                 .await
                 .unwrap();
-            s.checkpoint().unwrap();
         });
-        // Locate the checkpoint run via the superblock, scribble over it.
-        {
-            let bf =
-                crate::block_file::BlockFile::open(d.path().join("data.bin"))
-                    .unwrap();
-            let run = bf.checkpoint().run();
-            bf.write_run(run, &[0xFF; 16]).unwrap();
+        for j in journals(d.path()) {
+            std::fs::remove_file(j).unwrap();
         }
         assert!(matches!(
             PageStore::open(d.path(), &[&TEST_SLOT]).unwrap_err(),
@@ -763,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_restores_dictionary_compressed_pages() {
+    fn commit_restores_dictionary_compressed_pages() {
         let _g = engine_gate();
         let d = tempfile::tempdir().unwrap();
         // Repetitive bodies → the dictionary warms and pages store Zstd, so
@@ -781,7 +817,7 @@ mod tests {
                         .await
                         .unwrap();
                 }
-                s.checkpoint().unwrap();
+                s.commit_journal().unwrap();
             }
             let s = open(d.path());
             assert_eq!(s.cache_len(), 0);
@@ -792,11 +828,21 @@ mod tests {
                     "record {k} must decompress against the restored dict"
                 );
             }
-            // And the store keeps working (settle over restored state).
+            // The store keeps working: settle + a second commit over the
+            // restored state (untouched roots carry forward).
             s.apply(&[Write::Put(nonunique(60), body(60))])
                 .await
                 .unwrap();
-            s.checkpoint().unwrap();
+            s.commit_journal().unwrap();
+        });
+        // Third generation open still serves everything.
+        block_on(async {
+            let s = open(d.path());
+            assert!(s.get_of(SH, nonunique(60)).await.unwrap().is_some());
+            assert_eq!(
+                s.get_of(SH, nonunique(0)).await.unwrap(),
+                Some(body(0))
+            );
         });
     }
 

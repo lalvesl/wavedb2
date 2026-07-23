@@ -53,6 +53,22 @@ pub struct StructStorage {
     /// read path must not fall through to the (stale) page for these. Marked
     /// at commit, cleared when the settle rewrites the page.
     dead: RwLock<BTreeSet<u128>>,
+    /// This type's persisted directory-chain tracker (root + blocks +
+    /// dirty-since-last-commit) — compile-time state beside the directory,
+    /// so a journal commit knows what to rewrite and what to protect.
+    chain: Mutex<ChainTrack>,
+}
+
+/// Where a type's directory chain lives on disk, and whether the in-memory
+/// directory has drifted from it since the last journal commit.
+#[derive(Debug, Clone, Default)]
+pub struct ChainTrack {
+    /// Root block of the persisted chain (`0` = never committed).
+    pub root: u64,
+    /// Every block of the persisted chain (freed CoW on the next rewrite).
+    pub blocks: Vec<u64>,
+    /// `true` once a settle mutated the directory after the last commit.
+    pub dirty: bool,
 }
 
 impl StructStorage {
@@ -65,6 +81,11 @@ impl StructStorage {
             dir: Mutex::new(None),
             dict: Mutex::new(DictState::new(true)),
             dead: RwLock::new(BTreeSet::new()),
+            chain: Mutex::new(ChainTrack {
+                root: 0,
+                blocks: Vec::new(),
+                dirty: false,
+            }),
         }
     }
 
@@ -79,6 +100,11 @@ impl StructStorage {
             dir: Mutex::new(None),
             dict: Mutex::new(DictState::new(false)),
             dead: RwLock::new(BTreeSet::new()),
+            chain: Mutex::new(ChainTrack {
+                root: 0,
+                blocks: Vec::new(),
+                dirty: false,
+            }),
         }
     }
 
@@ -155,6 +181,12 @@ impl StructStorage {
         freed
     }
 
+    /// This type's directory-chain tracker (root + blocks + dirty flag).
+    #[must_use]
+    pub(crate) const fn chain(&self) -> &Mutex<ChainTrack> {
+        &self.chain
+    }
+
     /// Mark `id` removed-but-unsettled: its page still holds the old bytes,
     /// so the read fallback must answer `None` until the settle lands.
     pub(crate) fn mark_removed(&self, id: Id) {
@@ -181,6 +213,7 @@ impl StructStorage {
         *self.dir.lock() = None;
         self.dict.lock().reset();
         self.dead.write().clear();
+        *self.chain.lock() = ChainTrack::default();
     }
 }
 

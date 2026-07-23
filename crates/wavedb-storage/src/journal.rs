@@ -1,63 +1,154 @@
-//! [`Journal`] — the append-only write-ahead log.
+//! [`Journal`] — the append-only write-ahead log, and the engine's **only**
+//! atomicity mechanism.
 //!
-//! Durability lives here: a batch is durable once [`Journal::append`] returns,
-//! because append writes the frame and `fsync`s before yielding. The page
-//! directories and the block allocator are reconstructions — on startup
-//! [`Journal::replay`] re-derives the in-memory cache from the log, and a
-//! background settle pushes it down into `data.bin`. A crash therefore loses
-//! nothing that was acked, and an interrupted (torn) final write is discarded.
+//! Durability lives here: a batch is durable once [`Journal::append`]
+//! returns, because append writes the frame and `fsync`s before yielding.
+//! Everything else in the engine — pages, directory chains, the allocator —
+//! is a reconstruction rooted in journal frames.
+//!
+//! ## Files
+//!
+//! Journals are timestamped: `journal_<nanos>.log`. Rotation creates a new
+//! file and redirects appends; the old journal is retired by a [`Commit`]
+//! frame written into the **new** journal (see `crate::commit`), then
+//! deleted. A `data.bin` with **no** journal present is corrupt — the
+//! journal chain is the recovery root, its absence means history was lost.
 //!
 //! ## Frame format
 //!
 //! ```text
-//! [ payload_len (u32 LE) ][ payload = to_wire_checked(Vec<Write>) ]
+//! [ payload_len (u32 LE) ][ payload = to_wire_checked(JournalFrame) ]
 //!                           └── [ crc32 (u32 LE) ][ wire bytes ] ──┘
 //! ```
 //!
-//! The payload is the **checked wire encoding** of one batch of [`Write`]s —
-//! the same all-or-nothing unit [`Store::apply`](wavedb_core::Store::apply)
-//! commits. `Write` derives `WaveWire`, so there is no journal-private record
-//! format: the log stores exactly what the codec defines, crc-framed.
+//! Two frame kinds:
+//! - [`JournalFrame::Batch`] — one all-or-nothing batch of [`Write`]s (the
+//!   unit [`Store::apply`](wavedb_core::Store::apply) commits);
+//! - [`JournalFrame::Commit`] — "journal `<ts>` is fully settled into
+//!   `data.bin`": the retired journal's timestamp plus every registered
+//!   type's directory-chain root and dictionary run address. One frame, so
+//!   the framing crc makes the whole commit atomic — a torn commit is
+//!   ignored and the retired journal (still on disk) rules.
 //!
-//! Replay stops at the first frame whose length runs past EOF, whose crc fails,
-//! or whose payload does not decode — a torn tail from a crash mid-append — and
-//! truncates the file back to the last whole frame.
+//! Replay stops at the first frame whose length runs past EOF, whose crc
+//! fails, or whose payload does not decode — a torn tail from a crash
+//! mid-append — and truncates the file back to the last whole frame.
+//!
+//! [`Commit`]: JournalFrame::Commit
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use wavedb_core::Write;
-use wavedb_core::wire::{from_wire_checked, to_wire_checked};
+use wavedb_core::wire::{WaveWire, from_wire_checked, to_wire_checked};
 
-use crate::error::StorageResult;
+use crate::error::{StorageError, StorageResult};
 
 /// Per-frame prefix: `payload_len (u32)`.
 const FRAME_PREFIX: usize = 4;
 
-/// An append-only write-ahead log of [`Write`] batches.
+/// One journal frame — see the module docs for the two kinds.
+#[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
+pub enum JournalFrame {
+    /// One atomic batch of writes.
+    Batch(Vec<Write>),
+    /// The retirement record of an older journal.
+    Commit(CommitFrame),
+}
+
+/// "Journal `journal_ts` is fully settled into `data.bin`" — plus where
+/// every registered type's on-disk metadata lives.
+///
+/// Appended **after** every settle and chain write completed (physical
+/// order in the file is the contract: any later `Batch` fsync also makes
+/// this durable).
+#[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
+pub struct CommitFrame {
+    /// Timestamp of the journal this commit retires.
+    pub journal_ts: u64,
+    /// `(STRUCT_HASH, directory-chain root block)` for **every** registered
+    /// type — untouched types repeat their previous root (`0` = the type
+    /// never settled anything). All of them, every commit: the retired
+    /// journal may hold the only older mention.
+    pub roots: Vec<(u64, u64)>,
+    /// `(STRUCT_HASH, dictionary run descriptor raw)` — `0` = no dictionary.
+    pub dicts: Vec<(u64, u64)>,
+}
+
+/// An append-only log of [`JournalFrame`]s in one timestamped file.
 #[derive(Debug)]
 pub struct Journal {
     file: File,
-    /// Byte offset of the end of the last whole frame (where the next append lands).
+    path: PathBuf,
+    ts: u64,
+    /// Byte offset of the end of the last whole frame (next append lands here).
     end: u64,
 }
 
+/// The journal files under `dir`, sorted by timestamp (oldest first).
+///
+/// # Errors
+/// [`StorageError::Io`] on a directory read fault.
+pub fn scan(dir: &Path) -> StorageResult<Vec<(u64, PathBuf)>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if let Some(ts) = name
+            .strip_prefix("journal_")
+            .and_then(|r| r.strip_suffix(".log"))
+            .and_then(|t| t.parse::<u64>().ok())
+        {
+            found.push((ts, path));
+        }
+    }
+    found.sort_unstable_by_key(|(ts, _)| *ts);
+    Ok(found)
+}
+
 impl Journal {
-    /// Open (or create) the journal at `path`. Does not read anything yet — call
-    /// [`replay`](Self::replay) to recover committed batches.
+    /// Create a fresh journal `journal_<ts>.log` under `dir`.
     ///
     /// # Errors
     /// [`StorageError::Io`] on a filesystem failure.
-    pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
+    pub fn create(dir: &Path, ts: u64) -> StorageResult<Self> {
+        let path = dir.join(format!("journal_{ts}.log"));
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+            .create_new(true)
+            .open(&path)?;
+        Ok(Self {
+            file,
+            path,
+            ts,
+            end: 0,
+        })
+    }
+
+    /// Open an existing journal file. Call [`replay`](Self::replay) to read
+    /// its frames (and truncate any torn tail) before appending.
+    ///
+    /// # Errors
+    /// [`StorageError::Io`] on a filesystem failure.
+    pub fn open(path: &Path, ts: u64) -> StorageResult<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
         let end = file.metadata()?.len();
-        Ok(Self { file, end })
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            ts,
+            end,
+        })
+    }
+
+    /// This journal's timestamp (its identity in `Commit` frames).
+    #[must_use]
+    pub const fn ts(&self) -> u64 {
+        self.ts
     }
 
     /// Total bytes of committed frames.
@@ -66,50 +157,38 @@ impl Journal {
         self.end
     }
 
-    /// Append one batch and `fsync`. The batch is durable once this returns.
+    /// Append one frame and `fsync`. Durable once this returns.
     ///
     /// # Errors
     /// [`StorageError::Io`] if the write or sync fails.
-    pub fn append(&mut self, batch: &[Write]) -> StorageResult<()> {
-        let payload = to_wire_checked(&batch.to_vec());
-        let mut frame = Vec::with_capacity(FRAME_PREFIX + payload.len());
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&payload);
+    pub fn append(&mut self, frame: &JournalFrame) -> StorageResult<()> {
+        let payload = to_wire_checked(frame);
+        let mut buf = Vec::with_capacity(FRAME_PREFIX + payload.len());
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&payload);
 
-        self.file.write_all_at(&frame, self.end)?;
+        self.file.write_all_at(&buf, self.end)?;
         self.file.sync_all()?; // the durability point
-        self.end += frame.len() as u64;
+        self.end += buf.len() as u64;
         Ok(())
     }
 
-    /// Drop every committed frame — called **after** a checkpoint's
-    /// superblock pointer is durable, so the log restarts empty (the
-    /// checkpoint now carries everything the frames did).
+    /// Read every committed frame back, in append order.
+    ///
+    /// A torn tail (a frame whose length overruns EOF, or whose crc
+    /// mismatches — the signature of a crash mid-append) is dropped and the
+    /// file truncated to the last whole frame, so the next append writes
+    /// clean.
     ///
     /// # Errors
-    /// [`StorageError::Io`] if the truncate or sync fails.
-    pub fn truncate(&mut self) -> StorageResult<()> {
-        self.file.set_len(0)?;
-        self.file.sync_all()?;
-        self.end = 0;
-        Ok(())
-    }
-
-    /// Read every committed batch back, in append order.
-    ///
-    /// A torn tail (a frame whose length overruns EOF, or whose crc mismatches —
-    /// the signature of a crash mid-append) is dropped and the file truncated to
-    /// the last whole frame, so the next [`append`](Self::append) writes clean.
-    ///
-    /// # Errors
-    /// [`StorageError::Io`] on a read fault. Mid-log corruption surfaces as a
-    /// truncated tail, not an error (an append-only log is unreliable past its
-    /// first bad frame).
-    pub fn replay(&mut self) -> StorageResult<Vec<Vec<Write>>> {
+    /// [`StorageError::Io`] on a read fault. Mid-log corruption surfaces as
+    /// a truncated tail, not an error (an append-only log is unreliable past
+    /// its first bad frame).
+    pub fn replay(&mut self) -> StorageResult<Vec<JournalFrame>> {
         let mut buf = vec![0u8; self.end as usize];
         self.file.read_exact_at(&mut buf, 0)?;
 
-        let mut batches = Vec::new();
+        let mut frames = Vec::new();
         let mut pos = 0usize;
         let mut good_end = 0usize;
         while pos + FRAME_PREFIX <= buf.len() {
@@ -123,8 +202,9 @@ impl Journal {
                 break; // frame overruns EOF — torn tail
             }
             // crc verification + decode in one step; any fault = torn tail.
-            match from_wire_checked::<Vec<Write>>(&buf[body_start..body_end]) {
-                Ok(batch) => batches.push(batch),
+            match from_wire_checked::<JournalFrame>(&buf[body_start..body_end])
+            {
+                Ok(frame) => frames.push(frame),
                 Err(_) => break,
             }
             pos = body_end;
@@ -136,13 +216,59 @@ impl Journal {
             self.file.sync_all()?;
             self.end = good_end as u64;
         }
-        Ok(batches)
+        Ok(frames)
     }
+
+    /// Delete this (retired) journal file.
+    ///
+    /// # Errors
+    /// [`StorageError::Io`] if the unlink fails.
+    pub fn delete(self) -> StorageResult<()> {
+        std::fs::remove_file(&self.path)?;
+        Ok(())
+    }
+}
+
+/// Delete a retired journal by path (recovery cleanup of a
+/// committed-but-undeleted file).
+///
+/// # Errors
+/// [`StorageError::Io`] if the unlink fails.
+pub fn delete_file(path: &Path) -> StorageResult<()> {
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+/// A timestamp for a new journal: strictly greater than `after` (existing
+/// files), wall-clock nanos otherwise.
+#[must_use]
+pub fn next_ts(after: u64) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    now.max(after + 1)
+}
+
+/// The invariant check for an existing database: `data.bin` without any
+/// journal means the recovery root was lost.
+///
+/// # Errors
+/// [`StorageError::Corrupt`] when violated.
+pub const fn require_journal_for(
+    data_bin_existed: bool,
+    journals: &[(u64, PathBuf)],
+) -> StorageResult<()> {
+    if data_bin_existed && journals.is_empty() {
+        return Err(StorageError::Corrupt(
+            "data.bin present but no journal — recovery root lost",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Journal;
+    use super::{Journal, JournalFrame, next_ts, require_journal_for, scan};
     use crate::error::StorageResult;
     use std::os::unix::fs::FileExt;
     use wavedb_core::{Id, U48, Write};
@@ -151,105 +277,116 @@ mod tests {
         Id::new(key, U48::from(1u32), false, key as u16)
     }
 
-    fn temp() -> (tempfile::TempDir, std::path::PathBuf) {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("journal.log");
-        (d, p)
+    fn batch(frames: &[Write]) -> JournalFrame {
+        JournalFrame::Batch(frames.to_vec())
     }
 
     #[test]
     fn append_then_replay() -> StorageResult<()> {
-        let (_d, p) = temp();
+        let d = tempfile::tempdir().unwrap();
         {
-            let mut j = Journal::open(&p)?;
-            j.append(&[
+            let mut j = Journal::create(d.path(), 7)?;
+            j.append(&batch(&[
                 Write::Put(id(1), vec![1, 2, 3]),
                 Write::Put(id(2), vec![4]),
-            ])?;
-            j.append(&[Write::Remove(id(1))])?;
+            ]))?;
+            j.append(&batch(&[Write::Remove(id(1))]))?;
         }
-        let mut j = Journal::open(&p)?;
-        let batches = j.replay()?;
+        let (ts, path) = scan(d.path())?.pop().unwrap();
+        assert_eq!(ts, 7);
+        let mut j = Journal::open(&path, ts)?;
+        let frames = j.replay()?;
         assert_eq!(
-            batches,
+            frames,
             vec![
-                vec![
+                batch(&[
                     Write::Put(id(1), vec![1, 2, 3]),
                     Write::Put(id(2), vec![4])
-                ],
-                vec![Write::Remove(id(1))],
+                ]),
+                batch(&[Write::Remove(id(1))]),
             ]
         );
         Ok(())
     }
 
     #[test]
-    fn replay_then_append_continues() -> StorageResult<()> {
-        let (_d, p) = temp();
-        {
-            let mut j = Journal::open(&p)?;
-            j.append(&[Write::Put(id(1), vec![9])])?;
-        }
-        let mut j = Journal::open(&p)?;
-        assert_eq!(j.replay()?.len(), 1);
-        j.append(&[Write::Put(id(2), vec![8])])?; // append after replay
-        let mut j2 = Journal::open(&p)?;
-        assert_eq!(j2.replay()?.len(), 2);
+    fn scan_sorts_and_next_ts_is_monotonic() -> StorageResult<()> {
+        let d = tempfile::tempdir().unwrap();
+        Journal::create(d.path(), 30)?;
+        Journal::create(d.path(), 10)?;
+        Journal::create(d.path(), 20)?;
+        let found = scan(d.path())?;
+        let ts: Vec<u64> = found.iter().map(|(t, _)| *t).collect();
+        assert_eq!(ts, vec![10, 20, 30]);
+        assert!(next_ts(30) > 30);
+        assert!(next_ts(u64::MAX - 1) == u64::MAX);
         Ok(())
     }
 
     #[test]
-    fn empty_journal_replays_nothing() -> StorageResult<()> {
-        let (_d, p) = temp();
-        let mut j = Journal::open(&p)?;
-        assert!(j.replay()?.is_empty());
-        Ok(())
+    fn missing_journal_with_data_is_refused() {
+        assert!(require_journal_for(true, &[]).is_err());
+        assert!(require_journal_for(false, &[]).is_ok());
+        assert!(
+            require_journal_for(true, &[(1, std::path::PathBuf::new())])
+                .is_ok()
+        );
     }
 
     #[test]
     fn torn_tail_is_discarded_and_truncated() -> StorageResult<()> {
-        let (_d, p) = temp();
+        let d = tempfile::tempdir().unwrap();
         {
-            let mut j = Journal::open(&p)?;
-            j.append(&[Write::Put(id(1), vec![1, 2, 3])])?;
-            j.append(&[Write::Put(id(2), vec![4, 5, 6])])?;
+            let mut j = Journal::create(d.path(), 1)?;
+            j.append(&batch(&[Write::Put(id(1), vec![1, 2, 3])]))?;
+            j.append(&batch(&[Write::Put(id(2), vec![4, 5, 6])]))?;
         }
-        let whole = std::fs::metadata(&p)?.len();
+        let (ts, path) = scan(d.path())?.pop().unwrap();
+        let whole = std::fs::metadata(&path)?.len();
         // Simulate a crash mid-append: tack on a half-written frame.
         {
-            let f = std::fs::OpenOptions::new().write(true).open(&p)?;
+            let f = std::fs::OpenOptions::new().write(true).open(&path)?;
             f.write_all_at(&[0xFF; 5], whole)?; // garbage, shorter than a frame
         }
-        let mut j = Journal::open(&p)?;
-        let batches = j.replay()?;
-        assert_eq!(batches.len(), 2, "torn tail must be ignored");
+        let mut j = Journal::open(&path, ts)?;
+        assert_eq!(j.replay()?.len(), 2, "torn tail must be ignored");
         // File truncated back to the last whole frame.
-        assert_eq!(std::fs::metadata(&p)?.len(), whole);
+        assert_eq!(std::fs::metadata(&path)?.len(), whole);
         Ok(())
     }
 
     #[test]
     fn corrupt_frame_body_treated_as_tail() -> StorageResult<()> {
-        let (_d, p) = temp();
+        let d = tempfile::tempdir().unwrap();
         {
-            let mut j = Journal::open(&p)?;
-            j.append(&[Write::Put(id(1), vec![1, 2, 3])])?;
+            let mut j = Journal::create(d.path(), 1)?;
+            j.append(&batch(&[Write::Put(id(1), vec![1, 2, 3])]))?;
         }
+        let (ts, path) = scan(d.path())?.pop().unwrap();
         // Flip a byte in the payload → crc fails → whole frame dropped.
         {
             let f = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(&p)?;
-            let len = std::fs::metadata(&p)?.len();
-            let last = len - 1;
+                .open(&path)?;
+            let len = std::fs::metadata(&path)?.len();
             let mut b = [0u8];
-            f.read_exact_at(&mut b, last)?;
+            f.read_exact_at(&mut b, len - 1)?;
             b[0] ^= 0xFF;
-            f.write_all_at(&b, last)?;
+            f.write_all_at(&b, len - 1)?;
         }
-        let mut j = Journal::open(&p)?;
+        let mut j = Journal::open(&path, ts)?;
         assert!(j.replay()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn delete_removes_the_file() -> StorageResult<()> {
+        let d = tempfile::tempdir().unwrap();
+        Journal::create(d.path(), 5)?;
+        let (ts, path) = scan(d.path())?.pop().unwrap();
+        Journal::open(&path, ts)?.delete()?;
+        assert!(scan(d.path())?.is_empty());
         Ok(())
     }
 }
