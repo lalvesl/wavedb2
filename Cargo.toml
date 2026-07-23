@@ -12,6 +12,7 @@ members = [
   "crates/wavedb-net",
   "crates/wavedb-quick-node",
   "crates/wavedb",
+  "examples/contact-book",
   "examples/schema-smoke",
   "examples/todo-app/schema",
   "examples/todo-app/server",
