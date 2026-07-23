@@ -15,12 +15,17 @@ merge/rebalance, secondary indexes, version chain, per-type `StructStorage`,
 zstd dictionaries). The tail is now largely landed (task log in
 [PLAN — M2 tail](#plan--m2-tail-storage-engine)):
 
-- **background settle + checkpointing — LANDED (S1–S4, 2026-07-07)**:
-  page-backed read-through (cache is a cache), checkpoint run + superblock
-  pointer + journal truncation (the journal no longer grows unbounded;
-  open replays only the tail), deferred settle behind a `pending` queue
-  with unsettled-remove tombstones, node maintenance task (drain →
-  threshold checkpoint → cache eviction to budget);
+- **background settle + journal-rooted recovery — LANDED (S1, S4,
+  J1–J5, 2026-07-07)**: page-backed read-through (cache is a cache),
+  deferred settle behind a `pending` queue with unsettled-remove
+  tombstones, and the user-directed **journal-rooted commit**: timestamped
+  `journal_<ts>.log` rotation (no write lock), directory chains as CoW
+  blocks in `data.bin`, ONE atomic `Commit` frame (roots of all types) in
+  the new journal retiring the old one, superblock write-once again. The
+  journal no longer grows unbounded; recovery roots in the newest valid
+  `Commit`. (The interim S2/S3 superblock-pointer checkpoint was
+  superseded the same day.) Node maintenance task: drain → threshold
+  commit → cache eviction to budget;
 - **dedicated 32 KiB one-node-per-page BpTree format — DROPPED
   (2026-07-07)**: trees are per tenant; B2C = millions of small trees, so
   a page per node wastes exactly the dominant case (see S5 in the PLAN);
@@ -456,7 +461,7 @@ Each task lands green (fmt + clippy + tests + file gate) and moves to
       Settle path split to `settle.rs` for the file budget (the S4 drain
       task lands there).
 
-## S2 — checkpoint: persist the projection, truncate the journal — **DONE (2026-07-07)**
+## S2 — checkpoint: persist the projection, truncate the journal — **DONE, then SUPERSEDED by J1–J5 (superblock-pointer checkpoint replaced by the journal-rooted commit)**
 
 - [x] `checkpoint.rs`: a checkpoint block run holds
       `[len u32][to_wire_checked(CheckpointBody)]` — per settled type
@@ -480,7 +485,7 @@ Each task lands green (fmt + clippy + tests + file gate) and moves to
       dictionary-compressed pages readable after restore; post-checkpoint
       writes replay over it; allocator protection + layout-rebuild units.
 
-## S3 — fast open: load the checkpoint, replay the tail — **DONE (2026-07-07)**
+## S3 — fast open: load the checkpoint, replay the tail — **DONE, then SUPERSEDED by J1–J5 (recovery now roots in the newest `Commit` frame)**
 
 - [x] `open` skips the `data.bin` truncate when `checkpoint::restore`
       finds a committed checkpoint: directories/dicts load into the slots,
@@ -535,3 +540,76 @@ spec section needs a matching `> Status:` note.)
 - [ ] Large string/blob heap segments compress individually inside the
       record envelope; page-level zstd already covers the common case —
       only worth landing if measured wins on real payloads.
+
+# PLAN — journal-rooted recovery (replaces the S2/S3 checkpoint)
+
+User-directed redesign (2026-07-07): the journal's crc framing is the
+engine's **only** atomicity mechanism. No superblock rewrites, no
+checkpoint run, no pointer files. `data.bin` pages + directory chains are
+CoW; a single `Commit` frame in the *new* journal retires the old one.
+S2/S3's superblock-pointer checkpoint is superseded (S1 read-through and
+S4 drain/tombstones/eviction survive unchanged).
+
+Model: writes append `Batch` frames to `journal_<ts>.log` (fsync = client
+ack) + cache. Rotation at threshold creates `journal_<ts2>.log` and
+redirects appends (no write lock). Commit of the old journal: drain
+everything → write every type's directory as CoW **chain blocks**
+(`{next u64, prev u64, addresses Vec<u64>}`, 0 = null — block 0 is the
+write-once superblock) → append ONE `Commit { journal_ts, roots: all
+registered hashes, dicts }` frame (all roots, not just touched — deleting
+the old journal must not lose untouched types' tracking) → fsync → delete
+old journal → release deferred CoW frees. The Commit frame is appended
+only after every step, under the journal append lock — a concurrent
+`Batch` fsync makes everything before it durable (physical order is the
+contract). Recovery: scan `journal_*.log` sorted; newest valid `Commit`
+gives the roots base; allocator derives from the chains + pages; every
+`Batch` in the remaining journals replays (re-settle converges — proven).
+A `data.bin` with no journal present is corrupt (refuse).
+
+## J1 — timestamped journal + rotation — **DONE (2026-07-07)**
+
+- [x] `journal_<nanos>.log` naming; open scans the dir (fresh dir creates
+      the first; `data.bin` present with no journal = refuse). `rotate()`
+      creates + redirects appends without blocking writers.
+
+## J2 — typed frames — **DONE (2026-07-07)**
+
+- [x] `JournalFrame { Batch(Vec<Write>), Commit { journal_ts, roots:
+      Vec<(u64, u64)>, dicts: Vec<(u64, u64)> } }`, WaveWire inside the
+      existing `[len][crc]` framing; torn/invalid tail truncation
+      unchanged.
+
+## J3 — directory chain blocks (CoW, in `data.bin`) — **DONE (2026-07-07)**
+
+- [x] Encode a type's `Directory.slots` (+ occupation, raw descriptors) as
+      linked 4 KiB blocks **in `data.bin`**; load walks next/prev. The
+      journal only ever carries the 8-byte root address. A type whose
+      directory did **not** change since the last commit rewrites nothing —
+      the new `Commit` frame repeats its previous root address (the real
+      per-rotation saving); only touched types write a fresh CoW chain.
+      Dictionary runs stay as today, rooted from the Commit frame's
+      `dicts`.
+
+## J4 — commit flow + policy — **DONE (2026-07-07)**
+
+- [x] `PageStore::commit_journal()`: rotate → drain all → write fresh
+      chains for the touched types only → append ONE `Commit` frame
+      (roots for **all** registered hashes — 16 B each; untouched types
+      repeat their old address) → fsync → delete old journal → release
+      deferred frees (CoW blocks retired by this commit). Maintenance
+      task rotates at `checkpoint_after_bytes`; clean shutdown commits.
+      Nothing referenced by the latest durable Commit is ever
+      overwritten in place; frees defer until the covering Commit is
+      durable.
+
+## J5 — recovery + superblock revert + tests — **DONE (2026-07-07)**
+
+- [x] Open: sorted journal scan, newest valid `Commit` = roots base
+      (committed-but-undeleted old journal is skipped), allocator from
+      chains + pages + dict runs, replay remaining `Batch` frames.
+      Superblock reverts to write-once (checkpoint field removed);
+      `checkpoint.rs` run/pointer machinery deleted.
+- [x] Crash-window tests: torn `Commit` frame (old journal still rules);
+      crash after Commit before delete (old journal skipped); multi
+      rotation; untouched-type roots survive a commit that never touched
+      them; cold open reads via chains.

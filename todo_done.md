@@ -1,5 +1,37 @@
 # DONE
 
+- **Journal-rooted recovery — J1–J5 (2026-07-07, user-directed design)**:
+  the journal's crc framing is the engine's **only** atomicity mechanism;
+  the S2/S3 superblock-pointer checkpoint (same day) was superseded.
+  - **Timestamped journals** (`journal_<nanos>.log`): rotation creates a
+    new file and redirects appends under the lock for microseconds — no
+    write blocking during a commit. `data.bin` present with no journal
+    refuses to open (recovery root lost).
+  - **Typed frames**: `JournalFrame::{Batch(Vec<Write>), Commit}` inside
+    the existing `[len][crc]` framing. `CommitFrame { journal_ts, roots,
+    dicts }` — ONE frame, atomic by its own crc (torn ⇒ invisible ⇒ the
+    retired journal still on disk rules). Roots list **every** registered
+    type (16 B each) — untouched types repeat their old address, so
+    deleting the old journal never loses tracking.
+  - **Directory chains** (`chain.rs`): a type's page addresses persist in
+    `data.bin` as CoW linked 4 KiB blocks `{next, prev, addresses}`
+    (0 = null; block 0 is the write-once superblock). The journal carries
+    only the 8-byte root. Only dirty types (tracked per-slot in the
+    compile-time `ChainTrack`) rewrite their chain at commit.
+  - **Commit flow** (`commit.rs`): rotate → drain → CoW chains for dirty
+    types → data sync → append `Commit` (under the append lock — a
+    concurrent Batch fsync makes prior bytes durable, physical order is
+    the contract) → delete old journal → roll the allocator's protected
+    set forward (frees deferred under the previous commit release).
+  - **Recovery**: scan sorted journals, newest decodable `Commit` = base;
+    covered leftovers (crash between commit and delete) are skipped and
+    cleaned; allocator derives from chains + pages + dict runs
+    (`from_layout`); uncovered `Batch` frames replay (re-settle
+    converges). Superblock reverted to write-once (checkpoint field
+    removed). Crash-window tests: torn Commit falls back to the old
+    journal; covered-journal leftover; multi-generation; dict-compressed
+    pages restored.
+
 - **M2 tail — background settle + checkpointing (S1–S4, 2026-07-07)**: the
   journal no longer grows unbounded; `data.bin` is a real recovery source.
   - **S1 page-backed reads**: the cache is a cache — `get`/`get_of` fall
