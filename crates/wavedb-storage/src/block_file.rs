@@ -30,7 +30,9 @@ use wavedb_core::wire::{
     CRC_PREFIX_LEN, WaveWire, from_wire_checked, to_wire_checked,
 };
 
-use crate::block::{BLOCK_SIZE, Run};
+use parking_lot::Mutex;
+
+use crate::block::{BLOCK_SIZE, BlockDescriptor, Run};
 use crate::error::{StorageError, StorageResult};
 
 /// Magic at the head of every WaveDB `data.bin` superblock.
@@ -61,6 +63,10 @@ struct SuperblockBody {
     version: u32,
     /// The per-database hash seed every record is routed with.
     seed: [u64; 4],
+    /// The current checkpoint run ([`BlockDescriptor::EMPTY`] = none yet) —
+    /// repointing this (one atomic block-0 rewrite) is what commits a
+    /// checkpoint.
+    checkpoint: BlockDescriptor,
 }
 
 /// Byte length of the checked-encoded [`SuperblockBody`] within block 0.
@@ -72,6 +78,8 @@ const BODY_CHECKED_LEN: usize =
 pub struct BlockFile {
     file: File,
     seed: [u64; 4],
+    /// The committed checkpoint pointer (mirrors the superblock).
+    checkpoint: Mutex<BlockDescriptor>,
 }
 
 impl BlockFile {
@@ -97,14 +105,42 @@ impl BlockFile {
         let len = file.metadata()?.len();
         if len == 0 {
             let seed = random_seed();
-            let bf = Self { file, seed };
+            let bf = Self {
+                file,
+                seed,
+                checkpoint: Mutex::new(BlockDescriptor::EMPTY),
+            };
             bf.write_superblock()?;
             bf.file.sync_all()?;
             Ok(bf)
         } else {
-            let seed = read_and_check_superblock(&file)?;
-            Ok(Self { file, seed })
+            let body = read_and_check_superblock(&file)?;
+            Ok(Self {
+                file,
+                seed: body.seed,
+                checkpoint: Mutex::new(body.checkpoint),
+            })
         }
+    }
+
+    /// The committed checkpoint run ([`BlockDescriptor::EMPTY`] = none).
+    #[must_use]
+    pub fn checkpoint(&self) -> BlockDescriptor {
+        *self.checkpoint.lock()
+    }
+
+    /// Commit `desc` as the checkpoint pointer: rewrite the superblock and
+    /// `fsync`. Returns once the pointer is durable — **this is the moment a
+    /// checkpoint becomes the recovery source** (and the previous one is
+    /// retired).
+    ///
+    /// # Errors
+    /// [`StorageError::Io`] if the write or sync fails.
+    pub fn set_checkpoint(&self, desc: BlockDescriptor) -> StorageResult<()> {
+        *self.checkpoint.lock() = desc;
+        self.write_superblock()?;
+        self.file.sync_all()?;
+        Ok(())
     }
 
     /// The per-database hash seed read from (or written to) the superblock.
@@ -194,6 +230,7 @@ impl BlockFile {
         let body = to_wire_checked(&SuperblockBody {
             version: FORMAT_VERSION,
             seed: self.seed,
+            checkpoint: *self.checkpoint.lock(),
         });
         block[OFF_BODY..OFF_BODY + BODY_CHECKED_LEN].copy_from_slice(&body);
         self.ensure_len(BLOCK_SIZE as u64)?;
@@ -202,8 +239,8 @@ impl BlockFile {
     }
 }
 
-/// Read block 0, verify magic + crc + version, and return the stored seed.
-fn read_and_check_superblock(file: &File) -> StorageResult<[u64; 4]> {
+/// Read block 0, verify magic + crc + version, and return the stored body.
+fn read_and_check_superblock(file: &File) -> StorageResult<SuperblockBody> {
     let have = file.metadata()?.len();
     if have < BLOCK_SIZE as u64 {
         return Err(StorageError::OutOfBounds {
@@ -223,7 +260,7 @@ fn read_and_check_superblock(file: &File) -> StorageResult<[u64; 4]> {
     if body.version != FORMAT_VERSION {
         return Err(StorageError::BadVersion(body.version));
     }
-    Ok(body.seed)
+    Ok(body)
 }
 
 /// A per-database random `[u64; 4]` seed, drawn from the OS via the stdlib's
@@ -349,6 +386,7 @@ mod tests {
             let body = to_wire_checked(&SuperblockBody {
                 version: FORMAT_VERSION + 1,
                 seed: [1, 2, 3, 4],
+                checkpoint: crate::block::BlockDescriptor::EMPTY,
             });
             f.write_all_at(&body, OFF_BODY as u64).unwrap();
         }

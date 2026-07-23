@@ -23,11 +23,13 @@
 //!   under it so cache order always equals journal (= replay) order;
 //! - `alloc` (`Mutex`) — block space is one shared resource.
 //!
-//! Lock order: `journal → dir → cache` on the commit path (the directory is
-//! only taken to route a `Remove` whose owner is no longer cached);
-//! `dir → cache(read) → alloc` on the settle path; `dir → dict` on the
-//! read-through path. No path takes them in a conflicting order, so the
-//! graph is acyclic.
+//! Lock order: `journal → pending → dir → cache` on the commit path (the
+//! directory is only taken to route a `Remove` whose owner is no longer
+//! cached; the pending push stays under the journal so eviction's
+//! "queue empty ⇒ everything settled" check can't race a commit);
+//! `pending → dir → cache(read) → alloc` on the settle drain; `dir → dict`
+//! on the read-through path. No path takes them in a conflicting order, so
+//! the graph is acyclic.
 //!
 //! ## Reads
 //!
@@ -41,16 +43,24 @@
 //!
 //! ## Recovery model
 //!
-//! `data.bin` is a **deterministic projection of the journal**. On
-//! [`open`](PageStore::open) the data file is truncated back to its superblock
-//! and every committed batch is replayed through the same commit + settle path
-//! a live `apply` uses — rebuilding the caches, the directories, and the
-//! allocator from the log. So a crash loses nothing that was acked. Settle
-//! writes the **cache's current bytes** for a touched id (not the batch's),
-//! which makes it order-independent: a late settle can only write newer state.
+//! `data.bin` is a **deterministic projection of the journal**, snapshotted
+//! by checkpoints ([`crate::checkpoint`]). On [`open`](PageStore::open):
+//! with a committed checkpoint, the directories/dictionaries/allocator load
+//! from it, the caches start **empty** (reads fall through to the pages),
+//! and only the journal's post-checkpoint frames replay; without one, the
+//! data file is truncated back to its superblock and every committed batch
+//! replays through the same commit + settle path a live `apply` uses. Either
+//! way a crash loses nothing that was acked. Settle writes the **cache's
+//! current bytes** for a touched id (not the batch's), which makes it
+//! order-independent and replay-idempotent: a late or repeated settle can
+//! only write newer state.
 //!
-//! The settle into pages is currently **inline** with `apply`; the design's
-//! background settle/rebalance is a later optimisation, not a correctness need.
+//! The settle into pages is **deferred**: `apply` commits to the journal +
+//! caches and queues the touched ids; [`drain`](PageStore::drain) (driven by
+//! the node's maintenance task) writes the pages later. An unsettled remove
+//! is tombstoned so the read fallback never resurrects the page's stale
+//! bytes. [`checkpoint`](PageStore::checkpoint) drains first, so its
+//! snapshot always covers everything committed.
 
 use std::path::Path;
 
@@ -76,13 +86,16 @@ pub(crate) type Touched = Vec<(usize, Vec<Id>)>;
 #[derive(Debug)]
 pub struct PageStore {
     pub(crate) file: BlockFile,
-    journal: Mutex<crate::journal::Journal>,
+    pub(crate) journal: Mutex<crate::journal::Journal>,
     pub(crate) alloc: Mutex<BlockAllocator>,
     /// The registered slots, sorted by `STRUCT_HASH` (deduped) — a lock-free,
     /// read-only route table after open.
     pub(crate) types: Vec<&'static StructStorage>,
     pub(crate) seed: [u64; 4],
     pub(crate) split_threshold_blocks: u64,
+    /// Touched ids committed to the caches but not yet settled into pages —
+    /// what [`drain`](Self::drain) consumes.
+    pub(crate) pending: Mutex<Touched>,
     _claim: EngineClaim,
 }
 
@@ -109,11 +122,6 @@ impl PageStore {
 
         let file = BlockFile::open(dir.join("data.bin"))?;
         let seed = file.seed();
-        // Rebuild pages from the journal: drop any prior page layout.
-        file.truncate_to_blocks(RESERVED_BLOCKS)?;
-
-        let mut alloc = BlockAllocator::new();
-        alloc.alloc(RESERVED_BLOCKS); // reserve the superblock (block 0)
 
         let mut journal =
             crate::journal::Journal::open(dir.join("journal.log"))?;
@@ -129,6 +137,22 @@ impl PageStore {
             slot.reset(); // a prior run's state (same process) must not leak in
         }
 
+        // A committed checkpoint makes `data.bin` authoritative: load the
+        // directories/dictionaries/allocator from it, leave the caches empty
+        // (reads fall through to the pages), and replay only the journal's
+        // post-checkpoint frames. Without one, rebuild everything from the
+        // full journal as before.
+        let alloc =
+            if let Some(alloc) = crate::checkpoint::restore(&file, &types)? {
+                alloc
+            } else {
+                // Rebuild pages from the journal: drop any prior page layout.
+                file.truncate_to_blocks(RESERVED_BLOCKS)?;
+                let mut alloc = BlockAllocator::new();
+                alloc.alloc(RESERVED_BLOCKS); // reserve the superblock
+                alloc
+            };
+
         let store = Self {
             file,
             journal: Mutex::new(journal),
@@ -136,6 +160,7 @@ impl PageStore {
             types,
             seed,
             split_threshold_blocks: DEFAULT_SPLIT_THRESHOLD_BLOCKS,
+            pending: Mutex::new(Vec::new()),
             _claim: claim,
         };
         for batch in &batches {
@@ -169,23 +194,26 @@ impl PageStore {
     }
 
     /// Journal first (durable fsync), then commit to the per-type caches and
-    /// settle into their pages.
+    /// queue the touched ids for the settle drain. The batch is durable when
+    /// this returns; the page write happens later
+    /// ([`drain`](Self::drain)) — a crash before it replays from the journal.
     // The journal guard deliberately spans the cache commit — releasing it
     // earlier (the lint's suggestion) would let two applies commit their
     // caches in the opposite order to their journal frames, so replay could
-    // disagree with what live readers saw.
+    // disagree with what live readers saw. The pending-queue push also stays
+    // under it: eviction relies on "empty queue under its lock ⇒ every
+    // committed id is settled" (see `evict_settled`).
     #[allow(clippy::significant_drop_tightening)]
     fn apply_inner(&self, batch: &[Write]) -> StorageResult<()> {
         // Refuse unroutable writes *before* the journal sees the batch, so the
         // log never holds a batch replay would choke on.
         self.route_batch(batch)?;
-        let touched = {
-            let mut journal = self.journal.lock();
-            journal.append(batch)?; // durability point
-            // Commit under the journal lock: cache order == journal order.
-            self.commit_to_caches(batch)?
-        };
-        self.settle(&touched)
+        let mut journal = self.journal.lock();
+        journal.append(batch)?; // durability point
+        // Commit under the journal lock: cache order == journal order.
+        let touched = self.commit_to_caches(batch)?;
+        merge_touched(&mut self.pending.lock(), touched);
+        Ok(())
     }
 
     /// Verify every `Put` in `batch` routes to a registered slot.
@@ -225,55 +253,22 @@ impl PageStore {
                         .mem_cache()
                         .write()
                         .insert(id.raw(), bytes.clone());
+                    // A Put supersedes any unsettled remove of the same id.
+                    self.types[idx].clear_removed(*id);
                     note_touched(&mut touched, idx, *id);
                 }
                 Write::Remove(id) => {
                     if let Some(idx) = self.owner_of(*id)? {
                         self.types[idx].mem_cache().write().remove(&id.raw());
+                        // The page still holds the bytes until the settle
+                        // lands — tombstone so reads don't resurrect them.
+                        self.types[idx].mark_removed(*id);
                         note_touched(&mut touched, idx, *id);
                     }
                 }
             }
         }
         Ok(touched)
-    }
-
-    /// The slot index owning `id`, if any. The id alone names no type: the
-    /// owner is whichever cache holds it, falling back to the settled pages
-    /// for a record the cache no longer carries. Writers are serialised by
-    /// the journal lock, so the probe-then-mutate pair can't race.
-    fn owner_of(&self, id: Id) -> StorageResult<Option<usize>> {
-        let cached = self
-            .types
-            .iter()
-            .position(|s| s.mem_cache().read().contains_key(&id.raw()));
-        if let Some(idx) = cached {
-            return Ok(Some(idx));
-        }
-        for (idx, slot) in self.types.iter().enumerate() {
-            if self.read_from_pages(slot, id)?.is_some() {
-                return Ok(Some(idx));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Read `id` from `slot`'s settled pages — the read-through half of the
-    /// cache-or-page read path. `None` when the type has never settled
-    /// anything or the page does not hold the id.
-    // The directory guard must span the page read — `dir` borrows from it.
-    #[allow(clippy::significant_drop_tightening)]
-    fn read_from_pages(
-        &self,
-        slot: &'static StructStorage,
-        id: Id,
-    ) -> StorageResult<Option<Vec<u8>>> {
-        let dir_guard = slot.directory().lock();
-        let Some(dir) = dir_guard.as_ref() else {
-            return Ok(None);
-        };
-        let dict = slot.dictionary().lock();
-        dir.get_record(slot.struct_hash(), &self.file, id, &dict)
     }
 }
 
@@ -321,6 +316,15 @@ fn note_touched(touched: &mut Touched, idx: usize, id: Id) {
     match touched.iter_mut().find(|(i, _)| *i == idx) {
         Some((_, ids)) => ids.push(id),
         None => touched.push((idx, vec![id])),
+    }
+}
+
+/// Merge one batch's touched ids into the pending queue (slot-grouped).
+fn merge_touched(pending: &mut Touched, touched: Touched) {
+    for (idx, ids) in touched {
+        for id in ids {
+            note_touched(pending, idx, id);
+        }
     }
 }
 
@@ -478,6 +482,7 @@ mod tests {
             ])
             .await
             .unwrap();
+            s.drain().unwrap(); // settle into pages
             // Simulate eviction: drop the cache; the settled pages must serve.
             TEST_SLOT.mem_cache().write().clear();
             assert_eq!(
@@ -506,11 +511,17 @@ mod tests {
                 s.apply(&[Write::Put(nonunique(3), rec(SH, b"gone soon"))])
                     .await
                     .unwrap();
+                s.drain().unwrap();
                 // Evict, then remove: the owner must be found on the page.
                 TEST_SLOT.mem_cache().write().clear();
                 s.apply(&[Write::Remove(nonunique(3))]).await.unwrap();
+                // Before the settle lands, the tombstone must hide the
+                // (still-present) page bytes…
                 assert_eq!(s.get(nonunique(3)).await.unwrap(), None);
                 assert_eq!(s.get_of(SH, nonunique(3)).await.unwrap(), None);
+                // …and after it, the page itself agrees.
+                s.drain().unwrap();
+                assert_eq!(s.get(nonunique(3)).await.unwrap(), None);
             }
             // And the journal agrees on replay.
             let s = open(d.path());
@@ -532,6 +543,261 @@ mod tests {
         drop(first);
         // Slot released on drop — opening again succeeds.
         let _second = open(d.path());
+    }
+
+    #[test]
+    fn unsettled_writes_read_correctly_and_survive_reopen() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        block_on(async {
+            {
+                let s = open(d.path());
+                s.apply(&[Write::Put(nonunique(1), rec(SH, b"queued"))])
+                    .await
+                    .unwrap();
+                assert!(s.has_pending(), "settle must be deferred");
+                assert_eq!(
+                    s.get(nonunique(1)).await.unwrap(),
+                    Some(rec(SH, b"queued")),
+                    "the cache serves an unsettled write"
+                );
+                assert_eq!(s.bucket_count(SH), 0, "no page written yet");
+            } // dropped with the queue never drained
+            let s = open(d.path());
+            assert_eq!(
+                s.get(nonunique(1)).await.unwrap(),
+                Some(rec(SH, b"queued")),
+                "the journal covers unsettled writes"
+            );
+        });
+    }
+
+    #[test]
+    fn tombstone_hides_stale_page_until_settle() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let s = open(d.path());
+        block_on(async {
+            s.apply(&[Write::Put(nonunique(9), rec(SH, b"v1"))])
+                .await
+                .unwrap();
+            s.drain().unwrap(); // page holds v1
+            s.apply(&[Write::Remove(nonunique(9))]).await.unwrap();
+            // Unsettled remove: the page still holds v1; reads must not
+            // resurrect it.
+            assert_eq!(s.get(nonunique(9)).await.unwrap(), None);
+            // A re-put supersedes the tombstone immediately.
+            s.apply(&[Write::Put(nonunique(9), rec(SH, b"v2"))])
+                .await
+                .unwrap();
+            assert_eq!(
+                s.get(nonunique(9)).await.unwrap(),
+                Some(rec(SH, b"v2"))
+            );
+            s.drain().unwrap();
+            assert_eq!(
+                s.get(nonunique(9)).await.unwrap(),
+                Some(rec(SH, b"v2"))
+            );
+        });
+    }
+
+    #[test]
+    fn evict_settled_respects_budget_and_pending() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let s = open(d.path());
+        block_on(async {
+            s.apply(&[Write::Put(nonunique(1), rec(SH, b"resident"))])
+                .await
+                .unwrap();
+            // Pending queue non-empty ⇒ eviction must refuse.
+            s.evict_settled(0);
+            assert!(s.cache_len() > 0, "unsettled entries must not evict");
+            s.drain().unwrap();
+            s.evict_settled(0);
+            assert_eq!(s.cache_len(), 0, "settled entries evict to budget");
+            assert_eq!(
+                s.get(nonunique(1)).await.unwrap(),
+                Some(rec(SH, b"resident")),
+                "evicted reads fall through to the page"
+            );
+        });
+    }
+
+    #[test]
+    fn checkpoint_empties_journal_and_reopen_is_cold() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        block_on(async {
+            {
+                let s = open(d.path());
+                s.apply(&[Write::Put(nonunique(1), rec(SH, b"kept"))])
+                    .await
+                    .unwrap();
+                s.apply(&[
+                    Write::Put(nonunique(2), rec(SH, b"doomed")),
+                    Write::Put(nonunique(3), rec(SH, b"kept too")),
+                ])
+                .await
+                .unwrap();
+                s.apply(&[Write::Remove(nonunique(2))]).await.unwrap();
+                s.checkpoint().unwrap();
+            }
+            assert_eq!(
+                std::fs::metadata(d.path().join("journal.log"))
+                    .unwrap()
+                    .len(),
+                0,
+                "a committed checkpoint must truncate the journal"
+            );
+            let s = open(d.path());
+            assert_eq!(s.cache_len(), 0, "a checkpointed open starts cold");
+            assert_eq!(
+                s.get(nonunique(1)).await.unwrap(),
+                Some(rec(SH, b"kept"))
+            );
+            assert_eq!(
+                s.get_of(SH, nonunique(3)).await.unwrap(),
+                Some(rec(SH, b"kept too"))
+            );
+            assert_eq!(
+                s.get(nonunique(2)).await.unwrap(),
+                None,
+                "a pre-checkpoint remove must hold after restore"
+            );
+        });
+    }
+
+    #[test]
+    fn writes_after_checkpoint_replay_over_it() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        block_on(async {
+            {
+                let s = open(d.path());
+                s.apply(&[Write::Put(nonunique(1), rec(SH, b"old"))])
+                    .await
+                    .unwrap();
+                s.checkpoint().unwrap();
+                // Post-checkpoint traffic lands in the (fresh) journal.
+                s.apply(&[Write::Put(nonunique(1), rec(SH, b"new"))])
+                    .await
+                    .unwrap();
+                s.apply(&[Write::Put(nonunique(4), rec(SH, b"tail"))])
+                    .await
+                    .unwrap();
+            }
+            let s = open(d.path());
+            assert_eq!(
+                s.get(nonunique(1)).await.unwrap(),
+                Some(rec(SH, b"new")),
+                "the journal tail must win over checkpoint state"
+            );
+            assert_eq!(
+                s.get(nonunique(4)).await.unwrap(),
+                Some(rec(SH, b"tail"))
+            );
+        });
+    }
+
+    #[test]
+    fn stale_journal_replays_over_checkpoint_and_converges() {
+        // Simulates a crash between the superblock repoint and the journal
+        // truncate: the checkpoint already covers every frame, and replaying
+        // them again must converge, not corrupt.
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let journal_path = d.path().join("journal.log");
+        block_on(async {
+            let stale = {
+                let s = open(d.path());
+                s.apply(&[Write::Put(nonunique(1), rec(SH, b"v1"))])
+                    .await
+                    .unwrap();
+                s.apply(&[Write::Put(nonunique(1), rec(SH, b"v2"))])
+                    .await
+                    .unwrap();
+                s.apply(&[Write::Put(nonunique(5), rec(SH, b"other"))])
+                    .await
+                    .unwrap();
+                s.apply(&[Write::Remove(nonunique(5))]).await.unwrap();
+                let stale = std::fs::read(&journal_path).unwrap();
+                s.checkpoint().unwrap();
+                stale
+            };
+            // Un-truncate: put the covered frames back.
+            std::fs::write(&journal_path, &stale).unwrap();
+            let s = open(d.path());
+            assert_eq!(
+                s.get(nonunique(1)).await.unwrap(),
+                Some(rec(SH, b"v2"))
+            );
+            assert_eq!(s.get(nonunique(5)).await.unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn corrupt_checkpoint_refuses_to_open() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        block_on(async {
+            let s = open(d.path());
+            s.apply(&[Write::Put(nonunique(1), rec(SH, b"x"))])
+                .await
+                .unwrap();
+            s.checkpoint().unwrap();
+        });
+        // Locate the checkpoint run via the superblock, scribble over it.
+        {
+            let bf =
+                crate::block_file::BlockFile::open(d.path().join("data.bin"))
+                    .unwrap();
+            let run = bf.checkpoint().run();
+            bf.write_run(run, &[0xFF; 16]).unwrap();
+        }
+        assert!(matches!(
+            PageStore::open(d.path(), &[&TEST_SLOT]).unwrap_err(),
+            StorageError::Corrupt(_)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_restores_dictionary_compressed_pages() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        // Repetitive bodies → the dictionary warms and pages store Zstd, so
+        // reading them back after restore needs the persisted dictionary.
+        let body = |k: u64| {
+            let mut v = vec![b'A'; 1024];
+            v.extend_from_slice(&k.to_le_bytes());
+            rec(SH, &v)
+        };
+        block_on(async {
+            {
+                let s = open(d.path());
+                for k in 0..50u64 {
+                    s.apply(&[Write::Put(nonunique(k), body(k))])
+                        .await
+                        .unwrap();
+                }
+                s.checkpoint().unwrap();
+            }
+            let s = open(d.path());
+            assert_eq!(s.cache_len(), 0);
+            for k in 0..50u64 {
+                assert_eq!(
+                    s.get_of(SH, nonunique(k)).await.unwrap(),
+                    Some(body(k)),
+                    "record {k} must decompress against the restored dict"
+                );
+            }
+            // And the store keeps working (settle over restored state).
+            s.apply(&[Write::Put(nonunique(60), body(60))])
+                .await
+                .unwrap();
+            s.checkpoint().unwrap();
+        });
     }
 
     /// ~1 KiB of pseudo-random (zstd-incompressible) bytes — pages must grow
@@ -562,6 +828,7 @@ mod tests {
                     .await
                     .unwrap();
             }
+            s.drain().unwrap(); // splits happen on the settle path
             assert!(
                 s.bucket_count(SH) > 1,
                 "expected at least one bucket split"
