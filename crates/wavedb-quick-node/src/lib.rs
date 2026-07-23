@@ -203,8 +203,9 @@ where
             shutdown,
         )
         .await?;
-        // Clean shutdown: everything settled + checkpointed, journal empty.
-        self.store.checkpoint()?;
+        // Clean shutdown: everything settled + committed — a restart
+        // replays nothing.
+        self.store.commit_journal()?;
         Ok(())
     }
 }
@@ -222,7 +223,7 @@ async fn maintain(store: Rc<PageStore>, policy: Maintenance) {
             return;
         }
         if store.journal_len() > policy.checkpoint_after_bytes
-            && store.checkpoint().is_err()
+            && store.commit_journal().is_err()
         {
             return;
         }

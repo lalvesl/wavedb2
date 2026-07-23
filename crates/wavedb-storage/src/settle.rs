@@ -79,6 +79,8 @@ impl PageStore {
     pub(crate) fn settle(&self, touched: &Touched) -> StorageResult<()> {
         for (idx, ids) in touched {
             let slot = self.types[*idx];
+            // The directory is about to drift from its persisted chain.
+            slot.chain().lock().dirty = true;
             let mut dir_guard = slot.directory().lock();
             let dir =
                 dir_guard.get_or_insert_with(|| Directory::new(self.seed));

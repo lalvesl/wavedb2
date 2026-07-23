@@ -21,7 +21,8 @@
 pub mod alloc;
 pub mod block;
 pub mod block_file;
-mod checkpoint;
+mod chain;
+mod commit;
 pub mod dictionary;
 pub mod directory;
 mod directory_pages;
@@ -38,7 +39,7 @@ pub use block_file::{BlockFile, RESERVED_BLOCKS};
 pub use dictionary::{DictState, Dictionary};
 pub use directory::{Directory, bucket_index, hash_of};
 pub use error::{StorageError, StorageResult};
-pub use journal::Journal;
+pub use journal::{CommitFrame, Journal, JournalFrame};
 pub use page::SlotPage;
 pub use page_store::PageStore;
 pub use struct_storage::{
