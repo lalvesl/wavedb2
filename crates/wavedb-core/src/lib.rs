@@ -37,6 +37,7 @@ pub mod metadata;
 pub mod overlay;
 pub mod permission;
 pub mod record;
+mod record_unique;
 pub mod store;
 pub mod traits;
 pub mod u48;
@@ -45,6 +46,7 @@ pub mod wire;
 pub use collection::Collection;
 pub use collection_handle::CollectionHandle;
 pub use error::{Error, Result};
+pub use expose::Caller;
 pub use fn_identity::FnArgTag;
 pub use handle::{DbHandle, LocalHandle};
 // Generated `by_<field>` lookups return `impl Stream`, and a

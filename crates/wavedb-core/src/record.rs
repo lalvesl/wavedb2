@@ -179,6 +179,7 @@ pub(crate) async fn plan_chained_save<V: WaveWire, S: Store>(
     hash: u64,
     live_id: Id,
     tenant: U48,
+    user: U48,
     value: &V,
     pivot_id: Option<LocalId>,
 ) -> Result<(Vec<Write>, Option<(Metadata, V)>)> {
@@ -186,7 +187,7 @@ pub(crate) async fn plan_chained_save<V: WaveWire, S: Store>(
         // First version: nothing to archive.
         let meta = Metadata {
             pivot_id,
-            user: tenant,
+            user,
             ..Metadata::default()
         };
         let write = Write::Put(live_id, encode_record(hash, &meta, value));
@@ -227,7 +228,7 @@ pub(crate) async fn plan_chained_save<V: WaveWire, S: Store>(
         old_modification_id: Some(LocalId::from_id(archive_id)),
         new_modification_id: None,
         pivot_id: old_meta.pivot_id,
-        user: tenant,
+        user,
         device_created: 0,
         permission: old_meta.permission.clone(),
     };
@@ -267,82 +268,8 @@ where
 
 // ---- Unique anchors -----------------------------------------------------------
 
-/// The fixed anchor a `Unique` type's live record sits at under `tenant`.
-fn unique_anchor<T: crate::traits::WaveDbStruct>(tenant: U48) -> Id {
-    Id::new(T::STRUCT_HASH, tenant, true, 0)
-}
-
-/// Fetch a `Unique` record from its anchor (`KEY = STRUCT_HASH`, `FLAG = 1`,
-/// `SALT = 0`) under `tenant`. `None` = never saved.
-///
-/// # Errors
-/// Propagates a [`Store`] failure or a decode fault.
-pub async fn get_unique<T, S>(store: &S, tenant: U48) -> Result<Option<T>>
-where
-    T: crate::traits::WaveDbStruct,
-    S: Store,
-{
-    let anchor = unique_anchor::<T>(tenant);
-    match store.get_of(T::STRUCT_HASH, anchor).await? {
-        Some(bytes) => Ok(Some(decode_record(T::STRUCT_HASH, &bytes)?.1)),
-        None => Ok(None),
-    }
-}
-
-/// Save (insert-or-overwrite) a `Unique` record at its anchor under `tenant`.
-/// `save` **is** the upsert — `Unique` types have no separate create.
-///
-/// A save over an existing record archives the superseded version and links
-/// the modification chain (the timeline stays walkable via
-/// [`unique_history`]); everything commits as one atomic batch.
-///
-/// # Errors
-/// Propagates a [`Store`] failure or a decode fault on the existing record.
-pub async fn save_unique<T, S>(store: &S, tenant: U48, value: &T) -> Result<()>
-where
-    T: crate::traits::WaveDbStruct,
-    S: Store,
-{
-    let anchor = unique_anchor::<T>(tenant);
-    let (writes, _old) = plan_chained_save::<T, S>(
-        store,
-        T::STRUCT_HASH,
-        anchor,
-        tenant,
-        value,
-        None,
-    )
-    .await?;
-    store.apply(&writes).await
-}
-
-/// Stream a `Unique` record's versions **newest-first** (the live record,
-/// then each archived version along the modification chain). Empty when the
-/// record was never saved.
-pub fn unique_history<'a, T, S>(
-    store: &'a S,
-    tenant: U48,
-) -> impl futures::Stream<Item = Result<(Metadata, T)>> + 'a
-where
-    T: crate::traits::WaveDbStruct + 'a,
-    S: Store,
-{
-    use futures::StreamExt;
-    let anchor = unique_anchor::<T>(tenant);
-    futures::stream::once(async move {
-        store
-            .get_of(T::STRUCT_HASH, anchor)
-            .await
-            .map(|b| b.is_some())
-    })
-    .flat_map(move |exists| match exists {
-        Ok(true) => {
-            history_stream::<T, S>(store, T::STRUCT_HASH, anchor, tenant)
-                .left_stream()
-        }
-        Ok(false) => futures::stream::empty().left_stream().right_stream(),
-        Err(e) => futures::stream::once(async move { Err(e) })
-            .right_stream()
-            .right_stream(),
-    })
-}
+// Split out for the file budget; re-exported so the established
+// `crate::record::*` paths (collection, handle, expose) still resolve.
+pub use crate::record_unique::{
+    get_unique, save_unique, save_unique_as, unique_history,
+};

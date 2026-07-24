@@ -67,6 +67,45 @@ pub enum Reply {
     Returned(Vec<u8>),
 }
 
+/// The verified identity a command executes as — gate 1's output.
+///
+/// `tenant` partitions the data; `user` is authorship (`Metadata.user`).
+/// For a B2C session they are equal. The unauthenticated tier is
+/// `user == U48::MAX`: only `#[server(public)]` functions accept it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caller {
+    /// The authenticated user (`U48::MAX` = anonymous).
+    pub user: U48,
+    /// The tenant the command executes under.
+    pub tenant: U48,
+}
+
+impl Caller {
+    /// A caller whose user *is* the tenant — the engine-local/B2C identity.
+    #[must_use]
+    pub const fn tenant_owned(tenant: U48) -> Self {
+        Self {
+            user: tenant,
+            tenant,
+        }
+    }
+
+    /// The unauthenticated tier under a claimed tenant.
+    #[must_use]
+    pub const fn anonymous(tenant: U48) -> Self {
+        Self {
+            user: U48::MAX,
+            tenant,
+        }
+    }
+
+    /// Is this the unauthenticated tier?
+    #[must_use]
+    pub const fn is_anonymous(&self) -> bool {
+        self.user.get() == U48::MAX.get()
+    }
+}
+
 /// The declared registry surface.
 ///
 /// Implemented by the zero-sized types `expose_server!` / `expose_client!`
@@ -94,12 +133,12 @@ pub trait Exposure {
     async fn execute<S: Store>(
         &self,
         store: &S,
-        tenant: U48,
+        caller: Caller,
         struct_hash: u64,
         command: Command,
         payload: &[u8],
     ) -> Result<Reply> {
-        let _ = (store, tenant, command, payload);
+        let _ = (store, caller, command, payload);
         Err(Error::UnknownStructHash(struct_hash))
     }
 }
