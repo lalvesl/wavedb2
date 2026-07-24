@@ -12,36 +12,19 @@ workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-wavedb = { path = "../wavedb", default-features = false, features = ["wasm"] }
+# Anchors the whole client stack (`Db`, `NetClient`, the platform `fetch`
+# tunnel) into the wasm artifact — what the size tracker measures.
+wavedb = { path = "../wavedb" }
 
 # WASM-only dependencies — compiled only when targeting wasm32-unknown-unknown.
+# The IndexedDB `Store` (remaining M5 work) will add its web-sys Idb*
+# features here when it lands.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.3", features = ["wasm_js"] }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
-gloo-net = { workspace = true }
-js-sys = { workspace = true }
-
-futures = { workspace = true }
-# Direct dep so the `::wavedb_core::` paths emitted by #[wave_db] resolve
-# in this crate (the example schema lives here).
+# The probe drives the transport below the typed surface (raw frames).
 wavedb-core = { path = "../wavedb-core" }
-wavedb-net = { path = "../wavedb-net", default-features = false }
-# IndexedDB features on top of the workspace web-sys set — browser-side
-# persistence (pages + bookkeeping) lives in IndexedDB, not localStorage.
-web-sys = { workspace = true, features = [
-  "DomException",
-  "DomStringList",
-  "IdbDatabase",
-  "IdbFactory",
-  "IdbKeyRange",
-  "IdbObjectStore",
-  "IdbOpenDbRequest",
-  "IdbRequest",
-  "IdbTransaction",
-  "IdbTransactionMode",
-  "Window",
-] }
+wavedb-net = { path = "../wavedb-net" }
 
 [dev-dependencies]
 wasm-bindgen-test = { workspace = true }

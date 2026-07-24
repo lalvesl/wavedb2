@@ -18,6 +18,8 @@ path = "src/lib.rs"
 wavedb-core = { path = "../wavedb-core" }
 wavedb-storage = { path = "../wavedb-storage" }
 wavedb-net = { path = "../wavedb-net" }
+# Entropy for the default per-boot signing secret.
+wavedb-platform.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "time"] }
 thiserror.workspace = true
 
