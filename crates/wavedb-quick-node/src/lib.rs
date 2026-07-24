@@ -234,25 +234,18 @@ where
     }
 }
 
+/// A fresh random 32-byte secret from platform entropy
+/// (`wavedb_platform::rand`, infallible natively — and a node is always
+/// native). Default for a node given no explicit secret.
+fn random_secret() -> [u8; 32] {
+    wavedb_platform::rand::secret32()
+        .unwrap_or_else(|_| unreachable!("native entropy is infallible"))
+}
+
 /// The background maintenance loop: periodically settle the pending queue,
 /// checkpoint once the journal crosses the threshold, and evict settled
 /// cache entries down to budget. An engine fault stops maintenance (acked
 /// writes stay safe in the journal); serving continues.
-/// A fresh random 32-byte secret from OS entropy — `RandomState`'s keys are
-/// randomly seeded per value, so four of them yield 32 unpredictable bytes
-/// without a rand dependency. Default for a node given no explicit secret.
-fn random_secret() -> [u8; 32] {
-    use std::hash::{BuildHasher, Hasher};
-    let mut secret = [0u8; 32];
-    for chunk in secret.chunks_mut(8) {
-        let word = std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish();
-        chunk.copy_from_slice(&word.to_le_bytes());
-    }
-    secret
-}
-
 async fn maintain(store: Rc<PageStore>, policy: Maintenance) {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
