@@ -52,5 +52,20 @@ impl Error {
     }
 }
 
+/// Flatten the client error back into the core error a `#[server]`
+/// dispatch step must return — the typed variants keep their identity
+/// (`Unauthorized` stays refusable as such at the node); the transport
+/// wrappers, which a node-side body only hits through nested calls,
+/// flatten to `Backend` evidence.
+impl From<Error> for wavedb_core::Error {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Core(c) => c,
+            Error::Unauthorized(why) => Self::Unauthorized(why),
+            other => Self::Backend(other.to_string()),
+        }
+    }
+}
+
 /// Shorthand for a `Result` carrying the client [`Error`].
 pub type Result<T> = core::result::Result<T, Error>;

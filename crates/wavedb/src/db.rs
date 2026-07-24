@@ -23,6 +23,9 @@ pub struct Db {
     client: NetClient,
     user: U48,
     tenant: U48,
+    /// The signed access token each request carries (M8); absent = the
+    /// unauthenticated tier (only `#[server(public)]` functions answer).
+    access_token: Option<Vec<u8>>,
 }
 
 impl Db {
@@ -44,7 +47,27 @@ impl Db {
             client: NetClient::new(addr),
             user,
             tenant,
+            access_token: None,
         })
+    }
+
+    /// The same handle authenticating with `token` (the access half of a
+    /// login's pair). Every subsequent request carries it; the node derives
+    /// `user`/`tenant` from the verified claims.
+    #[must_use]
+    pub fn with_access_token(mut self, token: Vec<u8>) -> Self {
+        self.access_token = Some(token);
+        self
+    }
+
+    /// The identity claim each request ships.
+    fn auth(&self) -> wavedb_net::Auth {
+        self.access_token.clone().map_or(
+            wavedb_net::Auth::Anonymous {
+                tenant: self.tenant,
+            },
+            wavedb_net::Auth::Token,
+        )
     }
 
     /// A handle to the **same node** scoped to a different `tenant` — the
@@ -56,6 +79,7 @@ impl Db {
             client: self.client.clone(),
             user: self.user,
             tenant,
+            access_token: self.access_token.clone(),
         }
     }
 
@@ -88,7 +112,7 @@ impl Db {
         payload: Vec<u8>,
     ) -> Result<Reply> {
         self.client
-            .call(self.tenant, struct_hash, command, payload)
+            .call(self.auth(), struct_hash, command, payload)
             .await?
             .map_err(Error::Node)
     }
@@ -110,7 +134,7 @@ impl Db {
         use futures::TryStreamExt;
         let items = self
             .client
-            .call_stream(self.tenant, struct_hash, command, payload)
+            .call_stream(self.auth(), struct_hash, command, payload)
             .await?;
         // Keep the failure classes apart: a node refusal riding the stream
         // is `Error::Node`, not a transport fault.

@@ -14,9 +14,18 @@ workspace = true
 wavedb-core = { path = "../wavedb-core" }
 wavedb-macros = { path = "../wavedb-macros" }
 wavedb-net = { path = "../wavedb-net" }
+# `#[derive(WaveWire)]` (via #[wavedb]) expands absolute ::wavedb_wire:: paths.
+wavedb-wire.workspace = true
 thiserror.workspace = true
+# Refresh tokens are stored hashed (sha256) in the session record.
+sha2.workspace = true
 # Stream/StreamExt re-exported through the prelude for collection iterators.
 futures.workspace = true
+
+# `wavedb::auth` declares its session records with #[wavedb], whose native
+# expansion emits per-type storage slots.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wavedb-storage = { path = "../wavedb-storage" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "sync", "time"] }
