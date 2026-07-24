@@ -96,7 +96,8 @@ pub fn expose_client(input: TokenStream) -> TokenStream {
 /// function in `expose_server!` (as `fn name`) to make it reachable.
 #[proc_macro_attribute]
 pub fn server(attr: TokenStream, item: TokenStream) -> TokenStream {
-    server::expand(attr.into(), item.into())
+    let attr = proc_macro2::TokenStream::from(attr);
+    server::expand(&attr, item.into())
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }

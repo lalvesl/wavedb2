@@ -15,9 +15,11 @@
 //! The function's identity is a `STRUCT_HASH` composed from its signature, in
 //! the same hash space as structs — the registry `match` disambiguates.
 //!
-//! **Auth (M8).** `#[server(public)]` parses today but the login guard is not
-//! injected yet; every function is reachable. The marker is preserved so the
-//! guard slots into the body later without a signature change.
+//! **Auth (M8).** The login guard is live: a plain `#[server]` fn refuses
+//! the unauthenticated tier (`caller.user == U48::MAX`) before decoding its
+//! payload; `#[server(public)]` opens the fn to anonymous callers (login /
+//! register / refresh). The dispatch step receives gate 1's verified
+//! `Caller` and builds the node context with `ServerDb::for_caller`.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -194,11 +196,47 @@ fn composed_identity(
     }
 }
 
-/// Expand `#[server]` (the attribute is parsed for `public` but not yet used).
+/// Is the attribute the `public` marker? (`#[server(public)]` — the
+/// unauthenticated tier may call it; everything else is login-required.)
+fn is_public(attr: &TokenStream) -> syn::Result<bool> {
+    if attr.is_empty() {
+        return Ok(false);
+    }
+    let ident: syn::Ident = parse2(attr.clone())?;
+    if ident == "public" {
+        Ok(true)
+    } else {
+        Err(syn::Error::new_spanned(
+            ident,
+            "the only #[server] argument is `public`",
+        ))
+    }
+}
+
+/// The login guard injected ahead of arg decoding: a non-`public` function
+/// refuses the anonymous tier (`user == U48::MAX`) before touching the
+/// payload.
+pub fn guard(public: bool) -> TokenStream {
+    if public {
+        return TokenStream::new();
+    }
+    quote! {
+        if caller.is_anonymous() {
+            return ::core::result::Result::Err(
+                ::wavedb_core::Error::Unauthorized(
+                    ::std::string::String::from("login required"),
+                ),
+            );
+        }
+    }
+}
+
+/// Expand `#[server]` / `#[server(public)]`.
 pub fn expand(
-    _attr: TokenStream,
+    attr: &TokenStream,
     item: TokenStream,
 ) -> syn::Result<TokenStream> {
+    let public = is_public(attr)?;
     let func: ItemFn = parse2(item)?;
     let name = func.sig.ident.clone();
     let vis = func.vis.clone();
@@ -210,9 +248,10 @@ pub fn expand(
 
     if let Some(item_ty) = stream_item {
         return Ok(crate::server_stream::expand(
-            &func, &name, &vis, &db_pat, &args, &item_ty, &hash,
+            &func, &name, &vis, &db_pat, &args, &item_ty, &hash, public,
         ));
     }
+    let auth_guard = guard(public);
 
     let output = func.sig.output.clone();
     let body = func.block;
@@ -256,12 +295,13 @@ pub fn expand(
             #[allow(clippy::future_not_send)]
             pub async fn __wavedb_dispatch<S: ::wavedb_core::Store>(
                 store: &S,
-                tenant: ::wavedb_core::U48,
+                caller: ::wavedb_core::Caller,
                 _command: ::wavedb_core::expose::Command,
                 payload: &[u8],
             ) -> ::wavedb_core::Result<::wavedb_core::expose::Reply> {
+                #auth_guard
                 #decode
-                let db = ::wavedb::ServerDb::new(store, tenant);
+                let db = ::wavedb::ServerDb::for_caller(store, caller);
                 match #body_fn(&db, #(#forward),*).await {
                     ::core::result::Result::Ok(value) => {
                         ::core::result::Result::Ok(
@@ -272,9 +312,7 @@ pub fn expand(
                     }
                     ::core::result::Result::Err(error) => {
                         ::core::result::Result::Err(
-                            ::wavedb_core::Error::Backend(
-                                ::std::string::ToString::to_string(&error),
-                            ),
+                            ::core::convert::Into::into(error),
                         )
                     }
                 }

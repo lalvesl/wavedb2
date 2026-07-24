@@ -8,10 +8,12 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{ItemFn, Type};
 
-use crate::server::{Arg, decode_and_forward, encode_payload};
+use crate::server::{Arg, decode_and_forward, encode_payload, guard};
 
 /// Emit the three items for a stream-returning fn (body, fn-type + dispatch,
-/// client stub). `hash` is the composed-identity `const` expression.
+/// client stub). `hash` is the composed-identity `const` expression;
+/// `public` opens the fn to the unauthenticated tier.
+#[allow(clippy::too_many_arguments)]
 pub fn expand(
     func: &ItemFn,
     name: &syn::Ident,
@@ -20,9 +22,11 @@ pub fn expand(
     args: &[Arg],
     item_ty: &Type,
     hash: &TokenStream,
+    public: bool,
 ) -> TokenStream {
     let output = &func.sig.output;
     let body = &func.block;
+    let auth_guard = guard(public);
     let body_fn = format_ident!("__{}_body", name);
     let (decode, forward) = decode_and_forward(args);
     let payload = encode_payload(args);
@@ -62,22 +66,21 @@ pub fn expand(
             #[allow(clippy::future_not_send)]
             pub async fn __wavedb_dispatch<S: ::wavedb_core::Store>(
                 store: &S,
-                tenant: ::wavedb_core::U48,
+                caller: ::wavedb_core::Caller,
                 _command: ::wavedb_core::expose::Command,
                 payload: &[u8],
             ) -> ::wavedb_core::Result<::wavedb_core::expose::Reply> {
                 use ::wavedb_core::TryStreamExt as _;
+                #auth_guard
                 #decode
-                let db = ::wavedb::ServerDb::new(store, tenant);
+                let db = ::wavedb::ServerDb::for_caller(store, caller);
                 let items = #body_fn(&db, #(#forward),*);
                 let collected: ::std::vec::Vec<#item_ty> =
                     match items.try_collect().await {
                         ::core::result::Result::Ok(v) => v,
                         ::core::result::Result::Err(error) => {
                             return ::core::result::Result::Err(
-                                ::wavedb_core::Error::Backend(
-                                    ::std::string::ToString::to_string(&error),
-                                ),
+                                ::core::convert::Into::into(error),
                             );
                         }
                     };

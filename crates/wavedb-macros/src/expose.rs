@@ -36,7 +36,7 @@ fn op_call(entry: &Entry, op: &str) -> TokenStream {
     let path = &entry.path;
     match entry.overrides.iter().find(|(o, _)| o == op) {
         Some((_, Some(target))) => {
-            quote!(#target(store, tenant, payload).await)
+            quote!(#target(store, caller, payload).await)
         }
         Some((_, None)) => quote! {
             ::core::result::Result::Err(
@@ -47,7 +47,7 @@ fn op_call(entry: &Entry, op: &str) -> TokenStream {
         },
         None => {
             let step = format_ident!("__wavedb_{}", op);
-            quote!(#path::#step(store, tenant, payload).await)
+            quote!(#path::#step(store, caller, payload).await)
         }
     }
 }
@@ -88,7 +88,7 @@ fn execute_arm(entry: &Entry) -> TokenStream {
     if entry.kind == Kind::Fn {
         return quote! {
             h if h == #h => {
-                #path::__wavedb_dispatch(store, tenant, command, payload)
+                #path::__wavedb_dispatch(store, caller, command, payload)
                     .await
             }
         };
@@ -187,7 +187,7 @@ pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
             async fn execute<S: ::wavedb_core::Store>(
                 &self,
                 store: &S,
-                tenant: ::wavedb_core::U48,
+                caller: ::wavedb_core::Caller,
                 struct_hash: u64,
                 command: ::wavedb_core::expose::Command,
                 payload: &[u8],

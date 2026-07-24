@@ -25,6 +25,10 @@ fn refuse(name: &Ident) -> TokenStream {
 }
 
 /// The op-fn skeleton: `#[doc(hidden)] pub async fn __wavedb_<op>(…)`.
+///
+/// Every struct command starts with the tier guard: the unauthenticated
+/// caller (`user == U48::MAX`) may only reach `#[server(public)]` functions
+/// — direct object ops refuse uniformly, whatever the command.
 fn op_fn(op: &str, body: &TokenStream) -> TokenStream {
     let ident = quote::format_ident!("__wavedb_{}", op);
     quote! {
@@ -32,9 +36,16 @@ fn op_fn(op: &str, body: &TokenStream) -> TokenStream {
         #[allow(clippy::future_not_send)]
         pub async fn #ident<S: ::wavedb_core::Store>(
             store: &S,
-            tenant: ::wavedb_core::U48,
+            caller: ::wavedb_core::Caller,
             payload: &[u8],
         ) -> ::wavedb_core::Result<::wavedb_core::expose::Reply> {
+            if caller.is_anonymous() {
+                return ::core::result::Result::Err(
+                    ::wavedb_core::Error::Unauthorized(
+                        ::std::string::String::from("login required"),
+                    ),
+                );
+            }
             #body
         }
     }
@@ -50,7 +61,7 @@ pub fn unique_ops(name: &Ident) -> TokenStream {
             let _ = payload;
             let anchor = ::wavedb_core::Id::new(
                 <#name as ::wavedb_core::WaveDbStruct>::STRUCT_HASH,
-                tenant,
+                caller.tenant,
                 true,
                 0,
             );
@@ -61,24 +72,24 @@ pub fn unique_ops(name: &Ident) -> TokenStream {
         "save",
         &quote! {
             let value: #name = ::wavedb_core::wire::from_wire(payload)?;
-            ::wavedb_core::collection::save_unique(store, tenant, &value)
+            ::wavedb_core::collection::save_unique_as(store, caller.tenant, caller.user, &value)
                 .await?;
             ::core::result::Result::Ok(::wavedb_core::expose::Reply::Done)
         },
     );
     let insert =
-        op_fn("insert", &quote!(let _ = (store, tenant, payload); #refuse));
+        op_fn("insert", &quote!(let _ = (store, caller, payload); #refuse));
     let update =
-        op_fn("update", &quote!(let _ = (store, tenant, payload); #refuse));
+        op_fn("update", &quote!(let _ = (store, caller, payload); #refuse));
     let remove =
-        op_fn("remove", &quote!(let _ = (store, tenant, payload); #refuse));
-    let all = op_fn("all", &quote!(let _ = (store, tenant, payload); #refuse));
+        op_fn("remove", &quote!(let _ = (store, caller, payload); #refuse));
+    let all = op_fn("all", &quote!(let _ = (store, caller, payload); #refuse));
     let history = op_fn(
         "history",
         &quote! {
             let _ = payload;
             ::wavedb_core::expose::unique_history_values::<#name, S>(
-                store, tenant,
+                store, caller.tenant,
             )
             .await
         },
@@ -109,7 +120,7 @@ pub fn nonunique_ops(name: &Ident) -> TokenStream {
     let get = op_fn(
         "get",
         &quote! {
-            let _ = tenant;
+            let _ = caller;
             let id: ::wavedb_core::Id =
                 ::wavedb_core::wire::from_wire(payload)?;
             ::wavedb_core::expose::get_value::<#name, S>(store, id).await
@@ -120,7 +131,8 @@ pub fn nonunique_ops(name: &Ident) -> TokenStream {
         &quote! {
             let (pivot, value): (::wavedb_core::LocalId, #name) =
                 ::wavedb_core::wire::from_wire(payload)?;
-            let col = ::wavedb_core::Collection::<#name>::at(pivot, tenant);
+            let col = ::wavedb_core::Collection::<#name>::at(pivot, caller.tenant)
+                .stamped_by(caller.user);
             let id = col.insert(store, &value).await?;
             ::core::result::Result::Ok(
                 ::wavedb_core::expose::Reply::Inserted(id),
@@ -135,7 +147,8 @@ pub fn nonunique_ops(name: &Ident) -> TokenStream {
             let pivot =
                 ::wavedb_core::expose::record_pivot::<#name, S>(store, id)
                     .await?;
-            let col = ::wavedb_core::Collection::<#name>::at(pivot, tenant);
+            let col = ::wavedb_core::Collection::<#name>::at(pivot, caller.tenant)
+                .stamped_by(caller.user);
             col.save(store, id, &value).await?;
             ::core::result::Result::Ok(::wavedb_core::expose::Reply::Done)
         },
@@ -148,7 +161,8 @@ pub fn nonunique_ops(name: &Ident) -> TokenStream {
             let pivot =
                 ::wavedb_core::expose::record_pivot::<#name, S>(store, id)
                     .await?;
-            let col = ::wavedb_core::Collection::<#name>::at(pivot, tenant);
+            let col = ::wavedb_core::Collection::<#name>::at(pivot, caller.tenant)
+                .stamped_by(caller.user);
             let removed = col.remove(store, id).await?;
             ::core::result::Result::Ok(
                 ::wavedb_core::expose::Reply::Removed(removed),
@@ -156,19 +170,19 @@ pub fn nonunique_ops(name: &Ident) -> TokenStream {
         },
     );
     let save =
-        op_fn("save", &quote!(let _ = (store, tenant, payload); #refuse));
+        op_fn("save", &quote!(let _ = (store, caller, payload); #refuse));
     let all = op_fn(
         "all",
         &quote! {
             let pivot: ::wavedb_core::LocalId =
                 ::wavedb_core::wire::from_wire(payload)?;
-            ::wavedb_core::expose::all_values::<#name, S>(store, pivot, tenant)
+            ::wavedb_core::expose::all_values::<#name, S>(store, pivot, caller.tenant)
                 .await
         },
     );
     let history = op_fn(
         "history",
-        &quote!(let _ = (store, tenant, payload); #refuse),
+        &quote!(let _ = (store, caller, payload); #refuse),
     );
     quote! {
         impl #name {
