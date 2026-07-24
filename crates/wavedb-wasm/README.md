@@ -5,6 +5,15 @@ targets the crate is empty (it exists so `cargo test --workspace` compiles). The
 public `Db` API is identical to native — only the storage adapter and runtime
 change shape.
 
+> **Status:** M5 in progress. The platform seam (`wavedb-platform`) is
+> live: the whole client stack (`wavedb-core`, `wavedb-net`, `wavedb`)
+> compiles for wasm32-unknown-unknown — timestamps from `Date.now()`,
+> entropy from `crypto.getRandomValues`, the tunnel over browser `fetch` —
+> and this crate is a workspace member shipping one raw `probe` export
+> (anchors the stack for the size tracker). The IndexedDB `Store`, the
+> WebSocket runtime notes below, and the typed browser demo (the M5 exit)
+> are **not built yet**.
+
 > For the project-wide idea and quickstart see the
 > [root README](../../readme.md).
 
