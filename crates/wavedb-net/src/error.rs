@@ -14,6 +14,11 @@ pub enum Error {
     /// A socket-level fault (connect, read, write).
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// A client-side platform fault: the POST itself (socket or browser
+    /// `fetch`), or a response head that was not a 200. The seam where
+    /// `wavedb-platform`'s error enters this layer.
+    #[error(transparent)]
+    Platform(#[from] wavedb_platform::Error),
     /// The peer's bytes were not the minimal HTTP/1.1 the tunnel speaks.
     #[error("malformed http: {0}")]
     Http(&'static str),

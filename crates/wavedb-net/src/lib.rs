@@ -17,26 +17,32 @@
 //! ## Layers
 //!
 //! - [`frame`] — the [`Request`] / [`Response`] / [`NodeError`] wire values.
-//! - [`http`] — the minimal HTTP/1.1 framing (native only).
-//! - [`client`] — [`NetClient`], the client half (build → POST → decode).
+//! - [`frames`] — the response's `[len u32 LE][bytes]` frame sequence, read
+//!   over the platform body stream (both targets).
+//! - [`http`] — the server half's minimal HTTP/1.1 framing (native only;
+//!   the client half lives in `wavedb-platform::http`).
+//! - [`client`] — [`NetClient`], the client half (build → POST → decode);
+//!   compiles native (TcpStream) and wasm32 (`fetch`) alike.
 //!
 //! The **server** half (accepting connections, decoding a `Request`, running
 //! the gates + `Exposure::execute`, encoding the `Response`) lives in
 //! `wavedb-quick-node`, which owns the storage engine the node dispatches to.
 
+// Browser-side transport futures hold `JsValue`s (never `Send`); the native
+// path runs current-thread. Established stance across the workspace.
+#![allow(clippy::future_not_send)]
+
 pub mod auth;
+pub mod client;
 pub mod error;
 pub mod frame;
+pub mod frames;
 
+pub use client::{Executed, NetClient};
 pub use error::{Error, Result};
 pub use frame::{
     Auth, CommandFrame, NodeError, NodeErrorKind, Request, Response,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-pub mod client;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod http;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub use client::{Executed, NetClient};

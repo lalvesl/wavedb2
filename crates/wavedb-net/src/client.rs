@@ -1,5 +1,9 @@
 //! The client-side transport: build a [`Request`], POST it, read the framed
-//! response (native only).
+//! response.
+//!
+//! Compiles for native and wasm32 alike — the POST and the body stream come
+//! from `wavedb_platform::http` (a fresh `TcpStream` vs a browser `fetch`),
+//! and everything above that seam is byte-for-byte the same protocol.
 //!
 //! One exchange = one fresh connection (HTTP POST, the only wired transport;
 //! WebSocket with a bound identity is M7). Each call re-sends the identity —
@@ -10,7 +14,6 @@
 //! waiting for the whole collection.
 
 use futures::Stream;
-use tokio::net::TcpStream;
 use wavedb_core::expose::{Command, Reply};
 use wavedb_wire::{from_wire, to_wire};
 
@@ -18,7 +21,7 @@ use crate::error::{Error, Result};
 use crate::frame::{
     Auth, CommandFrame, NodeError, Request, Response, StreamFrame,
 };
-use crate::http;
+use crate::frames::FrameReader;
 
 /// A thin client bound to one node address. Cheap to clone/rebuild — it holds
 /// no connection (each call dials fresh).
@@ -46,7 +49,7 @@ impl NetClient {
         struct_hash: u64,
         command: Command,
         payload: Vec<u8>,
-    ) -> Result<http::FrameReader<TcpStream>> {
+    ) -> Result<FrameReader> {
         let request = Request {
             auth,
             frame: CommandFrame {
@@ -55,7 +58,9 @@ impl NetClient {
                 payload,
             },
         };
-        http::post(&self.addr, &to_wire(&request)).await
+        let body =
+            wavedb_platform::http::post(&self.addr, &to_wire(&request)).await?;
+        Ok(FrameReader::new(body))
     }
 
     /// Send one scalar command under `auth` and await the node's answer.
