@@ -54,7 +54,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         // and the writer identity is the tenant until node auth exists (M8).
         let meta = Metadata {
             pivot_id: Some(self.pivot()),
-            user: self.tenant(),
+            user: self.user(),
             ..Metadata::default()
         };
         let mut batch =
@@ -148,6 +148,7 @@ impl<T: NonUniqueStruct> Collection<T> {
             T::STRUCT_HASH,
             id,
             self.tenant(),
+            self.user(),
             value,
             Some(self.pivot()),
         )

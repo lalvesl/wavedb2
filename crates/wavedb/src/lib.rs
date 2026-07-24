@@ -35,12 +35,14 @@
 // seam, not a `Send`-bounded API. Same stance the core engine seams take.
 #![allow(clippy::future_not_send, async_fn_in_trait)]
 
+pub mod auth;
 mod client_handle;
 mod db;
 mod error;
 mod reply;
 mod server_db;
 
+pub use auth::TokenPair;
 pub use db::Db;
 pub use error::{Error, Result};
 pub use server_db::ServerDb;

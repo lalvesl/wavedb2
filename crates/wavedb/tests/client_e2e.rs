@@ -22,6 +22,24 @@ use wavedb::prelude::*;
 use wavedb_quick_node::{Bound, Server};
 
 const TENANT: u32 = 7;
+const SECRET: [u8; 32] = [7; 32];
+
+/// A signed access token for the test tenant — struct commands refuse the
+/// anonymous tier (M8); the test signs against the node's fixed secret.
+fn access_token() -> Vec<u8> {
+    use wavedb_net::auth::{AccessClaims, TokenPurpose, sign, unix_now};
+    sign(
+        &SECRET,
+        &AccessClaims {
+            user: U48::from(TENANT),
+            tenant: U48::from(TENANT),
+            expires_at: unix_now() + 3600,
+            purpose: TokenPurpose::Access,
+            session: 0,
+            nonce: 0,
+        },
+    )
+}
 
 struct Node {
     addr: SocketAddr,
@@ -48,6 +66,7 @@ fn start(dir: PathBuf) -> Node {
             .expect("build runtime");
         rt.block_on(async move {
             let bound: Bound<_> = Server::new(REGISTRY)
+                .secret(SECRET)
                 .data_dir(&dir)
                 .bind("127.0.0.1:0")
                 .await
@@ -86,7 +105,8 @@ async fn typed_surface_drives_a_live_node() {
         U48::from(TENANT),
     )
     .await
-    .expect("connect");
+    .expect("connect")
+    .with_access_token(access_token());
 
     unique_phase(&db).await;
     nonunique_phase(&db, node.pivot).await;

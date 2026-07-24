@@ -19,18 +19,39 @@ use wavedb_core::{
 
 use crate::error::{Error, Result};
 
-/// A node-side handle: a borrowed [`Store`] plus the bound tenant. Cheap to
-/// re-scope with [`as_tenant`](DbHandle::as_tenant).
+/// A node-side handle: a borrowed [`Store`] plus the bound identity. Cheap
+/// to re-scope with [`as_tenant`](DbHandle::as_tenant).
 pub struct ServerDb<'a, S> {
     local: LocalHandle<'a, S>,
+    user: U48,
 }
 
 impl<'a, S: Store> ServerDb<'a, S> {
-    /// Wrap a store + tenant as an execution context.
+    /// Wrap a store + tenant as an execution context (`user = tenant` — the
+    /// engine-local/B2C identity).
     pub const fn new(store: &'a S, tenant: U48) -> Self {
         Self {
             local: LocalHandle::new(store, tenant),
+            user: tenant,
         }
+    }
+
+    /// The context a verified request executes as — what the generated
+    /// `#[server]` dispatch builds from gate 1's [`Caller`].
+    ///
+    /// [`Caller`]: wavedb_core::Caller
+    pub const fn for_caller(store: &'a S, caller: wavedb_core::Caller) -> Self {
+        Self {
+            local: LocalHandle::new(store, caller.tenant),
+            user: caller.user,
+        }
+    }
+
+    /// The verified user this context executes as (`U48::MAX` = the
+    /// unauthenticated tier — only reachable inside `#[server(public)]`).
+    #[must_use]
+    pub const fn user(&self) -> U48 {
+        self.user
     }
 }
 
@@ -43,6 +64,7 @@ impl<S: Store> DbHandle for ServerDb<'_, S> {
 
     fn as_tenant(&self, tenant: U48) -> Self {
         Self {
+            user: self.user,
             local: self.local.as_tenant(tenant),
         }
     }
