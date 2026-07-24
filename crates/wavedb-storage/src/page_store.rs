@@ -4,8 +4,8 @@
 //! `Pivot`/`BpTree` layer in [`wavedb_core`] runs over. It ties together the
 //! pieces built below it:
 //!
-//! - [`Journal`] — the write-ahead log; **durability is here** (`apply` fsyncs
-//!   before it returns).
+//! - [`Journal`](crate::journal::Journal) — the write-ahead log;
+//!   **durability is here** (`apply` fsyncs before it returns).
 //! - one [`StructStorage`] **static per type** — that type's own in-memory
 //!   cache (reads serve from it) and its own [`Directory`] over the shared
 //!   [`BlockFile`]. The statics are `#[wavedb]`-generated and handed in as an
@@ -43,15 +43,17 @@
 //!
 //! ## Recovery model
 //!
-//! `data.bin` is a **deterministic projection of the journal**, snapshotted
-//! by checkpoints ([`crate::checkpoint`]). On [`open`](PageStore::open):
-//! with a committed checkpoint, the directories/dictionaries/allocator load
-//! from it, the caches start **empty** (reads fall through to the pages),
-//! and only the journal's post-checkpoint frames replay; without one, the
-//! data file is truncated back to its superblock and every committed batch
-//! replays through the same commit + settle path a live `apply` uses. Either
-//! way a crash loses nothing that was acked. Settle writes the **cache's
-//! current bytes** for a touched id (not the batch's), which makes it
+//! `data.bin` is a **deterministic projection of the journal**; recovery
+//! roots in the newest valid `Commit` frame (journal-rooted — see
+//! [`PageStore::commit_journal`] and the `commit` module docs). On
+//! [`open`](PageStore::open): with a durable `Commit`, the
+//! directories/dictionaries/allocator load from its chains, the caches start
+//! **empty** (reads fall through to the pages), and only the uncovered
+//! `Batch` frames replay; without one (first generation), the data file is
+//! truncated back to its superblock and every committed batch replays
+//! through the same commit + settle path a live `apply` uses. Either way a
+//! crash loses nothing that was acked. Settle writes the **cache's current
+//! bytes** for a touched id (not the batch's), which makes it
 //! order-independent and replay-idempotent: a late or repeated settle can
 //! only write newer state.
 //!
@@ -59,8 +61,8 @@
 //! caches and queues the touched ids; [`drain`](PageStore::drain) (driven by
 //! the node's maintenance task) writes the pages later. An unsettled remove
 //! is tombstoned so the read fallback never resurrects the page's stale
-//! bytes. [`checkpoint`](PageStore::checkpoint) drains first, so its
-//! snapshot always covers everything committed.
+//! bytes. [`PageStore::commit_journal`] drains first, so the frame it
+//! appends always covers everything committed.
 
 use std::path::Path;
 

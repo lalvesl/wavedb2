@@ -27,11 +27,11 @@ expose_client! { AboutUser, Note }
 #[allow(clippy::future_not_send)]
 async fn audited_invoice_save<S: wavedb_core::Store>(
     store: &S,
-    tenant: wavedb_core::U48,
+    caller: wavedb_core::Caller,
     payload: &[u8],
 ) -> wavedb_core::Result<wavedb_core::expose::Reply> {
     AUDITED_SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    billing::Invoice::__wavedb_save(store, tenant, payload).await
+    billing::Invoice::__wavedb_save(store, caller, payload).await
 }
 
 /// How many saves went through the audit override (test observability).
@@ -239,6 +239,7 @@ mod tests {
         block_on(async {
             let store = mem::MemStore::default();
             let tenant = U48::from(9u32);
+            let caller = wavedb_core::Caller::tenant_owned(tenant);
 
             // Reachability is exactly the list.
             assert!(REGISTRY.knows(AboutUser::STRUCT_HASH));
@@ -255,7 +256,7 @@ mod tests {
                 &REGISTRY
                     .execute(
                         &store,
-                        tenant,
+                        caller,
                         super::Attachment::STRUCT_HASH,
                         Command::Get,
                         &[],
@@ -282,14 +283,14 @@ mod tests {
             // Unlisted hash, wrong-shape command, and excluded op.
             assert!(unknown(
                 &REGISTRY
-                    .execute(&store, tenant, 0xDEAD_BEEF, Command::Get, &[])
+                    .execute(&store, caller, 0xDEAD_BEEF, Command::Get, &[])
                     .await
             ));
             assert!(unknown(
                 &REGISTRY
                     .execute(
                         &store,
-                        tenant,
+                        caller,
                         AboutUser::STRUCT_HASH,
                         Command::Insert,
                         &[],
@@ -300,7 +301,7 @@ mod tests {
                 &REGISTRY
                     .execute(
                         &store,
-                        tenant,
+                        caller,
                         Invoice::STRUCT_HASH,
                         Command::Get,
                         &[],
@@ -324,6 +325,7 @@ mod tests {
         block_on(async {
             let store = mem::MemStore::default();
             let tenant = U48::from(9u32);
+            let caller = wavedb_core::Caller::tenant_owned(tenant);
 
             // Unique: Save then Get round-trips through the dispatch.
             let ada = AboutUser {
@@ -333,7 +335,7 @@ mod tests {
             let done = REGISTRY
                 .execute(
                     &store,
-                    tenant,
+                    caller,
                     AboutUser::STRUCT_HASH,
                     Command::Save,
                     &to_wire(&ada),
@@ -344,7 +346,7 @@ mod tests {
             let got = REGISTRY
                 .execute(
                     &store,
-                    tenant,
+                    caller,
                     AboutUser::STRUCT_HASH,
                     Command::Get,
                     &[],
@@ -359,7 +361,7 @@ mod tests {
             REGISTRY
                 .execute(
                     &store,
-                    tenant,
+                    caller,
                     Invoice::STRUCT_HASH,
                     Command::Save,
                     &to_wire(&Invoice { cents: 12 }),
@@ -379,7 +381,7 @@ mod tests {
                 &CLIENT_REGISTRY
                     .execute(
                         &store,
-                        tenant,
+                        caller,
                         AboutUser::STRUCT_HASH,
                         Command::Get,
                         &[],
@@ -406,6 +408,7 @@ mod tests {
         block_on(async {
             let store = mem::MemStore::default();
             let tenant = U48::from(11u32);
+            let caller = wavedb_core::Caller::tenant_owned(tenant);
             let db = wavedb_core::LocalHandle::new(&store, tenant);
             let pivot = Note::create_pivot(&db).await.unwrap();
             let col = Note::collection(pivot);
@@ -418,7 +421,7 @@ mod tests {
             let Reply::Inserted(id) = REGISTRY
                 .execute(
                     &store,
-                    tenant,
+                    caller,
                     Note::STRUCT_HASH,
                     Command::Insert,
                     &to_wire(&(pivot.local_id(), note.clone())),
@@ -434,7 +437,7 @@ mod tests {
                 REGISTRY
                     .execute(
                         &store,
-                        tenant,
+                        caller,
                         Note::STRUCT_HASH,
                         Command::Get,
                         &to_wire(&id),
@@ -453,7 +456,7 @@ mod tests {
             REGISTRY
                 .execute(
                     &store,
-                    tenant,
+                    caller,
                     Note::STRUCT_HASH,
                     Command::Update,
                     &to_wire(&(id, pinned_now)),
@@ -473,7 +476,7 @@ mod tests {
                 REGISTRY
                     .execute(
                         &store,
-                        tenant,
+                        caller,
                         Note::STRUCT_HASH,
                         Command::Remove,
                         &to_wire(&id),

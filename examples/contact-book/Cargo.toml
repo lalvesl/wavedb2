@@ -24,6 +24,8 @@ wavedb-storage = { path = "../../crates/wavedb-storage" }
 
 [dev-dependencies]
 wavedb-quick-node = { path = "../../crates/wavedb-quick-node" }
+# The e2e test signs its own access token against the node's fixed secret.
+wavedb-net = { path = "../../crates/wavedb-net" }
 tokio.workspace = true
 tempfile.workspace = true
 futures.workspace = true
