@@ -23,10 +23,28 @@ use wavedb_core::expose::{Command, Reply};
 use wavedb_core::wire::{from_wire, to_wire};
 use wavedb_core::{LocalId, U48, WaveDbStruct};
 use wavedb_net::NetClient;
-use wavedb_net::frame::NodeErrorKind;
+use wavedb_net::auth::{AccessClaims, TokenPurpose, sign};
+use wavedb_net::frame::{Auth, NodeErrorKind};
 use wavedb_quick_node::{Bound, Server};
 
 const TENANT: u32 = 7;
+const SECRET: [u8; 32] = [7; 32];
+
+/// A signed access token for the test tenant — struct commands refuse the
+/// anonymous tier, so every object op authenticates.
+fn auth() -> Auth {
+    Auth::Token(sign(
+        &SECRET,
+        &AccessClaims {
+            user: U48::from(TENANT),
+            tenant: U48::from(TENANT),
+            expires_at: wavedb_net::auth::unix_now() + 3600,
+            purpose: TokenPurpose::Access,
+            session: 0,
+            nonce: 0,
+        },
+    ))
+}
 
 /// A running node plus the handles to address it and shut it down.
 struct Node {
@@ -57,6 +75,7 @@ fn start(dir: PathBuf) -> Node {
             .expect("build runtime");
         rt.block_on(async move {
             let bound: Bound<_> = Server::new(REGISTRY)
+                .secret(SECRET)
                 .data_dir(&dir)
                 .bind("127.0.0.1:0")
                 .await
@@ -90,7 +109,6 @@ fn start(dir: PathBuf) -> Node {
 async fn node_serves_records_over_http_and_survives_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
-    let tenant = U48::from(TENANT);
 
     // ── phase 1: write through the live node ──────────────────────────────
     let node = start(path.clone());
@@ -102,21 +120,18 @@ async fn node_serves_records_over_http_and_survives_restart() {
         city: "London".into(),
     };
     assert_eq!(
-        save(&client, tenant, AboutUser::STRUCT_HASH, &ada).await,
+        save(&client, AboutUser::STRUCT_HASH, &ada).await,
         Reply::Done
     );
-    assert_eq!(get_unique::<AboutUser>(&client, tenant).await, Some(ada));
+    assert_eq!(get_unique::<AboutUser>(&client).await, Some(ada));
 
     // A second save chains history; get returns the newest version.
     let ada2 = AboutUser {
         name: "Ada".into(),
         city: "Paris".into(),
     };
-    save(&client, tenant, AboutUser::STRUCT_HASH, &ada2).await;
-    assert_eq!(
-        get_unique::<AboutUser>(&client, tenant).await,
-        Some(ada2.clone())
-    );
+    save(&client, AboutUser::STRUCT_HASH, &ada2).await;
+    assert_eq!(get_unique::<AboutUser>(&client).await, Some(ada2.clone()));
 
     // NonUnique: insert (mints an Id), get by id, update at that Id — all
     // over the wire, through the pivot seeded node-side.
@@ -126,7 +141,7 @@ async fn node_serves_records_over_http_and_survives_restart() {
     };
     let Reply::Inserted(note_id) = client
         .call_ok(
-            tenant,
+            auth(),
             Note::STRUCT_HASH,
             Command::Insert,
             to_wire(&(node.pivot, item.clone())),
@@ -137,7 +152,7 @@ async fn node_serves_records_over_http_and_survives_restart() {
         panic!("insert must mint an id");
     };
     assert_eq!(
-        get_by_id(&client, tenant, Note::STRUCT_HASH, note_id).await,
+        get_by_id(&client, Note::STRUCT_HASH, note_id).await,
         Some(item)
     );
 
@@ -147,7 +162,7 @@ async fn node_serves_records_over_http_and_survives_restart() {
     };
     client
         .call_ok(
-            tenant,
+            auth(),
             Note::STRUCT_HASH,
             Command::Update,
             to_wire(&(note_id, pinned.clone())),
@@ -155,14 +170,14 @@ async fn node_serves_records_over_http_and_survives_restart() {
         .await
         .expect("update");
     assert_eq!(
-        get_by_id(&client, tenant, Note::STRUCT_HASH, note_id).await,
+        get_by_id(&client, Note::STRUCT_HASH, note_id).await,
         Some(pinned.clone())
     );
 
     // An unlisted hash is refused as an unknown hash — inside a 200, as a
     // structured NodeError (the transport did its job).
     let refusal = client
-        .call(tenant, 0xDEAD_BEEF, Command::Get, Vec::new())
+        .call(auth(), 0xDEAD_BEEF, Command::Get, Vec::new())
         .await
         .expect("transport ok");
     assert_eq!(
@@ -177,12 +192,12 @@ async fn node_serves_records_over_http_and_survives_restart() {
     let client = NetClient::new(node.addr.to_string());
 
     assert_eq!(
-        get_unique::<AboutUser>(&client, tenant).await,
+        get_unique::<AboutUser>(&client).await,
         Some(ada2),
         "the newest Unique version survives a restart"
     );
     assert_eq!(
-        get_by_id(&client, tenant, Note::STRUCT_HASH, note_id).await,
+        get_by_id(&client, Note::STRUCT_HASH, note_id).await,
         Some(pinned),
         "the updated NonUnique record survives a restart"
     );
@@ -193,23 +208,22 @@ async fn node_serves_records_over_http_and_survives_restart() {
 /// Save a Unique record and return the node's reply.
 async fn save<T: WaveDbStruct + wavedb_core::WaveWire>(
     client: &NetClient,
-    tenant: U48,
     struct_hash: u64,
     value: &T,
 ) -> Reply {
     client
-        .call_ok(tenant, struct_hash, Command::Save, to_wire(value))
+        .call_ok(auth(), struct_hash, Command::Save, to_wire(value))
         .await
         .expect("save")
 }
 
 /// Get a Unique record by its anchor (empty payload → the tenant's anchor).
-async fn get_unique<T>(client: &NetClient, tenant: U48) -> Option<T>
+async fn get_unique<T>(client: &NetClient) -> Option<T>
 where
     T: WaveDbStruct + wavedb_core::WaveWire,
 {
     let reply = client
-        .call_ok(tenant, T::STRUCT_HASH, Command::Get, Vec::new())
+        .call_ok(auth(), T::STRUCT_HASH, Command::Get, Vec::new())
         .await
         .expect("get");
     decode_value(&reply)
@@ -218,7 +232,6 @@ where
 /// Get a record by its `Id` (the `Get` payload for the NonUnique shape).
 async fn get_by_id<T>(
     client: &NetClient,
-    tenant: U48,
     struct_hash: u64,
     id: wavedb_core::Id,
 ) -> Option<T>
@@ -226,7 +239,7 @@ where
     T: wavedb_core::WaveWire,
 {
     let reply = client
-        .call_ok(tenant, struct_hash, Command::Get, to_wire(&id))
+        .call_ok(auth(), struct_hash, Command::Get, to_wire(&id))
         .await
         .expect("get by id");
     decode_value(&reply)

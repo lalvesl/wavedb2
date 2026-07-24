@@ -34,6 +34,7 @@ pub async fn run<E, S, F, M>(
     listener: TcpListener,
     registry: E,
     store: Rc<S>,
+    secret: [u8; 32],
     maintenance: M,
     shutdown: F,
 ) -> wavedb_net::Result<()>
@@ -62,7 +63,8 @@ where
                 spawn_local(async move {
                     // A per-connection fault is dropped: it never takes the
                     // node down. (No tracing dep yet — silent.)
-                    let _ = serve_connection(sock, &registry, &*store).await;
+                    let _ = serve_connection(sock, &registry, &*store, &secret)
+                        .await;
                 });
             }
         })
@@ -74,6 +76,7 @@ async fn serve_connection<E, S>(
     mut sock: TcpStream,
     registry: &E,
     store: &S,
+    secret: &[u8; 32],
 ) -> wavedb_net::Result<()>
 where
     E: Exposure,
@@ -85,7 +88,8 @@ where
     };
     match from_wire::<Request>(&body) {
         Ok(request) => {
-            let response = dispatch::handle(registry, store, request).await;
+            let response =
+                dispatch::handle(registry, store, secret, request).await;
             write_response(&mut writer, response).await?;
         }
         // The envelope itself is malformed — a transport-level client error,
