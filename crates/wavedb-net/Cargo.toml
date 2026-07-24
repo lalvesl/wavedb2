@@ -11,6 +11,9 @@ workspace = true
 [dependencies]
 # Frames wrap the core command/reply surface (Command, Reply, Id, U48).
 wavedb-core = { path = "../wavedb-core" }
+# The client half of the tunnel (POST + streamed body) — `TcpStream`
+# natively, `fetch` in the browser — so `NetClient` compiles both ways.
+wavedb-platform.workspace = true
 # Direct dep (not just via core): `#[derive(WaveWire)]` expands to absolute
 # `::wavedb_wire::` paths, so any crate deriving it must name the crate itself.
 wavedb-wire.workspace = true
@@ -18,15 +21,15 @@ thiserror.workspace = true
 # Access tokens are `[claims wire][HMAC-SHA256]` — signed/verified here.
 hmac.workspace = true
 sha2.workspace = true
-
-# The HTTP POST tunnel is a hand-rolled HTTP/1.1 exchange over a TcpStream:
-# WaveDB uses no HTTP semantics (no headers-as-API, no status codes, no
-# routing), so a full HTTP stack would be dead weight. Native only — the
-# browser build (M5) speaks `fetch` instead.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { workspace = true, features = ["net", "io-util", "time"] }
 # `call_stream` surfaces a walk's item frames as a `Stream`.
 futures.workspace = true
+
+# The **server half** of the tunnel (accept, read the POST, stream frames)
+# is a hand-rolled HTTP/1.1 exchange: WaveDB uses no HTTP semantics (no
+# headers-as-API, no status codes, no routing), so a full HTTP stack would
+# be dead weight. Native only — a node is never a browser.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "net", "io-util"] }

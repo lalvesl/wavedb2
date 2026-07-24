@@ -26,7 +26,6 @@
 //! from the live record or forward from any archive.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -84,9 +83,7 @@ pub(crate) fn decode_envelope<V: crate::wire::WaveWire>(
 /// `FLAG = 0` (the record namespace), and a per-process counter salt so ids
 /// minted in the same nanosecond stay distinct.
 pub(crate) fn mint_timestamped_id(tenant: U48) -> Id {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
+    let nanos = wavedb_platform::time::unix_nanos();
     let salt = (RECORD_SALT.fetch_add(1, Ordering::Relaxed) & 0x7FFF) as u16;
     Id::new(nanos, tenant, false, salt)
 }

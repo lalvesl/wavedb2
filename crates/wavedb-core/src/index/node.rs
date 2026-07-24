@@ -26,7 +26,6 @@
 //! the exact bytes without re-minting.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::local_id::LocalId;
@@ -125,9 +124,7 @@ impl<K: NodeKey> NodeBody<K> {
 /// Mint a fresh node `LocalId`: a nanosecond key with `FLAG = 1` (namespaced
 /// away from records) and a per-process counter salt.
 pub(super) fn mint_node_id() -> LocalId {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
+    let nanos = wavedb_platform::time::unix_nanos();
     let salt = (NODE_SALT.fetch_add(1, Ordering::Relaxed) & 0x7FFF) as u16;
     LocalId::new(nanos, true, salt)
 }

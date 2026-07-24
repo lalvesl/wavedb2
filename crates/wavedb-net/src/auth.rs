@@ -40,13 +40,11 @@ pub fn node_secret() -> Option<&'static [u8; 32]> {
     NODE_SECRET.get()
 }
 
-/// Unix seconds now — the clock token TTLs run on.
+/// Unix seconds now — the clock token TTLs run on (platform-routed, so
+/// expiry math works in the browser too).
 #[must_use]
 pub fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    wavedb_platform::time::unix_secs()
 }
 
 /// What a token is good for. Encoded in the claims (and so under the MAC):
