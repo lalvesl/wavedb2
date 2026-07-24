@@ -141,27 +141,45 @@ The developer surface — what `examples/todo-app` is written against.
 - **exit:** client A saves; client B's watcher fires within one round-trip
   (WS) / one poll tick (HTTP).
 
-## M8 — auth & permission enforcement
+## M8 — auth & permission enforcement — LANDED (2026-07-10)
 
-- **stateless HMAC access token** (short TTL; carries `user`/`tenant`/expiry/
-  `purpose`; verified per request, no store) riding **inside the request
-  envelope**, never an HTTP header;
-- **refresh token** bound to a session record (`{ user, tenant, issued,
-  revoked }`): rotate on use, replay = theft signal → revoke; revocation =
-  one record write;
-- `login` / `refresh` as `#[server(public)]` fns: local **Argon2** credential
-  object (replaces todo-app's placeholder sha256) or external OAuth/OIDC —
-  same path, same token pair;
-- unauthenticated tier `user = U48::MAX`: login + `Public` reads only;
-- **permission gate goes live** (gate 4): Unique = record
-  `Metadata.permission`; NonUnique = two-level (record authoritative;
-  `Pivot` default seeds inserts, gates `Insert`/`All`); checks apply inside
-  server-fn bodies too;
-- `Metadata.user` = real authorship from the verified token (today stamped
-  `user = tenant`);
-- **exit:** cross-tenant access without a grant rejected at the node; a
-  revoked session's next `Refresh` fails and its access token dies within one
-  TTL.
+What shipped (details in `todo_done.md`):
+
+- [x] **stateless HMAC access token** (`wavedb-net::auth`): 15-min TTL,
+  claims `{ user, tenant, expires_at, purpose, session, nonce }` +
+  HMAC-SHA256, verified per request by the node's gate 1; rides inside
+  `Request.auth` (`Auth::Anonymous { tenant } | Auth::Token(bytes)`), never
+  an HTTP header;
+- [x] **refresh token** bound to a `wavedb::auth::AuthSession` record
+  (stored **hashed**): rotate on use, replay = theft signal → session
+  revoked on the spot; revocation = one record write (`issue_pair` /
+  `refresh_pair` / `revoke` over any `DbHandle`);
+- [x] `login` / `refresh` / `logout` as `#[server(public)]` fns in todo-app,
+  returning `wavedb::TokenPair`; the guard is macro-injected — a plain
+  `#[server]` fn refuses `user == U48::MAX` before decoding;
+- [x] unauthenticated tier `user = U48::MAX`: public fns only; every struct
+  command refuses it uniformly (`Unauthorized`) in the generated steps;
+- [x] **verified identity threads the whole stack**: `Caller { user, tenant }`
+  through `Exposure::execute` → generated `__wavedb_*` steps →
+  `ServerDb::for_caller`; `Metadata.user` = the token's user
+  (`Collection::stamped_by`, `save_unique_as`);
+- [x] node secret: `Server::secret([u8; 32])` or a random one per boot,
+  published process-wide (`wavedb_net::auth::node_secret`) for the minting
+  helpers — one node per process, like the engine slots;
+- [x] **exit held** (`examples/todo-app` e2e): a claimed tenant cannot
+  override the token's; anonymous non-public call refused; replayed refresh
+  revokes the whole session; logout kills the next refresh; expired /
+  forged / wrong-purpose tokens refused (dispatch unit tests).
+
+Deliberately left as later seams:
+
+- [ ] **Argon2** credential object (todo-app still hashes sha256) and the
+  OAuth/OIDC path;
+- [ ] **record-level permission grants (gate 4)**: `Metadata.permission`
+  checks ride with the deferred cross-tenant read path — today tenant
+  isolation is the token binding itself (a caller only ever executes in the
+  tenant its token names), so grants have nothing to serve yet;
+- [ ] gates 5–6 (`validate` / `preprocess`) — unchanged, the hook seam.
 
 ## M9 — developer experience
 

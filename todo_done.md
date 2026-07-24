@@ -1,5 +1,49 @@
 # DONE
 
+- **M8 — auth & permission enforcement (2026-07-10)**: verified identity
+  end to end, sessions with rotation + revocation, the `#[server]` guard
+  live. Argon2 and record-level grants (gate 4, rides the deferred
+  cross-tenant read path) stay open — see the M8 section in `todo.md`.
+  - **Tokens** (`wavedb-net::auth`): `[to_wire(AccessClaims)][HMAC-SHA256]`;
+    claims `{ user, tenant, expires_at, purpose: Access|Refresh, session,
+    nonce }`. `sign`/`verify` (constant-time MAC first, then expiry, then
+    purpose — a refresh token can never pass as access). The `nonce` exists
+    because rotation compares token *hashes*: two pairs minted in the same
+    second must differ byte-for-byte.
+  - **Envelope**: `Request { auth, frame }` with
+    `Auth::Anonymous { tenant } | Auth::Token(bytes)` — identity inside the
+    body, transport stays a dumb tunnel. `NodeErrorKind::Unauthorized` is
+    the one uniform refusal (which check failed stays server-side).
+  - **Gate 1** (`quick-node::dispatch::identify`): token → verified
+    `Caller { user, tenant }` (claimed tenant ignored); anonymous →
+    `Caller::anonymous` (`user = U48::MAX`). Secret: `Server::secret(..)`
+    or random per boot; installed once process-wide
+    (`wavedb_net::auth::set_node_secret`) so the minting helpers and an
+    in-process reopen agree.
+  - **Caller threading**: `Exposure::execute(store, caller, ..)`; generated
+    `__wavedb_*` steps take `Caller` and refuse the anonymous tier before
+    any work; fn dispatch builds `ServerDb::for_caller`. Authorship:
+    `Metadata.user` = the verified user (`Collection::stamped_by`,
+    `save_unique_as`) — engine-local paths keep `user = tenant`.
+  - **Guard in the macro**: `#[server]` injects the anonymous refusal ahead
+    of arg decoding; `#[server(public)]` skips it. Body errors now flatten
+    via `Into<core::Error>` so `Error::Unauthorized` keeps its identity on
+    the wire (was: everything stringly `Backend`).
+  - **Sessions** (`wavedb::auth`): NonUnique `AuthSession { user,
+    refresh_hash, issued, revoked }` + Unique `AuthSessions` anchor, lazily
+    bootstrapped in the session tenant's space; refresh claims carry the
+    record's raw `Id`. `issue_pair` → `TokenPair` (15 min access / 30 day
+    refresh); `refresh_pair` rotates the stored hash (replay ⇒ revoke);
+    `revoke` = logout. Tokens stored only as sha256 — reading the store
+    never yields a usable token.
+  - **Client**: `Db::with_access_token(bytes)`; every request ships
+    `Auth::Token`, else `Auth::Anonymous` under the claimed tenant.
+  - **Proofs**: todo-app e2e (login pair → work under token; anonymous
+    non-public refused; replayed refresh revokes the session; logout kills
+    refresh; all survives restart); dispatch unit tests (expired / forged /
+    wrong-purpose / anonymous-tier); the M4/M3 e2es re-signed with real
+    tokens. `record.rs` split (`record_unique.rs`) for the file budget.
+
 - **Journal-rooted recovery — J1–J5 (2026-07-07, user-directed design)**:
   the journal's crc framing is the engine's **only** atomicity mechanism;
   the S2/S3 superblock-pointer checkpoint (same day) was superseded.
