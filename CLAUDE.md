@@ -67,10 +67,16 @@ Full rationale in `docs/development_standards.md`. The load-bearing ones:
 
 ## Architecture (bottom-up)
 
-Dependency chain: `wire` → `core` → {`macros`, `storage`} → `net` → `quick-node` → `wavedb`.
+Dependency chain: {`wire`, `platform`} → `core` → {`macros`, `storage`} → `net` →
+`quick-node` → `wavedb` → `wavedb-wasm`.
 The schema crate compiles into client and node — the schema IS the protocol; there is
 no DTO layer and no query DSL (filtered reads = `#[server]` functions).
 
+- **wavedb-platform** — the native ⇄ browser seam, cfg-switched (no traits): `time`
+  (`SystemTime` / `Date.now()` — `SystemTime::now()` **panics** on wasm32), `rand`
+  (`RandomState` keys / `window.crypto`), `http` (the tunnel's **client half**:
+  hand-rolled TcpStream POST / `fetch` + streamed body). Everything above must route
+  clock/entropy/client-HTTP through it — never name `SystemTime` or a socket directly.
 - **wavedb-wire / wavedb-wire-derive** — standalone `WaveWire` codec (no STRUCT_HASH,
   no engine coupling) + derive. Gotcha: `#[derive(WaveWire)]` emits absolute
   `::wavedb_wire::` paths, so any crate using it needs `wavedb-wire` as a direct dep.
@@ -103,7 +109,9 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
   cookies, or status semantics as API; the body is a self-contained
   `Request { tenant, CommandFrame { struct_hash, command, payload } }` and a WaveDB
   refusal is a 200 carrying `NodeError`. Functions and structs share one hash space —
-  a fn call is indistinguishable from an object op at the frame level.
+  a fn call is indistinguishable from an object op at the frame level. `NetClient` +
+  `frames::FrameReader` are target-independent (POST/body via `wavedb-platform`);
+  only the server half (`net::http`) is native-gated.
 - **wavedb-quick-node** — library (no bin): `Server::new(REGISTRY).data_dir(d).serve(addr)`.
   `expose_server!` also emits `StorageRegistry`, so `.registry(REGISTRY)` alone opens
   the `PageStore`. Gates 4–6 (permission/validate/preprocess) are an M8 seam.

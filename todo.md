@@ -2,9 +2,9 @@
 
 Clean reimplementation of WaveDB. The docs describe the **target** design;
 everything that has landed is in [`todo_done.md`](todo_done.md). Workspace
-members today: wire, wire-derive, core, macros, storage, net, quick-node,
-wavedb, schema-smoke, todo-app (schema/server/client). Excluded (not built
-yet): wasm, bench, test-cluster. Remaining work, bottom-up (the task log is
+members today: wire, wire-derive, platform, core, macros, storage, net,
+quick-node, wavedb, wasm, schema-smoke, contact-book, todo-app
+(schema/server/client). Excluded (not built yet): bench, test-cluster. Remaining work, bottom-up (the task log is
 in [PLAN — M4 completion](#plan--m4-completion) at the end; all tasks
 T1–T7 landed):
 
@@ -107,17 +107,31 @@ The developer surface — what `examples/todo-app` is written against.
 
 ## M5 — browser target (`wavedb-wasm` → members)
 
-- **IndexedDB `Store`**: key = 128-bit `Id` (big-endian), value = wire bytes;
-  `apply` = one IDB readwrite transaction; no pages, no journal (IndexedDB
-  already does block management + crash safety);
-- `wavedb` + `wavedb-net` compile for `wasm32`: browser `fetch` POST
-  transport, `wasm_bindgen_futures` runtime — same async API;
-- **no tokio inside wasm** (user constraint, 2026-07-07): tokio stays
-  behind `cfg(not(target_arch = "wasm32"))` everywhere (it already is —
-  net gates it, client/schema carry it as dev-deps only); the wasm build
-  runs on `wasm_bindgen_futures`, keeping the binary small. The wasm side
-  has **no journal and no `data.bin`** — IndexedDB `Id → Vec<u8>` is the
-  whole store (the `Store` trait absorbs the difference);
+- [x] **platform seam — LANDED (2026-07-10)**: new bottom crate
+  `wavedb-platform` (below core) owning the three per-target facts behind
+  one API compiled two ways — `time` (`SystemTime` / `Date.now()`; on
+  wasm32-unknown-unknown `SystemTime::now()` *panics*, so core's id minting
+  and net's token clock route through it), `rand` (`RandomState` keys /
+  `window.crypto.getRandomValues`; quick-node's default secret draws from
+  it), and `http` (the tunnel's **client half**: hand-rolled TcpStream POST
+  / `fetch` + `Request` with the response streamed through a
+  `ReadableStreamDefaultReader`). `wavedb-net::frames::FrameReader` now
+  reassembles `[len u32][bytes]` frames over the platform `Body` on both
+  targets; the server half stays native in `wavedb-net::http`;
+- [x] `wavedb` + `wavedb-net` (+ core, platform) compile and clippy clean
+  for `wasm32-unknown-unknown`; `wavedb-wasm` is a **workspace member**
+  shipping a raw `probe::call_fn_raw` export (anchors the client stack —
+  size tracker reads 501 KB raw / 124 KB gzip pre-bindgen, 278 KB smaller
+  than the last measurement);
+- **no tokio inside wasm** (user constraint, 2026-07-07) — holds: tokio
+  stays behind `cfg(not(target_arch = "wasm32"))` (platform + net gate it;
+  client/schema carry it as dev-deps only); the wasm build runs on
+  `wasm_bindgen_futures`. The wasm side has **no journal and no
+  `data.bin`** — IndexedDB `Id → Vec<u8>` will be the whole store (the
+  `Store` trait absorbs the difference);
+- [ ] **IndexedDB `Store`**: key = 128-bit `Id` (big-endian), value = wire
+  bytes; `apply` = one IDB readwrite transaction; no pages, no journal
+  (IndexedDB already does block management + crash safety);
 - the `Store`-generic `BpTree`/`Collection` already run over any backend —
   serverless mode (engine in-browser over IndexedDB) falls out;
 - **measure the per-struct wasm cost** of the registry `match` (M1 risk
@@ -260,10 +274,20 @@ Deliberately left as later seams:
   **32 KiB one-node-per-page** BpTree format, **background** settle / rebalance
   + journal checkpointing, per-value heap compression.
 
-_Workspace green: fmt + clippy (pedantic + nursery) clean, 29 test suites,
-file-length gate passing. Members: wire, wire-derive, core, macros, storage,
-net, quick-node, wavedb, schema-smoke, todo-app (schema/server/client).
-Still excluded: wasm, bench, test-cluster._
+- **M5 platform seam — LANDED (2026-07-10)**: `wavedb-platform` (new bottom
+  crate) owns time/entropy/HTTP-client-half per target; core id minting, the
+  token clock, quick-node's default secret, and `NetClient` all route through
+  it. The whole client stack compiles + clippy-cleans for
+  `wasm32-unknown-unknown`; `wavedb-wasm` is a member with a raw
+  `probe::call_fn_raw` export (fetch → node → framed reply). Remaining M5:
+  IndexedDB `Store`, browser demo (the exit), registry-`match` size
+  measurement.
+
+_Workspace green (both targets): fmt + clippy (pedantic + nursery) clean,
+tests green, file-length gate passing. Members: wire, wire-derive, platform,
+core, macros, storage, net, quick-node, wavedb, wasm, schema-smoke,
+contact-book, todo-app (schema/server/client). Still excluded: bench,
+test-cluster._
 
 # PLAN — M4 completion
 

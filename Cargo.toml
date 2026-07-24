@@ -6,6 +6,7 @@ resolver = "2"
 members = [
   "crates/wavedb-wire",
   "crates/wavedb-wire-derive",
+  "crates/wavedb-platform",
   "crates/wavedb-core",
   "crates/wavedb-macros",
   "crates/wavedb-storage",
@@ -14,12 +15,12 @@ members = [
   "crates/wavedb",
   "examples/contact-book",
   "examples/schema-smoke",
+  "crates/wavedb-wasm",
   "examples/todo-app/schema",
   "examples/todo-app/server",
   "examples/todo-app/client",
 ]
 exclude = [
-  "crates/wavedb-wasm",
   "crates/wavedb-bench",
   "crates/wavedb-test-cluster",
 ]
@@ -49,6 +50,10 @@ trivially_copy_pass_by_ref = "allow"
 wavedb-wire = { path = "crates/wavedb-wire" }
 # Its companion `#[derive(WaveWire)]` proc-macro, re-exported by `wavedb-wire`.
 wavedb-wire-derive = { path = "crates/wavedb-wire-derive" }
+# The native ⇄ browser seam: wall clock, entropy, and the client half of the
+# HTTP tunnel, one API compiled two ways (`SystemTime`/`TcpStream` vs
+# `Date.now()`/`fetch`). Everything above it stays target-independent.
+wavedb-platform = { path = "crates/wavedb-platform" }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 zstd = "0.13.3"

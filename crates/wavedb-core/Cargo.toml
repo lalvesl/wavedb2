@@ -10,6 +10,9 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+# Wall-clock reads for id minting — `SystemTime::now()` panics on
+# wasm32-unknown-unknown, so the clock routes through the platform seam.
+wavedb-platform.workspace = true
 # The Wire codec, re-exported as `wavedb_core::wire`. Lives in its own crate so
 # the serialization layer carries no STRUCT_HASH / engine coupling.
 wavedb-wire.workspace = true
