@@ -140,8 +140,8 @@ the per-`STRUCT_HASH` storage directory and the wire envelope.
 
 ```rust
 pub struct Metadata {
-    pub old_modification_id: Option<LocalId>, // None = first version
-    pub new_modification_id: Option<LocalId>, // None = live record
+    pub previous: Option<u64>,                // predecessor's authoring instant; None = first version
+    pub succession: Succession,               // CreatedAt(instant) live · Next(instant) on an archive
     pub pivot_id: Option<LocalId>,            // None = Unique record
     pub user: U48,                            // who wrote this version (48-bit newtype)
     pub device_created: u64,                  // which device produced it
@@ -152,12 +152,14 @@ pub struct Metadata {
 No `struct_version` field — the stored record's `STRUCT_HASH` (carried in the
 wire envelope) already says which schema it was written under.
 
-Modification IDs and `pivot_id` use `Option<LocalId>` (80-bit when `Some`)
-instead of a full `Id` (128-bit): the BpTree is already tenant-scoped so the
-48-bit `TENANT` is redundant, and `Option<T>` costs only 1 stack byte (flag) with
-the `LocalId` payload on the heap only when `Some`. Stack size = **18 bytes**
-(3 × 1-byte flag + 6 user + 8 device + 1 permission flag). A Unique record with
-all three `None` has zero heap bytes for those fields.
+The version chain links by **instant, not address**: `previous` and
+`Succession::Next` carry the `u64` instant a version was authored, and an archive's
+slot is a pure function of `(type, shape, instant)`, so a link written once is
+never repointed. `Succession` is hand-encoded as a fixed 9-byte stack
+(`tag + instant`); the whole `Metadata` stack is **26 bytes**, and a Unique first
+version (every `Option` `None`) adds zero heap. Full model:
+[RFC 0009](../../rfcs/0009-anchors-succession-and-history.md) /
+[RFC 0010](../../rfcs/0010-metadata-and-record-envelopes.md).
 
 ### `LocalId` — 80-bit compact ID
 
@@ -173,22 +175,22 @@ never disk.
 
 ### `pivot_id` — the NonUnique reindex back-link
 
-A NonUnique `save` (update) **force-reindexes every live tree** of its collection —
-the `current` `BpTree` _and_ every `#[wavedb::pivot(...)]` secondary — so it must
-reach all the tree roots, which live in the collection's **`Pivot`**. The record
-therefore carries its owning `PivotId` here as a `LocalId` (the typed
-`<T>::PivotId` is the compile-time view only — core never names macro types).
+A NonUnique `save` (update) re-keys the collection trees whose field changed — the
+`current` `BpTree` is keyed by the immutable `CREATED_AT` (never re-keyed), each
+`#[wavedb::pivot(...)]` secondary only when its field changed — so it must reach the
+tree roots, which live in the collection's **`Pivot`**. The record carries its
+owning `PivotId` here as a `LocalId` (the typed `<T>::PivotId` is the compile-time
+view only — core never names macro types).
 
 - **Stamped at `insert`** from the collection handle's `PivotId`; `None` for Unique.
 - Lets `save` reindex from the record alone, without re-passing the handle.
-- It is **outside `STRUCT_HASH`** (`name + shape + field names + types`), so it
-  changes **no** struct's identity — only Metadata's own wire layout.
+- It is **outside `STRUCT_HASH`**, so it changes **no** struct's identity — only
+  Metadata's own wire layout.
 
-Why not the `dead` tree on update? Because history is the `old_modification_id` ↔
-`new_modification_id` chain above: the previous version is retained and linked, so
-update never writes `dead`. `dead` is populated **only** by `remove`. The record's
-identity `Id` (the insert anchor) stays stable across updates so references never
-break; the trees re-establish the live version against that anchor.
+Why not the `dead` tree on update? Because the superseded version is archived at a
+derived slot and linked by `Succession` (above), so update never writes `dead`;
+`dead` is populated **only** by `remove`. The record's identity `Id` (the insert
+anchor) stays stable across updates so references never break.
 
 ---
 
@@ -454,32 +456,25 @@ tenant)` / `value.save(store, tenant)` (save **is** the upsert) — and since
 they don't implement `NonUniqueStruct`, driving one through a collection is a
 compile error.
 
-### 32 KiB pages — fanout and I/O
+### BpTree node encoding
 
-BpTree pages are **32 KiB** (8 × 4 KiB blocks), **one node per page**. Both
-node kinds use the same 18-byte entry format:
+A BpTree node is an ordinary `STRUCT_HASH`-headed value packed into the shared
+per-`STRUCT_HASH` page directory — **not** a dedicated one-node-per-page format.
+(A 32 KiB page-per-node layout was measured to waste the dominant B2C case of
+millions of small trees, and dropped —
+[RFC 0031](../../rfcs/0031-node-per-page-bptree-DEPRECATED.md).) Both node kinds
+use the same 18-byte entry:
 
 ```
 entry = [ key: [u8; 8] ][ LocalId: 10 bytes ]
 ```
 
-- **Internal node**: `LocalId` = child BpTree page pointer.
+- **Internal node**: `LocalId` = child node pointer.
 - **Leaf node**: `LocalId` = NonUnique record pointer.
 
-All `LocalId`s inflate to full `Id` via `local_id.to_id(tenant)` — 2–3 CPU
-cycles, never disk.
-
-Usable bytes per page: `32 768 − 20 (header) ≈ 32 748`. Per-entry cost = **18
-bytes**. Capacity ≈ **1 819 entries per page**. Tree height in page reads:
-
-| Records  | Page reads |
-| -------- | ---------- |
-| ≤ 1 819  | 1          |
-| ≤ 3.31 M | 2          |
-| ≤ 6.03 B | 3          |
-
-See [`wavedb-storage`](../../crates/wavedb-storage/README.md#bptree-page-layout--32-kib-one-node-per-page)
-for the full page layout, capacity math, split algorithm, and merge policy.
+All `LocalId`s inflate to a full `Id` via `local_id.to_id(tenant)` — 2–3 CPU
+cycles, never disk. Node layout and split/merge policy live in
+[RFC 0011](../../rfcs/0011-bptree-index-and-collections.md).
 
 ### Composite — set algebra on `Id` streams
 

@@ -36,7 +36,8 @@ builds (Android, Windows, Linux, macOS, iOS) use the filesystem (`data.bin` +
 journal); **web** builds use **IndexedDB directly** (no journal needed).
 
 > This file is the **idea + quickstart**. Every detailed mechanism lives in the
-> crate that implements it — see the [Crate map](#crate-map).
+> crate that implements it — see the [Crate map](#crate-map). The per-idea design
+> record and current progress live in [`rfcs/`](rfcs/README.md).
 
 ---
 
@@ -261,13 +262,13 @@ every index; a `save` only touches a secondary tree if it changed that field.
   - a record's **identity `Id` is assigned at `insert`** (that moment's
     `CREATED_AT`) and is its **stable anchor** — references point at it, it never
     changes.
-  - **`save` / update force-reindexes every live tree** — the `current` `BpTree`
-    **and** every `#[wavedb::pivot(...)]` secondary — removing the record's old
-    entries and reinserting for the new version. The **`dead`** tree is **not**
-    touched: update is not a delete, so the previous version is retained and linked
-    through `Metadata` (`old_modification_id` ↔ `new_modification_id`). Reaching all
-    tree roots needs the `Pivot`, found via **`Metadata.pivot_id`** (below) — so the
-    record carries its owning `PivotId` as a `LocalId` and `save` reindexes without the handle.
+  - **`save` / update re-keys only the trees whose field changed** — the `current`
+    `BpTree` is keyed by the immutable `CREATED_AT` (never re-keyed), and each
+    `#[wavedb::pivot(...)]` secondary is re-keyed only if its field changed. The
+    **`dead`** tree is **not** touched: update is not a delete — the superseded
+    version is archived at a derived slot and linked through `Metadata`
+    (see [History](#history--timeline)). Reaching the tree roots needs the `Pivot`,
+    found via **`Metadata.pivot_id`** — so `save` reindexes without the handle.
   - **`remove`** moves the record from `current` to the **dead** tree — the **only**
     op that writes `dead`. Nothing is erased; history stays navigable.
 
@@ -278,11 +279,13 @@ every index; a `save` only touches a secondary tree if it changed that field.
 
 ### History / timeline
 
-Saving never frees the old bytes. Each version is retained and the live record's
-`Metadata` chains backward (`old_modification_id`) and forward
-(`new_modification_id`) so a record's full timeline is walkable — this chain is why
-update needs **no `dead`-tree write**. Removed NonUnique records live on in the
-`dead` `BpTree` (the only thing that populates it).
+Saving never frees the old bytes. The **live** version sits at the record's
+anchor; each superseded version is archived at a **derived slot** — an address
+computed from the instant that version was authored — and versions chain through
+**`Metadata.succession`** by instant, not by pointer, so a version written once is
+never repointed and the full timeline is walkable. This is why update needs **no
+`dead`-tree write**. Removed NonUnique records live on in the `dead` `BpTree` (the
+only thing that populates it).
 
 ---
 
@@ -427,13 +430,14 @@ The full client API and object lifecycle live in
 | [`wavedb-macros`](crates/wavedb-macros/README.md)         | `#[wavedb]`, `#[server]`, `expose_server!`/`expose_client!`, generated `Pivot`/`BpTree` | Object declaration, `STRUCT_HASH` derivation, **exposure** + per-hash `match` dispatch                             |
 | [`wavedb-storage`](crates/wavedb-storage/README.md)       | The per-node engine                                                          | **Block manager, per-`STRUCT_HASH` page directory, linear hashing**, pages, dictionaries, journal + cache pipeline |
 | [`wavedb-quick-node`](crates/wavedb-quick-node/README.md) | Serving/storage node                                                         | Tenant write-ownership ring, replication, routing/failover, node-side validation                                   |
-| [`wavedb-net`](crates/wavedb-net/README.md)               | Transport                                                                    | WebSocket / HTTP queue, screen-sync (subscriptions + journal cursor)                                                                          |
+| [`wavedb-net`](crates/wavedb-net/README.md)               | Transport                                                                    | WebSocket / HTTP dumb tunnel, live sync (subscriptions + navigation catch-up)                                                               |
 | [`wavedb-wasm`](crates/wavedb-wasm/README.md)             | Browser client                                                               | IndexedDB key→value storage (no pages, no journal)                                                                 |
 
 Tooling: `wavedb-examples`, `wavedb-bench`, `wavedb-test-cluster`.
 
-A cold/history tier (slow-node) and cluster monitors are **deferred — not the
-moment**; their crates are intentionally absent for now.
+A cold/history tier (slow-node) was **removed** — history is single-tier in
+`data.bin`, unbounded growth accepted for now. A multi-node cluster and its
+monitors are **deferred**; those crates are intentionally absent.
 
 ---
 

@@ -157,15 +157,10 @@ probabilistic:
   HTTP the same op is an "anything new?" poll (`db.watch_via_polling(interval)`);
   over WebSocket it seeds the push stream on (re)subscribe.
 
-(The earlier design here was a **journal commit-cursor** — "since sequence N"
-streamed from the ordered batch log. The DB-1 anchor model made it obsolete:
-archives live at instant-derived slots and every collection carries instant-keyed
-recency/dead logs, so "changed since" is a tail scan of the data with no journal
-coupling and no per-session node state. A **Bloom filter** of on-screen ids was
-the design before *that*, and was rejected: answering one on reconnect would
-force the node to test its whole dataset against the filter, and for live
-filtering it adds false positives over nothing that exact pivot/anchor
-subscriptions don't already give.)
+(Two earlier catch-up designs were dropped for this one — a journal commit-cursor
+and, before it, a Bloom filter of on-screen ids. Why each lost is recorded in
+[RFC 0028](../../rfcs/0028-journal-commit-cursor-sync-DEPRECATED.md) and
+[RFC 0029](../../rfcs/0029-bloom-filter-screen-sync-DEPRECATED.md).)
 
 ---
 

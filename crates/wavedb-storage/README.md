@@ -263,145 +263,29 @@ PageBody (plain WaveWire struct):
   pages. Even when on, a body zstd cannot shrink is stored `Raw` — a page
   never grows for having been "compressed".
 
-What a page's records hold, by the kind of `STRUCT_HASH` that routed them (the
-future per-kind split — own dictionaries, the dedicated 32 KiB node page —
-specialises these without changing the framing):
+What a page's records hold, by the kind of `STRUCT_HASH` that routed them (a
+future per-kind split — e.g. its own dictionary — could specialise these without
+changing the framing):
 
 | Kind          | What the records hold                                              |
 | ------------- | ------------------------------------------------------------------ |
 | **Unique**    | The single live record per tenant at its fixed anchor address.     |
 | **NonUnique** | The collection's records (timestamp-keyed).                        |
 | **Pivot**     | Collection handles: `current`/`dead` BpTree pointers (no counter). |
-| **BpTree**    | Serialised B+tree nodes (target: 32 KiB, one node per page).       |
+| **BpTree**    | Serialised B+tree nodes (packed in the shared page directory).     |
 
-### BpTree page layout — 32 KiB, one node per page
+### BpTree node storage
 
-> Status: **dropped (2026-07-07).** This layout predates tenant
-> partitioning: a `BpTree` exists per tenant, so a B2C node hosts millions
-> of *small* trees and a dedicated 32 KiB page per node wastes space in
-> exactly the dominant case. Nodes ride the shared linear-hash `SlotPage`
-> directory instead — many tenants' small nodes pack into common buckets.
-> Revisit only if a measured workload shows single huge trees dominating
-> cold reads.
+> Status: the dedicated **32 KiB, one-node-per-page** format was **dropped
+> (2026-07-07)** — see [RFC 0031](../../rfcs/0031-node-per-page-bptree-DEPRECATED.md).
+> A `BpTree` exists per tenant, so a B2C node hosts millions of *small* trees and
+> a page per node wastes exactly the dominant case.
 
-BpTree pages are **32 KiB** (8 × 4 KiB blocks). Each page holds exactly **one**
-B+tree node (either an internal node or a leaf node). Both node kinds use the
-same 18-byte entry format — no special-casing:
-
-```
-entry = [ key: [u8; 8] ][ LocalId: 10 bytes ]
-```
-
-- **Internal node entry**: `LocalId` is the child BpTree page pointer.
-- **Leaf node entry**: `LocalId` is the NonUnique record pointer.
-
-All `LocalId`s are inflated to full `Id` via `local_id.to_id(tenant)` on read —
-2–3 CPU cycles, never disk.
-
-```
-┌──────────────────────────────────────────────────────┐  0
-│  HEADER  (20 bytes)                                  │
-│    crc32 (4) · STRUCT_HASH (8) · kind (u8)           │
-│    num_entries (u16) · reserved (5)                  │
-├──────────────────────────────────────────────────────┤  20
-│                                                      │
-│  ENTRIES  (18 bytes each, tightly packed)            │
-│    [ key: [u8; 8] | child/record: LocalId (10 B) ]  │
-│    …                                                 │
-│                                                      │
-└──────────────────────────────────────────────────────┘  32 768
-```
-
-#### Capacity and tree height
-
-```
-usable  = 32 768 − 20  = 32 748 bytes
-entries = 32 748 / 18  ≈  1 819 per page
-```
-
-Tree height in **page reads** (8-byte `CREATED_AT` keys):
-
-| Records  | Page reads |
-| -------- | ---------- |
-| ≤ 1 819  | 1          |
-| ≤ 3.31 M | 2          |
-| ≤ 6.03 B | 3          |
-
-Prior design (4 KiB page, 226-entry nodes, `LocalId` pointer per entry):
-
-| Records | Page reads (old) | Page reads (new) |
-| ------- | ---------------- | ---------------- |
-| 1 M     | 4                | **2**            |
-| 1 B     | 5                | **3**            |
-| 6 B     | 5                | **3**            |
-
-#### Page split
-
-Triggered when an insert would push a node past 1 819 entries (page full).
-
-**Step 1 — split the full node.**
-
-```
-page_X (FULL — 1 819 entries):
-  [ e0, e1, … e908 | e909, e910, … e1818 ]
-                   ↑
-              median = e909
-
-→ allocate page_Y (new LocalId)
-→ page_X keeps  [ e0  … e908 ]   (~50%)
-→ page_Y gets   [ e909 … e1818 ] (~50%)
-```
-
-**Step 2 — push median key up to parent.**
-
-Insert `(e909.key, page_Y_localid)` into the parent internal node, immediately
-to the right of the entry that pointed at `page_X`:
-
-```
-BEFORE parent: [ … | keyA → page_X | … ]
-AFTER  parent: [ … | keyA → page_X | e909.key → page_Y | … ]
-```
-
-**Step 3 — cascade if parent is also full.**
-
-The parent insert from Step 2 may itself overflow → apply Step 1–2 on the
-parent, recursing up the ancestor path.
-
-**Step 4 — root split (special case).**
-
-If the root page overflows there is no parent to absorb the pushed key.
-Instead:
-
-```
-old root (FULL):  [ e0 … e1818 ]
-
-→ allocate page_L, page_R  (two new LocalIds)
-→ page_L ← left  half  [ e0   … e908  ]
-→ page_R ← right half  [ e909 … e1818 ]
-→ allocate new root page_ROOT with one entry:
-      page_ROOT: [ e909.key → page_R ]
-      (implicit left child = page_L, stored as the "less-than" pointer)
-→ Pivot.current (or .dead / secondary root) ← page_ROOT LocalId
-```
-
-The tree grows one level. **All allocated pages and the updated `Pivot` are
-written in a single journal entry** — crash before the entry is committed leaves
-the tree unchanged; crash after is a complete, consistent state.
-
-#### Merge on delete
-
-When `remove` makes a node fall below **25% fill** (≈ 455 entries), check the
-adjacent sibling:
-
-- **Sibling + current ≤ 75% full** (≤ 1 364 entries): **merge** — copy all
-  entries into the sibling, free this page, remove the separator key from the
-  parent. Parent may in turn underflow → recurse.
-- **Sibling too full to absorb**: **redistribute** — steal entries from the
-  sibling until both sit near 50%, update the separator key in the parent.
-
-Both paths write all changed pages in a **single journal entry**. The `Pivot`
-is updated only if the root page is freed (tree becomes empty or shrinks to one
-level).
+Nodes ride the shared linear-hash `SlotPage` directory instead: a node is an
+ordinary `STRUCT_HASH`-headed value (`[hash][kind u8][WaveWire]`), packed with
+everything else of its type so many tenants' small nodes share common buckets.
+Entry format, split/rebalance, and merge policy live in
+[RFC 0011](../../rfcs/0011-bptree-index-and-collections.md).
 
 ---
 
@@ -559,11 +443,11 @@ it. All allocation deltas ride in a single journal write.
   per definition) and its `PivotId` stored by the holder; never auto-created. A
   record's **identity `Id` is fixed at `insert`** (stable anchor for references),
   so:
-  - **`save`** (update) **force-reindexes every live tree** — the `current`
-    `BpTree` _and_ every secondary — removing the record's old entries and
-    reinserting for the new version. It reaches the roots through `Metadata.pivot`.
-    The **`dead`** tree is **not** touched: the previous version is retained and
-    linked by the `Metadata` chain (`old_modification_id` ↔ `new_modification_id`);
+  - **`save`** (update) **re-keys only the trees whose field changed** — the
+    `current` `BpTree` is keyed by the immutable `CREATED_AT` (never re-keyed),
+    each secondary only when its field changed. It reaches the roots through
+    `Metadata.pivot`. The **`dead`** tree is **not** touched: the superseded
+    version is archived at a derived slot and linked by `Metadata.succession`;
   - **`insert`** adds the record to the `current` `BpTree` (and every secondary) and
     stamps `Metadata.pivot`; **`remove`** moves it to the **dead** tree — the only
     op that writes `dead`. All go through the `Pivot`.

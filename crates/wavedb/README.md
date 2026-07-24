@@ -22,10 +22,11 @@ clients, and (compiled to WASM) browsers.
 > native / IndexedDB wasm, under node-minted ids via `Collection::adopt`),
 > and reads serve locally only on a transport fault the cache can answer —
 > absence propagates the fault, refusals never fall back, offline writes
-> refuse (no queue until M7 sync). No cluster front door / failover URL, no
-> `another_tenant` (today: `as_tenant`), no Drop notification, no
-> `tokio::broadcast`; the typed surface lives on `Db` (`db.get::<T>()`), see
-> [RFC 0024](../../rfcs/0024-client-db-and-cache.md) on the `T::get(&db)` unification.
+> refuse (no queue yet — [RFC 0036](../../rfcs/0036-offline-write-queue-PLANNED.md)).
+> No cluster front door / failover URL, no Drop notification, no
+> `tokio::broadcast`; cross-tenant work is `db.as_tenant(t)`, and the typed
+> surface is `T::get(&db)` / `v.save(&db)` / `T::collection(pivot)`
+> ([RFC 0024](../../rfcs/0024-client-db-and-cache.md)).
 
 ## Entry points
 
@@ -39,11 +40,11 @@ clients, and (compiled to WASM) browsers.
 `url` resolves to the cluster's front door; the request is redirected to the
 Quick-Node owning the user's tenant, and the **backup** Quick-Node URL is
 returned alongside for failover. Native modes use the local `path` as a
-write-through cache under `tokio::broadcast`; WASM modes use IndexedDB in the
-same role. A `Db` can spawn another for a different tenant:
+write-through cache; WASM modes use IndexedDB in the same role. A `Db` can spawn
+another handle for a different tenant (server-side cross-tenant work):
 
 ```rust
-let other = db.another_tenant(other_tenant_id).await?;
+let other = db.as_tenant(other_tenant_id);
 ```
 
 The `Drop` impl notifies the Quick-Node so the session is released promptly.

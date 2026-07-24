@@ -55,8 +55,7 @@ agreement needs no handshake. Gossip moves the membership:
 Ownership is **per tenant** today (the tenant is the write-ownership unit).
 Finer-grained ownership keyed additionally by `STRUCT_HASH` is a planned
 refinement of the same ring walk; the data model already leaves room for it. The
-owner is the only writer: it validates, notifies replicas, and (later) forwards
-history to the cold tier.
+owner is the only writer: it validates and notifies replicas.
 
 ---
 
@@ -169,8 +168,9 @@ checks also apply inside the body. See
 
 ---
 
-## Hardware & history tier
+## Hardware
 
 Good CPU/RAM, fast NVMe. Holds active records and the in-memory write cache. A
-separate cold/history tier to which older versions flush down is **deferred —
-not the moment**; the node keeps full history locally until that tier lands.
+separate cold/history tier was **removed** — the node keeps full single-tier
+history in `data.bin`, unbounded growth accepted for now
+([RFC 0033](../../rfcs/0033-cold-history-slow-node-tier-DEPRECATED.md)).
