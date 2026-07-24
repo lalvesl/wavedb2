@@ -138,8 +138,10 @@ impl Db {
 }
 
 impl<T: UniqueStruct> UniqueWatch<T> {
-    /// The next mutation; `None` = the watch's connection ended (a poll
-    /// watch instead rides outages silently and keeps trying).
+    /// The next mutation; `None` = the watch ended **permanently** — a fatal
+    /// identity refusal, or the last handle dropped. A transient socket drop no
+    /// longer ends the stream: the connection manager reconnects and catches up
+    /// (W6), and a poll watch rides outages silently.
     ///
     /// # Errors
     /// [`Error::Core`] on a body that does not decode as `T`.
@@ -163,8 +165,10 @@ impl<T: UniqueStruct> UniqueWatch<T> {
 }
 
 impl<T: NonUniqueStruct> CollectionWatch<T> {
-    /// The next mutation; `None` = the watch's connection ended (a poll
-    /// watch instead rides outages silently and keeps trying).
+    /// The next mutation; `None` = the watch ended **permanently** — a fatal
+    /// identity refusal, or the last handle dropped. A transient socket drop no
+    /// longer ends the stream: the connection manager reconnects and catches up
+    /// (W6), and a poll watch rides outages silently.
     ///
     /// # Errors
     /// [`Error::Core`] on a body that does not decode as `T`.

@@ -25,7 +25,9 @@
 mod actor;
 mod boot;
 mod poll;
+mod sync_call;
 mod ws_conn;
+mod ws_dial;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
@@ -199,20 +201,23 @@ pub async fn watch(
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
+    use core::time::Duration;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::net::TcpListener;
     use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-    use wavedb_core::{Id, U48};
+    use wavedb_core::expose::Reply;
+    use wavedb_core::{Id, Metadata, Succession, U48};
     use wavedb_platform::ws::codec::{self, Messages, Msg, OP_BINARY};
     use wavedb_wire::{from_wire, to_wire};
 
     use futures::StreamExt as _;
 
     use super::{WatchMode, watch};
-    use crate::frame::Auth;
+    use crate::frame::{Auth, Request, Response, StreamFrame};
     use crate::http;
+    use crate::sync::{SYNC_STRUCT_HASH, SyncReply};
     use crate::ws::{ClientMsg, EventKind, RecordEvent, ServerMsg, Topic};
 
     const TOPIC_A: Topic = Topic {
@@ -261,10 +266,10 @@ mod tests {
                         send(&mut w, &ServerMsg::Event(event(TOPIC_A))).await;
                         send(&mut w, &ServerMsg::Event(event(TOPIC_B))).await;
                     }
-                    send(&mut w, &ServerMsg::TopicOk(topic)).await;
+                    send(&mut w, &ServerMsg::TopicOk(topic, 0)).await;
                 }
                 ClientMsg::Unsubscribe(topic) => {
-                    send(&mut w, &ServerMsg::TopicOk(topic)).await;
+                    send(&mut w, &ServerMsg::TopicOk(topic, 0)).await;
                 }
                 ClientMsg::Call(_) => panic!("a watch never calls"),
             }
@@ -348,5 +353,133 @@ mod tests {
             within!(watch(&addr, auth, WatchMode::WebSocket, TOPIC_A))
                 .expect("fresh watch after teardown");
         assert_eq!(conns.load(Ordering::SeqCst), 2, "a fresh dial");
+    }
+
+    /// A `Saved` event carrying a live-version instant in its metadata, so
+    /// [`RecordEvent::instant`] resolves — the cursor can advance and dedup.
+    fn saved_event(topic: Topic, instant: u64) -> RecordEvent {
+        RecordEvent {
+            topic,
+            id: Id::new(topic.struct_hash, U48::from(1u32), false, 0),
+            kind: EventKind::Saved,
+            meta: Some(Metadata {
+                succession: Succession::CreatedAt(instant),
+                ..Metadata::default()
+            }),
+            body: vec![1],
+        }
+    }
+
+    /// The catch-up POST answer: a `SyncReply` carrying the "downtime" event
+    /// (instant 20) the client missed while its socket was down.
+    async fn answer_catch_up(w: &mut OwnedWriteHalf, topic: Topic) {
+        let reply = SyncReply {
+            events: vec![saved_event(topic, 20)],
+            cursors: vec![(topic, 20)],
+        };
+        let end =
+            StreamFrame::End(Response::Ok(Reply::Returned(to_wire(&reply))));
+        http::write_ok_head(w).await.expect("ok head");
+        http::write_frame(w, &to_wire(&end)).await.expect("frame");
+    }
+
+    /// One WS connection of the reconnect node: `Hello`, ack the subscribe,
+    /// and — on the **first** connection only — push a live event (instant 10)
+    /// then drop the socket, forcing the client to reconnect.
+    async fn reconnect_ws(
+        mut msgs: Messages<OwnedReadHalf>,
+        mut w: OwnedWriteHalf,
+        first: bool,
+    ) {
+        while let Ok(Some(Msg::Binary(bytes))) = msgs.next(true).await {
+            match from_wire::<ClientMsg>(&bytes).expect("decode") {
+                ClientMsg::Hello(_) => send(&mut w, &ServerMsg::HelloOk).await,
+                ClientMsg::Subscribe(topic) => {
+                    send(&mut w, &ServerMsg::TopicOk(topic, 0)).await;
+                    if first {
+                        send(&mut w, &ServerMsg::Event(saved_event(topic, 10)))
+                            .await;
+                        return; // drop the socket → the client reconnects
+                    }
+                }
+                ClientMsg::Unsubscribe(topic) => {
+                    send(&mut w, &ServerMsg::TopicOk(topic, 0)).await;
+                }
+                ClientMsg::Call(_) => panic!("a watch never calls"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_watch_survives_a_dropped_socket_and_catches_up() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let ws_conns = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&ws_conns);
+        tokio::spawn(async move {
+            loop {
+                let (sock, _) = listener.accept().await.expect("accept");
+                let counted = Arc::clone(&counted);
+                tokio::spawn(async move {
+                    let (mut r, mut w) = sock.into_split();
+                    match http::read_request(&mut r).await {
+                        Ok(Some(http::Incoming::Upgrade { key })) => {
+                            http::write_switching_head(
+                                &mut w,
+                                &codec::accept_key(&key),
+                            )
+                            .await
+                            .expect("101");
+                            let first =
+                                counted.fetch_add(1, Ordering::SeqCst) == 0;
+                            reconnect_ws(Messages::new(r), w, first).await;
+                        }
+                        Ok(Some(http::Incoming::Post(body))) => {
+                            let request =
+                                from_wire::<Request>(&body).expect("request");
+                            assert_eq!(
+                                request.frame.struct_hash,
+                                SYNC_STRUCT_HASH
+                            );
+                            answer_catch_up(&mut w, TOPIC_A).await;
+                        }
+                        _ => {}
+                    }
+                });
+            }
+        });
+
+        macro_rules! within {
+            ($fut:expr) => {
+                tokio::time::timeout(Duration::from_secs(30), $fut)
+                    .await
+                    .expect("timed out")
+            };
+        }
+
+        let auth = Auth::Anonymous {
+            tenant: U48::from(3u32),
+        };
+        let (mut events, _guard) =
+            within!(watch(&addr, auth, WatchMode::WebSocket, TOPIC_A))
+                .expect("watch");
+
+        // The live event before the drop, then — after the socket dies and the
+        // manager reconnects — the event missed during the outage, delivered by
+        // navigation catch-up. The stream never ended.
+        assert_eq!(
+            within!(events.next()),
+            Some(saved_event(TOPIC_A, 10)),
+            "the pre-drop live event"
+        );
+        assert_eq!(
+            within!(events.next()),
+            Some(saved_event(TOPIC_A, 20)),
+            "the missed event, delivered by catch-up after reconnect"
+        );
+        assert!(
+            ws_conns.load(Ordering::SeqCst) >= 2,
+            "the watch re-dialed after the socket dropped"
+        );
     }
 }

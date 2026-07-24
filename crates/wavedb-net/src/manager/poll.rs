@@ -3,13 +3,13 @@
 //! on an adjustable timer ([`WatchMode::HttpPoll`](super::WatchMode)).
 //!
 //! Every tick (and immediately on a new watcher — the first successful
-//! sync is the liveness ack) it POSTs a [`SyncRequest`] declaring the
-//! **whole** current topic list, each topic with its **cursor** — the
-//! greatest node instant seen there (`None` on a fresh topic: the node
-//! answers its current tail, so the watch begins at "now"). The node holds
-//! no session state: it navigates the disk past each cursor and answers
-//! the changes plus the advanced cursors, which the actor stores for the
-//! next tick. Events fan out to watchers exactly like the WebSocket path.
+//! sync is the liveness ack) it declares the **whole** current topic list,
+//! each topic with its **cursor** — the greatest node instant seen there
+//! (`None` on a fresh topic: the node answers its current tail, so the watch
+//! begins at "now"). The node holds no session state: it navigates the disk
+//! past each cursor and answers the changes plus the advanced cursors, which
+//! the actor stores for the next tick (the exchange is [`super::sync_call`]).
+//! Events fan out to watchers exactly like the WebSocket path.
 //!
 //! Outage semantics differ from a pushed watch on purpose: a **transport**
 //! fault is tolerated (polling is loosely coupled — the next tick retries,
@@ -24,14 +24,9 @@ use std::collections::HashMap;
 
 use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt, StreamExt, select};
-use wavedb_core::expose::{Command, Reply};
-use wavedb_wire::{from_wire, to_wire};
 
-use super::ConnKey;
+use super::{ConnKey, sync_call};
 use crate::error::{Error, Result};
-use crate::frame::{CommandFrame, Request, Response, StreamFrame};
-use crate::frames::FrameReader;
-use crate::sync::{SYNC_STRUCT_HASH, SyncReply, SyncRequest, TopicCursor};
 use crate::ws::{RecordEvent, Topic};
 
 /// What the manager routes to a poll actor.
@@ -123,25 +118,12 @@ async fn sync(
     key: &ConnKey,
     state: &mut PollState,
 ) -> core::result::Result<(), ()> {
-    let request = Request {
-        auth: key.auth.clone(),
-        frame: CommandFrame {
-            struct_hash: SYNC_STRUCT_HASH,
-            // Like a function call, sync ignores the frame command.
-            command: Command::Get,
-            payload: to_wire(&SyncRequest {
-                topics: state
-                    .topics
-                    .keys()
-                    .map(|topic| TopicCursor {
-                        topic: *topic,
-                        since: state.cursors.get(topic).copied(),
-                    })
-                    .collect(),
-            }),
-        },
-    };
-    match exchange(&key.addr, &to_wire(&request)).await {
+    let cursors: HashMap<Topic, Option<u64>> = state
+        .topics
+        .keys()
+        .map(|topic| (*topic, state.cursors.get(topic).copied()))
+        .collect();
+    match sync_call::sync_once(&key.addr, &key.auth, &cursors).await {
         Ok(reply) => {
             for event in reply.events {
                 if let Some(subs) = state.topics.get_mut(&event.topic) {
@@ -171,28 +153,6 @@ async fn sync(
                     .unwrap_or(Error::Http("sync poll failed"))));
             }
             if fatal { Err(()) } else { Ok(()) }
-        }
-    }
-}
-
-/// POST the sync request and decode its scalar answer.
-async fn exchange(addr: &str, body: &[u8]) -> Result<SyncReply> {
-    let stream = wavedb_platform::http::post(addr, body).await?;
-    let mut frames = FrameReader::new(stream);
-    let bytes = frames
-        .next_frame()
-        .await?
-        .ok_or(Error::Http("response ended before its End frame"))?;
-    match from_wire::<StreamFrame>(&bytes)? {
-        StreamFrame::End(Response::Ok(Reply::Returned(reply))) => {
-            Ok(from_wire::<SyncReply>(&reply)?)
-        }
-        StreamFrame::End(Response::Ok(_)) => {
-            Err(Error::Http("sync answered with a non-return reply"))
-        }
-        StreamFrame::End(Response::Err(refusal)) => Err(Error::Node(refusal)),
-        StreamFrame::Item(_) => {
-            Err(Error::Http("item frame on a scalar command"))
         }
     }
 }

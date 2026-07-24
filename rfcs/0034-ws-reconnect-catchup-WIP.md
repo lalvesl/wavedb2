@@ -1,11 +1,25 @@
 # RFC 0034 — W6: WebSocket reconnect catch-up
 
-- **Status:** In progress (WIP) — the active work item; plan in this file
+- **Status:** In progress (WIP) — mechanism landed 2026-07-24; remaining: the
+  two-process e2e restart proof, then promote to Implemented
 - **Crates:** `wavedb-net` (primary), `wavedb-quick-node`, `wavedb`
-- **Code (to touch):** `net::manager::ws_conn`, `net::manager::poll`,
-  `net::ws` (`TopicOk`), `quick-node::serve_ws`, `examples/*/tests/live_watch_e2e.rs`
+- **Code:** `net::manager::{ws_conn, ws_dial, sync_call, poll}`, `net::ws`
+  (`TopicOk(Topic, u64)` + `RecordEvent::instant`), `quick-node::serve_ws`
+  (`topic_tail`)
 - **Depends on:** [RFC 0021](0021-connection-manager.md),
   [RFC 0022](0022-live-sync-navigation-catchup.md)
+
+> **Landed (2026-07-24).** The full mechanism: the `ws_conn` actor reconnects on
+> socket loss (`ws_dial::open` + `resubscribe`), tracks a per-topic cursor seeded
+> by `TopicOk`'s tail and advanced by `RecordEvent::instant`, catches up past it
+> via the shared `sync_call::sync_once` (buffering live events during catch-up),
+> and dedups the overlap. Fatal-refusal vs transient-fault split with bounded
+> backoff. Proven by `a_watch_survives_a_dropped_socket_and_catches_up` (a
+> loopback node that drops the socket then answers the catch-up POST — the watch
+> survives, re-dials, and receives the missed event). Whole workspace green
+> (fmt + clippy + tests + budget). **Remaining:** a real-node two-process restart
+> e2e (extend `live_watch_e2e.rs`), then rename this file to drop `-WIP` and set
+> *Implemented*.
 
 ## Summary
 

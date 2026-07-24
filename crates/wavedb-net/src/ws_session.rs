@@ -111,7 +111,7 @@ impl WsSession {
         self.send(msg).await?;
         loop {
             match self.next_msg().await? {
-                Some(ServerMsg::TopicOk(acked)) if acked == topic => {
+                Some(ServerMsg::TopicOk(acked, _)) if acked == topic => {
                     return Ok(());
                 }
                 Some(ServerMsg::Event(event)) => self.pending.push_back(event),
@@ -223,7 +223,7 @@ mod tests {
             );
             // An event lands BEFORE the ack — the session must buffer it.
             send_server(&mut w, &ServerMsg::Event(event(1))).await;
-            send_server(&mut w, &ServerMsg::TopicOk(TOPIC)).await;
+            send_server(&mut w, &ServerMsg::TopicOk(TOPIC, 0)).await;
             send_server(&mut w, &ServerMsg::Event(event(2))).await;
             let _ = codec::write_message(&mut w, OP_CLOSE, &[], false).await;
         });

@@ -171,13 +171,15 @@ where
             }
             // FIFO ack: once this arrives the subscription is live, so a
             // watcher established before a mutation cannot miss its event.
-            send(write, &ServerMsg::TopicOk(topic)).await?;
+            // The tail seeds the client's reconnect cursor (W6).
+            let tail = topic_tail(registry, store, caller, topic).await;
+            send(write, &ServerMsg::TopicOk(topic, tail)).await?;
         }
         FromClient::Msg(ClientMsg::Unsubscribe(topic)) => {
             if topics.remove(&topic) {
                 subs.borrow_mut().unsubscribe(caller.tenant, topic, conn);
             }
-            send(write, &ServerMsg::TopicOk(topic)).await?;
+            send(write, &ServerMsg::TopicOk(topic, 0)).await?;
         }
         // A second `Hello` is a protocol violation — end the session.
         FromClient::Msg(ClientMsg::Hello(_)) => {
@@ -186,6 +188,38 @@ where
         }
     }
     Ok(())
+}
+
+/// The topic's current tail instant — the cursor a fresh subscribe seeds its
+/// reconnect catch-up from (W6). Runs the type's `Changes` step with
+/// `since = None` (registration) through the registry and reads the cursor it
+/// answers; 0 if the topic hash is not served (the subscribe still acks).
+async fn topic_tail<E, S>(
+    registry: &E,
+    store: &S,
+    caller: Caller,
+    topic: Topic,
+) -> u64
+where
+    E: Exposure,
+    S: Store,
+{
+    use wavedb_core::expose::{Change, Command};
+
+    let payload = to_wire(&(topic.pivot, None::<u64>));
+    match registry
+        .execute(store, caller, topic.struct_hash, Command::Changes, &payload)
+        .await
+    {
+        Ok(Reply::Values(entries)) => entries
+            .first()
+            .and_then(|entry| from_wire::<Change>(entry).ok())
+            .map_or(0, |change| match change {
+                Change::Cursor(cursor) => cursor,
+                _ => 0,
+            }),
+        _ => 0,
+    }
 }
 
 /// The reader half: decode masked binary frames into [`ClientMsg`]s (and

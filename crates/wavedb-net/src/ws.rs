@@ -62,6 +62,23 @@ pub struct RecordEvent {
     pub body: Vec<u8>,
 }
 
+impl RecordEvent {
+    /// The node instant this event advances a topic's reconnect cursor to —
+    /// the removal instant for a removal, the live version's `CreatedAt`
+    /// instant (carried in `meta`) for a save. `None` if a save arrived
+    /// without metadata (a plain, non-catch-up frame).
+    #[must_use]
+    pub fn instant(&self) -> Option<u64> {
+        match self.kind {
+            EventKind::Removed(at) => Some(at),
+            EventKind::Saved => match self.meta.as_ref()?.succession {
+                wavedb_core::Succession::CreatedAt(at) => Some(at),
+                wavedb_core::Succession::Next(_) => None,
+            },
+        }
+    }
+}
+
 /// A client→server message. The first message on a connection must be
 /// [`Hello`](Self::Hello); everything else is refused until the identity
 /// is bound.
@@ -91,10 +108,11 @@ pub enum ServerMsg {
     Event(RecordEvent),
     /// The ack of a [`Subscribe`](ClientMsg::Subscribe) /
     /// [`Unsubscribe`](ClientMsg::Unsubscribe): messages are handled FIFO,
-    /// so once this arrives the subscription table mutation is live —
-    /// [`WsSession::subscribe`](crate::ws_session::WsSession::subscribe)
-    /// returns a watch that cannot miss a later mutation.
-    TopicOk(Topic),
+    /// so once this arrives the subscription table mutation is live and a
+    /// watch established before a mutation cannot miss it. The `u64` is the
+    /// topic's **current tail instant** — a fresh subscribe seeds its
+    /// reconnect cursor from it (ignored on an unsubscribe ack).
+    TopicOk(Topic, u64),
 }
 
 #[cfg(test)]
@@ -148,10 +166,13 @@ mod tests {
                 }),
                 body: vec![9],
             }),
-            ServerMsg::TopicOk(Topic {
-                struct_hash: 5,
-                pivot: Some(LocalId::new(2, false, 1)),
-            }),
+            ServerMsg::TopicOk(
+                Topic {
+                    struct_hash: 5,
+                    pivot: Some(LocalId::new(2, false, 1)),
+                },
+                0,
+            ),
         ] {
             assert_eq!(from_wire::<ServerMsg>(&to_wire(&msg)).unwrap(), msg);
         }
