@@ -47,6 +47,24 @@ wavedb::expose_server! { Profile, fn set_city, fn get_city }
 wavedb::expose_client! { fn set_city, fn get_city }
 
 const TENANT: u32 = 5;
+const SECRET: [u8; 32] = [3; 32];
+
+/// M8: non-public functions refuse the anonymous tier — the test signs an
+/// access token against the node's fixed secret.
+fn access_token() -> Vec<u8> {
+    use wavedb_net::auth::{AccessClaims, TokenPurpose, sign, unix_now};
+    sign(
+        &SECRET,
+        &AccessClaims {
+            user: U48::from(TENANT),
+            tenant: U48::from(TENANT),
+            expires_at: unix_now() + 3600,
+            purpose: TokenPurpose::Access,
+            session: 0,
+            nonce: 0,
+        },
+    )
+}
 
 struct Node {
     addr: SocketAddr,
@@ -71,6 +89,7 @@ fn start(dir: PathBuf) -> Node {
             .expect("build runtime");
         rt.block_on(async move {
             let bound: Bound<_> = Server::new(REGISTRY)
+                .secret(SECRET)
                 .data_dir(&dir)
                 .bind("127.0.0.1:0")
                 .await
@@ -100,7 +119,8 @@ async fn server_function_runs_on_the_node() {
         U48::from(TENANT),
     )
     .await
-    .expect("connect");
+    .expect("connect")
+    .with_access_token(access_token());
 
     // Empty before any write.
     assert_eq!(get_city(&db).await.expect("get_city"), "");

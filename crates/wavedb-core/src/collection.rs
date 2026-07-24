@@ -49,7 +49,9 @@ use crate::u48::U48;
 
 // The `#[wavedb]` macro reaches the Unique-anchor ops through this module's
 // path; the implementation lives with the envelope in [`crate::record`].
-pub use crate::record::{get_unique, save_unique, unique_history};
+pub use crate::record::{
+    get_unique, save_unique, save_unique_as, unique_history,
+};
 
 // ---- Collection ---------------------------------------------------------------
 
@@ -62,6 +64,7 @@ pub use crate::record::{get_unique, save_unique, unique_history};
 pub struct Collection<T: NonUniqueStruct> {
     pivot: LocalId,
     tenant: U48,
+    user: U48,
     leaf_cap: usize,
     internal_cap: usize,
     _record: PhantomData<fn() -> T>,
@@ -78,15 +81,26 @@ impl<T: NonUniqueStruct> Copy for Collection<T> {}
 
 impl<T: NonUniqueStruct> Collection<T> {
     /// The handle for the collection referenced by `pivot` under `tenant`.
+    /// Authorship (`Metadata.user`) defaults to the tenant — the engine-local
+    /// and B2C identity; [`stamped_by`](Self::stamped_by) overrides it.
     #[must_use]
     pub const fn at(pivot: LocalId, tenant: U48) -> Self {
         Self {
             pivot,
             tenant,
+            user: tenant,
             leaf_cap: crate::index::DEFAULT_LEAF_CAP,
             internal_cap: crate::index::DEFAULT_INTERNAL_CAP,
             _record: PhantomData,
         }
+    }
+
+    /// Stamp mutations' `Metadata.user` with the verified `user` (M8) instead
+    /// of the tenant.
+    #[must_use]
+    pub const fn stamped_by(mut self, user: U48) -> Self {
+        self.user = user;
+        self
     }
 
     /// Override the B+tree node capacities (small caps make deep trees cheap
@@ -102,6 +116,11 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// The tenant this handle is scoped to.
     pub(crate) const fn tenant(&self) -> U48 {
         self.tenant
+    }
+
+    /// The authorship stamped in mutations' `Metadata.user`.
+    pub(crate) const fn user(&self) -> U48 {
+        self.user
     }
 
     /// A tree handle at `root` with this collection's capacities.

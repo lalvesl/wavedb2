@@ -46,6 +46,11 @@ pub enum Error {
     /// not declare (out of `0..NUM_SECONDARIES`).
     #[error("secondary index {0} out of range")]
     SecondaryIndexOutOfRange(usize),
+    /// The caller's identity tier may not perform this operation (M8 gate:
+    /// an unauthenticated caller on a login-required item). The message is
+    /// evidence for the log; the wire flattens it to one uniform kind.
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
     /// A failure inside a [`Store`](crate::Store) backend — disk I/O, on-disk
     /// corruption, or similar. Core stays I/O-free, so the concrete cause is
     /// flattened to a message at the trait boundary.
