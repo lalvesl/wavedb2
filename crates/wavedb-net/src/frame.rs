@@ -25,16 +25,28 @@ pub struct CommandFrame {
     pub payload: Vec<u8>,
 }
 
+/// The request's identity claim — verified node-side (gate 1) into the
+/// caller the engine executes as.
+#[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
+pub enum Auth {
+    /// No token: the unauthenticated tier (`user = U48::MAX`). The claimed
+    /// tenant only scopes `#[server(public)]` functions (login/register);
+    /// every other operation refuses.
+    Anonymous {
+        /// The tenant public functions execute under.
+        tenant: U48,
+    },
+    /// A signed access token ([`crate::auth`]); `user`/`tenant` come from
+    /// the verified claims — a claimed tenant cannot override them.
+    Token(Vec<u8>),
+}
+
 /// A complete request — everything the node needs, in the POST body.
-///
-/// `tenant` is a **placeholder identity** until M8: the node trusts the
-/// claimed tenant as the session binding. M8 replaces it with a verified
-/// HMAC access token carried in this same envelope (pre-release wire
-/// layouts change freely — no versioning).
+/// Identity rides in [`Auth`], never in an HTTP header.
 #[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
 pub struct Request {
-    /// The claimed tenant (M8: derived from the verified access token).
-    pub tenant: U48,
+    /// The identity claim gate 1 verifies.
+    pub auth: Auth,
     /// The operation.
     pub frame: CommandFrame,
 }
@@ -61,6 +73,10 @@ pub enum NodeErrorKind {
     U48Overflow,
     /// A storage-backend fault (disk I/O, corruption).
     Backend,
+    /// Identity refused: missing/expired/forged token, or an operation the
+    /// caller's tier may not perform. One uniform kind — which check failed
+    /// is deliberately not distinguishable on the wire.
+    Unauthorized,
 }
 
 /// A structured node-side rejection, riding **inside** the 200 response —
@@ -92,6 +108,7 @@ impl NodeError {
             CoreError::SecondaryIndexOutOfRange(_) => {
                 NodeErrorKind::SecondaryIndexOutOfRange
             }
+            CoreError::Unauthorized(_) => NodeErrorKind::Unauthorized,
             CoreError::Backend(_) => NodeErrorKind::Backend,
         };
         Self {
@@ -149,11 +166,15 @@ mod tests {
     use wavedb_core::{Error as CoreError, U48};
     use wavedb_wire::{from_wire, to_wire};
 
-    use super::{CommandFrame, NodeError, NodeErrorKind, Request, Response};
+    use super::{
+        Auth, CommandFrame, NodeError, NodeErrorKind, Request, Response,
+    };
 
     fn request() -> Request {
         Request {
-            tenant: U48::from(42u32),
+            auth: Auth::Anonymous {
+                tenant: U48::from(42u32),
+            },
             frame: CommandFrame {
                 struct_hash: 0xABCD,
                 command: Command::Save,

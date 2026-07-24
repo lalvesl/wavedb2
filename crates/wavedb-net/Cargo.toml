@@ -15,6 +15,9 @@ wavedb-core = { path = "../wavedb-core" }
 # `::wavedb_wire::` paths, so any crate deriving it must name the crate itself.
 wavedb-wire.workspace = true
 thiserror.workspace = true
+# Access tokens are `[claims wire][HMAC-SHA256]` — signed/verified here.
+hmac.workspace = true
+sha2.workspace = true
 
 # The HTTP POST tunnel is a hand-rolled HTTP/1.1 exchange over a TcpStream:
 # WaveDB uses no HTTP semantics (no headers-as-API, no status codes, no

@@ -24,11 +24,14 @@
 //! the gates + `Exposure::execute`, encoding the `Response`) lives in
 //! `wavedb-quick-node`, which owns the storage engine the node dispatches to.
 
+pub mod auth;
 pub mod error;
 pub mod frame;
 
 pub use error::{Error, Result};
-pub use frame::{CommandFrame, NodeError, NodeErrorKind, Request, Response};
+pub use frame::{
+    Auth, CommandFrame, NodeError, NodeErrorKind, Request, Response,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod client;

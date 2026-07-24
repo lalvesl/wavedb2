@@ -2,7 +2,7 @@
 //! response (native only).
 //!
 //! One exchange = one fresh connection (HTTP POST, the only wired transport;
-//! WebSocket with a bound identity is M7). Each call re-sends the tenant —
+//! WebSocket with a bound identity is M7). Each call re-sends the identity —
 //! plain HTTP has no connection to bind identity to. A response is a
 //! sequence of [`StreamFrame`]s: a scalar command answers with a bare
 //! [`End`](StreamFrame::End); a walk streams `Item`s as the node produces
@@ -11,12 +11,13 @@
 
 use futures::Stream;
 use tokio::net::TcpStream;
-use wavedb_core::U48;
 use wavedb_core::expose::{Command, Reply};
 use wavedb_wire::{from_wire, to_wire};
 
 use crate::error::{Error, Result};
-use crate::frame::{CommandFrame, NodeError, Request, Response, StreamFrame};
+use crate::frame::{
+    Auth, CommandFrame, NodeError, Request, Response, StreamFrame,
+};
 use crate::http;
 
 /// A thin client bound to one node address. Cheap to clone/rebuild — it holds
@@ -41,13 +42,13 @@ impl NetClient {
     /// POST the request and return the response's frame reader.
     async fn exchange(
         &self,
-        tenant: U48,
+        auth: Auth,
         struct_hash: u64,
         command: Command,
         payload: Vec<u8>,
     ) -> Result<http::FrameReader<TcpStream>> {
         let request = Request {
-            tenant,
+            auth,
             frame: CommandFrame {
                 struct_hash,
                 command,
@@ -57,7 +58,7 @@ impl NetClient {
         http::post(&self.addr, &to_wire(&request)).await
     }
 
-    /// Send one scalar command as `tenant` and await the node's answer.
+    /// Send one scalar command under `auth` and await the node's answer.
     ///
     /// # Errors
     /// A transport [`Error`] (socket, HTTP framing, an undecodable frame, or
@@ -65,13 +66,13 @@ impl NetClient {
     /// **not** an error — it is the `Err` arm of the returned [`Executed`].
     pub async fn call(
         &self,
-        tenant: U48,
+        auth: Auth,
         struct_hash: u64,
         command: Command,
         payload: Vec<u8>,
     ) -> Result<Executed> {
         let mut frames =
-            self.exchange(tenant, struct_hash, command, payload).await?;
+            self.exchange(auth, struct_hash, command, payload).await?;
         let bytes = frames
             .next_frame()
             .await?
@@ -91,12 +92,12 @@ impl NetClient {
     /// [`Error::Node`] on a node-side refusal, else a transport fault.
     pub async fn call_ok(
         &self,
-        tenant: U48,
+        auth: Auth,
         struct_hash: u64,
         command: Command,
         payload: Vec<u8>,
     ) -> Result<Reply> {
-        self.call(tenant, struct_hash, command, payload)
+        self.call(auth, struct_hash, command, payload)
             .await?
             .map_err(Error::Node)
     }
@@ -111,13 +112,12 @@ impl NetClient {
     /// stream.
     pub async fn call_stream(
         &self,
-        tenant: U48,
+        auth: Auth,
         struct_hash: u64,
         command: Command,
         payload: Vec<u8>,
     ) -> Result<impl Stream<Item = Result<Vec<u8>>> + use<>> {
-        let frames =
-            self.exchange(tenant, struct_hash, command, payload).await?;
+        let frames = self.exchange(auth, struct_hash, command, payload).await?;
         Ok(futures::stream::unfold(Some(frames), |state| async move {
             let mut frames = state?;
             let item = match frames.next_frame().await {
