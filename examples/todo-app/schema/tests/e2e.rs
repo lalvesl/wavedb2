@@ -15,7 +15,8 @@ use std::sync::mpsc;
 use std::thread;
 
 use todo_app_schema::{
-    REGISTRY, add_todo, all_todos, complete_todo, delete_todo, login, register,
+    REGISTRY, add_todo, all_todos, complete_todo, delete_todo, login, refresh,
+    register,
 };
 use tokio::sync::oneshot;
 use wavedb::prelude::*;
@@ -97,17 +98,52 @@ async fn full_client_flow_and_restart() {
     let dup = register(&sys, "alice".into(), "other".into()).await;
     assert!(dup.is_err(), "duplicate username must refuse");
 
-    let (login_tenant, token) = login(&sys, "alice".into(), "secret".into())
+    let (login_tenant, pair) = login(&sys, "alice".into(), "secret".into())
         .await
         .expect("login");
     assert_eq!(login_tenant, tenant_id);
-    assert!(!token.is_empty());
+    assert!(!pair.access.is_empty() && !pair.refresh.is_empty());
     let wrong = login(&sys, "alice".into(), "nope".into()).await;
     assert!(wrong.is_err(), "wrong password must refuse");
 
-    // Reconnect as the assigned tenant (the client flow).
-    let db =
+    // ── M8 gates ────────────────────────────────────────────────────────────
+    // Anonymous (no token) may call the public fns only — a login-required
+    // fn refuses even under the right claimed tenant.
+    let anon =
         connect(node.addr, U48::try_from(tenant_id).expect("48-bit")).await;
+    let denied = add_todo(&anon, "sneak".into()).await;
+    assert!(denied.is_err(), "anonymous non-public call must refuse");
+
+    // Refresh rotates: the traded-in token dies, the new pair works.
+    let pair2 = refresh(&sys, tenant_id, pair.refresh.clone())
+        .await
+        .expect("refresh");
+    let replayed = refresh(&sys, tenant_id, pair.refresh.clone()).await;
+    assert!(replayed.is_err(), "a replayed refresh token must refuse");
+    // The replay was a theft signal: the whole session is revoked — even
+    // the *current* refresh token is dead now.
+    let after_revoke = refresh(&sys, tenant_id, pair2.refresh).await;
+    assert!(after_revoke.is_err(), "replay revokes the session");
+
+    // A fresh login opens a fresh session; logout revokes it.
+    let (_, pair3) = login(&sys, "alice".into(), "secret".into())
+        .await
+        .expect("re-login");
+    todo_app_schema::logout(&sys, tenant_id, pair3.refresh.clone())
+        .await
+        .expect("logout");
+    let after_logout = refresh(&sys, tenant_id, pair3.refresh).await;
+    assert!(after_logout.is_err(), "a revoked session must not refresh");
+
+    // Reconnect as the assigned tenant with a live access token (the
+    // client flow). The token's claims bind user + tenant — a claimed
+    // tenant cannot override them.
+    let (_, pair) = login(&sys, "alice".into(), "secret".into())
+        .await
+        .expect("login for work");
+    let db = connect(node.addr, U48::try_from(tenant_id).expect("48-bit"))
+        .await
+        .with_access_token(pair.access.clone());
 
     let id_milk = add_todo(&db, "Buy milk".into()).await.expect("add 1");
     let id_docs = add_todo(&db, "Write docs".into()).await.expect("add 2");
@@ -148,13 +184,14 @@ async fn full_client_flow_and_restart() {
     let node = start(path);
     let sys = connect(node.addr, U48::ZERO).await;
 
-    let (tenant_again, _) = login(&sys, "alice".into(), "secret".into())
+    let (tenant_again, pair) = login(&sys, "alice".into(), "secret".into())
         .await
         .expect("login after restart");
     assert_eq!(tenant_again, tenant_id, "username registry survives");
 
-    let db =
-        connect(node.addr, U48::try_from(tenant_id).expect("48-bit")).await;
+    let db = connect(node.addr, U48::try_from(tenant_id).expect("48-bit"))
+        .await
+        .with_access_token(pair.access);
     let all = collect_todos(&db).await.expect("all after restart");
     assert_eq!(
         titles(&all),

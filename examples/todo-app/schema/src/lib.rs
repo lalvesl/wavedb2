@@ -31,17 +31,19 @@ use wavedb::prelude::*;
 // unknown, indistinguishable from a type that never existed.
 
 wavedb::expose_server! {
-    fn register, fn login,
+    fn register, fn login, fn refresh, fn logout,
     fn add_todo, fn all_todos, fn complete_todo, fn delete_todo,
     store AllUserNamesToTenants,
     store UserEntry,
     store Auth,
     store Profile,
     store Todo,
+    store wavedb::auth::AuthSession,
+    store wavedb::auth::AuthSessions,
 }
 
 wavedb::expose_client! {
-    fn register, fn login,
+    fn register, fn login, fn refresh, fn logout,
     fn add_todo, fn all_todos, fn complete_todo, fn delete_todo,
 }
 
@@ -67,12 +69,12 @@ pub struct UserEntry {
 
 // ── Per-tenant records ─────────────────────────────────────────────────────
 
-/// Auth — Unique, one per tenant. Placeholder credential (M8 = Argon2).
+/// Auth — Unique, one per tenant. Placeholder hash (real Argon2 later);
+/// sessions live in `wavedb::auth` records now.
 #[wavedb]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Auth {
     pub password_hash: String,
-    pub session_token: Option<String>,
 }
 
 /// Profile — Unique, one per tenant. Owns the todo collection handle.
@@ -130,7 +132,6 @@ pub async fn register(
     let user_db = db.as_tenant(U48::try_from(tenant_id)?);
     Auth {
         password_hash: hash_password(&password),
-        session_token: None,
     }
     .save(&user_db)
     .await?;
@@ -140,14 +141,15 @@ pub async fn register(
     Ok(tenant_id)
 }
 
-/// Verify credentials. Returns `(tenant_id, session_token)`; the client uses
-/// the tenant id to open its own tenant connection.
+/// Verify credentials and open a session. Returns
+/// `(tenant_id, token pair)`: the client reconnects with the access token
+/// and keeps the refresh token to mint the next pair.
 #[server(public)]
 pub async fn login(
     db: &Db,
     username: String,
     password: String,
-) -> Result<(u64, String)> {
+) -> Result<(u64, wavedb::TokenPair)> {
     let registry = ensure_registry(db).await?;
     let col = UserEntry::collection(registry.entries);
 
@@ -157,7 +159,8 @@ pub async fn login(
         .await
         .ok_or_else(|| Error::not_found("user not found"))??;
 
-    let user_db = db.as_tenant(U48::try_from(entry.tenant_id)?);
+    let tenant = U48::try_from(entry.tenant_id)?;
+    let user_db = db.as_tenant(tenant);
     let auth = Auth::get(&user_db)
         .await?
         .ok_or_else(|| Error::not_found("auth record missing"))?;
@@ -165,15 +168,29 @@ pub async fn login(
         return Err(Error::unauthorized("wrong password"));
     }
 
-    let token = new_token();
-    Auth {
-        session_token: Some(token.clone()),
-        ..auth
-    }
-    .save(&user_db)
-    .await?;
+    let pair = wavedb::auth::issue_pair(&user_db, tenant).await?;
+    Ok((entry.tenant_id, pair))
+}
 
-    Ok((entry.tenant_id, token))
+/// Trade a refresh token for the next pair (rotates it; a replayed token
+/// revokes the whole session). Public: the caller's access token may
+/// already be dead — the refresh token itself is the credential.
+#[server(public)]
+pub async fn refresh(
+    db: &Db,
+    tenant_id: u64,
+    token: Vec<u8>,
+) -> Result<wavedb::TokenPair> {
+    let user_db = db.as_tenant(U48::try_from(tenant_id)?);
+    wavedb::auth::refresh_pair(&user_db, &token).await
+}
+
+/// Revoke the session behind `token` (logout): its next refresh fails and
+/// the outstanding access token dies within one TTL.
+#[server(public)]
+pub async fn logout(db: &Db, tenant_id: u64, token: Vec<u8>) -> Result<()> {
+    let user_db = db.as_tenant(U48::try_from(tenant_id)?);
+    wavedb::auth::revoke(&user_db, &token).await
 }
 
 // ── Todo server functions (called on the user's tenant connection) ────────
@@ -264,18 +281,6 @@ async fn get_profile<D: DbHandle<Error = Error>>(db: &D) -> Result<Profile> {
 fn hash_password(password: &str) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::new().chain_update(password).finalize())
-}
-
-fn new_token() -> String {
-    use sha2::{Digest, Sha256};
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!(
-        "{:x}",
-        Sha256::new().chain_update(ts.to_le_bytes()).finalize()
-    )
 }
 
 /// Mint a 48-bit tenant id from the current nanosecond timestamp — a

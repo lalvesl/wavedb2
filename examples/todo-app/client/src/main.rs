@@ -19,13 +19,15 @@ async fn main() -> anyhow::Result<()> {
     let tenant_id = register(&sys, "alice".into(), "secret".into()).await?;
     println!("registered  tenant_id={tenant_id}");
 
-    let (tenant_id, token) =
+    let (tenant_id, pair) =
         login(&sys, "alice".into(), "secret".into()).await?;
-    println!("logged in   tenant_id={tenant_id}  token={token}");
+    println!("logged in   tenant_id={tenant_id}");
 
     // ── Step 2: reconnect as the real user tenant ──────────────────────────
     let tenant = U48::try_from(tenant_id)?;
-    let db = Db::connect(SERVER, tenant, tenant).await?;
+    let db = Db::connect(SERVER, tenant, tenant)
+        .await?
+        .with_access_token(pair.access.clone());
 
     // ── Write ──────────────────────────────────────────────────────────────
     let id_milk = add_todo(&db, "Buy milk".into()).await?;
