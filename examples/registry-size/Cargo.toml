@@ -1,0 +1,35 @@
+[package]
+name = "registry-size"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The measured variable: how many of the 64 defined structs the
+# `expose_client!` list names. Additive, off by default (default = 1).
+[features]
+n16 = []
+n64 = ["n16"]
+
+[dependencies]
+# `#[wavedb]` + `expose_client!` — the machinery under measurement.
+wavedb = { path = "../../crates/wavedb" }
+# The derive-emitted code names ::wavedb_core:: paths directly.
+wavedb-core = { path = "../../crates/wavedb-core" }
+
+# `#[wavedb]` emits each type's native storage slot (`StructStorage`
+# statics), so on non-wasm targets a schema crate links the engine crate
+# defining it.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wavedb-storage = { path = "../../crates/wavedb-storage" }
+
+# The probe export that keeps the registry alive in the artifact.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { workspace = true }

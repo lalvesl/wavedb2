@@ -549,6 +549,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "registry-size"
+version = "0.1.0"
+dependencies = [
+ "wasm-bindgen",
+ "wavedb",
+ "wavedb-core",
+ "wavedb-storage",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
