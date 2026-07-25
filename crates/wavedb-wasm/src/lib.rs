@@ -4,10 +4,16 @@
 //! > the whole client stack (`wavedb-core`, `wavedb-net`, `wavedb`)
 //! > compiles for wasm32-unknown-unknown, timestamps come from
 //! > `Date.now()`, entropy from `crypto.getRandomValues`, and the tunnel
-//! > speaks browser `fetch`. This crate currently ships one raw
-//! > [`probe`] export that anchors that stack for the size tracker and
-//! > browser smoke tests. The IndexedDB `Store` and the typed browser
-//! > demo (the M5 exit) are the remaining work — see `todo.md`.
+//! > speaks browser `fetch`. This crate ships the IndexedDB [`Store`]
+//! > backend ([`IdbStore`]: flat `Id → wire bytes`, one transaction per
+//! > `apply`, no pages, no journal) and one raw [`probe`] export that
+//! > anchors the transport stack for the size tracker. The typed browser
+//! > demo (the M5 exit) is the remaining work — see `todo.md`.
+//! >
+//! > Browser-only tests (`tests/idb_store.rs`) need a browser runner:
+//! > `wasm-pack test --headless --chrome -p wavedb-wasm`.
+//!
+//! [`Store`]: wavedb_core::Store
 //!
 //! Native targets compile this crate empty (it exists so
 //! `cargo test --workspace` resolves the workspace).
@@ -17,4 +23,11 @@
 #![allow(clippy::future_not_send)]
 
 #[cfg(target_arch = "wasm32")]
+mod idb;
+#[cfg(target_arch = "wasm32")]
 pub mod probe;
+#[cfg(target_arch = "wasm32")]
+pub mod store;
+
+#[cfg(target_arch = "wasm32")]
+pub use store::IdbStore;
