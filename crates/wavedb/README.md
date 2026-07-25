@@ -8,6 +8,23 @@ clients, and (compiled to WASM) browsers.
 > wire/transport layer see [`wavedb-net`](../wavedb-net/README.md); for object
 > declaration see [`wavedb-macros`](../wavedb-macros/README.md).
 
+> Status: `Db::connect` (transport-only) and the M6 `Db::open` family are
+> built, with these divergences from the target below. The landed spelling is
+> `Db::open(CLIENT_REGISTRY, addr, user, tenant, app)` — the client registry
+> names the native engine's slots; `app` resolves the default store location
+> (`$XDG_CACHE_HOME`/`~/.cache` → `wavedb/<app>` on unix, `%LOCALAPPDATA%` on
+> Windows, IndexedDB `wavedb-<app>` in the browser) — plus native
+> `Db::open_at(…, dir)` and `db.local()` (the cache's direct typed surface).
+> The cache is **node-first**, not local-first: every op goes to the node,
+> acknowledged results mirror into the local engine (journal + `data.bin`
+> native / IndexedDB wasm, under node-minted ids via `Collection::adopt`),
+> and reads serve locally only on a transport fault the cache can answer —
+> absence propagates the fault, refusals never fall back, offline writes
+> refuse (no queue until M7 sync). No cluster front door / failover URL, no
+> `another_tenant` (today: `as_tenant`), no Drop notification, no
+> `tokio::broadcast`; the typed surface lives on `Db` (`db.get::<T>()`), see
+> `todo.md` on the `T::get(&db)` unification.
+
 ## Entry points
 
 | Mode                                        | Storage location         | Tenant model                |
