@@ -31,6 +31,13 @@ wavedb::expose_client! {
     Contact,
 }
 
+/// The fixed token-signing secret shared by the demo node and browser test.
+///
+/// `examples/node.rs` signs with it and the browser demo mints its own
+/// access token against it — the same shortcut the native e2e takes. Demo
+/// plumbing only; a real app gets its pair from a login `#[server]` function.
+pub const DEMO_SECRET: [u8; 32] = *b"wavedb-browser-demo-secret-32bb!";
+
 /// Unique — one per tenant. The owning record: holds the collection handle.
 #[wavedb]
 #[derive(Debug, Clone, PartialEq, Eq)]
