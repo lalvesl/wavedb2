@@ -123,11 +123,21 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
 - **wavedb-quick-node** — library (no bin): `Server::new(REGISTRY).data_dir(d).serve(addr)`.
   `expose_server!` also emits `StorageRegistry`, so `.registry(REGISTRY)` alone opens
   the `PageStore`. Gates 4–6 (permission/validate/preprocess) are an M8 seam.
-- **wavedb (client)** — `Db::connect(addr, user, tenant)`; typed surface lives **on
-  `Db`** (`db.get::<T>()`, `db.save(&v)`, `db.collection::<T>(pivot)`), not the
-  documented `T::get(&db)` — the macro's inherent `T::get(store, tenant)` wins method
-  resolution (known collision; unification is planned work, see `todo.md`).
-  `ServerDb` mirrors this surface node-side for `#[server]` bodies.
+- **wavedb (client)** — `Db::connect(addr, user, tenant)` (transport-only) and the
+  M6 `Db::open(CLIENT_REGISTRY, addr, user, tenant, app)` family attaching the local
+  **write-through cache** — WaveDB caching WaveDB, cfg-switched like the platform
+  seam: native = `PageStore` under `~/.cache|XDG_CACHE_HOME|%LOCALAPPDATA%`
+  `/wavedb/<app>` (auto-created; `open_at` for an explicit dir), wasm =
+  `wavedb::cache::IdbStore` (`wavedb-wasm` only re-exports it). Semantics
+  (`client_cache.rs`): **node-first** — acknowledged ops mirror best-effort under
+  node-minted ids (`Collection::adopt`; `All` frames carry `(Id, T)` for this);
+  reads fall back only on `Error::Transport` and only when the cache holds the
+  answer (absence propagates the fault; refusals never fall back); offline writes
+  refuse (queueing is M7). `db.local()` is the cache's direct `LocalHandle`. One
+  engine per process ⇒ a `Db::open` client and a node never share one (tests run
+  the node as a child process — see `local_cache_e2e.rs`). Typed calls spell
+  `T::get(&db)` / `v.save(&db)` / `T::collection(pivot)` via the `DbHandle` seam;
+  `ServerDb` mirrors it node-side for `#[server]` bodies.
 
 ## Data-model invariants
 
@@ -153,7 +163,9 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
 - Test names state behaviour (`tampered_payload_is_crc_mismatch`), not the method.
 - Anything touching `PageStore` must respect the one-store-per-process rule (see
   `engine_gate()` in the page_store tests, and the single-test pattern in
-  `crates/wavedb-quick-node/tests/node_http.rs`).
+  `crates/wavedb-quick-node/tests/node_http.rs`). That includes `Db::open`
+  clients: a cache-and-node test needs two processes — re-exec the test binary
+  as the node (`examples/contact-book/tests/local_cache_e2e.rs`).
 
 ## Commits
 
