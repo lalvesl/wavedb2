@@ -61,6 +61,6 @@ in `wavedb-core`. The web build supplies an **IndexedDB `Store`** and the _same_
 `BpTree`/`Pivot` code runs on it — pages and journal are `PageStore` internals, not
 the index. A thin client still ships filtered reads to a node; a **serverless** app
 (static files from a CDN, no node) links the engine and runs the `BpTree` walk +
-`#[server]` bodies **in-browser over IndexedDB**, authoritative locally. Sync needs no page parity either: the Bloom-filter
+`#[server]` bodies **in-browser over IndexedDB**, authoritative locally. Sync needs no page parity either: the sync
 protocol exchanges objects, never pages. (`localStorage` — synchronous,
 string-only, ~5 MB — cannot fill this role.)

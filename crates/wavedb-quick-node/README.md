@@ -85,8 +85,8 @@ not a deployment.
 ## Consistency
 
 - **Within one tenant:** strong (single writer via routing ownership).
-- **Across tenants:** eventual (Bloom-filter sync — see
-  [`wavedb-net`](../wavedb-net/README.md#bloom-filter-screen-sync)).
+- **Across tenants:** eventual (delta sync — see
+  [`wavedb-net`](../wavedb-net/README.md#screen-sync-subscriptions--journal-cursor)).
 - **On conflict:** most recent state wins via the live record; the loser becomes a
   branch in the history chain.
 

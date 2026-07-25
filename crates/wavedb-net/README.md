@@ -39,14 +39,14 @@ implementations; the same operations run on servers, native clients, and (via
 
 > **Status: HTTP POST only for now.** The current rebuild wires a single
 > transport — **HTTP POST** — on both native and browser. WebSocket (and with it
-> server push, idle-tick piggyback, and Bloom screen-sync) is **deferred**; the
+> server push, idle-tick piggyback, and screen-sync) is **deferred**; the
 > table below is the target shape. The request path is built so the transport is
 > swappable later without touching the command / dispatch / auth layers.
 
 | Transport         | Native | Browser | Status    | Notes                                                  |
 | ----------------- | ------ | ------- | --------- | ------------------------------------------------------ |
 | **HTTP POST**     | ✓      | ✓       | **wired** | The only transport for now. FIFO queue per client.     |
-| **WebSocket**     | pref.  | pref.   | deferred  | Bidirectional, push-capable; carries Bloom sync.       |
+| **WebSocket**     | pref.  | pref.   | deferred  | Bidirectional, push-capable; carries screen-sync.      |
 | **Future native** | plan.  | n/a     | planned   | Higher-throughput native-only transport, in scoping.   |
 
 ### HTTP POST: single-queue with piggybacked notifications
@@ -132,18 +132,29 @@ server-fn body on the decoded args instead. Identity and permission are enforced
 
 ---
 
-## Bloom Filter Screen-Sync
+## Screen-sync: subscriptions + journal cursor
 
 > **Deferred** — screen-sync rides WebSocket push, which the current rebuild does
 > not wire (HTTP POST only). The protocol below is the target.
 
-State-sync for the **online** read path. Clients keep a Bloom filter of the
-128-bit IDs currently on screen and send it over WebSocket. The owner node
-compares it against its live records and pushes back **only the deltas** — new
-objects, updated records, deletions. Event-driven: every accepted mutation
-triggers a notification to subscribers whose filters might match. For clients
-long offline (screen state far behind reality), sending the explicit array of
-on-screen IDs back for revalidation is cheaper than the filter.
+State-sync for the **online** read path, in two halves — both **exact**, never
+probabilistic:
+
+- **Live push — declared subscriptions.** A client subscribes to exactly what
+  its screen shows: Unique anchors and collection `Pivot`s (`T::watch(&db)`).
+  Every accepted mutation already knows its `Id` and owning pivot, so the node
+  routes it to subscribers by exact match — O(subscriptions) per mutation, no
+  dataset scan, no false positives. Interest is declared, like the registry:
+  the node never guesses what a client can see.
+- **Catch-up — the journal cursor.** The journal is already the ordered log of
+  every committed batch; the push stream carries its commit sequence. A
+  reconnecting client says "since sequence N" and the node streams exactly the
+  tenant's deltas after it — O(what changed), never a walk over the dataset.
+
+(A Bloom filter of on-screen ids was the earlier design here and was rejected:
+answering one on reconnect would force the node to test its whole dataset
+against the filter, and for live filtering it adds false positives over nothing
+that exact pivot/anchor subscriptions don't already give.)
 
 ---
 

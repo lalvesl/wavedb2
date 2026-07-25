@@ -427,7 +427,7 @@ The full client API and object lifecycle live in
 | [`wavedb-macros`](crates/wavedb-macros/README.md)         | `#[wavedb]`, `#[server]`, `expose_server!`/`expose_client!`, generated `Pivot`/`BpTree` | Object declaration, `STRUCT_HASH` derivation, **exposure** + per-hash `match` dispatch                             |
 | [`wavedb-storage`](crates/wavedb-storage/README.md)       | The per-node engine                                                          | **Block manager, per-`STRUCT_HASH` page directory, linear hashing**, pages, dictionaries, journal + cache pipeline |
 | [`wavedb-quick-node`](crates/wavedb-quick-node/README.md) | Serving/storage node                                                         | Tenant write-ownership ring, replication, routing/failover, node-side validation                                   |
-| [`wavedb-net`](crates/wavedb-net/README.md)               | Transport                                                                    | WebSocket / HTTP queue, Bloom screen-sync                                                                          |
+| [`wavedb-net`](crates/wavedb-net/README.md)               | Transport                                                                    | WebSocket / HTTP queue, screen-sync (subscriptions + journal cursor)                                                                          |
 | [`wavedb-wasm`](crates/wavedb-wasm/README.md)             | Browser client                                                               | IndexedDB key→value storage (no pages, no journal)                                                                 |
 
 Tooling: `wavedb-examples`, `wavedb-bench`, `wavedb-test-cluster`.
