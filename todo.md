@@ -3,8 +3,9 @@
 Clean reimplementation of WaveDB. The docs describe the **target** design;
 everything that has landed is in [`todo_done.md`](todo_done.md). Workspace
 members today: wire, wire-derive, platform, core, macros, storage, net,
-quick-node, wavedb, wasm, schema-smoke, contact-book, todo-app
-(schema/server/client). Excluded (not built yet): bench, test-cluster. Remaining work, bottom-up (the task log is
+quick-node, wavedb, wasm, schema-smoke, contact-book, registry-size,
+todo-app (schema/server/client). Excluded (not built yet): bench,
+test-cluster. Remaining work, bottom-up (the task log is
 in [PLAN — M4 completion](#plan--m4-completion) at the end; all tasks
 T1–T7 landed):
 
@@ -145,8 +146,15 @@ The developer surface — what `examples/todo-app` is written against.
 - [x] the `Store`-generic `BpTree`/`Collection` run over the IDB backend —
   serverless mode (engine in-browser over IndexedDB) proven by the typed
   browser test above;
-- **measure the per-struct wasm cost** of the registry `match` (M1 risk
-  item);
+- [x] **registry-`match` per-struct wasm cost — MEASURED (2026-07-10)**,
+  the M1 risk item, answered: **~23 B raw / 18 B gzip per exposed struct**
+  once its decode shape exists in the binary (the pure `match`-arm cost),
+  **~204 B raw / 44 B gzip** for a struct bringing a novel `WaveWire`
+  decode (code a heterogeneous schema needs anyway). Measured by
+  `examples/registry-size` (64 structs defined, exposure width
+  feature-selected 1/16/64, runtime-hash probe defeats DCE) via
+  `scripts/registry_size.sh`; numbers + method in that crate's README.
+  Verdict: no sum type, no descriptor table — the registry scales;
 - [x] **exit — LANDED (2026-07-10)**: the typed browser demo against a
   live node (`crates/wavedb-wasm/tests/live_node.rs`, run via
   `scripts/browser_demo.sh`: node = `cargo run -p contact-book --example
@@ -306,19 +314,23 @@ Deliberately left as later seams:
   real headless Chrome: raw roundtrip + reopen durability + the typed
   serverless flow (Unique, collection, BpTree secondary index) over
   IndexedDB.
-- **M5 EXIT — LANDED (2026-07-10)**: the typed browser demo runs against a
-  live node in headless Chrome (`tests/live_node.rs` +
-  `scripts/browser_demo.sh`, contact-book registry): `#[server]` calls,
-  typed Unique save, streamed collection walk over `fetch`, IndexedDB
-  caching reads. CORS unblocked as a transport-only change (no client
-  `content-type` ⇒ no preflight; `access-control-allow-origin: *` on the
-  node's heads). Remaining M5: the registry-`match` size measurement.
+- **M5 COMPLETE (2026-07-10)** — both remaining items closed the same day:
+  - **exit**: the typed browser demo runs against a live node in headless
+    Chrome (`tests/live_node.rs` + `scripts/browser_demo.sh`, contact-book
+    registry): `#[server]` calls, typed Unique save, streamed collection
+    walk over `fetch`, IndexedDB caching reads. CORS unblocked as a
+    transport-only change (no client `content-type` ⇒ no preflight;
+    `access-control-allow-origin: *` on the node's heads);
+  - **registry-`match` cost measured** (`examples/registry-size` +
+    `scripts/registry_size.sh`): ~23 B raw / 18 B gzip per exposed struct
+    (arm only), ~204 B raw / 44 B gzip with a novel decode shape — the M1
+    risk is retired.
 
 _Workspace green (both targets): fmt + clippy (pedantic + nursery) clean,
 tests green, file-length gate passing. Members: wire, wire-derive, platform,
 core, macros, storage, net, quick-node, wavedb, wasm, schema-smoke,
-contact-book, todo-app (schema/server/client). Still excluded: bench,
-test-cluster._
+contact-book, registry-size, todo-app (schema/server/client). Still
+excluded: bench, test-cluster._
 
 # PLAN — M4 completion
 
