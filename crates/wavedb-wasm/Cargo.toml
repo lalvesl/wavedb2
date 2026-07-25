@@ -45,4 +45,7 @@ wasm-bindgen-test = { workspace = true }
 # The browser test drives the typed surface (LocalHandle + Collection)
 # over `IdbStore` with a real schema crate — serverless mode.
 schema-smoke = { path = "../../examples/schema-smoke" }
+# The live-node demo (the M5 exit) drives contact-book's exposed schema
+# against a running node — see `tests/live_node.rs`.
+contact-book = { path = "../../examples/contact-book" }
 futures = { workspace = true }

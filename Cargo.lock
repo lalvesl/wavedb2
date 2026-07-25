@@ -1174,6 +1174,7 @@ dependencies = [
 name = "wavedb-wasm"
 version = "0.1.0"
 dependencies = [
+ "contact-book",
  "futures",
  "js-sys",
  "schema-smoke",
