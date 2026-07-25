@@ -40,6 +40,8 @@ nix build .#wasm                                   # size-optimised wasm artifac
 # nixpkgs chromedriver (the one wasm-pack downloads can't run on NixOS):
 nix shell nixpkgs#chromedriver --command bash -c \
   'CHROMEDRIVER=$(which chromedriver) wasm-pack test --headless --chrome'
+scripts/browser_demo.sh    # M5 exit: live node + browser demo (starts the
+                           # contact-book example node, handles chromedriver)
 ```
 
 Toolchain is pinned by `rust-toolchain.toml` (1.96.0, edition 2024, includes

@@ -147,8 +147,18 @@ The developer surface — what `examples/todo-app` is written against.
   browser test above;
 - **measure the per-struct wasm cost** of the registry `match` (M1 risk
   item);
-- **exit:** a browser demo performs typed `save` + a collection read + a
-  `#[server]` call against a node, IndexedDB caching reads.
+- [x] **exit — LANDED (2026-07-10)**: the typed browser demo against a
+  live node (`crates/wavedb-wasm/tests/live_node.rs`, run via
+  `scripts/browser_demo.sh`: node = `cargo run -p contact-book --example
+  node`, address baked in as `WAVEDB_DEMO_NODE`): a `#[server]` call
+  (`open_book`/`contacts_in`), a typed Unique `save`, collection
+  insert/update/remove + the streamed `all` walk — all over browser
+  `fetch` — and IndexedDB caching reads (Unique read-through/back-fill +
+  a locally re-walked collection over `IdbStore`). Unblocked by the CORS
+  seam: the wasm `post` sends **no** `content-type` (bytes-only POST = a
+  CORS simple request, no preflight for the POST-only server) and the
+  node's `200`/`400` heads carry `access-control-allow-origin: *` (not a
+  boundary — identity is the in-body token, never ambient credentials).
 
 ## M6 — local cache & `Db::open`
 
@@ -295,8 +305,14 @@ Deliberately left as later seams:
   flat `Id → wire bytes`, one readwrite transaction per `apply`. Proven in
   real headless Chrome: raw roundtrip + reopen durability + the typed
   serverless flow (Unique, collection, BpTree secondary index) over
-  IndexedDB. Remaining M5: the browser demo against a live node (the
-  exit) and the registry-`match` size measurement.
+  IndexedDB.
+- **M5 EXIT — LANDED (2026-07-10)**: the typed browser demo runs against a
+  live node in headless Chrome (`tests/live_node.rs` +
+  `scripts/browser_demo.sh`, contact-book registry): `#[server]` calls,
+  typed Unique save, streamed collection walk over `fetch`, IndexedDB
+  caching reads. CORS unblocked as a transport-only change (no client
+  `content-type` ⇒ no preflight; `access-control-allow-origin: *` on the
+  node's heads). Remaining M5: the registry-`match` size measurement.
 
 _Workspace green (both targets): fmt + clippy (pedantic + nursery) clean,
 tests green, file-length gate passing. Members: wire, wire-derive, platform,
