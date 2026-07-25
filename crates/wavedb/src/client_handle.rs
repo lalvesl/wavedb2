@@ -5,6 +5,11 @@
 //! spelling work against the network — the same call sites that resolve
 //! against a `LocalHandle` or a `ServerDb`.
 //!
+//! When the handle carries a local cache (`Db::open`), ops thread through
+//! [`crate::client_cache`]: node first, acknowledged results mirrored
+//! best-effort, reads served locally only on a transport fault the cache
+//! can actually answer.
+//!
 //! Walk-shaped ops are **streamed**: the node writes one frame per record
 //! and the client decodes each as it arrives — a caller can stop early
 //! without the node's whole answer in memory client-side. Three ops have
@@ -20,6 +25,7 @@ use wavedb_core::{
     Bound, DbHandle, Id, LocalId, Metadata, NonUniqueStruct, U48, UniqueStruct,
 };
 
+use crate::client_cache as cache;
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::reply;
@@ -69,17 +75,28 @@ impl DbHandle for Db {
     }
 
     async fn get_unique<T: UniqueStruct>(&self) -> Result<Option<T>> {
-        let r = self
-            .command(T::STRUCT_HASH, Command::Get, Vec::new())
-            .await?;
-        reply::value(r)
+        match self.command(T::STRUCT_HASH, Command::Get, Vec::new()).await {
+            Ok(r) => {
+                let value: Option<T> = reply::value(r)?;
+                if let Some(v) = &value {
+                    cache::mirror_unique(self, v).await;
+                }
+                Ok(value)
+            }
+            Err(err) if cache::is_transport(&err) => {
+                cache::unique_fallback(self, err).await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn save_unique<T: UniqueStruct>(&self, value: &T) -> Result<()> {
         let r = self
             .command(T::STRUCT_HASH, Command::Save, to_wire(value))
             .await?;
-        reply::done(&r)
+        reply::done(&r)?;
+        cache::mirror_unique(self, value).await;
+        Ok(())
     }
 
     fn unique_history<T: UniqueStruct + 'static>(
@@ -107,23 +124,34 @@ impl DbHandle for Db {
         let r = self
             .command(T::STRUCT_HASH, Command::Insert, payload)
             .await?;
-        reply::inserted(&r)
+        let id = reply::inserted(&r)?;
+        cache::mirror_record(self, pivot, id, value).await;
+        Ok(id)
     }
 
     async fn get_record<T: NonUniqueStruct>(
         &self,
-        _pivot: LocalId,
+        pivot: LocalId,
         id: Id,
     ) -> Result<Option<T>> {
-        let r = self
+        // No back-fill on the read: a `Get` also resolves *removed* records
+        // (history stays navigable), and adopting one would resurrect it
+        // into the cached living set. Walks and writes warm the cache.
+        match self
             .command(T::STRUCT_HASH, Command::Get, to_wire(&id))
-            .await?;
-        reply::value(r)
+            .await
+        {
+            Ok(r) => reply::value(r),
+            Err(err) if cache::is_transport(&err) => {
+                cache::record_fallback(self, pivot, id, err).await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn update<T: NonUniqueStruct>(
         &self,
-        _pivot: LocalId,
+        pivot: LocalId,
         id: Id,
         value: &T,
     ) -> Result<()> {
@@ -133,25 +161,35 @@ impl DbHandle for Db {
         let r = self
             .command(T::STRUCT_HASH, Command::Update, payload)
             .await?;
-        reply::done(&r)
+        reply::done(&r)?;
+        cache::mirror_record(self, pivot, id, value).await;
+        Ok(())
     }
 
     async fn remove<T: NonUniqueStruct>(
         &self,
-        _pivot: LocalId,
+        pivot: LocalId,
         id: Id,
     ) -> Result<bool> {
         let r = self
             .command(T::STRUCT_HASH, Command::Remove, to_wire(&id))
             .await?;
-        reply::removed(&r)
+        let removed = reply::removed(&r)?;
+        if removed {
+            cache::mirror_remove::<T>(self, pivot, id).await;
+        }
+        Ok(removed)
     }
 
     fn all<T: NonUniqueStruct + 'static>(
         &self,
         pivot: LocalId,
     ) -> impl Stream<Item = Result<T>> {
-        streamed(self, T::STRUCT_HASH, Command::All, to_wire(&pivot))
+        // Each `All` frame carries the wire pair `(Id, T)` — the node-minted
+        // identity rides along so the walk mirrors into the local cache; the
+        // typed surface yields values only. Transport fault + adopted local
+        // pivot = the warm walk.
+        cache::cached_all::<T>(self, pivot)
     }
 
     fn search_by<T: NonUniqueStruct + 'static>(
