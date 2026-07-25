@@ -1,14 +1,16 @@
 //! `wavedb-wasm` — the browser client crate.
 //!
-//! > Status: M5 in progress. The platform seam (`wavedb-platform`) landed:
-//! > the whole client stack (`wavedb-core`, `wavedb-net`, `wavedb`)
+//! > Status: the M5 exit holds. The platform seam (`wavedb-platform`) is
+//! > live — the whole client stack (`wavedb-core`, `wavedb-net`, `wavedb`)
 //! > compiles for wasm32-unknown-unknown, timestamps come from
 //! > `Date.now()`, entropy from `crypto.getRandomValues`, and the tunnel
 //! > speaks browser `fetch`. This crate ships the IndexedDB [`Store`]
 //! > backend ([`IdbStore`]: flat `Id → wire bytes`, one transaction per
 //! > `apply`, no pages, no journal) and one raw [`probe`] export that
 //! > anchors the transport stack for the size tracker. The typed browser
-//! > demo (the M5 exit) is the remaining work — see `todo.md`.
+//! > demo against a live node is `tests/live_node.rs`, run through
+//! > `scripts/browser_demo.sh`; the registry-`match` size measurement is
+//! > the one M5 item left — see `todo.md`.
 //! >
 //! > Browser-only tests (`tests/idb_store.rs`) need a browser runner:
 //! > `wasm-pack test --headless --chrome -p wavedb-wasm`.
