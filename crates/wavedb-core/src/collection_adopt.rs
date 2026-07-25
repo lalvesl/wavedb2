@@ -1,0 +1,268 @@
+//! [`Collection`]'s adopt half — writing **foreign-minted identities** into a
+//! local [`Store`].
+//!
+//! Everything in [`crate::collection_write`] mints its own ids; a client-side
+//! cache (and later, live sync) instead mirrors records whose `Id`s the node
+//! already minted. [`adopt_pivot`](Collection::adopt_pivot) bootstraps the
+//! local copy of a node collection at the node's `PivotId`;
+//! [`adopt`](Collection::adopt) upserts one record under its node `Id` —
+//! indexing it like an insert when it is new locally, delegating to `save`
+//! (secondary re-keys, version chain) when it is already living, and skipping
+//! entirely when the bytes are unchanged, so read-path mirroring never grows
+//! the local store.
+//!
+//! Adopted values are assumed **living** — the mirror sources (a successful
+//! node insert/update, a walked `All` item) only ever see living records.
+
+use crate::collection::Collection;
+use crate::error::Result;
+use crate::id::Id;
+use crate::index::Pivot;
+use crate::local_id::LocalId;
+use crate::store::Store;
+use crate::traits::NonUniqueStruct;
+use crate::u48::U48;
+use crate::wire::to_wire;
+
+impl<T: NonUniqueStruct> Collection<T> {
+    /// Bootstrap this collection **at the given `pivot`** (a node-minted
+    /// `PivotId`) if no pivot record exists there yet: empty trees + the
+    /// `Pivot` record, one atomic batch — [`create`](Self::create) with the
+    /// identity supplied instead of minted. Idempotent.
+    ///
+    /// # Errors
+    /// Propagates a [`Store`] failure.
+    pub async fn adopt_pivot<S: Store>(
+        store: &S,
+        tenant: U48,
+        pivot: LocalId,
+    ) -> Result<()> {
+        let exists = store
+            .get_of(<T::Pivot as Pivot>::STRUCT_HASH, pivot.to_id(tenant))
+            .await?
+            .is_some();
+        if exists {
+            return Ok(());
+        }
+        Self::create_rooted(store, tenant, pivot.to_id(tenant)).await
+    }
+
+    /// Mirror the **living** record `(id, value)` into this (local) collection
+    /// under its node-minted `Id`: index + write it like an insert when the id
+    /// is new here, [`save`](Self::save) it (archive + secondary re-keys) when
+    /// it is already living with different bytes, and do nothing when the
+    /// bytes match — a read-path mirror of an unchanged record must not grow
+    /// the store.
+    ///
+    /// # Errors
+    /// Propagates a [`Store`] failure, [`Error::PivotMissing`] when the local
+    /// pivot was never adopted, or a decode fault on a corrupt local record.
+    ///
+    /// [`Error::PivotMissing`]: crate::Error::PivotMissing
+    pub async fn adopt<S: Store>(
+        &self,
+        store: &S,
+        id: Id,
+        value: &T,
+    ) -> Result<()> {
+        let pivot = self.load_pivot(store).await?;
+        let living = self
+            .tree(pivot.current())
+            .contains(store, LocalId::from_id(id))
+            .await?;
+        if !living {
+            return self.insert_at(store, id, value).await;
+        }
+        // No `PartialEq` bound on record types — unchanged is decided on the
+        // wire bytes, the identity the store actually holds.
+        let unchanged = matches!(
+            self.get(store, id).await?,
+            Some(existing) if to_wire(&existing) == to_wire(value)
+        );
+        if unchanged {
+            return Ok(());
+        }
+        self.save(store, id, value).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::TryStreamExt;
+    use futures::executor::block_on;
+
+    use crate::collection::Collection;
+    use crate::error::Error;
+    use crate::id::Id;
+    use crate::index::mem_store::MemStore;
+    use crate::index::{IndexKey, Pivot};
+    use crate::local_id::LocalId;
+    use crate::permission::PermissionRef;
+    use crate::traits::{NonUniqueStruct, Shape, WaveDbStruct};
+    use crate::u48::U48;
+    use crate::wire::WaveWire;
+
+    // Hand-rolled fixture with one secondary index — exactly what
+    // `#[wavedb] … #[wavedb::pivot(label)]` generates (core can't use the
+    // proc-macro; it lives downstream).
+    #[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
+    struct Item {
+        label: String,
+        n: u64,
+    }
+    impl WaveDbStruct for Item {
+        const STRUCT_HASH: u64 = 0xADD_0001;
+        const SHAPE: Shape = Shape::NonUnique;
+        type PivotId = ();
+    }
+    impl NonUniqueStruct for Item {
+        type Pivot = ItemPivot;
+        const NUM_SECONDARIES: usize = 1;
+        fn secondary_key(&self, index: usize) -> Vec<u8> {
+            match index {
+                0 => self.label.key_bytes(),
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
+    struct ItemPivot {
+        current: LocalId,
+        dead: LocalId,
+        secondaries: [LocalId; 1],
+        permission: Option<PermissionRef>,
+    }
+    impl Pivot for ItemPivot {
+        const STRUCT_HASH: u64 = 0xADD_0002;
+        fn current(&self) -> LocalId {
+            self.current
+        }
+        fn dead(&self) -> LocalId {
+            self.dead
+        }
+        fn secondaries(&self) -> &[LocalId] {
+            &self.secondaries
+        }
+        fn permission(&self) -> Option<&PermissionRef> {
+            self.permission.as_ref()
+        }
+        fn replace_roots(
+            &self,
+            current: LocalId,
+            dead: LocalId,
+            secondaries: &[LocalId],
+        ) -> Self {
+            let mut s = self.secondaries;
+            s.copy_from_slice(secondaries);
+            Self {
+                current,
+                dead,
+                secondaries: s,
+                permission: self.permission.clone(),
+            }
+        }
+    }
+
+    fn item(label: &str, n: u64) -> Item {
+        Item {
+            label: label.into(),
+            n,
+        }
+    }
+
+    // The "node" mints ids in one store; the "cache" adopts them in another
+    // and must agree on identity, order, and secondary lookups.
+    #[test]
+    fn adopted_records_keep_node_ids_order_and_indexes() {
+        block_on(async {
+            let tenant = U48::from(3u32);
+            let node = MemStore::default();
+            let node_pivot =
+                Collection::<Item>::create(&node, tenant).await.unwrap();
+            let node_col = Collection::<Item>::at(node_pivot, tenant);
+            let a = node_col.insert(&node, &item("red", 1)).await.unwrap();
+            let b = node_col.insert(&node, &item("blue", 2)).await.unwrap();
+
+            let cache = MemStore::default();
+            Collection::<Item>::adopt_pivot(&cache, tenant, node_pivot)
+                .await
+                .unwrap();
+            // Idempotent: adopting an existing pivot is a no-op, not a reset.
+            Collection::<Item>::adopt_pivot(&cache, tenant, node_pivot)
+                .await
+                .unwrap();
+            let col = Collection::<Item>::at(node_pivot, tenant);
+            col.adopt(&cache, a, &item("red", 1)).await.unwrap();
+            col.adopt(&cache, b, &item("blue", 2)).await.unwrap();
+
+            let walked: Vec<(Id, Item)> =
+                col.all(&cache).try_collect().await.unwrap();
+            assert_eq!(
+                walked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                vec![a, b],
+                "the cache walk must yield the node's ids in node order"
+            );
+            let blues: Vec<(Id, Item)> = col
+                .search_by(
+                    &cache,
+                    0,
+                    crate::index::Bound::Exact("blue".key_bytes()),
+                )
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(blues, vec![(b, item("blue", 2))]);
+        });
+    }
+
+    #[test]
+    fn re_adoption_skips_unchanged_and_rekeys_changed() {
+        block_on(async {
+            let tenant = U48::from(4u32);
+            let store = MemStore::default();
+            let pivot =
+                Collection::<Item>::create(&store, tenant).await.unwrap();
+            let col = Collection::<Item>::at(pivot, tenant);
+            let id = Id::new(7, tenant, false, 1);
+
+            col.adopt(&store, id, &item("red", 1)).await.unwrap();
+            // Same bytes again (a read-path mirror): no new version.
+            col.adopt(&store, id, &item("red", 1)).await.unwrap();
+            let versions: Vec<(crate::metadata::Metadata, Item)> =
+                col.history(&store, id).try_collect().await.unwrap();
+            assert_eq!(versions.len(), 1, "unchanged adopt must not archive");
+
+            // Changed bytes: one archived version, secondary re-keyed.
+            col.adopt(&store, id, &item("blue", 1)).await.unwrap();
+            let versions: Vec<(crate::metadata::Metadata, Item)> =
+                col.history(&store, id).try_collect().await.unwrap();
+            assert_eq!(versions.len(), 2);
+            let reds: Vec<(Id, Item)> = col
+                .search_by(
+                    &store,
+                    0,
+                    crate::index::Bound::Exact("red".key_bytes()),
+                )
+                .try_collect()
+                .await
+                .unwrap();
+            assert!(reds.is_empty(), "the old key must be de-indexed");
+        });
+    }
+
+    #[test]
+    fn adopt_without_a_local_pivot_is_pivot_missing() {
+        block_on(async {
+            let tenant = U48::from(5u32);
+            let store = MemStore::default();
+            let col =
+                Collection::<Item>::at(LocalId::new(42, false, 1), tenant);
+            let id = Id::new(7, tenant, false, 1);
+            assert!(matches!(
+                col.adopt(&store, id, &item("red", 1)).await,
+                Err(Error::PivotMissing(_))
+            ));
+        });
+    }
+}
