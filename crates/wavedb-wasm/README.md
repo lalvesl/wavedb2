@@ -5,7 +5,7 @@ targets the crate is empty (it exists so `cargo test --workspace` compiles). The
 public `Db` API is identical to native — only the storage adapter and runtime
 change shape.
 
-> **Status:** M5 in progress. The platform seam (`wavedb-platform`) is
+> **Status:** the M5 exit holds. The platform seam (`wavedb-platform`) is
 > live: the whole client stack (`wavedb-core`, `wavedb-net`, `wavedb`)
 > compiles for wasm32-unknown-unknown — timestamps from `Date.now()`,
 > entropy from `crypto.getRandomValues`, the tunnel over browser `fetch`.
@@ -13,9 +13,11 @@ change shape.
 > (`IdbStore`; `tests/idb_store.rs` covers the raw batch contract and the
 > typed serverless flow — collection + BpTree secondary index over real
 > IndexedDB; run it with the chromedriver incantation in `CLAUDE.md`).
-> A raw `probe` export anchors the transport stack for the size tracker.
-> The WebSocket runtime notes below and the typed browser demo against a
-> live node (the M5 exit) are **not built yet**.
+> The **typed browser demo against a live node** is `tests/live_node.rs`,
+> run through `scripts/browser_demo.sh`: `#[server]` calls, a typed Unique
+> save, and the streamed collection walk over `fetch`, with IndexedDB
+> caching reads. A raw `probe` export anchors the transport stack for the
+> size tracker. The WebSocket runtime notes below are **not built yet**.
 
 > For the project-wide idea and quickstart see the
 > [root README](../../readme.md).
