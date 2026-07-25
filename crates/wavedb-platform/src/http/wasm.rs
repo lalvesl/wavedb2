@@ -24,12 +24,13 @@ pub async fn post(addr: &str, body: &[u8]) -> Result<Body> {
     let init = RequestInit::new();
     init.set_method("POST");
     init.set_body(&Uint8Array::from(body).into());
+    // No `content-type` header, deliberately: the node never reads one (the
+    // tunnel is dumb), and a bytes-only POST with no non-safelisted headers
+    // is a CORS *simple request* — the browser sends it straight to a node
+    // on another origin with no OPTIONS preflight (which the POST-only
+    // server would refuse).
     let request = Request::new_with_str_and_init(&url, &init)
         .map_err(|e| js("Request::new", &e))?;
-    request
-        .headers()
-        .set("content-type", "application/octet-stream")
-        .map_err(|e| js("headers.set", &e))?;
     let window = web_sys::window()
         .ok_or_else(|| Error::Js(String::from("no window")))?;
     let response: Response =
