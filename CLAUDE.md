@@ -36,6 +36,10 @@ cargo doc --workspace --no-deps                    # doc build (CI-gated)
 cargo deny check                                   # license/advisory audit (CI-gated)
 cargo nextest run --workspace --tests --release    # CI e2e job
 nix build .#wasm                                   # size-optimised wasm artifact
+# browser-only tests (IndexedDB store), from crates/wavedb-wasm — needs the
+# nixpkgs chromedriver (the one wasm-pack downloads can't run on NixOS):
+nix shell nixpkgs#chromedriver --command bash -c \
+  'CHROMEDRIVER=$(which chromedriver) wasm-pack test --headless --chrome'
 ```
 
 Toolchain is pinned by `rust-toolchain.toml` (1.96.0, edition 2024, includes
