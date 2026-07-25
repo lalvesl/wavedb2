@@ -36,6 +36,8 @@
 #![allow(clippy::future_not_send, async_fn_in_trait)]
 
 pub mod auth;
+pub mod cache;
+mod client_cache;
 mod client_handle;
 mod db;
 mod error;
@@ -43,6 +45,9 @@ mod reply;
 mod server_db;
 
 pub use auth::TokenPair;
+pub use cache::CacheStore;
+#[cfg(target_arch = "wasm32")]
+pub use cache::IdbStore;
 pub use db::Db;
 pub use error::{Error, Result};
 pub use server_db::ServerDb;

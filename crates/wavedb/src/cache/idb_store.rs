@@ -22,7 +22,7 @@ use web_sys::{
 
 use wavedb_core::{Id, Result, Store, Write};
 
-use crate::idb::{self, STORE_NAME, backend};
+use crate::cache::idb::{self, STORE_NAME, backend};
 
 /// The browser store — one IndexedDB database holding one `kv` object
 /// store. Cheap handle; transactions are per call.
