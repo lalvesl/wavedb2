@@ -1174,12 +1174,16 @@ dependencies = [
 name = "wavedb-wasm"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "js-sys",
+ "schema-smoke",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "wavedb",
  "wavedb-core",
  "wavedb-net",
+ "web-sys",
 ]
 
 [[package]]
