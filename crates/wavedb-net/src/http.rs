@@ -133,12 +133,19 @@ where
 /// Server side: write the `200` head that a frame sequence follows. No
 /// `content-length` — the frames stream out as produced and
 /// `connection: close` delimits the body.
+///
+/// `access-control-allow-origin: *` lets a browser page on any origin read
+/// the tunnel's bytes. CORS is not a security boundary here: requests carry
+/// no ambient credentials (identity is the signed token *inside* the body,
+/// never a cookie or header), so the header only unblocks the browser
+/// client — enforcement stays in the WaveDB gates.
 pub async fn write_ok_head<W>(w: &mut W) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     w.write_all(
         b"HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n\
+          access-control-allow-origin: *\r\n\
           connection: close\r\n\r\n",
     )
     .await?;
@@ -167,6 +174,7 @@ where
 {
     w.write_all(
         b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\
+          access-control-allow-origin: *\r\n\
           connection: close\r\n\r\n",
     )
     .await?;
@@ -228,6 +236,7 @@ mod tests {
         client.read_to_end(&mut raw).await.unwrap();
         let mut expected = b"HTTP/1.1 200 OK\r\n\
               content-type: application/octet-stream\r\n\
+              access-control-allow-origin: *\r\n\
               connection: close\r\n\r\n"
             .to_vec();
         expected.extend_from_slice(&3u32.to_le_bytes());
