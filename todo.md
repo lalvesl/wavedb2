@@ -129,11 +129,22 @@ The developer surface — what `examples/todo-app` is written against.
   `wasm_bindgen_futures`. The wasm side has **no journal and no
   `data.bin`** — IndexedDB `Id → Vec<u8>` will be the whole store (the
   `Store` trait absorbs the difference);
-- [ ] **IndexedDB `Store`**: key = 128-bit `Id` (big-endian), value = wire
-  bytes; `apply` = one IDB readwrite transaction; no pages, no journal
-  (IndexedDB already does block management + crash safety);
-- the `Store`-generic `BpTree`/`Collection` already run over any backend —
-  serverless mode (engine in-browser over IndexedDB) falls out;
+- [x] **IndexedDB `Store` — LANDED (2026-07-10)**: `wavedb_wasm::IdbStore`
+  — one `kv` object store, key = 128-bit `Id` (16 B big-endian, bytewise
+  key order == numeric order), value = wire bytes; `apply` = ONE IDB
+  readwrite transaction (complete = durable, error/abort = rolled back
+  whole — the atomic-batch contract for free); no pages, no journal.
+  `idb.rs` bridges the event-driven requests to futures (oneshot per op,
+  closures dropped after the await — no per-op leak); faults convert to
+  `core::Error::Backend` at the module edge. **Proven in real headless
+  Chrome** (`tests/idb_store.rs`, run via the nixpkgs-chromedriver
+  incantation in CLAUDE.md): raw batch roundtrip + reopen durability, and
+  the typed serverless flow — `LocalHandle` + Unique `AboutUser` +
+  NonUnique `Note` collection with BpTree + `by_pinned` secondary, all
+  over IndexedDB;
+- [x] the `Store`-generic `BpTree`/`Collection` run over the IDB backend —
+  serverless mode (engine in-browser over IndexedDB) proven by the typed
+  browser test above;
 - **measure the per-struct wasm cost** of the registry `match` (M1 risk
   item);
 - **exit:** a browser demo performs typed `save` + a collection read + a
@@ -279,9 +290,13 @@ Deliberately left as later seams:
   token clock, quick-node's default secret, and `NetClient` all route through
   it. The whole client stack compiles + clippy-cleans for
   `wasm32-unknown-unknown`; `wavedb-wasm` is a member with a raw
-  `probe::call_fn_raw` export (fetch → node → framed reply). Remaining M5:
-  IndexedDB `Store`, browser demo (the exit), registry-`match` size
-  measurement.
+  `probe::call_fn_raw` export (fetch → node → framed reply).
+- **M5 IndexedDB `Store` — LANDED (2026-07-10)**: `wavedb_wasm::IdbStore`,
+  flat `Id → wire bytes`, one readwrite transaction per `apply`. Proven in
+  real headless Chrome: raw roundtrip + reopen durability + the typed
+  serverless flow (Unique, collection, BpTree secondary index) over
+  IndexedDB. Remaining M5: the browser demo against a live node (the
+  exit) and the registry-`match` size measurement.
 
 _Workspace green (both targets): fmt + clippy (pedantic + nursery) clean,
 tests green, file-length gate passing. Members: wire, wire-derive, platform,
