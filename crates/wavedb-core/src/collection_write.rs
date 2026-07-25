@@ -44,11 +44,24 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// Propagates a [`Store`] failure, [`Error::PivotMissing`] on a stale
     /// handle, or a decode fault on a corrupt pivot.
     pub async fn insert<S: Store>(&self, store: &S, value: &T) -> Result<Id> {
+        let id = mint_timestamped_id(self.tenant());
+        self.insert_at(store, id, value).await?;
+        Ok(id)
+    }
+
+    /// [`insert`](Self::insert)'s body with the identity supplied instead of
+    /// minted — the seam [`adopt`](Self::adopt) writes a **node-minted** `Id`
+    /// through when mirroring a record into a local cache store.
+    pub(crate) async fn insert_at<S: Store>(
+        &self,
+        store: &S,
+        id: Id,
+        value: &T,
+    ) -> Result<()> {
         let pivot = self.load_pivot(store).await?;
         let mut current = self.tree(pivot.current());
         let mut secs = self.sec_trees(&pivot);
 
-        let id = mint_timestamped_id(self.tenant());
         // First version: no chain yet; the pivot back-link is stamped here
         // (the future handle-less `record.save(&db)` reaches roots through it)
         // and the writer identity is the tenant until node auth exists (M8).
@@ -71,8 +84,7 @@ impl<T: NonUniqueStruct> Collection<T> {
             pivot.dead(),
             &secs,
         );
-        store.apply(&batch).await?;
-        Ok(id)
+        store.apply(&batch).await
     }
 
     /// Remove the record at `id` from the living set: de-indexes it from
