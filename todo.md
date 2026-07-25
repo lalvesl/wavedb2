@@ -168,12 +168,17 @@ The developer surface — what `examples/todo-app` is written against.
   node's `200`/`400` heads carry `access-control-allow-origin: *` (not a
   boundary — identity is the in-body token, never ambient credentials).
 
-## M6 — local cache & `Db::open`
+## M6 — local cache & `Db::open` — LANDED (2026-07-10)
 
-- `Db::open` family (native file path / wasm IndexedDB) with the local store
-  as a real write-through cache: read-your-writes between local store and
-  notifications;
-- **exit:** client survives node restart with warm local reads.
+- [x] `Db::open` family (native file path / wasm IndexedDB) with the local
+  store as a real write-through cache — node-first (revalidation = every
+  successful read), mirrors best-effort under node-minted ids
+  (`Collection::adopt`), fallback only on transport faults the cache can
+  answer, offline writes refuse (no queue until M7). Details in the DOING
+  entry and `crates/wavedb/README.md`'s status block;
+- [x] **exit held:** client survives node restart with warm local reads
+  (`examples/contact-book/tests/local_cache_e2e.rs` — two processes, the
+  node re-executed as a child of the test binary).
 
 ## M7 — live sync (WebSocket lands here)
 
@@ -325,6 +330,38 @@ Deliberately left as later seams:
     `scripts/registry_size.sh`): ~23 B raw / 18 B gzip per exposed struct
     (arm only), ~204 B raw / 44 B gzip with a novel decode shape — the M1
     risk is retired.
+
+- **M6 COMPLETE (2026-07-10)** — `Db::open`: the client cache is WaveDB
+  caching WaveDB, cfg-switched like the platform seam (native = the
+  journal + `data.bin` `PageStore`; wasm = `IdbStore`, which moved from
+  `wavedb-wasm` into `wavedb::cache` — the wasm crate re-exports it).
+  What landed:
+  - `Db::open(CLIENT_REGISTRY, addr, user, tenant, app)` both targets
+    (`app` → auto-created `$XDG_CACHE_HOME|~/.cache/wavedb/<app>` or
+    `%LOCALAPPDATA%`, IndexedDB `wavedb-<app>`), native `open_at(…, dir)`,
+    and `db.local()` (the cache's direct `LocalHandle` surface);
+  - **semantics: node-first** (chosen over local-first + revalidation —
+    every successful read IS the revalidation; Bloom screen-sync discarded
+    for now): acknowledged ops mirror best-effort; fallback only on
+    `Error::Transport` and only when the cache holds the answer (absence
+    propagates the fault; `NodeError` refusals never fall back); offline
+    writes refuse — the cache is strictly behind the node, no merge needed;
+  - **core adopt seam** (`collection_adopt.rs`): `adopt_pivot` /
+    `Collection::adopt` write **node-minted** identities into a local store
+    (insert-at-id / save / skip-unchanged — read mirroring can't grow the
+    store), shared with future M7 sync. `All` frames now carry `(Id, T)`
+    so walks mirror under authoritative ids (same order, same ids warm);
+  - `expose_client!` now also emits the native `StorageRegistry` (the
+    engine slots `Db::open` registers); one open engine per process —
+    a `Db::open` client and a node can't share one (child-process node);
+  - `get_record` deliberately does **not** back-fill (it also resolves
+    removed records; adopting one would resurrect it into the living walk);
+  - proven: `local_cache_e2e.rs` (M6 exit: warm unique/by-id/ordered-walk
+    reads through a node kill, honest refusals, restart + journal replay),
+    `local_cache_cold.rs` (cold cache propagates the fault, `db.local()`
+    warms, refused writes don't touch the cache), browser suite +
+    `browser_demo.sh` re-run green with the moved `IdbStore` and new
+    `All` frames.
 
 _Workspace green (both targets): fmt + clippy (pedantic + nursery) clean,
 tests green, file-length gate passing. Members: wire, wire-derive, platform,

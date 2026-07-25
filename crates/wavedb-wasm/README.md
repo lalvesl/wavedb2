@@ -5,19 +5,21 @@ targets the crate is empty (it exists so `cargo test --workspace` compiles). The
 public `Db` API is identical to native — only the storage adapter and runtime
 change shape.
 
-> **Status:** the M5 exit holds. The platform seam (`wavedb-platform`) is
-> live: the whole client stack (`wavedb-core`, `wavedb-net`, `wavedb`)
-> compiles for wasm32-unknown-unknown — timestamps from `Date.now()`,
-> entropy from `crypto.getRandomValues`, the tunnel over browser `fetch`.
-> The IndexedDB `Store` below is **built and proven in headless Chrome**
-> (`IdbStore`; `tests/idb_store.rs` covers the raw batch contract and the
-> typed serverless flow — collection + BpTree secondary index over real
-> IndexedDB; run it with the chromedriver incantation in `CLAUDE.md`).
-> The **typed browser demo against a live node** is `tests/live_node.rs`,
-> run through `scripts/browser_demo.sh`: `#[server]` calls, a typed Unique
-> save, and the streamed collection walk over `fetch`, with IndexedDB
-> caching reads. A raw `probe` export anchors the transport stack for the
-> size tracker. The WebSocket runtime notes below are **not built yet**.
+> **Status:** M5 complete; M6's `Db::open` reaches the browser. The
+> platform seam (`wavedb-platform`) is live: the whole client stack
+> (`wavedb-core`, `wavedb-net`, `wavedb`) compiles for
+> wasm32-unknown-unknown — timestamps from `Date.now()`, entropy from
+> `crypto.getRandomValues`, the tunnel over browser `fetch`. The IndexedDB
+> `Store` (`IdbStore`) **moved into `wavedb::cache` with M6** — it is the
+> browser half of `Db::open`'s write-through cache; this crate re-exports
+> it, and `tests/idb_store.rs` still proves the raw batch contract and the
+> typed serverless flow in headless Chrome (chromedriver incantation in
+> `CLAUDE.md`). The **typed browser demo against a live node** is
+> `tests/live_node.rs`, run through `scripts/browser_demo.sh`: `#[server]`
+> calls, a typed Unique save, and the streamed collection walk over
+> `fetch`, with IndexedDB caching reads. A raw `probe` export anchors the
+> transport stack for the size tracker. The WebSocket runtime notes below
+> are **not built yet**.
 
 > For the project-wide idea and quickstart see the
 > [root README](../../readme.md).
