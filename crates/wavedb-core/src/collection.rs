@@ -161,6 +161,19 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// # Errors
     /// Propagates a [`Store`] failure.
     pub async fn create<S: Store>(store: &S, tenant: U48) -> Result<LocalId> {
+        let pivot_id = mint_timestamped_id(tenant);
+        Self::create_rooted(store, tenant, pivot_id).await?;
+        Ok(LocalId::from_id(pivot_id))
+    }
+
+    /// [`create`](Self::create)'s body with the pivot's identity supplied
+    /// instead of minted — the seam [`adopt_pivot`](Self::adopt_pivot)
+    /// bootstraps a cache-local copy of a **node-minted** collection through.
+    pub(crate) async fn create_rooted<S: Store>(
+        store: &S,
+        tenant: U48,
+        pivot_id: Id,
+    ) -> Result<()> {
         let (current, current_write) = BpTree::<LocalId>::plan_create(tenant);
         let (dead, dead_write) = BpTree::<LocalId>::plan_create(tenant);
         let mut batch = vec![current_write, dead_write];
@@ -175,13 +188,11 @@ impl<T: NonUniqueStruct> Collection<T> {
             dead.root(),
             &sec_roots,
         );
-        let pivot_id = mint_timestamped_id(tenant);
         batch.push(Write::Put(
             pivot_id,
             encode_envelope(T::Pivot::STRUCT_HASH, &pivot_record),
         ));
-        store.apply(&batch).await?;
-        Ok(LocalId::from_id(pivot_id))
+        store.apply(&batch).await
     }
 
     /// The `LocalId` of this collection's `Pivot` record.

@@ -172,8 +172,12 @@ where
     }
 }
 
-/// Walk a NonUnique collection in `CREATED_AT` order and buffer each record's
-/// body wire bytes — the shared tail of the generated `All` step.
+/// Walk a NonUnique collection in `CREATED_AT` order and buffer each record
+/// as the wire pair `(Id, T)` — the shared tail of the generated `All` step.
+///
+/// The node-minted `Id` rides with every item so a client can mirror the walk
+/// into its local cache under the authoritative identity (M6); the typed
+/// surface still yields values only.
 ///
 /// Buffered (not streamed) for now: the HTTP POST tunnel answers one request
 /// with one response, so a walk collects before replying. Streaming frames are
@@ -193,8 +197,8 @@ where
     use futures::TryStreamExt;
     let col = Collection::<T>::at(pivot, tenant);
     let items: Vec<(Id, T)> = col.all(store).try_collect().await?;
-    let bodies = items.iter().map(|(_, v)| to_wire(v)).collect();
-    Ok(Reply::Values(bodies))
+    let entries = items.iter().map(to_wire).collect();
+    Ok(Reply::Values(entries))
 }
 
 /// Walk a `Unique` record's version chain **newest-first**, buffered.

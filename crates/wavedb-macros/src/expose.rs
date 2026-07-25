@@ -107,14 +107,18 @@ fn execute_arm(entry: &Entry) -> TokenStream {
     }
 }
 
-/// The `StorageRegistry` impl for `ServerRegistry` — native only, flattening
+/// The `StorageRegistry` impl for a registry type — native only, flattening
 /// each listed struct **and `store` entry**'s `storage_entries()` (functions
 /// hold no storage; the reserved BpTree-node slot is added by
-/// `PageStore::open`).
-fn storage_registry_impl(struct_paths: &[&Path]) -> TokenStream {
+/// `PageStore::open`). The server registry opens the node's engine with it;
+/// the client registry opens `Db::open`'s local cache store with it.
+fn storage_registry_impl(
+    registry: &proc_macro2::Ident,
+    struct_paths: &[&Path],
+) -> TokenStream {
     quote! {
         #[cfg(not(target_arch = "wasm32"))]
-        impl ::wavedb_storage::StorageRegistry for ServerRegistry {
+        impl ::wavedb_storage::StorageRegistry for #registry {
             fn storage_entries(
                 &self,
             ) -> ::std::vec::Vec<&'static ::wavedb_storage::StructStorage>
@@ -150,7 +154,8 @@ pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
         .collect();
     let hashes: Vec<TokenStream> =
         wire_entries.iter().copied().map(hash_expr).collect();
-    let storage_impl = storage_registry_impl(&struct_paths);
+    let storage_impl =
+        storage_registry_impl(&format_ident!("ServerRegistry"), &struct_paths);
     let decode_arms = wire_entries.iter().copied().map(decode_arm);
     let execute_arms = wire_entries.iter().copied().map(execute_arm);
 
@@ -221,13 +226,24 @@ pub fn expand_client(input: TokenStream) -> syn::Result<TokenStream> {
         if entry.kind == Kind::Store {
             return Err(syn::Error::new_spanned(
                 &entry.path,
-                "`store` entries shape the node's storage surface — a \
-                 client registry has no engine to register into",
+                "`store` entries shape the node's storage surface — the \
+                 client's cache store registers exactly the wire-reachable \
+                 list, so a storage-only entry has nothing to serve here",
             ));
         }
     }
     let hashes: Vec<TokenStream> = decl.entries.iter().map(hash_expr).collect();
     let decode_arms = decl.entries.iter().map(decode_arm);
+    // The cache half of `Db::open`: the same declared list, flattened to the
+    // per-type engine slots (functions hold no storage).
+    let struct_paths: Vec<&Path> = decl
+        .entries
+        .iter()
+        .filter(|e| e.kind != Kind::Fn)
+        .map(|e| &e.path)
+        .collect();
+    let storage_impl =
+        storage_registry_impl(&format_ident!("ClientRegistry"), &struct_paths);
 
     Ok(quote! {
         /// The client-side allowlist `expose_client!` declared: which items
@@ -256,5 +272,7 @@ pub fn expand_client(input: TokenStream) -> syn::Result<TokenStream> {
                 }
             }
         }
+
+        #storage_impl
     })
 }

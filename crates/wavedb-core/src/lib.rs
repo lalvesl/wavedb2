@@ -23,6 +23,7 @@
 extern crate self as wavedb_core;
 
 pub mod collection;
+mod collection_adopt;
 pub mod collection_handle;
 mod collection_write;
 pub mod error;
