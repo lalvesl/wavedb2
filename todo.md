@@ -184,8 +184,15 @@ The developer surface — what `examples/todo-app` is written against.
 
 - WebSocket transport: token once at handshake, connection-bound identity;
   push notifications; HTTP piggyback + idle-tick fallback for POST clients;
-- Bloom-filter screen-sync (client sends filter of on-screen `Id`s, node
-  pushes deltas); client event API (`T::watch(&db)`);
+- screen-sync as **declared subscriptions + journal cursor** (client event
+  API `T::watch(&db)` over Unique anchors / collection pivots; reconnect =
+  "since journal sequence N" streaming exactly the tenant's deltas). The
+  earlier Bloom-filter idea is **rejected** (2026-07-10): answering a filter
+  on reconnect would force the node to test its whole dataset against it,
+  and exact pivot/anchor subscriptions already give live filtering without
+  false positives;
+- offline write queue replaying through the same cursor path (M6 refuses
+  offline writes on purpose — the cache never diverges);
 - **exit:** client A saves; client B's watcher fires within one round-trip
   (WS) / one poll tick (HTTP).
 
