@@ -92,6 +92,9 @@ web-sys = { version = "0.3.98", features = [
 clap = { version = "4.6.1", features = ["derive"] }
 hmac = "0.12"
 sha2 = "0.10"
+# RFC 6455 accept key (the WS handshake pins SHA-1); same RustCrypto family
+# as hmac/sha2. Never used for anything security-load-bearing.
+sha1 = "0.10"
 ratatui = "0.29"
 crossterm = "0.28"
 sysinfo = "0.32"
