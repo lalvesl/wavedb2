@@ -7,6 +7,8 @@
 //! followed by length-prefixed frames (`[len u32 LE][bytes]`, each a wire
 //! [`StreamFrame`](crate::frame::StreamFrame)) written progressively — the
 //! `connection: close` the tunnel always sends is what delimits the body.
+//! The one other thing a peer may say is a **WebSocket upgrade** (`GET` +
+//! `Upgrade: websocket`), which hands the socket to the WS transport (M7).
 //! Anything else on the socket is a transport fault, not a protocol.
 //! Identity, commands, and refusals never touch this layer — they live in
 //! the [`frame`](crate::frame) envelopes.
@@ -19,20 +21,36 @@ use crate::frames::MAX_BODY;
 /// Cap on the head section (request/status line + headers).
 const MAX_HEAD: usize = 8 * 1024;
 
-/// A parsed head: the first line plus the one header the tunnel reads.
+/// A parsed head: the first line plus the headers the tunnel reads.
 #[derive(Debug)]
 struct Head {
     first_line: String,
     content_length: Option<usize>,
+    /// `Sec-WebSocket-Key`, when the peer asks to upgrade.
+    websocket_key: Option<String>,
 }
 
-/// Split the head bytes into the first line + `content-length`.
+/// One request off the socket: a POST body (the tunnel), or a WebSocket
+/// upgrade offer to be answered with [`write_switching_head`].
+#[derive(Debug)]
+pub enum Incoming {
+    /// A `POST`'s complete body bytes.
+    Post(Vec<u8>),
+    /// A `GET` + `Upgrade: websocket`; `key` is the `Sec-WebSocket-Key`.
+    Upgrade {
+        /// The handshake nonce [`write_switching_head`] answers.
+        key: String,
+    },
+}
+
+/// Split the head bytes into the first line + the read headers.
 fn parse_head(bytes: &[u8]) -> Result<Head> {
     let text = core::str::from_utf8(bytes)
         .map_err(|_| Error::Http("head is not utf-8"))?;
     let mut lines = text.split("\r\n");
     let first_line = lines.next().ok_or(Error::Http("empty head"))?.to_owned();
     let mut content_length = None;
+    let mut websocket_key = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -43,11 +61,14 @@ fn parse_head(bytes: &[u8]) -> Result<Head> {
                 .parse()
                 .map_err(|_| Error::Http("bad content-length"))?;
             content_length = Some(n);
+        } else if name.eq_ignore_ascii_case("sec-websocket-key") {
+            websocket_key = Some(value.trim().to_owned());
         }
     }
     Ok(Head {
         first_line,
         content_length,
+        websocket_key,
     })
 }
 
@@ -112,22 +133,33 @@ where
     Ok(leftover)
 }
 
-/// Server side: read one `POST` request's body. `None` = the peer closed
-/// the connection instead of sending another request.
-pub async fn read_post<R>(r: &mut R) -> Result<Option<Vec<u8>>>
+/// Server side: read one request — a `POST` body or a WebSocket upgrade
+/// offer. `None` = the peer closed the connection instead of sending one.
+pub async fn read_request<R>(r: &mut R) -> Result<Option<Incoming>>
 where
     R: AsyncRead + Unpin,
 {
     let Some((head, leftover)) = read_head(r).await? else {
         return Ok(None);
     };
-    if !head.first_line.starts_with("POST ") {
-        return Err(Error::Http("only POST"));
+    if head.first_line.starts_with("POST ") {
+        let declared = head
+            .content_length
+            .ok_or(Error::Http("missing content-length"))?;
+        return Ok(Some(Incoming::Post(
+            read_body(r, declared, leftover).await?,
+        )));
     }
-    let declared = head
-        .content_length
-        .ok_or(Error::Http("missing content-length"))?;
-    Ok(Some(read_body(r, declared, leftover).await?))
+    if head.first_line.starts_with("GET ")
+        && let Some(key) = head.websocket_key
+    {
+        // Frames may not be pipelined ahead of the server's 101.
+        if leftover.is_empty() {
+            return Ok(Some(Incoming::Upgrade { key }));
+        }
+        return Err(Error::Http("bytes before the upgrade completed"));
+    }
+    Err(Error::Http("only POST or websocket upgrade"))
 }
 
 /// Server side: write the `200` head that a frame sequence follows. No
@@ -166,6 +198,26 @@ where
     Ok(())
 }
 
+/// Server side: answer a WebSocket upgrade with the `101` head.
+///
+/// `accept` is [`accept_key`](wavedb_platform::ws::codec::accept_key) over
+/// the offer's `Sec-WebSocket-Key`; the socket then speaks RFC 6455 frames.
+///
+/// # Errors
+/// A socket fault.
+pub async fn write_switching_head<W>(w: &mut W, accept: &str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let head = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\
+         connection: Upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n"
+    );
+    w.write_all(head.as_bytes()).await?;
+    w.flush().await?;
+    Ok(())
+}
+
 /// Server side: reject bytes that never became a WaveDB request. This is
 /// the only non-200 the node sends — it means the *transport* broke.
 pub async fn write_bad_request<W>(w: &mut W) -> Result<()>
@@ -187,8 +239,21 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        Error, head_end, parse_head, read_post, write_frame, write_ok_head,
+        Error, Incoming, head_end, parse_head, read_request, write_frame,
+        write_ok_head,
     };
+
+    /// Unwrap a read request into its POST body.
+    async fn read_post<R>(r: &mut R) -> super::Result<Option<Vec<u8>>>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        match read_request(r).await? {
+            Some(Incoming::Post(body)) => Ok(Some(body)),
+            Some(Incoming::Upgrade { .. }) => panic!("unexpected upgrade"),
+            None => Ok(None),
+        }
+    }
 
     #[test]
     fn parse_head_reads_first_line_and_length() {
@@ -197,6 +262,7 @@ mod tests {
                 .unwrap();
         assert_eq!(head.first_line, "POST / HTTP/1.1");
         assert_eq!(head.content_length, Some(12));
+        assert_eq!(head.websocket_key, None);
     }
 
     #[test]
@@ -254,14 +320,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_post_is_refused() {
+    async fn plain_get_is_refused() {
         let (mut client, mut server) = tokio::io::duplex(256);
         client
             .write_all(b"GET / HTTP/1.1\r\ncontent-length: 0\r\n\r\n")
             .await
             .unwrap();
-        let err = read_post(&mut server).await.unwrap_err();
-        assert!(matches!(err, Error::Http("only POST")));
+        let err = read_request(&mut server).await.unwrap_err();
+        assert!(matches!(err, Error::Http("only POST or websocket upgrade")));
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_surfaces_its_key() {
+        let (mut client, mut server) = tokio::io::duplex(256);
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nupgrade: websocket\r\n\
+                  connection: Upgrade\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                  sec-websocket-version: 13\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let Some(Incoming::Upgrade { key }) =
+            read_request(&mut server).await.unwrap()
+        else {
+            panic!("must be an upgrade");
+        };
+        assert_eq!(key, "dGhlIHNhbXBsZSBub25jZQ==");
+    }
+
+    #[tokio::test]
+    async fn frames_pipelined_before_the_101_are_refused() {
+        let (mut client, mut server) = tokio::io::duplex(256);
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nsec-websocket-key: abc\r\n\r\n\x82\x00",
+            )
+            .await
+            .unwrap();
+        let err = read_request(&mut server).await.unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Http("bytes before the upgrade completed")
+        ));
     }
 
     #[tokio::test]
