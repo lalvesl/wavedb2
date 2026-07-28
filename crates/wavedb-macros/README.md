@@ -259,6 +259,35 @@ What the macro emits:
 | **Server** (`cfg`) | The real body + a dispatch arm under the function's own `STRUCT_HASH` (below) so the node can route an incoming call.                                                                                                              |
 | **Client** (`cfg`) | A stub with the **same signature**: `WaveWire`-encode the args → send a `CommandFrame { struct_hash, command, payload = args }` over `wavedb-net` (the **same** frame an object op uses — no separate call frame) → `WaveWire`-decode the return. The body is **not** in the binary (keeps wasm small, keeps server logic private). |
 
+> **Status: implemented — the side features.** The `cfg` in the table is
+> real and its names are pinned: a schema crate declares two cargo features
+> named exactly **`server-side`** and **`client-side`**, and the macros gate
+> emission on them —
+>
+> - `server-side` → the `#[server]` **body** and its `__wavedb_dispatch`
+>   step, plus the whole `expose_server!` output (`REGISTRY` and every
+>   dispatch arm);
+> - `client-side` → the **client stub** and the whole `expose_client!`
+>   output (`CLIENT_REGISTRY`);
+> - always (both sides) → the fn-type and its `STRUCT_HASH`, and everything
+>   `#[wavedb]` emits for structs — the schema IS the protocol.
+>
+> A deployed binary depends on the schema with `default-features = false`
+> and exactly its side (see `examples/todo-app/{server,client}/Cargo.toml`),
+> so the other side's code is **never compiled** into the artifact — no
+> string, constant, or code path of a `#[server]` body can reach a client
+> build. This is deliberately stronger than trusting LTO/dead-code
+> elimination. The convention is `default = ["server-side", "client-side"]`
+> so the schema crate's own tests drive the full loop; server-only deps ride
+> the feature (`server-side = ["dep:sha2"]`). Two duties stay with the
+> schema author: (1) helpers written *outside* `#[server]` bodies that serve
+> them must carry `#[cfg(feature = "server-side")]` by hand (todo-app's
+> `hash_password` et al. are the worked example); (2) never enable
+> `server-side` for a wasm32 build — `expose_server!` hard-refuses it with a
+> `compile_error!` (a browser is never a node). The guarantee applies to the
+> artifact's own build graph (`cargo build -p <client>`): a `--workspace`
+> build unifies features with the schema's default-on test build.
+
 - **A function has a `STRUCT_HASH: u64` too — there is no separate `FN_HASH`.** It
   is computed at compile time by the **same SeaHash + fixed four-lane WaveDB seed**
   as a struct's, but **composed from its input/output objects' `STRUCT_HASH`es**:
@@ -313,7 +342,12 @@ effect of merely existing.
 > reachability half. Every refusal — unlisted type, excluded op, wrong-shape
 > command — is a uniform `UnknownStructHash`. `#[server]` functions join the
 > same lists in M4 (they need `Db`); streaming reads (`All`) join with the
-> transport.
+> transport. The whole `expose_server!` emission rides the schema crate's
+> `server-side` feature and `expose_client!`'s its `client-side` feature —
+> the same no-leak contract as `#[server]` (see the status note in _Server
+> functions_ above); per-op **overrides** are server code and must carry
+> `#[cfg(feature = "server-side")]` at their definition (schema-smoke's
+> `audited_invoice_save` is the worked example).
 
 **Division of labor (the two halves).**
 
