@@ -8,6 +8,7 @@
 //!
 //! [`spawn_local`]: tokio::task::spawn_local
 
+use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
 
@@ -18,9 +19,10 @@ use wavedb_core::Store;
 use wavedb_core::expose::{Exposure, Reply};
 use wavedb_core::wire::{from_wire, to_wire};
 use wavedb_net::frame::{Request, Response, StreamFrame};
-use wavedb_net::http;
+use wavedb_net::http::{self, Incoming};
 
-use crate::dispatch;
+use crate::subscribe::SubTable;
+use crate::{dispatch, serve_ws};
 
 /// Serve `store` under `registry` on an already-bound `listener` until either
 /// the `shutdown` future resolves or an accept fault. Each connection is
@@ -35,6 +37,7 @@ pub async fn run<E, S, F, M>(
     registry: E,
     store: Rc<S>,
     secret: [u8; 32],
+    subs: Rc<RefCell<SubTable>>,
     maintenance: M,
     shutdown: F,
 ) -> wavedb_net::Result<()>
@@ -60,43 +63,56 @@ where
                     }
                 };
                 let store = Rc::clone(&store);
+                let subs = Rc::clone(&subs);
                 spawn_local(async move {
                     // A per-connection fault is dropped: it never takes the
                     // node down. (No tracing dep yet — silent.)
-                    let _ = serve_connection(sock, &registry, &*store, &secret)
-                        .await;
+                    let _ = serve_connection(
+                        sock, &registry, &*store, &secret, &subs,
+                    )
+                    .await;
                 });
             }
         })
         .await
 }
 
-/// Read one request, dispatch it, write the framed response.
+/// Read one request and answer it: a POST body dispatches + writes the
+/// framed response; a WebSocket upgrade switches protocols and hands the
+/// socket to the [`serve_ws`] session loop.
 async fn serve_connection<E, S>(
-    mut sock: TcpStream,
+    sock: TcpStream,
     registry: &E,
     store: &S,
     secret: &[u8; 32],
+    subs: &Rc<RefCell<SubTable>>,
 ) -> wavedb_net::Result<()>
 where
     E: Exposure,
     S: Store,
 {
-    let (mut reader, mut writer) = sock.split();
-    let Some(body) = http::read_post(&mut reader).await? else {
-        return Ok(()); // peer closed without sending — clean.
-    };
-    match from_wire::<Request>(&body) {
-        Ok(request) => {
-            let response =
-                dispatch::handle(registry, store, secret, request).await;
-            write_response(&mut writer, response).await?;
+    let (mut reader, mut writer) = sock.into_split();
+    match http::read_request(&mut reader).await? {
+        None => Ok(()), // peer closed without sending — clean.
+        Some(Incoming::Post(body)) => {
+            match from_wire::<Request>(&body) {
+                Ok(request) => {
+                    let response =
+                        dispatch::handle(registry, store, secret, request)
+                            .await;
+                    write_response(&mut writer, response).await
+                }
+                // The envelope is malformed — a transport-level client
+                // error, not a WaveDB refusal (no struct_hash to refuse).
+                Err(_) => http::write_bad_request(&mut writer).await,
+            }
         }
-        // The envelope itself is malformed — a transport-level client error,
-        // not a WaveDB refusal (there is no struct_hash to refuse yet).
-        Err(_) => http::write_bad_request(&mut writer).await?,
+        Some(Incoming::Upgrade { key }) => {
+            let accept = wavedb_platform::ws::codec::accept_key(&key);
+            http::write_switching_head(&mut writer, &accept).await?;
+            serve_ws::serve(reader, writer, registry, store, secret, subs).await
+        }
     }
-    Ok(())
 }
 
 /// Write one response as its frame sequence: a `Values` reply (a walk)
