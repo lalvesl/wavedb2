@@ -40,7 +40,9 @@ pub fn expand(
 
     quote! {
         // The server body: not async — it *returns* the stream, borrowing
-        // the node context like any collection walk.
+        // the node context like any collection walk. Compiled only under
+        // the schema crate's `server-side` feature (see `crate::server`).
+        #[cfg(feature = "server-side")]
         #[allow(clippy::future_not_send, non_snake_case)]
         fn #body_fn<S: ::wavedb_core::Store>(
             #db_pat: &::wavedb::ServerDb<'_, S>,
@@ -51,14 +53,18 @@ pub fn expand(
             #body
         }
 
-        // The fn-type: identity + the node dispatch step.
+        // The fn-type: the identity both sides share.
         #[allow(non_camel_case_types)]
         #vis struct #name {}
 
         impl #name {
             /// This function's composed identity, in the struct hash space.
             pub const STRUCT_HASH: u64 = #hash;
+        }
 
+        // The node dispatch step — server side only, like the body it runs.
+        #[cfg(feature = "server-side")]
+        impl #name {
             /// Decode args, run the body's stream, ship the items. Buffered
             /// node-side for now (a later internal change); the wire and the
             /// client already stream frame-by-frame.

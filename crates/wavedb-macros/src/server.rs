@@ -15,6 +15,15 @@
 //! The function's identity is a `STRUCT_HASH` composed from its signature, in
 //! the same hash space as structs — the registry `match` disambiguates.
 //!
+//! **Side gating.** A schema crate compiles into the node AND every client,
+//! but the three items must not: body + dispatch are emitted under
+//! `#[cfg(feature = "server-side")]`, the stub under
+//! `#[cfg(feature = "client-side")]` — the schema declares both features, a
+//! deployment enables only its side. Stronger than LTO/DCE: with
+//! `server-side` off the body is **never compiled**, so no string or code
+//! path of it can survive into a client artifact. Only the fn-type and its
+//! `STRUCT_HASH` are unconditional — identity is the protocol.
+//!
 //! **Auth (M8).** The login guard is live: a plain `#[server]` fn refuses
 //! the unauthenticated tier (`caller.user == U48::MAX`) before decoding its
 //! payload; `#[server(public)]` opens the fn to anonymous callers (login /
@@ -270,7 +279,10 @@ pub fn expand(
         // The server body: the user's block, `db` retyped to the node
         // context. `DbHandle` is imported so the body may use the trait
         // spellings (`db.as_tenant(..)`, `db.tenant()`) alongside the
-        // generated inherent ones (`T::get(db)`).
+        // generated inherent ones (`T::get(db)`). Compiled only under the
+        // schema crate's `server-side` feature — a client build never even
+        // parses these tokens into code.
+        #[cfg(feature = "server-side")]
         #[allow(clippy::future_not_send, non_snake_case)]
         async fn #body_fn<S: ::wavedb_core::Store>(
             #db_pat: &::wavedb::ServerDb<'_, S>,
@@ -281,14 +293,19 @@ pub fn expand(
             #body
         }
 
-        // The fn-type: identity + the node dispatch step.
+        // The fn-type: the identity both sides share (the schema IS the
+        // protocol — a stub must name the same hash the node serves).
         #[allow(non_camel_case_types)]
         #vis struct #name {}
 
         impl #name {
             /// This function's composed identity, in the struct hash space.
             pub const STRUCT_HASH: u64 = #hash;
+        }
 
+        // The node dispatch step — server side only, like the body it runs.
+        #[cfg(feature = "server-side")]
+        impl #name {
             /// Decode args, run the body against a node context, wire the
             /// return. A function ignores the frame command.
             #[doc(hidden)]
@@ -320,6 +337,7 @@ pub fn expand(
         }
 
         // The client stub: ship the args, decode the return.
+        #[cfg(feature = "client-side")]
         #[allow(clippy::future_not_send)]
         #vis async fn #name(
             #db_pat: &::wavedb::Db,
