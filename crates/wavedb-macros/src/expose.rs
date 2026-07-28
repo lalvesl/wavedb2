@@ -22,6 +22,15 @@
 //! (`CLIENT_REGISTRY`). The declaration grammar lives in
 //! [`crate::expose_parse`].
 //!
+//! **Side gating.** `expose_server!`'s whole output rides the schema
+//! crate's `server-side` feature and `expose_client!`'s its `client-side`
+//! feature (the same contract as `#[server]`, see [`crate::server`]): a
+//! client artifact built with `default-features = false,
+//! features = ["client-side"]` contains no dispatch arm, no `#[server]`
+//! body, no server registry — not compiled, not merely optimized away.
+//! `expose_server!` additionally refuses (`compile_error!`) any wasm32
+//! build that has `server-side` enabled: a browser is never a node.
+//!
 //! [`Exposure`]: wavedb_core::expose::Exposure
 
 use proc_macro2::TokenStream;
@@ -112,12 +121,15 @@ fn execute_arm(entry: &Entry) -> TokenStream {
 /// hold no storage; the reserved BpTree-node slot is added by
 /// `PageStore::open`). The server registry opens the node's engine with it;
 /// the client registry opens `Db::open`'s local cache store with it.
+/// `side` is the schema-crate feature the whole registry rides
+/// (`"server-side"` / `"client-side"`).
 fn storage_registry_impl(
     registry: &proc_macro2::Ident,
     struct_paths: &[&Path],
+    side: &str,
 ) -> TokenStream {
     quote! {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = #side))]
         impl ::wavedb_storage::StorageRegistry for #registry {
             fn storage_entries(
                 &self,
@@ -154,20 +166,40 @@ pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
         .collect();
     let hashes: Vec<TokenStream> =
         wire_entries.iter().copied().map(hash_expr).collect();
-    let storage_impl =
-        storage_registry_impl(&format_ident!("ServerRegistry"), &struct_paths);
+    let storage_impl = storage_registry_impl(
+        &format_ident!("ServerRegistry"),
+        &struct_paths,
+        "server-side",
+    );
     let decode_arms = wire_entries.iter().copied().map(decode_arm);
     let execute_arms = wire_entries.iter().copied().map(execute_arm);
 
     Ok(quote! {
+        // The declared server surface is server code: everything below
+        // rides the schema crate's `server-side` feature, so a client build
+        // (`default-features = false, features = ["client-side"]`) never
+        // compiles the dispatch arms or the `#[server]` steps they name.
+        // And a browser artifact must never carry them at all — refuse the
+        // misconfiguration outright instead of shipping it.
+        #[cfg(all(target_arch = "wasm32", feature = "server-side"))]
+        ::core::compile_error!(
+            "`expose_server!` (the node dispatch and every `#[server]` body) \
+             must never reach a wasm32 artifact: depend on the schema crate \
+             with `default-features = false, features = [\"client-side\"]` \
+             for browser builds"
+        );
+
         /// The node-side registry `expose_server!` declared: exactly the
         /// listed items are wire-reachable, dispatched by a per-hash `match`.
+        #[cfg(feature = "server-side")]
         #[derive(Debug, Clone, Copy)]
         pub struct ServerRegistry;
 
         /// What a node's `.registry(…)` takes — the declared surface.
+        #[cfg(feature = "server-side")]
         pub const REGISTRY: ServerRegistry = ServerRegistry;
 
+        #[cfg(feature = "server-side")]
         impl ::wavedb_core::expose::Exposure for ServerRegistry {
             fn knows(&self, struct_hash: u64) -> bool {
                 [#(#hashes),*].contains(&struct_hash)
@@ -242,18 +274,24 @@ pub fn expand_client(input: TokenStream) -> syn::Result<TokenStream> {
         .filter(|e| e.kind != Kind::Fn)
         .map(|e| &e.path)
         .collect();
-    let storage_impl =
-        storage_registry_impl(&format_ident!("ClientRegistry"), &struct_paths);
+    let storage_impl = storage_registry_impl(
+        &format_ident!("ClientRegistry"),
+        &struct_paths,
+        "client-side",
+    );
 
     Ok(quote! {
         /// The client-side allowlist `expose_client!` declared: which items
         /// this binary's typed stubs may route (stubs land with `#[server]`).
+        #[cfg(feature = "client-side")]
         #[derive(Debug, Clone, Copy)]
         pub struct ClientRegistry;
 
         /// The declared client surface.
+        #[cfg(feature = "client-side")]
         pub const CLIENT_REGISTRY: ClientRegistry = ClientRegistry;
 
+        #[cfg(feature = "client-side")]
         impl ::wavedb_core::expose::Exposure for ClientRegistry {
             fn knows(&self, struct_hash: u64) -> bool {
                 [#(#hashes),*].contains(&struct_hash)
