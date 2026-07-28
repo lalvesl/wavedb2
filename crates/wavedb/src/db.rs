@@ -63,9 +63,10 @@ impl Db {
 
     /// [`connect`](Self::connect) plus a local write-through cache at the
     /// **default location** for `app`: natively the journal + `data.bin`
-    /// engine under the platform cache base (`<base>/wavedb/<app>`, created
-    /// automatically — see [`crate::cache::default_dir`]); in the browser the
-    /// IndexedDB database `wavedb-<app>`.
+    /// engine under the platform cache base (`<base>/<app>` — `app` is the
+    /// leaf directly under the base, created automatically; see
+    /// [`crate::cache::default_dir`]); in the browser the IndexedDB database
+    /// named exactly `app`.
     ///
     /// `registry` is the schema crate's `CLIENT_REGISTRY`: the declared
     /// client surface names exactly the types the native engine registers
@@ -111,10 +112,12 @@ impl Db {
         Ok(db)
     }
 
-    /// [`connect`](Self::connect) plus the IndexedDB write-through cache
-    /// `wavedb-<app>`. The `registry` parameter is unused here (the browser
-    /// store is a flat `Id → bytes` map, no per-type slots) — it exists so
-    /// application code spells the call identically on both targets.
+    /// [`connect`](Self::connect) plus the IndexedDB write-through cache in
+    /// the database named exactly `app` (no forced prefix — the developer
+    /// chooses the whole name, matching the native `<base>/<app>` leaf). The
+    /// `registry` parameter is unused here (the browser store is a flat
+    /// `Id → bytes` map, no per-type slots) — it exists so application code
+    /// spells the call identically on both targets.
     ///
     /// # Errors
     /// [`Error::Core`] (`Backend`) when IndexedDB is unavailable or refuses
@@ -128,9 +131,7 @@ impl Db {
         app: &str,
     ) -> Result<Self> {
         let _ = registry;
-        let store = CacheStore::open(&format!("wavedb-{app}"))
-            .await
-            .map_err(Error::Core)?;
+        let store = CacheStore::open(app).await.map_err(Error::Core)?;
         let mut db = Self::connect(addr, user, tenant).await?;
         db.cache = Some(Arc::new(store));
         Ok(db)

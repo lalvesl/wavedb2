@@ -10,10 +10,13 @@
 //!   write is durable at the moment the op resolves — read-your-writes needs
 //!   no extra flush. The default location is created automatically under the
 //!   platform cache base (`$XDG_CACHE_HOME` / `~/.cache` on unix,
-//!   `%LOCALAPPDATA%` on Windows) as `<base>/wavedb/<app>`.
+//!   `%LOCALAPPDATA%` on Windows) as `<base>/<app>` — `app` names its own
+//!   directory directly under the base (the XDG convention), with no extra
+//!   `wavedb/` component in between.
 //! - **wasm** — `IdbStore`: IndexedDB as a flat `Id → wire bytes` map
 //!   (no pages, no journal — IndexedDB is already a durable transactional
-//!   store), database name `wavedb-<app>`.
+//!   store), database named exactly `app` (the developer chooses the whole
+//!   name — no forced prefix, mirroring the native `<app>` leaf).
 //!
 //! One process, one open native cache: the engine's per-type state lives in
 //! `StructStorage` statics, so a `Db::open` client and an in-process node
@@ -38,9 +41,12 @@ pub type CacheStore = wavedb_storage::PageStore;
 #[cfg(target_arch = "wasm32")]
 pub type CacheStore = IdbStore;
 
-/// Resolve `<platform cache base>/wavedb/<app>` — the directory
-/// [`Db::open`](crate::Db::open) roots the native cache engine in. The
-/// engine creates the whole path on first open.
+/// Resolve `<platform cache base>/<app>` — the directory
+/// [`Db::open`](crate::Db::open) roots the native cache engine in.
+///
+/// `app` is the leaf directly under the base (XDG-style: each app owns its
+/// own cache dir, no shared `wavedb/` parent). The engine creates the whole
+/// path on first open.
 ///
 /// # Errors
 /// [`Error::Core`](crate::Error::Core) (`Backend`) when no cache base is
@@ -67,7 +73,7 @@ pub fn default_dir(app: &str) -> crate::Result<std::path::PathBuf> {
              LOCALAPPDATA/APPDATA (windows), or use Db::open_at",
         ))
     })?;
-    Ok(base.join("wavedb").join(app))
+    Ok(base.join(app))
 }
 
 /// Open the native cache engine rooted at `dir`, registering exactly the
@@ -93,7 +99,8 @@ mod tests {
     #[test]
     fn default_dir_is_rooted_under_the_platform_cache_base() {
         let dir = super::default_dir("demo-app").unwrap();
-        assert!(dir.ends_with("wavedb/demo-app"));
+        // `app` is the leaf directly under the base — no `wavedb/` parent.
+        assert!(dir.ends_with("demo-app"));
         let base = std::env::var_os("XDG_CACHE_HOME").map_or_else(
             || {
                 std::path::PathBuf::from(std::env::var_os("HOME").unwrap())

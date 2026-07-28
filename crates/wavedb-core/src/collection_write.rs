@@ -9,11 +9,13 @@ use crate::id::Id;
 use crate::index::{BpTree, Pivot, SecKey};
 use crate::local_id::LocalId;
 use crate::metadata::Metadata;
+use crate::notify::{Mutation, MutationKind};
 use crate::record::{
     Overlay, encode_record, mint_timestamped_id, plan_chained_save,
 };
 use crate::store::{Store, Write};
 use crate::traits::NonUniqueStruct;
+use crate::wire::to_wire;
 
 impl<T: NonUniqueStruct> Collection<T> {
     /// When any tree root moved, append the `Pivot` rewrite carrying them all.
@@ -84,7 +86,16 @@ impl<T: NonUniqueStruct> Collection<T> {
             pivot.dead(),
             &secs,
         );
-        store.apply(&batch).await
+        store.apply(&batch).await?;
+        store.note_mutation(|| Mutation {
+            struct_hash: T::STRUCT_HASH,
+            tenant: self.tenant(),
+            pivot: Some(self.pivot()),
+            id,
+            kind: MutationKind::Saved,
+            body: to_wire(value),
+        });
+        Ok(())
     }
 
     /// Remove the record at `id` from the living set: de-indexes it from
@@ -126,6 +137,14 @@ impl<T: NonUniqueStruct> Collection<T> {
             &secs,
         );
         store.apply(&batch).await?;
+        store.note_mutation(|| Mutation {
+            struct_hash: T::STRUCT_HASH,
+            tenant: self.tenant(),
+            pivot: Some(self.pivot()),
+            id,
+            kind: MutationKind::Removed,
+            body: Vec::new(),
+        });
         Ok(true)
     }
 
@@ -196,6 +215,15 @@ impl<T: NonUniqueStruct> Collection<T> {
                 &secs,
             );
         }
-        store.apply(&batch).await
+        store.apply(&batch).await?;
+        store.note_mutation(|| Mutation {
+            struct_hash: T::STRUCT_HASH,
+            tenant: self.tenant(),
+            pivot: Some(self.pivot()),
+            id,
+            kind: MutationKind::Saved,
+            body: to_wire(value),
+        });
+        Ok(())
     }
 }
