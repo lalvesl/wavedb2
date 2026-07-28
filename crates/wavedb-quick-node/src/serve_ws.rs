@@ -8,7 +8,10 @@
 //!
 //! - the **client** — [`Call`](ClientMsg::Call)s (gates 2–3, answered by
 //!   `Item*`/`End`, FIFO per connection) and
-//!   [`Subscribe`](ClientMsg::Subscribe)/[`Unsubscribe`](ClientMsg::Unsubscribe);
+//!   [`Subscribe`](ClientMsg::Subscribe)/[`Unsubscribe`](ClientMsg::Unsubscribe),
+//!   each acked with a [`TopicOk`](ServerMsg::TopicOk) once applied (FIFO ⇒
+//!   an acked watch cannot miss a later mutation); an **anonymous**
+//!   `Subscribe` is refused by closing the connection;
 //! - the **event channel** — mutations the [`NotifyStore`] pushed for this
 //!   connection's subscriptions, forwarded verbatim.
 //!
@@ -151,9 +154,14 @@ where
         }
         FromClient::Msg(ClientMsg::Subscribe(topic)) => {
             // Only an authenticated caller may watch a tenant's data; an
-            // anonymous connection (public functions only) subscribes to
-            // nothing.
-            if !caller.is_anonymous() && topics.insert(topic) {
+            // anonymous connection (public functions only) asking to is a
+            // protocol violation — refused loudly (close), never silently
+            // ignored (a client waiting on the ack must not hang).
+            if caller.is_anonymous() {
+                close(write).await;
+                return Err(wavedb_net::Error::Http("anonymous subscribe"));
+            }
+            if topics.insert(topic) {
                 subs.borrow_mut().subscribe(
                     caller.tenant,
                     topic,
@@ -161,11 +169,15 @@ where
                     event_tx.clone(),
                 );
             }
+            // FIFO ack: once this arrives the subscription is live, so a
+            // watcher established before a mutation cannot miss its event.
+            send(write, &ServerMsg::TopicOk(topic)).await?;
         }
         FromClient::Msg(ClientMsg::Unsubscribe(topic)) => {
             if topics.remove(&topic) {
                 subs.borrow_mut().unsubscribe(caller.tenant, topic, conn);
             }
+            send(write, &ServerMsg::TopicOk(topic)).await?;
         }
         // A second `Hello` is a protocol violation — end the session.
         FromClient::Msg(ClientMsg::Hello(_)) => {
