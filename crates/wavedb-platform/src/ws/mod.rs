@@ -23,9 +23,21 @@ pub mod codec;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{Conn, connect};
+pub use native::{Conn, RecvHalf, SendHalf, connect};
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 #[cfg(target_arch = "wasm32")]
-pub use wasm::{Conn, connect};
+pub use wasm::{Conn, RecvHalf, SendHalf, connect};
+
+/// One message off the receiving half of a split connection
+/// ([`Conn::split`]): a binary payload, or a ping the sending half must
+/// answer ([`SendHalf::pong`] — surfaced on native only; the browser pongs
+/// itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Received {
+    /// A binary message — a `wavedb-net` envelope.
+    Binary(Vec<u8>),
+    /// A ping to answer.
+    Ping(Vec<u8>),
+}

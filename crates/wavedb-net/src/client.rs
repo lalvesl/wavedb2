@@ -42,6 +42,13 @@ impl NetClient {
         Self { addr: addr.into() }
     }
 
+    /// The node address this client is bound to — what a sibling transport
+    /// (the WebSocket [`WsSession`](crate::WsSession)) dials.
+    #[must_use]
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+
     /// POST the request and return the response's frame reader.
     async fn exchange(
         &self,
