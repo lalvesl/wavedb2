@@ -64,6 +64,10 @@ pub fn wavedb(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     Order { save: audited_save, remove: never }, // harden / exclude ops
 /// }
 /// ```
+///
+/// The whole emission rides the schema crate's **`server-side`** feature
+/// (declare it in `[features]`): a client build that disables it compiles
+/// none of this — see the `#[server]` docs for the side-feature contract.
 #[proc_macro]
 pub fn expose_server(input: TokenStream) -> TokenStream {
     expose::expand_server(input.into())
@@ -74,6 +78,10 @@ pub fn expose_server(input: TokenStream) -> TokenStream {
 /// Declare the client-side allowlist: which items this binary's typed stubs
 /// may route (emits `CLIENT_REGISTRY`). No per-op overrides — those shape
 /// the server surface.
+///
+/// The whole emission rides the schema crate's **`client-side`** feature
+/// (declare it in `[features]`) — the mirror of `expose_server!`'s
+/// `server-side` gate.
 #[proc_macro]
 pub fn expose_client(input: TokenStream) -> TokenStream {
     expose::expand_client(input.into())
@@ -94,6 +102,17 @@ pub fn expose_client(input: TokenStream) -> TokenStream {
 /// The body's `db` is retyped to the node-side `ServerDb`; the client sees a
 /// stub with the same signature that ships `WaveWire`-encoded args. List the
 /// function in `expose_server!` (as `fn name`) to make it reachable.
+///
+/// **Side features (the leak guarantee).** The schema crate must declare
+/// two cargo features with these exact names, and the expansion gates on
+/// them: the **body + dispatch** compile only under `server-side`, the
+/// **client stub** only under `client-side` (the fn-type and its
+/// `STRUCT_HASH` exist under both — identity is the protocol). A deployed
+/// client depends on the schema with `default-features = false,
+/// features = ["client-side"]`, so server logic is never *compiled* into
+/// its artifact — a stronger guarantee than LTO/dead-code stripping.
+/// Server-only helpers written outside `#[server]` bodies must carry
+/// `#[cfg(feature = "server-side")]` by hand.
 #[proc_macro_attribute]
 pub fn server(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attr = proc_macro2::TokenStream::from(attr);
