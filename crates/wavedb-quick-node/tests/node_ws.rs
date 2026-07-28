@@ -173,15 +173,12 @@ async fn websocket_binds_identity_runs_commands_and_pushes_subscriptions() {
         struct_hash: Note::STRUCT_HASH,
         pivot: Some(node.pivot),
     };
+    // Each Subscribe is acked once applied (FIFO) — the ack IS the barrier
+    // proving both subscriptions are live before alice mutates anything.
     ws_send(&mut bob, &ClientMsg::Subscribe(anchor)).await;
+    assert_eq!(ws_recv(&mut bob).await, ServerMsg::TopicOk(anchor));
     ws_send(&mut bob, &ClientMsg::Subscribe(collection)).await;
-    // Barrier: a round-trip on bob's own FIFO connection proves both
-    // Subscribes were processed before alice mutates anything.
-    let get = frame(AboutUser::STRUCT_HASH, Command::Get, Vec::new());
-    assert_eq!(
-        ws_call(&mut bob, get).await.1,
-        Response::Ok(Reply::Value(None))
-    );
+    assert_eq!(ws_recv(&mut bob).await, ServerMsg::TopicOk(collection));
 
     // Alice saves a Unique record; bob sees it (exact topic, body, anchor id).
     let ada = AboutUser {
@@ -240,12 +237,8 @@ async fn unsubscribe_isolates_topics(
         pivot: Some(node.pivot),
     };
     ws_send(bob, &ClientMsg::Unsubscribe(collection)).await;
-    // Barrier: a round-trip proves the Unsubscribe landed.
-    let get = frame(AboutUser::STRUCT_HASH, Command::Get, Vec::new());
-    assert!(matches!(
-        ws_call(bob, get).await.1,
-        Response::Ok(Reply::Value(Some(_)))
-    ));
+    // The ack proves the Unsubscribe landed before the insert below.
+    assert_eq!(ws_recv(bob).await, ServerMsg::TopicOk(collection));
 
     // A collection insert bob must NOT hear about.
     let insert = frame(
