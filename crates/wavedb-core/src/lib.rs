@@ -35,6 +35,7 @@ pub mod id;
 pub mod index;
 pub mod local_id;
 pub mod metadata;
+pub mod notify;
 pub mod overlay;
 pub mod permission;
 pub mod record;
@@ -63,6 +64,7 @@ pub use index::{
 };
 pub use local_id::LocalId;
 pub use metadata::Metadata;
+pub use notify::{Mutation, MutationKind};
 pub use permission::PermissionRef;
 pub use store::{Store, Write};
 pub use traits::{

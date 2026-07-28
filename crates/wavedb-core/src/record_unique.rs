@@ -75,7 +75,16 @@ where
         None,
     )
     .await?;
-    store.apply(&writes).await
+    store.apply(&writes).await?;
+    store.note_mutation(|| crate::notify::Mutation {
+        struct_hash: T::STRUCT_HASH,
+        tenant,
+        pivot: None,
+        id: anchor,
+        kind: crate::notify::MutationKind::Saved,
+        body: crate::wire::to_wire(value),
+    });
+    Ok(())
 }
 
 /// Stream a `Unique` record's versions **newest-first** (the live record,
