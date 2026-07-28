@@ -27,7 +27,9 @@
 use wavedb_core::expose::{Caller, Exposure};
 use wavedb_core::{Error, Store};
 use wavedb_net::auth::{self, TokenPurpose};
-use wavedb_net::frame::{Auth, NodeError, NodeErrorKind, Request, Response};
+use wavedb_net::frame::{
+    Auth, CommandFrame, NodeError, NodeErrorKind, Request, Response,
+};
 
 /// The uniform identity refusal — which check failed stays server-side.
 fn unauthorized(struct_hash: u64) -> Response {
@@ -40,8 +42,10 @@ fn unauthorized(struct_hash: u64) -> Response {
 
 /// Gate 1: resolve the request's identity claim into the [`Caller`] the
 /// engine executes as. `Err(())` = refuse (bad/expired/foreign token, or a
-/// token before the node has a secret).
-fn identify(auth: &Auth, secret: &[u8; 32]) -> Result<Caller, ()> {
+/// token before the node has a secret). Shared by the HTTP path
+/// ([`handle`]) and the WebSocket `Hello` (`serve_ws`), which binds it once
+/// for the connection.
+pub(crate) fn identify(auth: &Auth, secret: &[u8; 32]) -> Result<Caller, ()> {
     match auth {
         Auth::Anonymous { tenant } => Ok(Caller::anonymous(*tenant)),
         Auth::Token(token) => {
@@ -80,7 +84,25 @@ where
     let Ok(caller) = identify(&auth, secret) else {
         return unauthorized(frame.struct_hash);
     };
+    execute(registry, store, caller, frame).await
+}
 
+/// Gates 2–3 for an already-identified [`Caller`].
+///
+/// The shared tail of the HTTP [`handle`] and the WebSocket session's `Call`
+/// (whose caller was bound once at `Hello`, so gate 1 does not repeat per
+/// message). Never returns a transport error: a refusal or engine fault is
+/// the [`Response::Err`] arm.
+pub async fn execute<E, S>(
+    registry: &E,
+    store: &S,
+    caller: Caller,
+    frame: CommandFrame,
+) -> Response
+where
+    E: Exposure,
+    S: Store,
+{
     // Gate 2 — header check. `execute` would also refuse an unlisted hash,
     // but the explicit gate short-circuits and keeps the refusal uniform.
     if !registry.knows(frame.struct_hash) {
