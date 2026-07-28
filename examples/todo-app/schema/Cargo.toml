@@ -9,16 +9,29 @@ publish = false
 [lints]
 workspace = true
 
+# Which side(s) of the schema this build carries — the macros gate their
+# emission on these exact names (`#[server]` bodies + `expose_server!` under
+# `server-side`; client stubs + `expose_client!` under `client-side`). Both
+# are on by default so this crate's own tests drive the full loop; a deployed
+# binary depends with `default-features = false` and exactly its side, so the
+# other side's code is never even COMPILED into its artifact (the leak
+# guarantee — LTO/DCE is not relied on). Server-only deps ride `server-side`.
+[features]
+default = ["server-side", "client-side"]
+server-side = ["dep:sha2", "dep:futures"]
+client-side = []
+
 [dependencies]
 # The one dependency an app schema names: re-exports the derives, the
 # expose_*! declaration macros, the prelude, and the Db/ServerDb handles.
 wavedb = { path = "../../../crates/wavedb" }
 # The derive-emitted code names ::wavedb_core:: paths directly.
 wavedb-core = { path = "../../../crates/wavedb-core" }
-# Placeholder credential hashing (real Argon2 lands with M8 auth).
-sha2.workspace = true
-# Stream combinators for the stream-returning `all_todos`.
-futures.workspace = true
+# Placeholder credential hashing (real Argon2 lands with M8 auth) — used
+# only inside `#[server]` bodies, so it rides `server-side`.
+sha2 = { workspace = true, optional = true }
+# Stream combinators for the stream-returning `all_todos` (server body).
+futures = { workspace = true, optional = true }
 
 # `#[wavedb]` emits each type's native storage slot (`StructStorage`
 # statics), so on non-wasm targets a schema crate links the engine crate

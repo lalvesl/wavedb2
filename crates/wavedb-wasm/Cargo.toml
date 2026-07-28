@@ -30,10 +30,17 @@ wavedb-net = { path = "../wavedb-net" }
 
 [dev-dependencies]
 wasm-bindgen-test = { workspace = true }
+# Schema crates ride in CLIENT SIDE ONLY (`default-features = false`): a
+# browser artifact must never compile `expose_server!`/`#[server]` bodies —
+# `expose_server!` even hard-refuses (compile_error!) wasm32 + server-side.
 # The browser test drives the typed surface (LocalHandle + Collection)
 # over `IdbStore` with a real schema crate — serverless mode.
-schema-smoke = { path = "../../examples/schema-smoke" }
+schema-smoke = { path = "../../examples/schema-smoke", default-features = false, features = [
+  "client-side",
+] }
 # The live-node demo (the M5 exit) drives contact-book's exposed schema
 # against a running node — see `tests/live_node.rs`.
-contact-book = { path = "../../examples/contact-book" }
+contact-book = { path = "../../examples/contact-book", default-features = false, features = [
+  "client-side",
+] }
 futures = { workspace = true }

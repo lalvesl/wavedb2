@@ -10,7 +10,11 @@ publish = false
 workspace = true
 
 [dependencies]
-todo-app-schema = { path = "../schema" }
+# Server side only: the client stubs and their registry are not compiled
+# into the node binary — the two sides are asymmetric on purpose.
+todo-app-schema = { path = "../schema", default-features = false, features = [
+  "server-side",
+] }
 wavedb-quick-node = { path = "../../../crates/wavedb-quick-node" }
 tokio.workspace = true
 # Binary-level error reporting (apps aren't layers; anyhow is fine here).

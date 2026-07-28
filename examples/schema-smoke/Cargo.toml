@@ -9,6 +9,14 @@ publish = false
 [lints]
 workspace = true
 
+# The schema side features the expose macros gate on (see todo-app-schema
+# for the full story). Both on by default — this crate's tests exercise both
+# registries; `wavedb-wasm`'s browser test pulls `client-side` only.
+[features]
+default = ["server-side", "client-side"]
+server-side = []
+client-side = []
+
 [dependencies]
 wavedb-core = { path = "../../crates/wavedb-core" }
 wavedb-macros = { path = "../../crates/wavedb-macros" }

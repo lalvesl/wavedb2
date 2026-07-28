@@ -10,7 +10,14 @@ publish = false
 workspace = true
 
 [dependencies]
-todo-app-schema = { path = "../schema" }
+# Client side only: `#[server]` bodies, the node dispatch, and the
+# server-only helpers are NOT compiled into this binary. The guarantee
+# applies to this package's own build graph (`cargo build -p
+# todo-app-client`) — a `--workspace` build unifies features with the
+# schema's default-on test build.
+todo-app-schema = { path = "../schema", default-features = false, features = [
+  "client-side",
+] }
 wavedb = { path = "../../../crates/wavedb" }
 tokio.workspace = true
 # Binary-level error reporting (apps aren't layers; anyhow is fine here).
