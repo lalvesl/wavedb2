@@ -8,6 +8,11 @@
 //! it inside the Unique holder. After that the client reads the holder with
 //! `ContactBook::get(&db)` and drives the collection directly — `Contact` is
 //! listed in both exposures, so its collection commands are wire-reachable.
+//!
+//! **Sides.** The `server-side`/`client-side` features pick what a build
+//! carries (both by default; the browser demo pulls `client-side` only, so
+//! the `#[server]` bodies never reach the wasm artifact — see the features
+//! table in `Cargo.toml` and the todo-app schema for the full story).
 
 // The typed handle futures hold `&Db` across awaits — non-Send by design
 // (current-thread model), the workspace stance.
