@@ -43,6 +43,7 @@ mod db;
 mod error;
 mod reply;
 mod server_db;
+pub mod watch;
 
 pub use auth::TokenPair;
 pub use cache::CacheStore;
@@ -51,6 +52,7 @@ pub use cache::IdbStore;
 pub use db::Db;
 pub use error::{Error, Result};
 pub use server_db::ServerDb;
+pub use watch::{CollectionWatch, UniqueWatch, WatchEvent};
 
 // The compile-time front door, re-exported so a schema crate names one
 // dependency: `wavedb::wavedb` / `wavedb::server` / `wavedb::expose_*!`.
@@ -58,7 +60,9 @@ pub use wavedb_macros::{expose_client, expose_server, server, wavedb};
 
 /// Everything an application touches, in one glob.
 pub mod prelude {
-    pub use crate::{Db, Error, Result, ServerDb};
+    pub use crate::{
+        CollectionWatch, Db, Error, Result, ServerDb, UniqueWatch, WatchEvent,
+    };
 
     // The declaration + object macros (one import surface for schema crates).
     pub use wavedb_macros::{expose_client, expose_server, server, wavedb};

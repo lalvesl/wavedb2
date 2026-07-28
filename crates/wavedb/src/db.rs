@@ -157,14 +157,29 @@ impl Db {
         self
     }
 
-    /// The identity claim each request ships.
-    fn auth(&self) -> wavedb_net::Auth {
+    /// The identity claim each request ships (also presented once as the
+    /// WebSocket `Hello` by [`crate::watch`]).
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) fn auth(&self) -> wavedb_net::Auth {
         self.access_token.clone().map_or(
             wavedb_net::Auth::Anonymous {
                 tenant: self.tenant,
             },
             wavedb_net::Auth::Token,
         )
+    }
+
+    /// The node address this handle is bound to.
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) fn addr(&self) -> &str {
+        self.client.addr()
+    }
+
+    /// Whether this handle carries an access token — the node refuses
+    /// anonymous subscriptions, so a watch requires one.
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) const fn has_token(&self) -> bool {
+        self.access_token.is_some()
     }
 
     /// A handle to the **same node** scoped to a different `tenant` — the
