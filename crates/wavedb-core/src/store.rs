@@ -65,6 +65,50 @@ pub trait Store {
 
     /// Apply a batch of writes atomically (all-or-nothing).
     async fn apply(&self, batch: &[Write]) -> Result<()>;
+
+    /// Observe one committed mutation — the write paths call this right
+    /// after the op's `apply` resolves, carrying the op-level meaning a
+    /// raw batch cannot (see [`crate::notify`]). The default does nothing
+    /// and drops `mutation` unbuilt, so ordinary stores pay nothing; the
+    /// node's event-routing wrapper overrides it (M7 push).
+    fn note_mutation(
+        &self,
+        mutation: impl FnOnce() -> crate::notify::Mutation,
+    ) {
+        let _ = mutation;
+    }
+}
+
+/// A shared store is a store: every method forwards through the [`Rc`]. This
+/// lets a wrapper own its backend by value (`W<Rc<S>>`) while another handle
+/// — a maintenance loop, a seeding path — keeps its own clone of the same
+/// engine. Single-thread by design (the engine futures are non-`Send`), so
+/// [`Rc`] not [`Arc`].
+///
+/// [`Rc`]: std::rc::Rc
+impl<S: Store + ?Sized> Store for std::rc::Rc<S> {
+    async fn get(&self, id: Id) -> Result<Option<Vec<u8>>> {
+        (**self).get(id).await
+    }
+
+    async fn get_of(
+        &self,
+        struct_hash: u64,
+        id: Id,
+    ) -> Result<Option<Vec<u8>>> {
+        (**self).get_of(struct_hash, id).await
+    }
+
+    async fn apply(&self, batch: &[Write]) -> Result<()> {
+        (**self).apply(batch).await
+    }
+
+    fn note_mutation(
+        &self,
+        mutation: impl FnOnce() -> crate::notify::Mutation,
+    ) {
+        (**self).note_mutation(mutation);
+    }
 }
 
 #[cfg(test)]
