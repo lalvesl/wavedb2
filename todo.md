@@ -182,6 +182,8 @@ The developer surface — what `examples/todo-app` is written against.
 
 ## M7 — live sync (WebSocket lands here)
 
+Task log in [PLAN — M7 live sync](#plan--m7-live-sync) at the end.
+
 - WebSocket transport: token once at handshake, connection-bound identity;
   push notifications; HTTP piggyback + idle-tick fallback for POST clients;
 - screen-sync as **declared subscriptions + journal cursor** (client event
@@ -344,8 +346,9 @@ Deliberately left as later seams:
   `wavedb-wasm` into `wavedb::cache` — the wasm crate re-exports it).
   What landed:
   - `Db::open(CLIENT_REGISTRY, addr, user, tenant, app)` both targets
-    (`app` → auto-created `$XDG_CACHE_HOME|~/.cache/wavedb/<app>` or
-    `%LOCALAPPDATA%`, IndexedDB `wavedb-<app>`), native `open_at(…, dir)`,
+    (`app` → auto-created `$XDG_CACHE_HOME|~/.cache/<app>` or
+    `%LOCALAPPDATA%/<app>`, IndexedDB database named exactly `<app>`), native
+    `open_at(…, dir)`,
     and `db.local()` (the cache's direct `LocalHandle` surface);
   - **semantics: node-first** (chosen over local-first + revalidation —
     every successful read IS the revalidation; Bloom screen-sync discarded
@@ -369,6 +372,41 @@ Deliberately left as later seams:
     warms, refused writes don't touch the cache), browser suite +
     `browser_demo.sh` re-run green with the moved `IdbStore` and new
     `All` frames.
+
+- **Schema side features — LANDED (2026-07-13, user-directed)**: the
+  server-code no-leak guarantee, stronger than LTO/DCE. A crate expanding
+  `#[server]` / `expose_server!` / `expose_client!` declares cargo features
+  named exactly `server-side` / `client-side`; the macros gate emission on
+  them — body + `__wavedb_dispatch` + the whole `expose_server!` output
+  under `server-side`, client stubs + `expose_client!` under `client-side`,
+  the fn-type/`STRUCT_HASH` and all `#[wavedb]` struct machinery under both
+  (the schema IS the protocol). The client/schema/server crate split stays
+  (each side may carry unrelated code — jobs, UI); deployed binaries pull
+  the schema `default-features = false` + their side, so the other side is
+  never *compiled* in; defaults keep both on for the schema's own tests.
+  Hand-written server-only helpers carry the cfg themselves (todo-app,
+  schema-smoke show the pattern); `expose_server!` `compile_error!`s any
+  wasm32 + `server-side` build; `wavedb-wasm` pulls its schema dev-deps
+  client-side only. Proven: debug `todo-app-server` carries the body
+  strings, `todo-app-client` carries none; contract in
+  `docs/development_standards.md` + the macros README.
+- **M7 W1–W4 LANDED (2026-07-11)** — the WebSocket transport + node push,
+  a complete tested vertical slice (task log in
+  [PLAN — M7 live sync](#plan--m7-live-sync)). Hand-rolled RFC 6455 in the
+  same dumb-tunnel stance as the HTTP POST tunnel (`sha1` the one new dep;
+  the Phase-11 `tokio-tungstenite`/`gloo-net`/`axum` stay unused). What
+  landed: `wavedb_platform::ws` (codec + native handshake + browser
+  `WebSocket` bridge, one surface two targets); `wavedb_net::ws` envelopes
+  + the `http` head parser routing `GET`+`Upgrade` alongside POST; the core
+  `Store::note_mutation` seam (+ `core::notify::Mutation`, + blanket
+  `impl Store for Rc<S>`); and the node's `SubTable`/`NotifyStore` +
+  `serve_ws` session loop (identity bound once at `Hello`, exact-topic push,
+  FIFO `Call`s, `dispatch::execute` shared with HTTP). Proven by
+  `node_ws.rs` (two connections, real frames, subscription events + an
+  `Unsubscribe` isolation check). Next: **W5** — the client `WsSession` +
+  `Db::watch_*` sugar mirroring events into the M6 cache, and the two-client
+  exit e2e; then W6 (journal-cursor catch-up), W7 (HTTP piggyback), W8
+  (offline write queue).
 
 _Workspace green (both targets): fmt + clippy (pedantic + nursery) clean,
 tests green, file-length gate passing. Members: wire, wire-derive, platform,
@@ -742,3 +780,140 @@ A `data.bin` with no journal present is corrupt (refuse).
       crash after Commit before delete (old journal skipped); multi
       rotation; untouched-type roots survive a commit that never touched
       them; cold open reads via chains.
+
+# PLAN — M7 live sync
+
+Grounded in the code as of 2026-07-11. Exit: **client A saves; client B's
+watcher fires within one round-trip (WS) / one poll tick (HTTP)**.
+Dependency chain: W1 → W2 → W3 → W4 → W5 (the WS half of the exit);
+W6/W7/W8 follow independently. Each task lands green (fmt + clippy + tests
++ file gate) and moves to `todo_done.md` prose when done.
+
+Standing decision: WebSocket is **hand-rolled RFC 6455**, same stance as
+the HTTP tunnel — binary messages only as API, no extensions, no
+subprotocols; the workspace's Phase-11 `tokio-tungstenite` / `gloo-net` /
+`axum` declarations stay unused exactly like `reqwest` did when the POST
+tunnel was hand-rolled. Sharing the POST port (routing on `GET` + `Upgrade`
+in the same head parser) falls out for free. One new dep: `sha1`
+(RustCrypto, the family `hmac`/`sha2` already come from) for the RFC 6455
+accept key; base64 is a ~20-line encode (encode-only, no alphabet variants).
+
+## W1 — WebSocket primitives (`wavedb-platform::ws`) — **DONE (2026-07-11)**
+
+- [x] Frame codec (`ws/codec.rs`, native, shared with the server half):
+      read/write over `AsyncRead`/`AsyncWrite` — binary/continuation
+      reassembly (browsers may fragment), ping/pong, close; client→server
+      frames masked, server→client unmasked (per RFC — the server refuses
+      unmasked data frames); payload cap `MAX_MESSAGE`. `accept_key` +
+      an encode-only `base64` (no dep). One new dep: `sha1`.
+- [x] `ws::connect(addr) -> Conn` cfg-switched like `http::post`:
+      native = fresh `TcpStream` + client handshake (key from platform
+      entropy, `Sec-WebSocket-Accept` verified); wasm = `web-sys`
+      `WebSocket` (`binaryType = arraybuffer`, events bridged to a
+      `futures::channel` — the `idb.rs` closure pattern, closures held for
+      the connection). Same surface both targets: `send(bytes)` /
+      `recv() -> Option<Vec<u8>>` / `close()`; `recv` answers pings
+      internally.
+- [x] Unit tests: RFC 6455 §1.3 accept-key worked example, base64
+      alignment vectors, masked roundtrip across all length forms,
+      fragmented reassembly across a ping, oversized refusal, unmasked
+      refusal, clean-close-as-`None`; native loopback echo + handshake +
+      bad-accept + non-upgrade tests.
+
+## W2 — WS envelopes + server upgrade (`wavedb-net`) — **DONE (2026-07-11)**
+
+- [x] Wire messages (`ws.rs`, target-independent):
+      `ClientMsg { Hello(Auth) | Call(CommandFrame) | Subscribe(Topic) |
+      Unsubscribe(Topic) }`, `ServerMsg { HelloOk | Item(Vec<u8>) |
+      End(Response) | Event(RecordEvent) }`,
+      `Topic { struct_hash, pivot: Option<LocalId> }`,
+      `RecordEvent { topic, id, kind: Saved|Removed, body }`. The tenant
+      never rides a topic — it is the connection's bound identity.
+- [x] Server half: the head parser learns `GET` + `Upgrade` (new
+      `read_request -> Incoming::{Post, Upgrade{key}}`; POST path
+      byte-identical, `read_post` retired), `write_switching_head`
+      (101 + accept key); frames pipelined before the 101 are refused.
+
+## W3 — mutation notifications (core seam) — **DONE (2026-07-11)**
+
+- [x] `Store::note_mutation(&self, impl FnOnce() -> Mutation)` — a
+      **provided no-op** on the trait (the closure never runs unless a
+      store overrides it, so ordinary stores never even build the value);
+      `Mutation { struct_hash, tenant, pivot: Option<LocalId>, id,
+      kind: Saved|Removed, body }` in `core::notify`. Called after the one
+      atomic `apply` in `save_unique_as`, `insert_at`, `Collection::save`,
+      `Collection::remove` — the chokepoint every mutation crosses,
+      **including `#[server]` bodies** (they write through `ServerDb` →
+      the same collection layer). Batch-derivation was considered and
+      rejected: a chained save writes up to three same-type record `Put`s
+      (live + fresh archive + repointed archive, metadata-indistinguishable)
+      and a remove may rewrite no record at all — semantics live above the
+      batch. Also landed: blanket `impl Store for Rc<S>` (a shared store is
+      a store) so a wrapper can own its backend by value while a
+      maintenance handle keeps its own clone.
+- [x] Cache mirrors (`Collection::adopt`, the client cache) ride the
+      default no-op — a mirrored write is not a mutation event. Tests prove
+      one event per op, the anchor id for a Unique save, and **nothing** on
+      a failed `apply` or a no-op re-remove.
+
+## W4 — node: subscriptions + push (`wavedb-quick-node`) — **DONE (2026-07-11)**
+
+- [x] `SubTable` + `NotifyStore<S>` (`subscribe.rs`) — concrete wrapper
+      (no `dyn`) forwarding `get`/`get_of`/`apply`, overriding
+      `note_mutation` to route into a `Rc<RefCell<SubTable>>` keyed
+      `(tenant, Topic)` → per-connection `ServerMsg` senders
+      (O(subscribers-of-this-topic), exact match, no scan; dead senders
+      pruned on publish). `Bound` keeps the raw `Rc<PageStore>` for
+      maintenance/seeding/commit and builds the `NotifyStore` per-serve
+      around a clone of that `Rc`.
+- [x] WS session loop (`serve_ws.rs`): 101 handshake → first message must
+      be `Hello` (gate 1 `identify` via the extracted `dispatch::execute`
+      shared with HTTP, else refuse + close) → `select!` over a reader
+      task's decoded messages (frame reads aren't cancel-safe) and the
+      event channel. `Call` runs gates 2–3 + `Item*/End` (FIFO per
+      connection); `Subscribe`/`Unsubscribe` mutate the table under the
+      **caller's** tenant (anonymous callers subscribe to nothing).
+      Disconnect unregisters every subscription of the connection.
+- [x] **Proven** (`tests/node_ws.rs`, one process/one engine, node on its
+      own thread): two identity-bound connections over real RFC 6455 frames
+      (native `ws::connect`) — `Hello`→`HelloOk`, a `Call` walk, a Unique
+      save + a collection insert on one connection push exact-topic
+      `Event`s (right id, decoded body) to the other's declared
+      subscriptions, and an `Unsubscribe` provably stops one topic while
+      the other still fires.
+
+## W5 — client watch + cache sync (`wavedb-net` client, `wavedb`)
+
+- [ ] `WsSession` (net, both targets): platform `ws::connect` + `Hello` →
+      `HelloOk`, `subscribe(topic)`, `next_event()`.
+- [ ] `Db::watch_unique::<T>()` / `Db::watch_collection::<T>(pivot)` —
+      each watch owns one WS connection (multiplexing = later refinement);
+      events **mirror into the M6 cache** (`mirror_unique` /
+      `mirror_record` / `mirror_remove`) before yielding, so a watcher
+      keeps the local store warm — the live half of sync. Typed
+      `T::watch(&db)` sugar joins the `T::get(&db)` unification note.
+- [ ] **Exit (WS half) e2e**: two clients on one node — A saves a Unique +
+      inserts/updates/removes in a collection; B's watchers see each event
+      typed, in order, and B's cache answers warm after a node kill.
+
+## W6 — journal cursor catch-up (reconnect)
+
+- [ ] A monotone commit sequence per applied batch, carried on the push
+      stream; reconnect = `Resume { since }` streaming exactly the
+      tenant's deltas after it; a cursor older than the oldest retained
+      journal answers "resync" (the client re-reads its subscriptions).
+      Mechanism decision recorded when the task starts: replaying
+      journal `Batch` frames needs the W3 disambiguation, so the cursor
+      path likely logs `Mutation`s (or resolves live-vs-archive by id).
+
+## W7 — HTTP piggyback + idle tick (POST clients)
+
+- [ ] Per-session (token `session` id) event buffer node-side; the client
+      queue sends empty polls at `http_poll_interval` when idle, backing
+      off; responses piggyback buffered events. The HTTP half of the exit.
+
+## W8 — offline write queue
+
+- [ ] M6's refused offline writes become a durable local queue replayed
+      through the W6 cursor path on reconnect (order kept, node-first
+      semantics preserved: the queue drains before reads trust the node).
