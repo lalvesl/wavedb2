@@ -35,7 +35,10 @@
 pub mod dispatch;
 pub mod error;
 mod serve;
+mod serve_ws;
+mod subscribe;
 
+use std::cell::RefCell;
 use std::future::{Future, pending};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -46,6 +49,8 @@ use wavedb_core::expose::Exposure;
 use wavedb_storage::{PageStore, StorageRegistry};
 
 pub use error::{Result, ServerError};
+
+use subscribe::{NotifyStore, SubTable};
 
 /// A node, configured but not yet bound.
 ///
@@ -85,7 +90,13 @@ impl Default for Maintenance {
 pub struct Bound<E> {
     registry: E,
     listener: TcpListener,
+    /// The raw engine — maintenance, node-side seeding, and the final commit
+    /// drive it directly (the notify wrapper is built per-serve around a
+    /// clone of this `Rc`).
     store: Rc<PageStore>,
+    /// Shared with the serve-time [`NotifyStore`]; the WS session loops
+    /// register their subscriptions here.
+    subs: Rc<RefCell<SubTable>>,
     maintenance: Maintenance,
     secret: [u8; 32],
 }
@@ -157,10 +168,12 @@ where
         );
         let secret = *wavedb_net::auth::node_secret()
             .unwrap_or_else(|| unreachable!("just installed"));
+        let subs = Rc::new(RefCell::new(SubTable::default()));
         Ok(Bound {
             registry: self.registry,
             listener,
             store: Rc::new(store),
+            subs,
             maintenance: self.maintenance,
             secret,
         })
@@ -190,6 +203,8 @@ where
     /// The opened engine — direct access for node-side seeding (e.g. creating
     /// a collection `Pivot` before serving, or admin tooling). Ordinary
     /// requests never touch this; they route through [`run`](Self::run).
+    /// Seeding writes bypass the notify wrapper, so they raise no live
+    /// events — subscriptions predate serving anyway.
     #[must_use]
     pub fn store(&self) -> &PageStore {
         &self.store
@@ -217,13 +232,19 @@ where
         self,
         shutdown: impl Future<Output = ()>,
     ) -> Result<()> {
-        let store = Rc::clone(&self.store);
+        // The serving store publishes mutations; maintenance + the final
+        // commit drive the raw engine underneath it (same `Rc`).
+        let serving = Rc::new(NotifyStore::new(
+            Rc::clone(&self.store),
+            Rc::clone(&self.subs),
+        ));
         serve::run(
             self.listener,
             self.registry,
-            Rc::clone(&store),
+            serving,
             self.secret,
-            maintain(store, self.maintenance),
+            Rc::clone(&self.subs),
+            maintain(Rc::clone(&self.store), self.maintenance),
             shutdown,
         )
         .await?;
