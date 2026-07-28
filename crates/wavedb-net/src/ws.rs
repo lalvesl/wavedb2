@@ -81,6 +81,12 @@ pub enum ServerMsg {
     End(Response),
     /// A subscribed topic's mutation.
     Event(RecordEvent),
+    /// The ack of a [`Subscribe`](ClientMsg::Subscribe) /
+    /// [`Unsubscribe`](ClientMsg::Unsubscribe): messages are handled FIFO,
+    /// so once this arrives the subscription table mutation is live —
+    /// [`WsSession::subscribe`](crate::ws_session::WsSession::subscribe)
+    /// returns a watch that cannot miss a later mutation.
+    TopicOk(Topic),
 }
 
 #[cfg(test)]
@@ -128,6 +134,10 @@ mod tests {
                 id: Id::new(7, U48::from(2u32), false, 1),
                 kind: EventKind::Saved,
                 body: vec![9],
+            }),
+            ServerMsg::TopicOk(Topic {
+                struct_hash: 5,
+                pivot: Some(LocalId::new(2, false, 1)),
             }),
         ] {
             assert_eq!(from_wire::<ServerMsg>(&to_wire(&msg)).unwrap(), msg);

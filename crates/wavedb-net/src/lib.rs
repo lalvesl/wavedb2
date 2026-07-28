@@ -24,6 +24,9 @@
 //! - [`ws`] — the WebSocket envelopes (`Hello`/`Call`/`Subscribe` →
 //!   `Item`/`End`/`Event`), both targets; the server session loop lives in
 //!   `wavedb-quick-node`.
+//! - [`ws_session`] — [`WsSession`], the client half of the WebSocket
+//!   transport (both targets): identity once, acked subscriptions, pushed
+//!   events.
 //! - [`http`] — the server half's minimal HTTP/1.1 framing (native only;
 //!   the client half lives in `wavedb-platform::http`), now also routing
 //!   the WebSocket upgrade.
@@ -44,12 +47,14 @@ pub mod error;
 pub mod frame;
 pub mod frames;
 pub mod ws;
+pub mod ws_session;
 
 pub use client::{Executed, NetClient};
 pub use error::{Error, Result};
 pub use frame::{
     Auth, CommandFrame, NodeError, NodeErrorKind, Request, Response,
 };
+pub use ws_session::WsSession;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod http;
