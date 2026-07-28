@@ -196,7 +196,10 @@ Task log in [PLAN — M7 live sync](#plan--m7-live-sync) at the end.
 - offline write queue replaying through the same cursor path (M6 refuses
   offline writes on purpose — the cache never diverges);
 - **exit:** client A saves; client B's watcher fires within one round-trip
-  (WS) / one poll tick (HTTP).
+  (WS) / one poll tick (HTTP). **The WS half holds (W1–W5 landed
+  2026-07-13)** — `Db::watch_unique`/`watch_collection` push typed events
+  and keep the M6 cache warm; remaining: W6 (reconnect cursor), W7 (the
+  HTTP poll-tick half of the exit), W8 (offline queue).
 
 ## M8 — auth & permission enforcement — LANDED (2026-07-10)
 
@@ -403,10 +406,28 @@ Deliberately left as later seams:
   `serve_ws` session loop (identity bound once at `Hello`, exact-topic push,
   FIFO `Call`s, `dispatch::execute` shared with HTTP). Proven by
   `node_ws.rs` (two connections, real frames, subscription events + an
-  `Unsubscribe` isolation check). Next: **W5** — the client `WsSession` +
-  `Db::watch_*` sugar mirroring events into the M6 cache, and the two-client
-  exit e2e; then W6 (journal-cursor catch-up), W7 (HTTP piggyback), W8
-  (offline write queue).
+  `Unsubscribe` isolation check).
+
+- **M7 W5 LANDED (2026-07-13)** — client watch + cache sync; **the M7
+  exit's WS half holds**: client A saves, client B's watcher fires within
+  one round-trip, typed and in order (`live_watch_e2e.rs`, two processes).
+  What landed: `wavedb_net::WsSession` (both targets: `Hello`→`HelloOk`,
+  acked `subscribe`/`unsubscribe`, `next_event`; buffers events racing an
+  ack); the protocol gained `ServerMsg::TopicOk` — subscription mutations
+  are acked FIFO, so a returned watch **cannot miss** a later mutation
+  (the W4 test's barrier-call pattern retired), and an anonymous
+  `Subscribe` now closes the connection (loud refusal, nothing silent);
+  `Db::watch_unique::<T>()` / `Db::watch_collection::<T>(pivot)` →
+  `UniqueWatch`/`CollectionWatch` yielding `WatchEvent::{Saved(Id, T),
+  Removed(Id)}`, each event **mirrored into the M6 cache before it is
+  yielded** (`mirror_unique`/`mirror_record`/`mirror_remove`) — proven by
+  a post-kill warm walk of a collection the watcher never read online; a
+  token-less handle refuses `watch_*` typed (`Unauthorized`) instead of a
+  dead socket. One WS connection per watch (multiplexing = later
+  refinement); typed `T::watch(&db)` sugar joins the `T::get(&db)`
+  unification note (watch is `Db`-only — no `DbHandle` seam for it yet).
+  Next: W6 (journal-cursor catch-up), W7 (HTTP piggyback), W8 (offline
+  write queue).
 
 _Workspace green (both targets): fmt + clippy (pedantic + nursery) clean,
 tests green, file-length gate passing. Members: wire, wire-derive, platform,
@@ -882,19 +903,30 @@ accept key; base64 is a ~20-line encode (encode-only, no alphabet variants).
       subscriptions, and an `Unsubscribe` provably stops one topic while
       the other still fires.
 
-## W5 — client watch + cache sync (`wavedb-net` client, `wavedb`)
+## W5 — client watch + cache sync — **DONE (2026-07-13)**
 
-- [ ] `WsSession` (net, both targets): platform `ws::connect` + `Hello` →
-      `HelloOk`, `subscribe(topic)`, `next_event()`.
-- [ ] `Db::watch_unique::<T>()` / `Db::watch_collection::<T>(pivot)` —
+- [x] `WsSession` (net, both targets): platform `ws::connect` + `Hello` →
+      `HelloOk`, `subscribe(topic)`, `next_event()`. Landed with a protocol
+      addition: `ServerMsg::TopicOk` acks `Subscribe`/`Unsubscribe` (FIFO ⇒
+      the ack proves the table mutation is live), events racing an ack are
+      buffered, and an anonymous `Subscribe` closes the connection instead
+      of being silently ignored. Loopback unit tests (ack buffering,
+      refused hello).
+- [x] `Db::watch_unique::<T>()` / `Db::watch_collection::<T>(pivot)` —
       each watch owns one WS connection (multiplexing = later refinement);
       events **mirror into the M6 cache** (`mirror_unique` /
       `mirror_record` / `mirror_remove`) before yielding, so a watcher
-      keeps the local store warm — the live half of sync. Typed
-      `T::watch(&db)` sugar joins the `T::get(&db)` unification note.
-- [ ] **Exit (WS half) e2e**: two clients on one node — A saves a Unique +
-      inserts/updates/removes in a collection; B's watchers see each event
-      typed, in order, and B's cache answers warm after a node kill.
+      keeps the local store warm — the live half of sync. Token-less
+      handles refuse typed (`Unauthorized`). Typed `T::watch(&db)` sugar
+      stays deferred — joins the `T::get(&db)` unification note (watch is
+      `Db`-only; no `DbHandle` seam for it yet).
+- [x] **Exit (WS half) e2e**: two clients on one node
+      (`examples/contact-book/tests/live_watch_e2e.rs`, node as a child
+      process) — A saves a Unique + inserts/updates/removes in a
+      collection; B's watchers see each event typed, in order, under
+      node-minted ids; after a node kill B's cache answers warm — including
+      the full walk of a collection B never once read online (the watcher's
+      mirrors alone built it).
 
 ## W6 — journal cursor catch-up (reconnect)
 
