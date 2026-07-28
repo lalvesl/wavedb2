@@ -15,6 +15,14 @@
 //!
 //! Auth here is a placeholder (sha256 + timestamp token) — real tokens and
 //! the permission gates are M8.
+//!
+//! **Sides.** One source, two builds: the macros gate `#[server]` bodies +
+//! `expose_server!` under the `server-side` feature and the client stubs +
+//! `expose_client!` under `client-side` (both on by default for the tests
+//! here; the server/client binaries each pull only their side). Helpers
+//! that exist *outside* `#[server]` bodies but serve them — everything
+//! under "Private helpers" below — carry `#[cfg(feature = "server-side")]`
+//! by hand: that is the schema author's half of the no-leak contract.
 
 // The DbHandle-generic helpers hold `&D` across awaits: their futures are
 // only `Send` when the context is — the workspace stance on every
@@ -220,6 +228,7 @@ pub fn all_todos(db: &Db) -> impl Stream<Item = Result<Todo>> {
 
 /// The stream behind [`all_todos`]: resolve the profile, then walk its
 /// collection — one `try_stream`-free composition over the handle.
+#[cfg(feature = "server-side")]
 fn async_profile_todos<D: DbHandle<Error = Error>>(
     db: &D,
 ) -> impl Stream<Item = Result<Todo>> {
@@ -255,10 +264,14 @@ pub async fn delete_todo(db: &Db, id: Id) -> Result<()> {
 }
 
 // ── Private helpers — generic over the execution context ──────────────────
+//
+// All server-side only: they exist to serve `#[server]` bodies, so they are
+// cfg-gated out of client builds along with them (no leaked logic).
 
 /// Lazily initialise the global username registry on first call. Generic
 /// over [`DbHandle`], so the same helper serves the node bodies and any
 /// engine-local test.
+#[cfg(feature = "server-side")]
 async fn ensure_registry<D: DbHandle>(
     db: &D,
 ) -> core::result::Result<AllUserNamesToTenants, D::Error> {
@@ -272,12 +285,14 @@ async fn ensure_registry<D: DbHandle>(
 }
 
 /// The caller tenant's profile — the root of the profile→pivot path.
+#[cfg(feature = "server-side")]
 async fn get_profile<D: DbHandle<Error = Error>>(db: &D) -> Result<Profile> {
     Profile::get(db)
         .await?
         .ok_or_else(|| Error::not_found("profile missing"))
 }
 
+#[cfg(feature = "server-side")]
 fn hash_password(password: &str) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::new().chain_update(password).finalize())
@@ -285,6 +300,7 @@ fn hash_password(password: &str) -> String {
 
 /// Mint a 48-bit tenant id from the current nanosecond timestamp — a
 /// placeholder allocator (collisions astronomically unlikely at demo scale).
+#[cfg(feature = "server-side")]
 fn new_tenant_id() -> u64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -23,7 +23,10 @@ expose_client! { AboutUser, Note }
 
 /// A hardened per-op override — same signature as the generated step; the
 /// exposure arm calls this path instead (compiler-resolved, no callback).
+/// Referenced only by `expose_server!`'s arms, so it rides `server-side`
+/// like them — the pattern for any hand-written server-only item.
 // Store-generic seam — Send only when the backing store is (workspace stance).
+#[cfg(feature = "server-side")]
 #[allow(clippy::future_not_send)]
 async fn audited_invoice_save<S: wavedb_core::Store>(
     store: &S,
@@ -35,6 +38,7 @@ async fn audited_invoice_save<S: wavedb_core::Store>(
 }
 
 /// How many saves went through the audit override (test observability).
+#[cfg(feature = "server-side")]
 static AUDITED_SAVES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 

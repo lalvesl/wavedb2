@@ -10,17 +10,23 @@
 //!
 //! The transport is a **dumb tunnel**: identity, the command, and any
 //! refusal all ride *inside* the wire envelopes — never in HTTP headers,
-//! cookies, or status codes. The only wired transport is HTTP POST (one
-//! exchange per connection); WebSocket, push, and Bloom screen-sync are
-//! deferred (M7).
+//! cookies, or status codes. Two transports are wired: HTTP POST (one
+//! exchange per connection, the token re-sent each time) and WebSocket
+//! (M7 — the token presented once in [`ws::ClientMsg::Hello`], the
+//! connection bound to that identity, subscription
+//! [`Event`](ws::ServerMsg::Event)s pushed as mutations land).
 //!
 //! ## Layers
 //!
 //! - [`frame`] — the [`Request`] / [`Response`] / [`NodeError`] wire values.
 //! - [`frames`] — the response's `[len u32 LE][bytes]` frame sequence, read
 //!   over the platform body stream (both targets).
+//! - [`ws`] — the WebSocket envelopes (`Hello`/`Call`/`Subscribe` →
+//!   `Item`/`End`/`Event`), both targets; the server session loop lives in
+//!   `wavedb-quick-node`.
 //! - [`http`] — the server half's minimal HTTP/1.1 framing (native only;
-//!   the client half lives in `wavedb-platform::http`).
+//!   the client half lives in `wavedb-platform::http`), now also routing
+//!   the WebSocket upgrade.
 //! - [`client`] — [`NetClient`], the client half (build → POST → decode);
 //!   compiles native (TcpStream) and wasm32 (`fetch`) alike.
 //!
@@ -37,6 +43,7 @@ pub mod client;
 pub mod error;
 pub mod frame;
 pub mod frames;
+pub mod ws;
 
 pub use client::{Executed, NetClient};
 pub use error::{Error, Result};
