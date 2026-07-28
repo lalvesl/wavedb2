@@ -119,6 +119,21 @@ refactor:
 - **Features are additive and off by default** (`validation` is the
   template): optional dep behind `dep:`, gated items `#[cfg(feature)]`-marked
   in docs, downstream crates forward the feature by the same name.
+- **Schema crates never leak a side.** Every crate that expands `#[server]` /
+  `expose_server!` / `expose_client!` declares two cargo features named
+  exactly **`server-side`** and **`client-side`**; the macros gate their
+  emission on them (`#[server]` bodies + dispatch + `expose_server!` under
+  `server-side`; client stubs + `expose_client!` under `client-side`; the
+  fn-type's `STRUCT_HASH` under both — identity is the protocol). A deployed
+  binary depends on the schema with `default-features = false` and exactly
+  its side, so the other side's logic is **never compiled** into the
+  artifact — the guarantee is the `cfg`, not LTO/dead-code stripping.
+  Hand-written server-only helpers (anything outside a `#[server]` body that
+  serves one) carry `#[cfg(feature = "server-side")]` themselves, and
+  `expose_server!` refuses (`compile_error!`) a wasm32 build with
+  `server-side` on. Deliberate divergence from the additive template: both
+  sides default **on**, so a schema crate's own tests drive the full loop —
+  deployments opt *down* to one side.
 
 ## Testing
 

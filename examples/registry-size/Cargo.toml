@@ -14,7 +14,11 @@ crate-type = ["cdylib", "rlib"]
 
 # The measured variable: how many of the 64 defined structs the
 # `expose_client!` list names. Additive, off by default (default = 1).
+# `client-side` is the schema side feature `expose_client!` gates on —
+# always on here (this crate IS a client-surface measurement).
 [features]
+default = ["client-side"]
+client-side = []
 n16 = []
 n64 = ["n16"]
 
