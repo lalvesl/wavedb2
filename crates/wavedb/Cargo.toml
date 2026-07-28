@@ -8,6 +8,16 @@ license.workspace = true
 [lints]
 workspace = true
 
+# The schema side features exist here only because this crate's own
+# integration tests act as a schema crate (tests/server_fn_e2e.rs expands
+# `#[server]` + `expose_*!`, whose emission gates on the *invoking* crate's
+# features). Library code never reads them; app schema crates declare their
+# own pair.
+[features]
+default = ["server-side", "client-side"]
+server-side = []
+client-side = []
+
 [dependencies]
 # The client re-exports core types + the derive macros (so downstream schema
 # crates use one dependency, `wavedb`), and talks to a node over `wavedb-net`.

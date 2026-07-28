@@ -12,8 +12,10 @@ clients, and (compiled to WASM) browsers.
 > built, with these divergences from the target below. The landed spelling is
 > `Db::open(CLIENT_REGISTRY, addr, user, tenant, app)` — the client registry
 > names the native engine's slots; `app` resolves the default store location
-> (`$XDG_CACHE_HOME`/`~/.cache` → `wavedb/<app>` on unix, `%LOCALAPPDATA%` on
-> Windows, IndexedDB `wavedb-<app>` in the browser) — plus native
+> (`$XDG_CACHE_HOME`/`~/.cache` → `<app>` on unix, `%LOCALAPPDATA%` on
+> Windows — the app is the leaf directly under the base, no shared `wavedb/`
+> parent; in the browser the IndexedDB database is named exactly `app`) —
+> plus native
 > `Db::open_at(…, dir)` and `db.local()` (the cache's direct typed surface).
 > The cache is **node-first**, not local-first: every op goes to the node,
 > acknowledged results mirror into the local engine (journal + `data.bin`

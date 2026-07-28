@@ -106,6 +106,14 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
   `expose_server!`/`expose_client!` are the **declared allowlist registry**: one match
   per operation over exactly the listed items; unlisted/excluded/wrong-shape all refuse
   as uniform `UnknownStructHash` (deliberately indistinguishable — security).
+  **Side features (no-leak contract)**: a crate expanding these macros declares
+  features named exactly `server-side`/`client-side`; body + dispatch +
+  `expose_server!` compile only under `server-side`, stubs + `expose_client!` only
+  under `client-side` (fn-type/STRUCT_HASH always). Deployed binaries pull the schema
+  `default-features = false` + their side — the other side is never *compiled* in
+  (the cfg is the guarantee, not LTO). Server-only helpers outside `#[server]` bodies
+  carry the cfg by hand; wasm32 + `server-side` is a `compile_error!`. Defaults keep
+  both on so schema-crate tests run the full loop.
 - **wavedb-storage** — the node engine behind `Store`: `data.bin` (4 KiB blocks,
   superblock in block 0), per-STRUCT_HASH linear-hashed page directories, `SlotPage`
   (checked-wire envelope, per-type zstd dictionaries with version = prefix length),
@@ -127,7 +135,8 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
   M6 `Db::open(CLIENT_REGISTRY, addr, user, tenant, app)` family attaching the local
   **write-through cache** — WaveDB caching WaveDB, cfg-switched like the platform
   seam: native = `PageStore` under `~/.cache|XDG_CACHE_HOME|%LOCALAPPDATA%`
-  `/wavedb/<app>` (auto-created; `open_at` for an explicit dir), wasm =
+  `/<app>` (the app is the leaf directly under the base, XDG-style, no shared
+  `wavedb/` parent; auto-created; `open_at` for an explicit dir), wasm =
   `wavedb::cache::IdbStore` (`wavedb-wasm` only re-exports it). Semantics
   (`client_cache.rs`): **node-first** — acknowledged ops mirror best-effort under
   node-minted ids (`Collection::adopt`; `All` frames carry `(Id, T)` for this);
