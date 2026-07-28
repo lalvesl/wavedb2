@@ -35,6 +35,32 @@ pub fn unix_nanos() -> u64 {
     millis * 1_000_000
 }
 
+/// Sleep for `duration` — the timer the connection manager's poll loop
+/// runs on (tokio's timer natively, `setTimeout` in the browser — no
+/// tokio in wasm).
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn sleep(duration: core::time::Duration) {
+    tokio::time::sleep(duration).await;
+}
+
+/// Sleep for `duration` — the timer the connection manager's poll loop
+/// runs on (tokio's timer natively, `setTimeout` in the browser — no
+/// tokio in wasm).
+#[cfg(target_arch = "wasm32")]
+pub async fn sleep(duration: core::time::Duration) {
+    let millis = i32::try_from(duration.as_millis()).unwrap_or(i32::MAX);
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        if let Some(window) = web_sys::window() {
+            // A refused timer leaves the promise pending — the caller's
+            // task idles rather than spinning; nothing to surface.
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                &resolve, millis,
+            );
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{unix_nanos, unix_secs};
