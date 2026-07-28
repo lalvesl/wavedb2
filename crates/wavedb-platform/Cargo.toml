@@ -12,24 +12,35 @@ workspace = true
 thiserror.workspace = true
 
 # Native: the client half of the dumb tunnel is a hand-rolled HTTP/1.1 POST
-# over a fresh TcpStream (no HTTP stack — WaveDB uses no HTTP semantics).
+# over a fresh TcpStream (no HTTP stack — WaveDB uses no HTTP semantics);
+# the WebSocket client half is a hand-rolled RFC 6455 exchange in the same
+# stance. `sha1` is the handshake's pinned accept-key digest — not a
+# security boundary, just the RFC.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["net", "io-util"] }
+sha1.workspace = true
 
 # Browser: the same seams over the web APIs — `Date.now()`, `fetch` +
-# `Request` with a streamed response body, `crypto.getRandomValues`.
+# `Request` with a streamed response body, `crypto.getRandomValues`, and
+# the browser's own `WebSocket` object (it frames RFC 6455 itself).
+# `futures` only bridges WebSocket events into an awaitable `recv()`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
+futures.workspace = true
 web-sys = { workspace = true, features = [
+  "BinaryType",
+  "CloseEvent",
   "Crypto",
   "Headers",
+  "MessageEvent",
   "ReadableStream",
   "ReadableStreamDefaultReader",
   "Request",
   "RequestInit",
   "Response",
+  "WebSocket",
   "Window",
 ] }
 
