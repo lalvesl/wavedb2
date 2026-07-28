@@ -152,6 +152,79 @@ impl Conn {
     pub async fn close(&mut self) -> Result<()> {
         codec::write_message(&mut self.w, OP_CLOSE, &[], true).await
     }
+
+    /// Split into independently owned halves — what the connection
+    /// manager's per-connection actor needs: a dedicated reader task (frame
+    /// reads are not cancel-safe) while sends stay with the actor. Pings
+    /// surface on the receiving half ([`Received::Ping`]) for the sending
+    /// half to [`pong`](SendHalf::pong).
+    #[must_use]
+    pub fn split(self) -> (RecvHalf, SendHalf) {
+        (RecvHalf { msgs: self.msgs }, SendHalf { w: self.w })
+    }
+}
+
+/// The receiving half of a split [`Conn`].
+#[derive(Debug)]
+pub struct RecvHalf {
+    msgs: Messages<ReadSide>,
+}
+
+/// The sending half of a split [`Conn`].
+#[derive(Debug)]
+pub struct SendHalf {
+    w: OwnedWriteHalf,
+}
+
+impl RecvHalf {
+    /// The next message; `None` = the peer closed. Pongs are swallowed;
+    /// pings surface for the sending half to answer.
+    ///
+    /// # Errors
+    /// A socket fault or a protocol violation.
+    pub async fn next(&mut self) -> Result<Option<super::Received>> {
+        loop {
+            match self.msgs.next(false).await? {
+                Some(Msg::Binary(bytes)) => {
+                    return Ok(Some(super::Received::Binary(bytes)));
+                }
+                Some(Msg::Ping(payload)) => {
+                    return Ok(Some(super::Received::Ping(payload)));
+                }
+                Some(Msg::Pong(_)) => {}
+                Some(Msg::Close) | None => return Ok(None),
+            }
+        }
+    }
+}
+
+impl SendHalf {
+    /// Send one binary message (masked — this is the client side).
+    ///
+    /// # Errors
+    /// A socket fault, or a message past the codec cap.
+    pub async fn send(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > MAX_MESSAGE {
+            return Err(Error::Http("ws frame too large"));
+        }
+        codec::write_message(&mut self.w, OP_BINARY, bytes, true).await
+    }
+
+    /// Answer a ping the receiving half surfaced.
+    ///
+    /// # Errors
+    /// A socket fault.
+    pub async fn pong(&mut self, payload: &[u8]) -> Result<()> {
+        codec::write_message(&mut self.w, OP_PONG, payload, true).await
+    }
+
+    /// Announce the close (RFC close frame).
+    ///
+    /// # Errors
+    /// A socket fault.
+    pub async fn close(&mut self) -> Result<()> {
+        codec::write_message(&mut self.w, OP_CLOSE, &[], true).await
+    }
 }
 
 #[cfg(test)]
