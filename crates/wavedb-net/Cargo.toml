@@ -32,4 +32,4 @@ futures.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "net", "io-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }

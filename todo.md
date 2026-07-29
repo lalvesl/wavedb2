@@ -429,6 +429,41 @@ Deliberately left as later seams:
   Next: W6 (journal-cursor catch-up), W7 (HTTP piggyback), W8 (offline
   write queue).
 
+- **M7 W5.5 — connection manager + HTTP-poll watch — LANDED (2026-07-16,
+  user-directed)**: ONE never-ending background task per process
+  (`wavedb_net::manager`) now owns **every** exchange with a node — the
+  real place connections are dialed, shared, and torn down (and the seam
+  W6's reconnect cursor and W8's offline queue will land on). Native = a
+  dedicated thread with a current-thread runtime + `LocalSet` (new
+  `wavedb_platform::task::spawn_detached`/`spawn_local`); wasm = a
+  detached `spawn_local` — no tokio in wasm; boots lazily on first use.
+  All POSTs route through it (`NetClient` internals re-plumbed, public
+  API unchanged, the establish-vs-mid-stream error split preserved for
+  the M6 cache fallback). **Watches multiplex**: every watch of one
+  `(addr, identity)` shares ONE WebSocket connection — `Hello` once, one
+  wire subscribe per topic, events fanned out per topic; no pumping on
+  watchers (the connection's reader task pushes; `ws::Conn::split()` is
+  the new platform seam). Lifecycle authority = the manager loop
+  (watch-id sets per key; the last unregistration drops the actor's
+  channel, so a later watch always gets a fresh dial — no ack racing a
+  dying actor). **Watches ride plain HTTP too**:
+  `Db::watch_via_polling(every)` polls "anything new?" on an adjustable
+  timer — `wavedb_net::sync` (reserved `SYNC_STRUCT_HASH` = `"WDB.SYNC"`,
+  routed before the registry) re-declares the FULL topic list and the
+  node **replaces** the session's set (stateless, self-heals across node
+  restarts); node buffers per `(tenant, token-session)`
+  (`quick-node::poll::PollTable`, cap 1024 drop-oldest, idle sessions
+  pruned after `poll_session_ttl` = 1 min by maintenance). Poll outages
+  are ridden silently (next tick retries); node refusals end the watch;
+  events during downtime are missed — the honest pre-W6 gap. Proven:
+  manager loopback (3 watches/2 topics = 1 connection, fan-out, teardown
+  ⇒ fresh dial), PollTable + dispatch-sync units, and
+  `live_watch_poll_e2e.rs` (poll watcher sees each mutation within a
+  tick + warm cache after node kill); `live_watch_e2e.rs` green
+  unchanged over the multiplexed path. This pulls the W7 poll half
+  forward — W7's remainder is piggybacking events on ordinary responses
+  + idle backoff.
+
 _Workspace green (both targets): fmt + clippy (pedantic + nursery) clean,
 tests green, file-length gate passing. Members: wire, wire-derive, platform,
 core, macros, storage, net, quick-node, wavedb, wasm, schema-smoke,
@@ -940,9 +975,16 @@ accept key; base64 is a ~20-line encode (encode-only, no alphabet variants).
 
 ## W7 — HTTP piggyback + idle tick (POST clients)
 
-- [ ] Per-session (token `session` id) event buffer node-side; the client
-      queue sends empty polls at `http_poll_interval` when idle, backing
-      off; responses piggyback buffered events. The HTTP half of the exit.
+- [x] **Poll half — LANDED EARLY (2026-07-16, with the connection
+      manager; details in DOING)**: per-session (token `session` id)
+      event buffers node-side (`PollTable`), the client polls "anything
+      new?" at an adjustable interval (`Db::watch_via_polling`), full
+      topic list re-declared each tick (replace semantics — self-healing).
+      **The HTTP half of the exit holds** (`live_watch_poll_e2e.rs`: B's
+      watcher fires within one poll tick).
+- [ ] Piggyback + backoff: buffered events ride back on ordinary POST
+      responses (saving the poll when the app is already talking); idle
+      polls back off.
 
 ## W8 — offline write queue
 

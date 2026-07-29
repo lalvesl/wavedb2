@@ -81,10 +81,14 @@ The schema crate compiles into client and node — the schema IS the protocol; t
 no DTO layer and no query DSL (filtered reads = `#[server]` functions).
 
 - **wavedb-platform** — the native ⇄ browser seam, cfg-switched (no traits): `time`
-  (`SystemTime` / `Date.now()` — `SystemTime::now()` **panics** on wasm32), `rand`
-  (`RandomState` keys / `window.crypto`), `http` (the tunnel's **client half**:
-  hand-rolled TcpStream POST / `fetch` + streamed body). Everything above must route
-  clock/entropy/client-HTTP through it — never name `SystemTime` or a socket directly.
+  (`SystemTime` / `Date.now()` — `SystemTime::now()` **panics** on wasm32; + `sleep`),
+  `rand` (`RandomState` keys / `window.crypto`), `http` (the tunnel's **client half**:
+  hand-rolled TcpStream POST / `fetch` + streamed body), `ws` (the WebSocket client
+  half: hand-rolled RFC 6455 / browser `WebSocket`; `Conn::split()` for reader-task
+  patterns), and `task` (`spawn_detached` = dedicated thread w/ current-thread
+  runtime + LocalSet / `wasm_bindgen_futures::spawn_local` — **no tokio in wasm**).
+  Everything above must route clock/entropy/client-HTTP through it — never name
+  `SystemTime` or a socket directly.
 - **wavedb-wire / wavedb-wire-derive** — standalone `WaveWire` codec (no STRUCT_HASH,
   no engine coupling) + derive. Gotcha: `#[derive(WaveWire)]` emits absolute
   `::wavedb_wire::` paths, so any crate using it needs `wavedb-wire` as a direct dep.
@@ -127,7 +131,13 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
   refusal is a 200 carrying `NodeError`. Functions and structs share one hash space —
   a fn call is indistinguishable from an object op at the frame level. `NetClient` +
   `frames::FrameReader` are target-independent (POST/body via `wavedb-platform`);
-  only the server half (`net::http`) is native-gated.
+  only the server half (`net::http`) is native-gated. **Every exchange routes through
+  `net::manager`** — one never-ending background task per process (M7, user-directed):
+  it runs all POSTs, multiplexes all watches of one `(addr, identity)` over ONE
+  WebSocket connection (`Hello` once, per-topic subscribe, fan-out; lifecycle owned by
+  the manager loop), and can watch over plain HTTP instead ("anything new?" polls —
+  `net::sync`, reserved hash `"WDB.SYNC"` routed before the registry; node buffers per
+  token-session in `quick-node::poll`, replace-semantics topic declaration).
 - **wavedb-quick-node** — library (no bin): `Server::new(REGISTRY).data_dir(d).serve(addr)`.
   `expose_server!` also emits `StorageRegistry`, so `.registry(REGISTRY)` alone opens
   the `PageStore`. Gates 4–6 (permission/validate/preprocess) are an M8 seam.
@@ -146,7 +156,11 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
   engine per process ⇒ a `Db::open` client and a node never share one (tests run
   the node as a child process — see `local_cache_e2e.rs`). Typed calls spell
   `T::get(&db)` / `v.save(&db)` / `T::collection(pivot)` via the `DbHandle` seam;
-  `ServerDb` mirrors it node-side for `#[server]` bodies.
+  `ServerDb` mirrors it node-side for `#[server]` bodies. Live sync (M7):
+  `db.watch_unique::<T>()` / `db.watch_collection::<T>(pivot)` (token required)
+  yield typed `WatchEvent`s and mirror each into the cache before yielding; watches
+  multiplex through `net::manager` (one WS connection per identity), or poll over
+  HTTP with `db.watch_via_polling(interval)`.
 
 ## Data-model invariants
 
