@@ -30,8 +30,9 @@ mod wasm;
 #[cfg(target_arch = "wasm32")]
 pub use wasm::{Conn, RecvHalf, SendHalf, connect};
 
-/// One message off the receiving half of a split connection
-/// ([`Conn::split`]): a binary payload, or a ping the sending half must
+/// One message off the receiving half of a split connection.
+///
+/// From [`Conn::split`]: a binary payload, or a ping the sending half must
 /// answer ([`SendHalf::pong`] — surfaced on native only; the browser pongs
 /// itself).
 #[derive(Debug, Clone, PartialEq, Eq)]

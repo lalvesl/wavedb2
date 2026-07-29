@@ -53,9 +53,10 @@ pub async fn sleep(duration: core::time::Duration) {
         if let Some(window) = web_sys::window() {
             // A refused timer leaves the promise pending — the caller's
             // task idles rather than spinning; nothing to surface.
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                &resolve, millis,
-            );
+            let _ = window
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    &resolve, millis,
+                );
         }
     });
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;

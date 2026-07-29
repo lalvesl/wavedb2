@@ -34,6 +34,7 @@
 
 pub mod dispatch;
 pub mod error;
+mod poll;
 mod serve;
 mod serve_ws;
 mod subscribe;
@@ -73,6 +74,9 @@ struct Maintenance {
     checkpoint_after_bytes: u64,
     /// Cache bytes the settle task evicts down to (settled entries only).
     cache_budget_bytes: usize,
+    /// How long a poll-watch session survives without polling before its
+    /// event buffer is dropped.
+    poll_session_ttl: std::time::Duration,
 }
 
 impl Default for Maintenance {
@@ -80,6 +84,7 @@ impl Default for Maintenance {
         Self {
             checkpoint_after_bytes: 64 * 1024 * 1024, // 64 MiB of journal
             cache_budget_bytes: 1024 * 1024 * 1024,   // 1 GiB — generous
+            poll_session_ttl: std::time::Duration::from_mins(1),
         }
     }
 }
@@ -97,6 +102,9 @@ pub struct Bound<E> {
     /// Shared with the serve-time [`NotifyStore`]; the WS session loops
     /// register their subscriptions here.
     subs: Rc<RefCell<SubTable>>,
+    /// The HTTP poll-watch buffers — fed by the same [`NotifyStore`],
+    /// drained by the sync route, pruned by maintenance.
+    polls: subscribe::Polls,
     maintenance: Maintenance,
     secret: [u8; 32],
 }
@@ -169,11 +177,13 @@ where
         let secret = *wavedb_net::auth::node_secret()
             .unwrap_or_else(|| unreachable!("just installed"));
         let subs = Rc::new(RefCell::new(SubTable::default()));
+        let polls = Rc::new(RefCell::new(poll::PollTable::default()));
         Ok(Bound {
             registry: self.registry,
             listener,
             store: Rc::new(store),
             subs,
+            polls,
             maintenance: self.maintenance,
             secret,
         })
@@ -237,6 +247,7 @@ where
         let serving = Rc::new(NotifyStore::new(
             Rc::clone(&self.store),
             Rc::clone(&self.subs),
+            Rc::clone(&self.polls),
         ));
         serve::run(
             self.listener,
@@ -244,7 +255,12 @@ where
             serving,
             self.secret,
             Rc::clone(&self.subs),
-            maintain(Rc::clone(&self.store), self.maintenance),
+            Rc::clone(&self.polls),
+            maintain(
+                Rc::clone(&self.store),
+                Rc::clone(&self.polls),
+                self.maintenance,
+            ),
             shutdown,
         )
         .await?;
@@ -264,10 +280,15 @@ fn random_secret() -> [u8; 32] {
 }
 
 /// The background maintenance loop: periodically settle the pending queue,
-/// checkpoint once the journal crosses the threshold, and evict settled
-/// cache entries down to budget. An engine fault stops maintenance (acked
-/// writes stay safe in the journal); serving continues.
-async fn maintain(store: Rc<PageStore>, policy: Maintenance) {
+/// checkpoint once the journal crosses the threshold, evict settled cache
+/// entries down to budget, and age out poll-watch sessions that stopped
+/// polling. An engine fault stops maintenance (acked writes stay safe in
+/// the journal); serving continues.
+async fn maintain(
+    store: Rc<PageStore>,
+    polls: subscribe::Polls,
+    policy: Maintenance,
+) {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -281,5 +302,6 @@ async fn maintain(store: Rc<PageStore>, policy: Maintenance) {
             return;
         }
         store.evict_settled(policy.cache_budget_bytes);
+        polls.borrow_mut().prune(policy.poll_session_ttl);
     }
 }
