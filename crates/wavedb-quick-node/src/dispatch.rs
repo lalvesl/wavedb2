@@ -41,13 +41,17 @@ fn unauthorized(struct_hash: u64) -> Response {
 }
 
 /// Gate 1: resolve the request's identity claim into the [`Caller`] the
-/// engine executes as. `Err(())` = refuse (bad/expired/foreign token, or a
-/// token before the node has a secret). Shared by the HTTP path
-/// ([`handle`]) and the WebSocket `Hello` (`serve_ws`), which binds it once
-/// for the connection.
-pub(crate) fn identify(auth: &Auth, secret: &[u8; 32]) -> Result<Caller, ()> {
+/// engine executes as, plus the token's session id (`None` for the
+/// anonymous tier — the poll-sync route requires one). `Err(())` = refuse
+/// (bad/expired/foreign token, or a token before the node has a secret).
+/// Shared by the HTTP path ([`handle`]) and the WebSocket `Hello`
+/// (`serve_ws`), which binds it once for the connection.
+pub(crate) fn identify(
+    auth: &Auth,
+    secret: &[u8; 32],
+) -> Result<(Caller, Option<u128>), ()> {
     match auth {
-        Auth::Anonymous { tenant } => Ok(Caller::anonymous(*tenant)),
+        Auth::Anonymous { tenant } => Ok((Caller::anonymous(*tenant), None)),
         Auth::Token(token) => {
             let claims = auth::verify(
                 secret,
@@ -56,10 +60,13 @@ pub(crate) fn identify(auth: &Auth, secret: &[u8; 32]) -> Result<Caller, ()> {
                 TokenPurpose::Access,
             )
             .map_err(|_| ())?;
-            Ok(Caller {
-                user: claims.user,
-                tenant: claims.tenant,
-            })
+            Ok((
+                Caller {
+                    user: claims.user,
+                    tenant: claims.tenant,
+                },
+                Some(claims.session),
+            ))
         }
     }
 }
@@ -72,6 +79,7 @@ pub async fn handle<E, S>(
     registry: &E,
     store: &S,
     secret: &[u8; 32],
+    polls: &crate::subscribe::Polls,
     request: Request,
 ) -> Response
 where
@@ -81,10 +89,46 @@ where
     let Request { auth, frame } = request;
 
     // Gate 1 — identity.
-    let Ok(caller) = identify(&auth, secret) else {
+    let Ok((caller, session)) = identify(&auth, secret) else {
         return unauthorized(frame.struct_hash);
     };
+
+    // The reserved sync exchange (HTTP-poll watch) routes before the
+    // registry — no schema hash can reach it, and it can shadow none.
+    if frame.struct_hash == wavedb_net::sync::SYNC_STRUCT_HASH {
+        return sync_poll(polls, caller, session, &frame.payload);
+    }
     execute(registry, store, caller, frame).await
+}
+
+/// The "anything new?" answer: replace the session's declared topics,
+/// drain its buffer. Requires an authenticated identity — the session id
+/// keys the buffer — so the anonymous tier refuses uniformly.
+fn sync_poll(
+    polls: &crate::subscribe::Polls,
+    caller: Caller,
+    session: Option<u128>,
+    payload: &[u8],
+) -> Response {
+    use wavedb_core::wire::{from_wire, to_wire};
+    use wavedb_net::sync::{SYNC_STRUCT_HASH, SyncReply, SyncRequest};
+
+    let Some(session) = session else {
+        return unauthorized(SYNC_STRUCT_HASH);
+    };
+    let request: SyncRequest = match from_wire(payload) {
+        Ok(request) => request,
+        Err(e) => {
+            return Response::Err(NodeError::from_core(
+                SYNC_STRUCT_HASH,
+                &Error::from(e),
+            ));
+        }
+    };
+    let events = polls.borrow_mut().sync(caller.tenant, session, &request);
+    Response::Ok(wavedb_core::expose::Reply::Returned(to_wire(&SyncReply {
+        events,
+    })))
 }
 
 /// Gates 2–3 for an already-identified [`Caller`].
@@ -235,13 +279,96 @@ mod tests {
         }
     }
 
+    fn polls() -> crate::subscribe::Polls {
+        std::rc::Rc::new(std::cell::RefCell::new(
+            crate::poll::PollTable::default(),
+        ))
+    }
+
+    /// A sync frame declaring one watched topic.
+    fn sync_request(auth: Auth) -> Request {
+        use wavedb_net::sync::{SYNC_STRUCT_HASH, SyncRequest};
+        use wavedb_net::ws::Topic;
+        Request {
+            auth,
+            frame: CommandFrame {
+                struct_hash: SYNC_STRUCT_HASH,
+                command: Command::Get,
+                payload: wavedb_core::wire::to_wire(&SyncRequest {
+                    subscribe: vec![Topic {
+                        struct_hash: 0x1234,
+                        pivot: None,
+                    }],
+                }),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_answers_an_authenticated_session_with_its_events() {
+        use wavedb_core::notify::{Mutation, MutationKind};
+        use wavedb_net::sync::SyncReply;
+
+        let store = MemStore::default();
+        let polls = polls();
+        let auth =
+            Auth::Token(token(42, unix_now() + 60, TokenPurpose::Access));
+        // First sync registers the topic (drains nothing)…
+        let Response::Ok(Reply::Returned(bytes)) = handle(
+            &OneHash,
+            &store,
+            &SECRET,
+            &polls,
+            sync_request(auth.clone()),
+        )
+        .await
+        else {
+            panic!("sync must answer with a return");
+        };
+        let reply: SyncReply = wavedb_core::wire::from_wire(&bytes).unwrap();
+        assert!(reply.events.is_empty());
+
+        // …a mutation lands in the buffer…
+        polls.borrow_mut().publish(&Mutation {
+            struct_hash: 0x1234,
+            tenant: U48::from(42u32),
+            pivot: None,
+            id: wavedb_core::Id::new(7, U48::from(42u32), false, 0),
+            kind: MutationKind::Saved,
+            body: vec![9],
+        });
+
+        // …and the next poll drains it.
+        let Response::Ok(Reply::Returned(bytes)) =
+            handle(&OneHash, &store, &SECRET, &polls, sync_request(auth)).await
+        else {
+            panic!("sync must answer with a return");
+        };
+        let reply: SyncReply = wavedb_core::wire::from_wire(&bytes).unwrap();
+        assert_eq!(reply.events.len(), 1);
+        assert_eq!(reply.events[0].body, vec![9]);
+    }
+
+    #[tokio::test]
+    async fn anonymous_sync_is_unauthorized() {
+        let store = MemStore::default();
+        let Response::Err(e) =
+            handle(&OneHash, &store, &SECRET, &polls(), sync_request(anon()))
+                .await
+        else {
+            panic!("must refuse");
+        };
+        assert_eq!(e.kind, NodeErrorKind::Unauthorized);
+    }
+
     #[tokio::test]
     async fn verified_token_reaches_the_engine_as_its_user() {
         let store = MemStore::default();
         let auth =
             Auth::Token(token(42, unix_now() + 60, TokenPurpose::Access));
         let resp =
-            handle(&OneHash, &store, &SECRET, request(auth, 0x1234)).await;
+            handle(&OneHash, &store, &SECRET, &polls(), request(auth, 0x1234))
+                .await;
         assert_eq!(resp, Response::Ok(Reply::Value(Some(vec![42]))));
     }
 
@@ -250,8 +377,14 @@ mod tests {
         // The tier itself passes gate 1; refusing non-public work is the
         // engine arms' guard (proven in the macro/e2e layers).
         let store = MemStore::default();
-        let resp =
-            handle(&OneHash, &store, &SECRET, request(anon(), 0x1234)).await;
+        let resp = handle(
+            &OneHash,
+            &store,
+            &SECRET,
+            &polls(),
+            request(anon(), 0x1234),
+        )
+        .await;
         assert_eq!(resp, Response::Ok(Reply::Value(Some(vec![0xFF]))));
     }
 
@@ -260,7 +393,8 @@ mod tests {
         let store = MemStore::default();
         let auth = Auth::Token(token(42, unix_now() - 1, TokenPurpose::Access));
         let Response::Err(e) =
-            handle(&OneHash, &store, &SECRET, request(auth, 0x1234)).await
+            handle(&OneHash, &store, &SECRET, &polls(), request(auth, 0x1234))
+                .await
         else {
             panic!("must refuse");
         };
@@ -273,7 +407,8 @@ mod tests {
         let auth =
             Auth::Token(token(42, unix_now() + 60, TokenPurpose::Refresh));
         let Response::Err(e) =
-            handle(&OneHash, &store, &SECRET, request(auth, 0x1234)).await
+            handle(&OneHash, &store, &SECRET, &polls(), request(auth, 0x1234))
+                .await
         else {
             panic!("must refuse");
         };
@@ -298,6 +433,7 @@ mod tests {
             &OneHash,
             &store,
             &SECRET,
+            &polls(),
             request(Auth::Token(forged), 0x1234),
         )
         .await
@@ -310,8 +446,14 @@ mod tests {
     #[tokio::test]
     async fn unknown_hash_refused_at_the_header_gate() {
         let store = MemStore::default();
-        let Response::Err(e) =
-            handle(&OneHash, &store, &SECRET, request(anon(), 0x9999)).await
+        let Response::Err(e) = handle(
+            &OneHash,
+            &store,
+            &SECRET,
+            &polls(),
+            request(anon(), 0x9999),
+        )
+        .await
         else {
             panic!("must refuse");
         };
