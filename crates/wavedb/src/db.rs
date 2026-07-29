@@ -11,6 +11,7 @@
 //! *and* it can actually answer. See [`crate::client_cache`] for the exact
 //! semantics.
 
+use core::time::Duration;
 use std::sync::Arc;
 
 use wavedb_core::expose::{Command, Reply};
@@ -35,6 +36,9 @@ pub struct Db {
     /// The local write-through cache (`Db::open`); `None` = pure transport
     /// handle (`Db::connect`). Shared by clones — one engine per client.
     cache: Option<Arc<CacheStore>>,
+    /// How watches transport their events (WebSocket push by default;
+    /// [`watch_via_polling`](Self::watch_via_polling) switches to POSTs).
+    watch_mode: wavedb_net::WatchMode,
 }
 
 impl Db {
@@ -58,6 +62,7 @@ impl Db {
             tenant,
             access_token: None,
             cache: None,
+            watch_mode: wavedb_net::WatchMode::WebSocket,
         })
     }
 
@@ -157,6 +162,16 @@ impl Db {
         self
     }
 
+    /// Deliver this handle's watches by "anything new?" POST polls `every`
+    /// so often, instead of a pushed WebSocket — for clients whose path to
+    /// the node cannot hold one open. Larger intervals cost latency, not
+    /// correctness: the node buffers per session between polls.
+    #[must_use]
+    pub const fn watch_via_polling(mut self, every: Duration) -> Self {
+        self.watch_mode = wavedb_net::WatchMode::HttpPoll(every);
+        self
+    }
+
     /// The identity claim each request ships (also presented once as the
     /// WebSocket `Hello` by [`crate::watch`]).
     #[allow(clippy::redundant_pub_crate)]
@@ -182,6 +197,12 @@ impl Db {
         self.access_token.is_some()
     }
 
+    /// The transport this handle's watches ride.
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) const fn watch_mode(&self) -> wavedb_net::WatchMode {
+        self.watch_mode
+    }
+
     /// A handle to the **same node** scoped to a different `tenant` — the
     /// server-side cross-tenant seam (e.g. a `#[server]` `register` writing
     /// into a freshly minted tenant's space). Keeps the same `user`.
@@ -193,6 +214,7 @@ impl Db {
             tenant,
             access_token: self.access_token.clone(),
             cache: self.cache.clone(),
+            watch_mode: self.watch_mode,
         }
     }
 

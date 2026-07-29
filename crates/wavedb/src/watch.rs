@@ -1,30 +1,36 @@
 //! Live watch (M7 W5) — typed subscription streams that keep the local
 //! cache warm.
 //!
-//! [`Db::watch_unique`] / [`Db::watch_collection`] open one WebSocket
-//! session each ([`WsSession`]; multiplexing many watches over one
-//! connection is a later refinement), present the handle's identity once,
-//! and subscribe to exactly one topic — a Unique anchor or one collection
-//! `Pivot`, the same granularity a screen shows. The call returns only
-//! after the node acked the subscription, so a mutation committed after a
-//! watch exists **cannot be missed**.
+//! [`Db::watch_unique`] / [`Db::watch_collection`] register with the
+//! process's connection manager ([`wavedb_net::manager`]): every watch of
+//! one identity shares ONE WebSocket connection (`Hello` once, each topic
+//! subscribed once, events fanned out) — or, on a handle configured with
+//! [`watch_via_polling`](Db::watch_via_polling), rides "anything new?"
+//! POST polls instead. Either way the call returns only once the
+//! subscription is **live** (acked / registered node-side), so a mutation
+//! committed after a watch exists cannot be missed, and no pumping falls
+//! on the watcher — the manager pushes each event into the watch's channel
+//! as it arrives.
 //!
 //! Every event **mirrors into the M6 cache before it is yielded**
 //! ([`crate::client_cache`]'s `mirror_*` — best-effort, absent when the
 //! handle has no cache): a watcher is the live half of sync, keeping local
-//! reads warm without polling. Events decode to the watched type; the
-//! record's authoritative id rides along ([`WatchEvent`]).
+//! reads warm. Events decode to the watched type; the record's
+//! authoritative id rides along ([`WatchEvent`]).
 //!
 //! A watch needs an authenticated handle
 //! ([`with_access_token`](Db::with_access_token)) — the node refuses
-//! anonymous subscriptions, so the refusal here is typed and immediate
-//! instead of a closed socket.
+//! anonymous subscriptions (and the poll buffer is keyed by the token's
+//! session claim), so the refusal here is typed and immediate instead of
+//! a closed socket.
 
 use std::marker::PhantomData;
 
+use futures::StreamExt;
+use futures::channel::mpsc;
 use wavedb_core::wire::from_wire;
 use wavedb_core::{Id, NonUniqueStruct, PivotHandle, UniqueStruct};
-use wavedb_net::WsSession;
+use wavedb_net::manager::{self, WatchGuard};
 use wavedb_net::ws::{EventKind, RecordEvent, Topic};
 
 use crate::client_cache::{mirror_record, mirror_remove, mirror_unique};
@@ -44,18 +50,18 @@ pub enum WatchEvent<T> {
 /// A live watch on a Unique anchor — see [`Db::watch_unique`].
 #[derive(Debug)]
 pub struct UniqueWatch<T> {
-    session: WsSession,
+    events: mpsc::UnboundedReceiver<RecordEvent>,
+    _guard: WatchGuard,
     db: Db,
-    topic: Topic,
     _record: PhantomData<T>,
 }
 
 /// A live watch on one collection — see [`Db::watch_collection`].
 #[derive(Debug)]
 pub struct CollectionWatch<T> {
-    session: WsSession,
+    events: mpsc::UnboundedReceiver<RecordEvent>,
+    _guard: WatchGuard,
     db: Db,
-    topic: Topic,
     _record: PhantomData<T>,
 }
 
@@ -66,7 +72,7 @@ impl Db {
     ///
     /// # Errors
     /// [`Error::Unauthorized`] on a token-less handle, [`Error::Transport`]
-    /// on a connect/handshake fault or a refused identity.
+    /// on a connect/handshake/poll fault or a refused identity.
     pub async fn watch_unique<T: UniqueStruct>(
         &self,
     ) -> Result<UniqueWatch<T>> {
@@ -74,11 +80,11 @@ impl Db {
             struct_hash: T::STRUCT_HASH,
             pivot: None,
         };
-        let session = self.subscribed(topic).await?;
+        let (events, guard) = self.subscribed(topic).await?;
         Ok(UniqueWatch {
-            session,
+            events,
+            _guard: guard,
             db: self.clone(),
-            topic,
             _record: PhantomData,
         })
     }
@@ -102,39 +108,40 @@ impl Db {
             struct_hash: T::STRUCT_HASH,
             pivot: Some(pivot.local_id()),
         };
-        let session = self.subscribed(topic).await?;
+        let (events, guard) = self.subscribed(topic).await?;
         Ok(CollectionWatch {
-            session,
+            events,
+            _guard: guard,
             db: self.clone(),
-            topic,
             _record: PhantomData,
         })
     }
 
-    /// Open the watch session: identity, then the acked subscription.
-    async fn subscribed(&self, topic: Topic) -> Result<WsSession> {
+    /// Register the watch with the connection manager — live on return.
+    async fn subscribed(
+        &self,
+        topic: Topic,
+    ) -> Result<(mpsc::UnboundedReceiver<RecordEvent>, WatchGuard)> {
         if !self.has_token() {
             return Err(Error::unauthorized(
                 "a watch needs an authenticated session — the node refuses \
                  anonymous subscriptions",
             ));
         }
-        let mut session = WsSession::open(self.addr(), self.auth())
+        manager::watch(self.addr(), self.auth(), self.watch_mode(), topic)
             .await
-            .map_err(Error::Transport)?;
-        session.subscribe(topic).await.map_err(Error::Transport)?;
-        Ok(session)
+            .map_err(Error::Transport)
     }
 }
 
 impl<T: UniqueStruct> UniqueWatch<T> {
-    /// The next mutation; `None` = the node closed the connection.
+    /// The next mutation; `None` = the watch's connection ended (a poll
+    /// watch instead rides outages silently and keeps trying).
     ///
     /// # Errors
-    /// [`Error::Transport`] on a socket fault, [`Error::Core`] on a body
-    /// that does not decode as `T`.
+    /// [`Error::Core`] on a body that does not decode as `T`.
     pub async fn next(&mut self) -> Result<Option<WatchEvent<T>>> {
-        let Some(event) = next_for(&mut self.session, self.topic).await? else {
+        let Some(event) = self.events.next().await else {
             return Ok(None);
         };
         let typed = decode::<T>(&event)?;
@@ -146,12 +153,13 @@ impl<T: UniqueStruct> UniqueWatch<T> {
 }
 
 impl<T: NonUniqueStruct> CollectionWatch<T> {
-    /// The next mutation; `None` = the node closed the connection.
+    /// The next mutation; `None` = the watch's connection ended (a poll
+    /// watch instead rides outages silently and keeps trying).
     ///
     /// # Errors
-    /// As [`UniqueWatch::next`].
+    /// [`Error::Core`] on a body that does not decode as `T`.
     pub async fn next(&mut self) -> Result<Option<WatchEvent<T>>> {
-        let Some(event) = next_for(&mut self.session, self.topic).await? else {
+        let Some(event) = self.events.next().await else {
             return Ok(None);
         };
         let Some(pivot) = event.topic.pivot else {
@@ -167,21 +175,6 @@ impl<T: NonUniqueStruct> CollectionWatch<T> {
             }
         }
         Ok(Some(typed))
-    }
-}
-
-/// Pump the session until an event for `topic` arrives (the session holds
-/// exactly one subscription, so a foreign topic is skipped defensively).
-async fn next_for(
-    session: &mut WsSession,
-    topic: Topic,
-) -> Result<Option<RecordEvent>> {
-    loop {
-        match session.next_event().await.map_err(Error::Transport)? {
-            None => return Ok(None),
-            Some(event) if event.topic == topic => return Ok(Some(event)),
-            Some(_) => {}
-        }
     }
 }
 

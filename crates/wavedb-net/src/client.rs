@@ -1,13 +1,15 @@
 //! The client-side transport: build a [`Request`], POST it, read the framed
 //! response.
 //!
-//! Compiles for native and wasm32 alike — the POST and the body stream come
-//! from `wavedb_platform::http` (a fresh `TcpStream` vs a browser `fetch`),
-//! and everything above that seam is byte-for-byte the same protocol.
+//! Compiles for native and wasm32 alike. Every exchange routes through the
+//! process's [`manager`](crate::manager) task — the one place connections
+//! are made — which does the actual POST (`wavedb_platform::http`: a fresh
+//! `TcpStream` vs a browser `fetch`) and pumps the response frames back;
+//! everything above that seam is byte-for-byte the same protocol.
 //!
-//! One exchange = one fresh connection (HTTP POST, the only wired transport;
-//! WebSocket with a bound identity is M7). Each call re-sends the identity —
-//! plain HTTP has no connection to bind identity to. A response is a
+//! One exchange = one fresh connection. Each call re-sends the identity —
+//! plain HTTP has no connection to bind identity to (the WebSocket watch
+//! path binds it once; see [`manager`](crate::manager)). A response is a
 //! sequence of [`StreamFrame`]s: a scalar command answers with a bare
 //! [`End`](StreamFrame::End); a walk streams `Item`s as the node produces
 //! them, so [`call_stream`](NetClient::call_stream) yields records without
@@ -21,7 +23,7 @@ use crate::error::{Error, Result};
 use crate::frame::{
     Auth, CommandFrame, NodeError, Request, Response, StreamFrame,
 };
-use crate::frames::FrameReader;
+use crate::manager::PostFrames;
 
 /// A thin client bound to one node address. Cheap to clone/rebuild — it holds
 /// no connection (each call dials fresh).
@@ -49,14 +51,16 @@ impl NetClient {
         &self.addr
     }
 
-    /// POST the request and return the response's frame reader.
+    /// POST the request through the manager and return the response's
+    /// frames. Resolves once the head is in — an establishment fault is an
+    /// `Err` here, a mid-stream fault rides the frames.
     async fn exchange(
         &self,
         auth: Auth,
         struct_hash: u64,
         command: Command,
         payload: Vec<u8>,
-    ) -> Result<FrameReader> {
+    ) -> Result<PostFrames> {
         let request = Request {
             auth,
             frame: CommandFrame {
@@ -65,9 +69,7 @@ impl NetClient {
                 payload,
             },
         };
-        let body =
-            wavedb_platform::http::post(&self.addr, &to_wire(&request)).await?;
-        Ok(FrameReader::new(body))
+        crate::manager::post(&self.addr, to_wire(&request)).await
     }
 
     /// Send one scalar command under `auth` and await the node's answer.

@@ -26,8 +26,9 @@ pub struct CommandFrame {
 }
 
 /// The request's identity claim — verified node-side (gate 1) into the
-/// caller the engine executes as.
-#[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
+/// caller the engine executes as. `Hash` because the connection manager
+/// keys its per-identity connections on `(addr, Auth)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, WaveWire)]
 pub enum Auth {
     /// No token: the unauthenticated tier (`user = U48::MAX`). The claimed
     /// tenant only scopes `#[server(public)]` functions (login/register);

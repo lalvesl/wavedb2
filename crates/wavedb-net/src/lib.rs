@@ -27,6 +27,12 @@
 //! - [`ws_session`] — [`WsSession`], the client half of the WebSocket
 //!   transport (both targets): identity once, acked subscriptions, pushed
 //!   events.
+//! - [`manager`] — the **connection manager**: one never-ending background
+//!   task per process that every exchange (POST and WebSocket) routes
+//!   through; multiplexes all watches of one identity over one connection,
+//!   or polls them over plain HTTP ([`sync`]).
+//! - [`sync`] — the "anything new?" poll envelopes + the reserved hash
+//!   they ride.
 //! - [`http`] — the server half's minimal HTTP/1.1 framing (native only;
 //!   the client half lives in `wavedb-platform::http`), now also routing
 //!   the WebSocket upgrade.
@@ -46,6 +52,8 @@ pub mod client;
 pub mod error;
 pub mod frame;
 pub mod frames;
+pub mod manager;
+pub mod sync;
 pub mod ws;
 pub mod ws_session;
 
@@ -54,6 +62,7 @@ pub use error::{Error, Result};
 pub use frame::{
     Auth, CommandFrame, NodeError, NodeErrorKind, Request, Response,
 };
+pub use manager::{WatchGuard, WatchMode};
 pub use ws_session::WsSession;
 
 #[cfg(not(target_arch = "wasm32"))]

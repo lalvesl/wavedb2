@@ -37,6 +37,10 @@ pub enum Error {
     /// An envelope failed to decode as its wire type.
     #[error(transparent)]
     Wire(#[from] wavedb_wire::Error),
+    /// The background connection manager is unavailable — its task could
+    /// not start or has stopped, so no exchange can be made at all.
+    #[error("connection manager unavailable")]
+    ManagerUnavailable,
     /// A node-side refusal, surfaced by [`call_ok`](crate::NetClient::call_ok)
     /// (which flattens the `Response::Err` arm into this error type). The
     /// lower-level [`call`](crate::NetClient::call) returns it as a value.
