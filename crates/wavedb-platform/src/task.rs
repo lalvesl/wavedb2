@@ -33,19 +33,21 @@ where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + 'static,
 {
-    std::thread::Builder::new().name(name.into()).spawn(move || {
-        // A runtime that cannot build leaves the factory unconsumed: its
-        // channels drop, so every handle into this task errors instead of
-        // hanging — the failure is loud at the callers, not here.
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
-        let local = tokio::task::LocalSet::new();
-        rt.block_on(local.run_until(async move { factory().await }));
-    })?;
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            // A runtime that cannot build leaves the factory unconsumed: its
+            // channels drop, so every handle into this task errors instead of
+            // hanging — the failure is loud at the callers, not here.
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async move { factory().await }));
+        })?;
     Ok(())
 }
 

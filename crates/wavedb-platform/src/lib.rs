@@ -13,7 +13,10 @@
 //!   POST over `TcpStream` / browser `fetch` + `Request` with a streamed
 //!   response body);
 //! - [`ws`] — the **client half** of the WebSocket transport (hand-rolled
-//!   RFC 6455 over `TcpStream` / the browser's own `WebSocket` object).
+//!   RFC 6455 over `TcpStream` / the browser's own `WebSocket` object);
+//! - [`task`] — background tasks: the never-ending world the connection
+//!   manager runs on (dedicated thread + current-thread runtime /
+//!   `wasm_bindgen_futures::spawn_local` — no tokio in wasm).
 //!
 //! Same module paths, same signatures, two implementations — conditional
 //! compilation is the dispatch (no traits, no `dyn`). The server halves of
@@ -27,6 +30,7 @@
 pub mod error;
 pub mod http;
 pub mod rand;
+pub mod task;
 pub mod time;
 pub mod ws;
 
