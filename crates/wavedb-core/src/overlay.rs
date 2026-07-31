@@ -39,6 +39,8 @@ impl<'a, S: Store> Overlay<'a, S> {
                 Write::Remove(id) => {
                     self.pending.insert(id.raw(), None);
                 }
+                // A guard is not state — nothing to stage.
+                Write::Expect(..) => {}
             }
         }
     }

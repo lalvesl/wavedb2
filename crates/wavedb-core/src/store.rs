@@ -24,6 +24,14 @@ pub enum Write {
     Put(Id, Vec<u8>),
     /// Delete `Id`.
     Remove(Id),
+    /// Commit-time guard: the batch applies only if `Id` currently holds
+    /// exactly these bytes (`None` = is absent). Every `Expect` in a batch
+    /// is validated against the **pre-batch** state inside the backend's
+    /// atomic section; any mismatch refuses the whole batch as
+    /// [`Error::Conflict`](crate::Error::Conflict) and nothing is written.
+    /// A guard is not state — a durable backend validates it but never
+    /// persists it.
+    Expect(Id, Option<Vec<u8>>),
 }
 
 impl Write {
@@ -31,7 +39,7 @@ impl Write {
     #[must_use]
     pub const fn id(&self) -> Id {
         match self {
-            Self::Put(id, _) | Self::Remove(id) => *id,
+            Self::Put(id, _) | Self::Remove(id) | Self::Expect(id, _) => *id,
         }
     }
 }
@@ -135,6 +143,13 @@ mod tests {
             {
                 let mut map = self.0.lock().unwrap();
                 for w in batch {
+                    if let Write::Expect(id, expected) = w
+                        && map.get(&id.raw()) != expected.as_ref()
+                    {
+                        return Err(crate::Error::Conflict(*id));
+                    }
+                }
+                for w in batch {
                     match w {
                         Write::Put(id, bytes) => {
                             map.insert(id.raw(), bytes.clone());
@@ -142,6 +157,7 @@ mod tests {
                         Write::Remove(id) => {
                             map.remove(&id.raw());
                         }
+                        Write::Expect(..) => {}
                     }
                 }
             }

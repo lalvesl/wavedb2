@@ -24,6 +24,7 @@
 
 use crate::id::Id;
 use crate::local_id::LocalId;
+use crate::metadata::Metadata;
 use crate::u48::U48;
 
 /// What a mutation did to its record.
@@ -32,8 +33,10 @@ pub enum MutationKind {
     /// Inserted, updated, or Unique-saved — [`Mutation::body`] is the new
     /// state.
     Saved,
-    /// Moved to the dead tree — [`Mutation::body`] is empty.
-    Removed,
+    /// Moved to the dead tree — [`Mutation::body`] is empty. Carries the
+    /// removal instant the dead-log entry is keyed by, so a watcher's
+    /// catch-up cursor can advance past the removal.
+    Removed(u64),
 }
 
 /// One committed mutation, as the write path that planned it saw it.
@@ -50,6 +53,10 @@ pub struct Mutation {
     pub id: Id,
     /// Saved or removed.
     pub kind: MutationKind,
+    /// The new live version's [`Metadata`] (`None` on a removal — a remove
+    /// rewrites no record). Riding the event lets a mirror adopt the
+    /// node's authoritative chain data instead of minting its own.
+    pub meta: Option<Metadata>,
     /// The record's new body wire bytes (empty for a removal).
     pub body: Vec<u8>,
 }
@@ -116,6 +123,7 @@ mod tests {
     struct NotePivot {
         current: LocalId,
         dead: LocalId,
+        recency: LocalId,
         permission: Option<PermissionRef>,
     }
     impl Pivot for NotePivot {
@@ -125,6 +133,9 @@ mod tests {
         }
         fn dead(&self) -> LocalId {
             self.dead
+        }
+        fn recency(&self) -> LocalId {
+            self.recency
         }
         fn secondaries(&self) -> &[LocalId] {
             &[]
@@ -136,11 +147,13 @@ mod tests {
             &self,
             current: LocalId,
             dead: LocalId,
+            recency: LocalId,
             _: &[LocalId],
         ) -> Self {
             Self {
                 current,
                 dead,
+                recency,
                 permission: self.permission.clone(),
             }
         }
@@ -191,8 +204,21 @@ mod tests {
             assert_eq!(noted[0].body, to_wire(&note("hi")));
             assert_eq!(noted[1].kind, MutationKind::Saved);
             assert_eq!(noted[1].body, to_wire(&note("edited")));
-            assert_eq!(noted[2].kind, MutationKind::Removed);
+            let MutationKind::Removed(removed_at) = noted[2].kind else {
+                panic!("a remove notes a removal");
+            };
+            let saved_at =
+                noted[1].meta.as_ref().map_or(0, |m| m.succession.instant());
+            assert!(
+                removed_at > saved_at,
+                "the removal instant lands past every earlier mutation — \
+                 a catch-up cursor advanced to it misses nothing"
+            );
             assert!(noted[2].body.is_empty());
+            // Saved events carry the new live metadata; a removal rewrites
+            // no record, so it carries none.
+            assert!(noted[0].meta.is_some() && noted[1].meta.is_some());
+            assert!(noted[2].meta.is_none());
         });
     }
 
