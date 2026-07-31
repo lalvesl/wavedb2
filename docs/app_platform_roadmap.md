@@ -99,7 +99,7 @@ between the local store and notifications.
 ## M7 — Live sync
 
 Owner node fans out mutations to subscribed sessions (WS push; HTTP piggyback +
-idle ticks). Screen-sync = declared subscriptions + journal cursor (Bloom filter rejected 2026-07-10). Client event API
+idle ticks). Live sync = declared subscriptions + navigation catch-up (journal-cursor design superseded by DB-1 2026-07-17; Bloom filter rejected 2026-07-10). Client event API
 (`Order::watch(&db)` over a collection / key).
 
 **Exit:** client A saves; client B's watcher fires within one round-trip (WS) /

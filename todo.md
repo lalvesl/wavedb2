@@ -186,20 +186,25 @@ Task log in [PLAN — M7 live sync](#plan--m7-live-sync) at the end.
 
 - WebSocket transport: token once at handshake, connection-bound identity;
   push notifications; HTTP piggyback + idle-tick fallback for POST clients;
-- screen-sync as **declared subscriptions + journal cursor** (client event
+- live sync as **declared subscriptions + navigation catch-up** (client event
   API `T::watch(&db)` over Unique anchors / collection pivots; reconnect =
-  "since journal sequence N" streaming exactly the tenant's deltas). The
-  earlier Bloom-filter idea is **rejected** (2026-07-10): answering a filter
-  on reconnect would force the node to test its whole dataset against it,
-  and exact pivot/anchor subscriptions already give live filtering without
-  false positives;
+  each topic declares an instant cursor and the node navigates the data —
+  recency/dead logs for a collection, the version chain for a Unique record —
+  so catch-up is stateless with no per-session node buffer). The original
+  **journal commit-cursor** design ("since sequence N") is **superseded** by
+  the DB-1 anchor model (2026-07-17), and the **Bloom-filter** idea before it
+  is **rejected** (2026-07-10): answering a filter on reconnect would force the
+  node to test its whole dataset against it, and exact pivot/anchor
+  subscriptions already give live filtering without false positives;
 - offline write queue replaying through the same cursor path (M6 refuses
   offline writes on purpose — the cache never diverges);
 - **exit:** client A saves; client B's watcher fires within one round-trip
   (WS) / one poll tick (HTTP). **The WS half holds (W1–W5 landed
   2026-07-13)** — `Db::watch_unique`/`watch_collection` push typed events
-  and keep the M6 cache warm; remaining: W6 (reconnect cursor), W7 (the
-  HTTP poll-tick half of the exit), W8 (offline queue).
+  and keep the M6 cache warm; **W6 navigation catch-up landed (2026-07-19)** —
+  `Command::Changes` powers stateless HTTP-poll sync; remaining: the WS
+  reconnect-cursor bookkeeping (issue `Changes` per resubscribed topic on
+  manager respawn), W7 (the HTTP piggyback half), W8 (offline queue).
 
 ## M8 — auth & permission enforcement — LANDED (2026-07-10)
 
@@ -426,8 +431,8 @@ Deliberately left as later seams:
   dead socket. One WS connection per watch (multiplexing = later
   refinement); typed `T::watch(&db)` sugar joins the `T::get(&db)`
   unification note (watch is `Db`-only — no `DbHandle` seam for it yet).
-  Next: W6 (journal-cursor catch-up), W7 (HTTP piggyback), W8 (offline
-  write queue).
+  Next: W6 (catch-up by navigation — the journal-cursor design was later
+  superseded by DB-1), W7 (HTTP piggyback), W8 (offline write queue).
 
 - **M7 W5.5 — connection manager + HTTP-poll watch — LANDED (2026-07-16,
   user-directed)**: ONE never-ending background task per process
@@ -597,6 +602,26 @@ Deliberately left as later seams:
   navigation across death, mirror revival byte-identical) +
   schema-smoke `Setting` e2e through the real macro expansion. 289
   tests green, clippy 0, budget ok, wasm targets ok. Then: docs sweep.
+
+  **Docs sweep LANDED (2026-07-20): the DB-1 restructure docs caught up
+  to the code.** `docs/wire_format.md` gained an "Engine record layout"
+  section (the three `STRUCT_HASH`-headed envelopes + the `Metadata`
+  26-byte stack table + the instants-not-addresses chain note).
+  `wavedb-net/README.md` retitled "Screen-sync: subscriptions + journal
+  cursor" → "Live sync: subscriptions + navigation catch-up" (catch-up is
+  now stateless `Command::Changes` navigation over recency/dead logs +
+  the Unique chain; the journal commit-cursor is recorded as *superseded*
+  by DB-1, Bloom as *rejected*), and its transport table/status un-deferred
+  WebSocket (M7 live watches wired, HTTP-poll fallback). Stale wording
+  cleaned in `todo.md` (M7 summary + the W5 "Next:" line) and
+  `app_platform_roadmap.md`; `wavedb-quick-node/README.md` link re-anchored.
+  All `cargo doc` link warnings zeroed (~24 across core/wire/net/wavedb/
+  macros/wire-derive/storage/quick-node/platform: `Error` enum-vs-derive
+  disambiguated `enum@`, private items (`Overlay`/`type_salt`/
+  `Bound::created_at_range`/`client_cache`/`PagePayload`) delinked to code
+  spans, cross-crate/out-of-scope paths qualified, `Arc`/`Received::Ping`
+  resolved, redundant targets trimmed). `cargo doc` 0, clippy 0, fmt ok,
+  budget ok, 290 tests green.
 
 - **`examples/showcase` LANDED (2026-07-18, user-requested)**: the big
   runnable usage example — one project-tracker schema (Unique

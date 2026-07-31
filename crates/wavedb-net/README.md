@@ -23,7 +23,7 @@ rather than buffering a whole `Vec`, so the client can stop early.
 | `ws`      | WebSocket transport (preferred).                                |
 | `http`    | HTTP POST transport (fallback) + the client queue.              |
 | `notify`  | "object changed" notifications (push / piggyback).              |
-| `browse`  | Live-browse / screen-sync surface.                              |
+| `browse`  | Live-browse / live-sync surface.                                |
 | `auth`    | Session + node-to-node HMAC tokens, login, identity derivation. |
 | `request` | Request/response envelopes (`TransportResponse`, `NodeError`).  |
 | `metrics` | Per-node transport metrics.                                     |
@@ -37,16 +37,18 @@ implementations; the same operations run on servers, native clients, and (via
 
 ## Transports
 
-> **Status: HTTP POST only for now.** The current rebuild wires a single
-> transport — **HTTP POST** — on both native and browser. WebSocket (and with it
-> server push, idle-tick piggyback, and screen-sync) is **deferred**; the
-> table below is the target shape. The request path is built so the transport is
-> swappable later without touching the command / dispatch / auth layers.
+> **Status: request/reply over HTTP POST; live watches over WebSocket.** The
+> request hot path is **HTTP POST** on both native and browser. Live sync (M7)
+> wires **WebSocket** push — all watches of one identity multiplex over a single
+> connection owned by `net::manager` — with an **HTTP-poll** fallback for
+> POST-only clients (`db.watch_via_polling`). Still open: idle-tick piggyback of
+> events onto ordinary responses (W7). Both transports run through the same
+> command / dispatch / auth layers.
 
 | Transport         | Native | Browser | Status    | Notes                                                  |
 | ----------------- | ------ | ------- | --------- | ------------------------------------------------------ |
-| **HTTP POST**     | ✓      | ✓       | **wired** | The only transport for now. FIFO queue per client.     |
-| **WebSocket**     | pref.  | pref.   | deferred  | Bidirectional, push-capable; carries screen-sync.      |
+| **HTTP POST**     | ✓      | ✓       | **wired** | Request/reply hot path; also carries the poll-watch fallback. |
+| **WebSocket**     | ✓      | ✓       | **wired** | Multiplexed live watches (one connection per identity). |
 | **Future native** | plan.  | n/a     | planned   | Higher-throughput native-only transport, in scoping.   |
 
 ### HTTP POST: single-queue with piggybacked notifications
@@ -132,10 +134,7 @@ server-fn body on the decoded args instead. Identity and permission are enforced
 
 ---
 
-## Screen-sync: subscriptions + journal cursor
-
-> **Deferred** — screen-sync rides WebSocket push, which the current rebuild does
-> not wire (HTTP POST only). The protocol below is the target.
+## Live sync: subscriptions + navigation catch-up
 
 State-sync for the **online** read path, in two halves — both **exact**, never
 probabilistic:
@@ -145,16 +144,28 @@ probabilistic:
   Every accepted mutation already knows its `Id` and owning pivot, so the node
   routes it to subscribers by exact match — O(subscriptions) per mutation, no
   dataset scan, no false positives. Interest is declared, like the registry:
-  the node never guesses what a client can see.
-- **Catch-up — the journal cursor.** The journal is already the ordered log of
-  every committed batch; the push stream carries its commit sequence. A
-  reconnecting client says "since sequence N" and the node streams exactly the
-  tenant's deltas after it — O(what changed), never a walk over the dataset.
+  the node never guesses what a client can see. All watches of one
+  `(addr, identity)` multiplex over **one** WebSocket connection owned by
+  `net::manager`.
+- **Catch-up — navigation.** A reconnecting (or polling) client declares each
+  topic with an **instant cursor** and the node answers by *navigating the data
+  itself* (`Command::Changes`, reserved hash `"WDB.SYNC"` routed before the
+  registry): a NonUnique collection walks its recency and dead logs from the
+  cursor, a Unique record walks the version chain forward. This is **stateless**
+  — the node keeps no per-session buffer, so an outage or restart loses nothing,
+  and same-record writes within one tick coalesce to the live state. Over plain
+  HTTP the same op is an "anything new?" poll (`db.watch_via_polling(interval)`);
+  over WebSocket it seeds the push stream on (re)subscribe.
 
-(A Bloom filter of on-screen ids was the earlier design here and was rejected:
-answering one on reconnect would force the node to test its whole dataset
-against the filter, and for live filtering it adds false positives over nothing
-that exact pivot/anchor subscriptions don't already give.)
+(The earlier design here was a **journal commit-cursor** — "since sequence N"
+streamed from the ordered batch log. The DB-1 anchor model made it obsolete:
+archives live at instant-derived slots and every collection carries instant-keyed
+recency/dead logs, so "changed since" is a tail scan of the data with no journal
+coupling and no per-session node state. A **Bloom filter** of on-screen ids was
+the design before *that*, and was rejected: answering one on reconnect would
+force the node to test its whole dataset against the filter, and for live
+filtering it adds false positives over nothing that exact pivot/anchor
+subscriptions don't already give.)
 
 ---
 

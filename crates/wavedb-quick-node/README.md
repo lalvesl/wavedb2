@@ -86,7 +86,7 @@ not a deployment.
 
 - **Within one tenant:** strong (single writer via routing ownership).
 - **Across tenants:** eventual (delta sync — see
-  [`wavedb-net`](../wavedb-net/README.md#screen-sync-subscriptions--journal-cursor)).
+  [`wavedb-net`](../wavedb-net/README.md#live-sync-subscriptions--navigation-catch-up)).
 - **On conflict:** most recent state wins via the live record; the loser becomes a
   branch in the history chain.
 

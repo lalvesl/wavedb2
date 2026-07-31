@@ -66,6 +66,51 @@ Two ways a value nests, and they are different on purpose:
    until the region is exhausted (the region length is the parent's `u32`
    slot, so no element count is stored).
 
+## Engine record layout
+
+The codec above is engine-agnostic (the `wavedb-wire` crate has no `STRUCT_HASH`
+and no engine coupling), but the node and the client cache stack a few fixed
+envelopes on top of it. Every stored value opens with an 8-byte little-endian
+`STRUCT_HASH` head — storage routes on it and decode verifies it, so a stale or
+foreign `Id` can never decode as the wrong type. Three envelope forms follow:
+
+- **bare** (`Pivot` records — pure addressing, no history):
+  `[STRUCT_HASH (8)][WaveWire bytes]`.
+- **record** (Unique + NonUnique user data):
+  `[STRUCT_HASH (8)][meta_len (u32 LE)][WaveWire(Metadata)][WaveWire body]` — the
+  `meta_len` prefix splits two independently-decodable payloads, and carrying the
+  `Metadata` header is what makes every version chainable.
+- **B+tree node**: `[BPTREE_NODE_HASH (8)][kind (u8)][WaveWire bytes]`.
+
+### `Metadata`
+
+The per-record header records **who wrote a version, when, and under which
+rule** — state review, not domain data (a domain fact like "member since"
+belongs in the record's own fields). It rides `WaveWire` field-by-field like
+everything else; its stack is a fixed **26 bytes**:
+
+| Field            | Type                    | Stack | Heap (when `Some`)        |
+| ---------------- | ----------------------- | ----- | ------------------------- |
+| `previous`       | `Option<u64>`           | 1     | 8 (predecessor's instant) |
+| `succession`     | `Succession`            | 9     | —                         |
+| `pivot_id`       | `Option<LocalId>`       | 1     | 10 (owning Pivot)         |
+| `user`           | `U48`                   | 6     | —                         |
+| `device_created` | `u64`                   | 8     | —                         |
+| `permission`     | `Option<PermissionRef>` | 1     | variable                  |
+
+`Succession` (`CreatedAt(u64)` on the live version, `Next(u64)` on an archive)
+is **hand-encoded** as a fixed 9-byte stack — `tag (1) + instant (8 LE)` —
+rather than the derive's enum form: the payload never varies, so the derive's
+`u32` length prefix would be dead weight on every stored record. A Unique first
+version (every `Option` field `None`) is the minimal case: 26 stack bytes, zero
+heap.
+
+Chain links are **authoring instants, not addresses**: `previous` and
+`Succession::Next` carry the `u64` instant a version was written, and an
+archive's slot is a pure function of `(type, shape, instant)` — so a link
+written once stays correct forever and no archive is ever repointed. The slot
+derivation lives in `crates/wavedb-core/src/record.rs`.
+
 ## Trade-offs vs postcard
 
 - No varints: integers cost their full width before compression. Downstream
