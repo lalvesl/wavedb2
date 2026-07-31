@@ -42,6 +42,25 @@ pub enum Error {
     /// [`Store`]: crate::Store
     #[error("record {0:?} missing")]
     RecordMissing(Id),
+    /// A batch's [`Write::Expect`] guard found the record changed between
+    /// the plan's read and the commit — a concurrent save of the same
+    /// anchor. Nothing was written; the caller re-plans against the new
+    /// live version.
+    ///
+    /// [`Write::Expect`]: crate::Write::Expect
+    #[error("write conflict at {0:?}")]
+    Conflict(Id),
+    /// The record at a live anchor carried an archive's `Succession::Next`
+    /// — the version chain at this id is corrupt.
+    #[error("version chain corrupt at {0:?}")]
+    ChainCorrupt(Id),
+    /// A save addressed an id that is not the value's own content-derived
+    /// anchor (`#[wavedb::key(...)]` types): the key fields ARE the
+    /// identity, so "renaming" is an explicit `remove` + `insert` of the
+    /// new key — never a silent write that would duplicate the record or
+    /// orphan its indexes.
+    #[error("value's natural key does not derive the addressed id {0:?}")]
+    KeyMismatch(Id),
     /// A secondary-index lookup named an index this collection's `Pivot` does
     /// not declare (out of `0..NUM_SECONDARIES`).
     #[error("secondary index {0} out of range")]
