@@ -25,9 +25,12 @@ extern crate self as wavedb_core;
 pub mod collection;
 mod collection_adopt;
 pub mod collection_handle;
+mod collection_keyed;
+mod collection_recency;
 mod collection_write;
 pub mod error;
 pub mod expose;
+mod expose_changes;
 pub mod fn_identity;
 pub mod handle;
 pub mod hooks;
@@ -35,6 +38,7 @@ pub mod id;
 pub mod index;
 pub mod local_id;
 pub mod metadata;
+mod mint;
 pub mod notify;
 pub mod overlay;
 pub mod permission;
@@ -63,7 +67,10 @@ pub use index::{
     SecKey, Union,
 };
 pub use local_id::LocalId;
-pub use metadata::Metadata;
+pub use metadata::{Metadata, Succession};
+// Generated `natural_key` impls derive their anchor through this one fn,
+// so every build agrees on the address a key-field value set maps to.
+pub use mint::natural_key_hash;
 pub use notify::{Mutation, MutationKind};
 pub use permission::PermissionRef;
 pub use store::{Store, Write};

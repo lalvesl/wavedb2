@@ -17,12 +17,17 @@
 use crate::collection::Collection;
 use crate::error::{Error, Result};
 use crate::id::Id;
+use crate::index::Pivot as _;
 use crate::local_id::LocalId;
 use crate::record;
 use crate::store::Store;
 use crate::traits::{NonUniqueStruct, WaveDbStruct};
 use crate::u48::U48;
 use crate::wire::{WaveWire, from_wire, to_wire};
+
+// The catch-up navigation (the `Changes` command's engine) lives in its own
+// module; re-exported so the wire vocabulary reads from one place.
+pub use crate::expose_changes::{Change, collection_changes, unique_changes};
 
 /// The wire command set: `Get`/`Save` for a `Unique` type,
 /// `Insert`/`Update`/`Remove`/`Get` for a NonUnique one. A `#[server]`
@@ -46,6 +51,11 @@ pub enum Command {
     /// Unique version-chain walk, newest-first (empty payload → the tenant's
     /// anchor). Buffered like `All`.
     History,
+    /// Everything that changed since a cursor — the reconnect catch-up
+    /// (payload = `(Option<LocalId> pivot, Option<u64> since)`; `None`
+    /// since = register: answer the current tail, no events). Answered as
+    /// `Values` of [`Change`] entries, `Cursor` first.
+    Changes,
 }
 
 /// What an executed command yields. Derives [`WaveWire`] so the transport
@@ -196,7 +206,26 @@ where
 {
     use futures::TryStreamExt;
     let col = Collection::<T>::at(pivot, tenant);
-    let items: Vec<(Id, T)> = col.all(store).try_collect().await?;
+    // Each entry is the wire triple `(Id, Metadata, T)`: the node-minted
+    // identity and the authoritative chain data ride along so a client
+    // mirror adopts them verbatim; the typed surface still yields values —
+    // hence the direct tree walk here, decoding once and keeping the
+    // metadata `all` would drop.
+    let pivot_record = col.load_pivot(store).await?;
+    let items: Vec<(Id, crate::metadata::Metadata, T)> = col
+        .tree(pivot_record.current())
+        .search(store, crate::index::Bound::All)
+        .and_then(|id| async move {
+            let bytes = store
+                .get_of(T::STRUCT_HASH, id)
+                .await?
+                .ok_or(Error::RecordMissing(id))?;
+            let (meta, value) =
+                crate::record::decode_record::<T>(T::STRUCT_HASH, &bytes)?;
+            Ok((id, meta, value))
+        })
+        .try_collect()
+        .await?;
     let entries = items.iter().map(to_wire).collect();
     Ok(Reply::Values(entries))
 }
