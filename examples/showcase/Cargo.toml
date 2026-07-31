@@ -1,0 +1,41 @@
+[package]
+name = "showcase"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# The schema side features (see the todo-app schema for the full story):
+# both on by default so this crate's own examples run the full loop; a
+# deployed client would depend with `default-features = false,
+# features = ["client-side"]` and never even compile the `#[server]` bodies.
+[features]
+default = ["server-side", "client-side"]
+server-side = ["dep:futures"]
+client-side = []
+
+[dependencies]
+wavedb = { path = "../../crates/wavedb" }
+# The derive-emitted code names ::wavedb_core:: paths directly.
+wavedb-core = { path = "../../crates/wavedb-core" }
+# Stream combinators for the index-backed reads (server bodies).
+futures = { workspace = true, optional = true }
+
+# `#[wavedb]` emits each type's native storage slot (`StructStorage`
+# statics), so on non-wasm targets a schema crate links the engine crate
+# defining it.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wavedb-storage = { path = "../../crates/wavedb-storage" }
+
+# The runnable halves (`examples/node.rs`, `examples/client.rs`) use these.
+[dev-dependencies]
+wavedb-quick-node = { path = "../../crates/wavedb-quick-node" }
+# The client example signs its own access token against the demo secret —
+# the same shortcut every e2e takes; a real app logs in over `#[server]` fns.
+wavedb-net = { path = "../../crates/wavedb-net" }
+tokio.workspace = true
+futures.workspace = true
