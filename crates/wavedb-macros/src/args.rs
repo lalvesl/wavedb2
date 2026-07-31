@@ -146,3 +146,25 @@ impl syn::parse::Parse for PivotSpec {
         }
     }
 }
+
+/// The one `#[wavedb::key(...)]` declaration a keyed struct carries: the
+/// natural-key field(s), declaration order — the record's anchor is
+/// SeaHash over their wire bytes, so these fields ARE the identity.
+#[derive(Debug, Clone)]
+pub struct KeySpec {
+    pub fields: Vec<Ident>,
+}
+
+impl syn::parse::Parse for KeySpec {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let idents = Punctuated::<Ident, Token![,]>::parse_terminated(input)?;
+        let fields: Vec<Ident> = idents.into_iter().collect();
+        if fields.is_empty() {
+            return Err(syn::Error::new(
+                input.span(),
+                "#[wavedb::key(...)] takes at least one field",
+            ));
+        }
+        Ok(Self { fields })
+    }
+}

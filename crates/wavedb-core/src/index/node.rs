@@ -19,13 +19,13 @@
 //!
 //! ## Node identity
 //!
-//! Node ids are minted with `FLAG = 1`, which namespaces them away from the
-//! `FLAG = 0` record keys sharing the tenant's keyspace — a node id and a
-//! record id can never collide. Minting is non-deterministic (clock + counter),
-//! which is fine: nodes are persisted by value, so a journal replay reproduces
-//! the exact bytes without re-minting.
-
-use std::sync::atomic::{AtomicU64, Ordering};
+//! Node ids carry the reserved node hash's type salt and a
+//! [`key_nanos`](wavedb_platform::time::key_nanos) key (collision-free by
+//! its fused counter), like every other mint in the workspace — which keeps
+//! them apart from record ids even in a flat keyspace (IndexedDB). Minting
+//! is non-deterministic (clock + counter), which is fine: nodes are
+//! persisted by value, so a journal replay reproduces the exact bytes
+//! without re-minting.
 
 use crate::error::{Error, Result};
 use crate::local_id::LocalId;
@@ -46,10 +46,6 @@ const NODE_PREFIX: usize = 8;
 /// `kind` byte values.
 const KIND_LEAF: u8 = 0;
 const KIND_INTERNAL: u8 = 1;
-
-/// Process-wide counter salting node ids, so two nodes minted in the same
-/// nanosecond still get distinct `LocalId`s.
-static NODE_SALT: AtomicU64 = AtomicU64::new(0);
 
 /// A B+tree node, decoded from its `Store` value.
 ///
@@ -121,12 +117,16 @@ impl<K: NodeKey> NodeBody<K> {
     }
 }
 
-/// Mint a fresh node `LocalId`: a nanosecond key with `FLAG = 1` (namespaced
-/// away from records) and a per-process counter salt.
+/// Mint a fresh node `LocalId`: a [`key_nanos`] key (collision-free by its
+/// fused counter), `FLAG = 1`, and the reserved node hash's type salt.
+///
+/// [`key_nanos`]: wavedb_platform::time::key_nanos
 pub(super) fn mint_node_id() -> LocalId {
-    let nanos = wavedb_platform::time::unix_nanos();
-    let salt = (NODE_SALT.fetch_add(1, Ordering::Relaxed) & 0x7FFF) as u16;
-    LocalId::new(nanos, true, salt)
+    LocalId::new(
+        wavedb_platform::time::key_nanos(),
+        true,
+        crate::record::type_salt(BPTREE_NODE_STRUCT_HASH),
+    )
 }
 
 #[cfg(test)]
