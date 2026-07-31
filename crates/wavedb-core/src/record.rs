@@ -17,26 +17,32 @@
 //!
 //! ## The version chain
 //!
-//! Saving never destroys the old bytes. A save **archives** the superseded
-//! version at a freshly minted id and links the chain through `Metadata`:
-//! the live record's `old_modification_id` points at the newest archive, each
-//! archive's `old_modification_id` at the one before it, and each archive's
-//! `new_modification_id` at the archive that superseded it (`None` on the
-//! newest archive — its successor is the live record itself). Walk backward
-//! from the live record or forward from any archive.
-
-use std::sync::atomic::{AtomicU64, Ordering};
+//! Saving never destroys the old bytes; the live record always sits at the
+//! shape's **anchor** and every superseded version archives at a **derived
+//! slot**: `KEY` = the instant that version was authored (its
+//! [`Succession::CreatedAt`]), `SALT` = the type's [`type_salt`], `FLAG` =
+//! the anchor's bit **flipped**. Because the address is a pure function of
+//! `(type, shape, instant)`, chain links are bare instants (`Metadata`'s
+//! `previous` / [`Succession::Next`]) and a link written once is correct
+//! forever — no archive is ever repointed. Walk backward from the live
+//! record via `previous`; walk forward from any archive via `Next` — a
+//! MISS at a derived slot means the successor is still the live record at
+//! the anchor.
 
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::local_id::LocalId;
-use crate::metadata::Metadata;
+use crate::metadata::{Metadata, Succession};
 use crate::store::{Store, Write};
+use crate::traits::Shape;
 use crate::u48::U48;
 use crate::wire::{WaveWire, from_wire, to_wire};
 
-// The plan-time read view lives in its own module; re-exported so the
-// established `crate::record::Overlay` path (collection_write) still resolves.
+// The plan-time read view and the minting half live in their own modules;
+// re-exported so the established `crate::record::*` paths still resolve.
+pub(crate) use crate::mint::{
+    archive_id, keyed_id, mint_floored_id, mint_instant, type_salt,
+};
 pub(crate) use crate::overlay::Overlay;
 
 /// Bytes before the wire body: the `STRUCT_HASH` head.
@@ -44,10 +50,6 @@ const ENVELOPE_PREFIX: usize = 8;
 
 /// Bytes before a record's `Metadata`: the head plus the `meta_len` slot.
 const RECORD_PREFIX: usize = ENVELOPE_PREFIX + 4;
-
-/// Process-wide counter salting minted record ids, so two records minted in
-/// the same nanosecond still get distinct ids.
-static RECORD_SALT: AtomicU64 = AtomicU64::new(0);
 
 /// Serialise a value as a stored record: `[hash (8 B LE)][WaveWire bytes]`.
 pub(crate) fn encode_envelope<V: crate::wire::WaveWire>(
@@ -77,15 +79,6 @@ pub(crate) fn decode_envelope<V: crate::wire::WaveWire>(
         return Err(Error::UnknownStructHash(got));
     }
     Ok(from_wire::<V>(&bytes[ENVELOPE_PREFIX..])?)
-}
-
-/// Mint a fresh timestamp-keyed id under `tenant`: `KEY = CREATED_AT` (nanos),
-/// `FLAG = 0` (the record namespace), and a per-process counter salt so ids
-/// minted in the same nanosecond stay distinct.
-pub(crate) fn mint_timestamped_id(tenant: U48) -> Id {
-    let nanos = wavedb_platform::time::unix_nanos();
-    let salt = (RECORD_SALT.fetch_add(1, Ordering::Relaxed) & 0x7FFF) as u16;
-    Id::new(nanos, tenant, false, salt)
 }
 
 // ---- Record envelope (Metadata-carrying) ----------------------------------------
@@ -161,84 +154,126 @@ pub(crate) fn decode_record<V: WaveWire>(
 
 // ---- The version chain -----------------------------------------------------------
 
-/// Plan a chained save of `value` at `live_id`: archive the superseded
-/// version (when one exists) at a fresh id, repoint the previous archive's
-/// forward link at it, and write the new live record — all as `Write`s for
-/// one atomic batch. Returns the writes plus the superseded version's
-/// decoded state (`None` on a first save) for the caller's own needs
-/// (secondary re-keying).
+/// One chained save's addressing and authorship, bundled for
+/// [`plan_chained_save`].
+pub(crate) struct SavePlan {
+    /// The saved type's `STRUCT_HASH`.
+    pub hash: u64,
+    /// Its shape — picks the archive namespace's flipped `FLAG`.
+    pub shape: Shape,
+    /// The shape's anchor the live record sits at.
+    pub live_id: Id,
+    pub tenant: U48,
+    /// Stamped as `Metadata.user`.
+    pub user: U48,
+    /// The pivot back-link a **first** version is stamped with (a later
+    /// save carries the existing one forward).
+    pub pivot_id: Option<LocalId>,
+    /// A node-authoritative [`Metadata`] to write **verbatim** instead of
+    /// authoring one — the cache-mirror adopt path, so a mirrored record
+    /// carries the node's chain data and the mirror's archives land at the
+    /// node's own derived slots. `None` = author a fresh version here.
+    pub imposed: Option<Metadata>,
+    /// The collection's persisted instant watermark (its recency/dead
+    /// maxima) an authored version must land strictly above — `0` for a
+    /// `Unique` (no collection; its chain guard alone keeps it walkable).
+    pub floor: u64,
+}
+
+/// Plan a chained save of `value` at the shape's anchor: archive the
+/// superseded version (when one exists) at its **derived slot**, stamp
+/// its forward link, and write the new live record — all as `Write`s for
+/// one atomic batch. Returns the writes, the superseded version's
+/// authoring instant and decoded value (`None` on a first save) for the
+/// caller's own needs (secondary and recency re-keying), and the new live
+/// version's [`Metadata`] (what `note_mutation` carries to watchers).
+///
+/// The batch opens with a [`Write::Expect`] guard: two concurrent saves of
+/// one anchor would derive the **same** archive slot, and the loser's
+/// commit would overwrite history — the guard refuses it as a typed
+/// [`Error::Conflict`] instead (the caller re-plans against the new live
+/// version).
 ///
 /// # Errors
-/// Propagates a [`Store`] failure or a decode fault on the existing record
-/// or the previous archive.
+/// Propagates a [`Store`] failure or a decode fault on the existing
+/// record; [`Error::ChainCorrupt`] when the record at the anchor carries
+/// an archive's `Next` (or an imposed metadata does).
 pub(crate) async fn plan_chained_save<V: WaveWire, S: Store>(
     store: &S,
-    hash: u64,
-    live_id: Id,
-    tenant: U48,
-    user: U48,
+    plan: &SavePlan,
     value: &V,
-    pivot_id: Option<LocalId>,
-) -> Result<(Vec<Write>, Option<(Metadata, V)>)> {
-    let Some(old_bytes) = store.get_of(hash, live_id).await? else {
-        // First version: nothing to archive.
-        let meta = Metadata {
-            pivot_id,
-            user,
+) -> Result<(Vec<Write>, Option<(u64, V)>, Metadata)> {
+    let Some(old_bytes) = store.get_of(plan.hash, plan.live_id).await? else {
+        // First version: nothing to archive. The guard still rides along —
+        // a concurrent first save must conflict, not silently supersede.
+        let meta = plan.imposed.clone().unwrap_or_else(|| Metadata {
+            succession: Succession::CreatedAt(mint_instant(plan.floor)),
+            pivot_id: plan.pivot_id,
+            user: plan.user,
             ..Metadata::default()
-        };
-        let write = Write::Put(live_id, encode_record(hash, &meta, value));
-        return Ok((vec![write], None));
+        });
+        let writes = vec![
+            Write::Expect(plan.live_id, None),
+            Write::Put(plan.live_id, encode_record(plan.hash, &meta, value)),
+        ];
+        return Ok((writes, None, meta));
     };
-    let (old_meta, old_body) = split_record(hash, &old_bytes)?;
+    let (old_meta, old_body) = split_record(plan.hash, &old_bytes)?;
     let old_value = from_wire::<V>(old_body)?;
+    let Succession::CreatedAt(authored) = old_meta.succession else {
+        return Err(Error::ChainCorrupt(plan.live_id));
+    };
 
-    let archive_id = mint_timestamped_id(tenant);
-    let mut writes = Vec::with_capacity(3);
-
-    // The previous newest archive now has a successor: repoint its forward
-    // link from "the live record" (None) to the new archive.
-    if let Some(prev) = old_meta.old_modification_id {
-        let prev_id = prev.to_id(tenant);
-        let prev_bytes = store
-            .get_of(hash, prev_id)
-            .await?
-            .ok_or(Error::RecordMissing(prev_id))?;
-        let (mut prev_meta, prev_body) = split_record(hash, &prev_bytes)?;
-        prev_meta.new_modification_id = Some(LocalId::from_id(archive_id));
-        writes.push(Write::Put(
-            prev_id,
-            encode_record_raw(hash, &prev_meta, prev_body),
-        ));
-    }
-
-    // Archive the superseded version byte-for-byte (its own chain links kept;
-    // forward = None means "my successor is the live record").
-    writes.push(Write::Put(
-        archive_id,
-        encode_record_raw(hash, &old_meta, old_body),
-    ));
-
-    // The new live version chains back at the archive; pivot back-link and
-    // permission carry forward.
-    let live_meta = Metadata {
-        old_modification_id: Some(LocalId::from_id(archive_id)),
-        new_modification_id: None,
+    // The new version's instant: imposed metadata rules verbatim (the node
+    // authored it); an authored-here save stays monotone within the chain
+    // (equal instants would collapse two archive slots into one) and above
+    // the collection floor, even against a stalled or rewound clock.
+    let live_meta = plan.imposed.clone().unwrap_or_else(|| Metadata {
+        previous: Some(authored),
+        succession: Succession::CreatedAt(mint_instant(
+            authored.max(plan.floor),
+        )),
         pivot_id: old_meta.pivot_id,
-        user,
+        user: plan.user,
         device_created: 0,
         permission: old_meta.permission.clone(),
+    });
+    let Succession::CreatedAt(instant) = live_meta.succession else {
+        return Err(Error::ChainCorrupt(plan.live_id));
     };
-    writes.push(Write::Put(live_id, encode_record(hash, &live_meta, value)));
 
-    Ok((writes, Some((old_meta, old_value))))
+    let mut writes = vec![Write::Expect(plan.live_id, Some(old_bytes.clone()))];
+    // Archive the superseded version byte-for-byte at its derived slot,
+    // its forward link stamped with the successor's instant — written once,
+    // correct forever (the successor's own archival derives the same slot
+    // from the same value). A mirror whose local state does not precede the
+    // imposed instant skips the archive: its stale bytes are not a version
+    // the node's chain knows.
+    if authored < instant {
+        let slot = archive_id(plan.hash, plan.shape, authored, plan.tenant);
+        let archived = Metadata {
+            succession: Succession::Next(instant),
+            ..old_meta
+        };
+        writes.push(Write::Put(
+            slot,
+            encode_record_raw(plan.hash, &archived, old_body),
+        ));
+    }
+    writes.push(Write::Put(
+        plan.live_id,
+        encode_record(plan.hash, &live_meta, value),
+    ));
+    Ok((writes, Some((authored, old_value)), live_meta))
 }
 
 /// Stream a record's versions **newest-first**: the live record, then each
-/// archived version following the `old_modification_id` chain.
+/// archived version at the slot derived from `previous` — the chain is
+/// instants, addresses are computed.
 pub(crate) fn history_stream<'a, V, S>(
     store: &'a S,
     hash: u64,
+    shape: Shape,
     live_id: Id,
     tenant: U48,
 ) -> impl futures::Stream<Item = Result<(Metadata, V)>> + 'a
@@ -255,7 +290,8 @@ where
         };
         match decode_record::<V>(hash, &bytes) {
             Ok((meta, value)) => {
-                let older = meta.old_modification_id.map(|l| l.to_id(tenant));
+                let older =
+                    meta.previous.map(|t| archive_id(hash, shape, t, tenant));
                 Some((Ok((meta, value)), older))
             }
             Err(e) => Some((Err(e), None)),
@@ -268,5 +304,5 @@ where
 // Split out for the file budget; re-exported so the established
 // `crate::record::*` paths (collection, handle, expose) still resolve.
 pub use crate::record_unique::{
-    get_unique, save_unique, save_unique_as, unique_history,
+    adopt_unique, get_unique, save_unique, save_unique_as, unique_history,
 };

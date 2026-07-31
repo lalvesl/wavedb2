@@ -41,7 +41,7 @@ use crate::local_id::LocalId;
 use crate::metadata::Metadata;
 use crate::record::{
     decode_envelope, decode_record, encode_envelope, history_stream,
-    mint_timestamped_id,
+    mint_floored_id,
 };
 use crate::store::{Store, Write};
 use crate::traits::NonUniqueStruct;
@@ -50,7 +50,7 @@ use crate::u48::U48;
 // The `#[wavedb]` macro reaches the Unique-anchor ops through this module's
 // path; the implementation lives with the envelope in [`crate::record`].
 pub use crate::record::{
-    get_unique, save_unique, save_unique_as, unique_history,
+    adopt_unique, get_unique, save_unique, save_unique_as, unique_history,
 };
 
 // ---- Collection ---------------------------------------------------------------
@@ -152,16 +152,20 @@ impl<T: NonUniqueStruct> Collection<T> {
         }
     }
 
-    /// Create a new, empty collection under `tenant`: the `current` + `dead`
-    /// B+trees, one secondary tree per `#[wavedb::pivot(...)]`, and the
-    /// `Pivot` record pointing at them all, committed in one atomic batch.
-    /// Returns the pivot's `LocalId` — the caller stores it (via the generated
-    /// `{Name}PivotId`) in an owning record.
+    /// Create a new, empty collection under `tenant`: the `current`, `dead`,
+    /// and recency B+trees, one secondary tree per `#[wavedb::pivot(...)]`,
+    /// and the `Pivot` record pointing at them all, committed in one atomic
+    /// batch. Returns the pivot's `LocalId` — the caller stores it (via the
+    /// generated `{Name}PivotId`) in an owning record.
     ///
     /// # Errors
     /// Propagates a [`Store`] failure.
     pub async fn create<S: Store>(store: &S, tenant: U48) -> Result<LocalId> {
-        let pivot_id = mint_timestamped_id(tenant);
+        let pivot_id = mint_floored_id(
+            tenant,
+            <T::Pivot as Pivot>::STRUCT_HASH,
+            0, // a pivot's id is pure addressing — no cursor scans it
+        );
         Self::create_rooted(store, tenant, pivot_id).await?;
         Ok(LocalId::from_id(pivot_id))
     }
@@ -175,8 +179,10 @@ impl<T: NonUniqueStruct> Collection<T> {
         pivot_id: Id,
     ) -> Result<()> {
         let (current, current_write) = BpTree::<LocalId>::plan_create(tenant);
-        let (dead, dead_write) = BpTree::<LocalId>::plan_create(tenant);
-        let mut batch = vec![current_write, dead_write];
+        // The dead and recency logs are instant-keyed — `SecKey` trees.
+        let (dead, dead_write) = BpTree::<SecKey>::plan_create(tenant);
+        let (recency, recency_write) = BpTree::<SecKey>::plan_create(tenant);
+        let mut batch = vec![current_write, dead_write, recency_write];
         let mut sec_roots = Vec::with_capacity(T::NUM_SECONDARIES);
         for _ in 0..T::NUM_SECONDARIES {
             let (tree, write) = BpTree::<SecKey>::plan_create(tenant);
@@ -186,6 +192,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         let pivot_record = T::Pivot::default().replace_roots(
             current.root(),
             dead.root(),
+            recency.root(),
             &sec_roots,
         );
         batch.push(Write::Put(
@@ -264,7 +271,7 @@ impl<T: NonUniqueStruct> Collection<T> {
     where
         T: 'a,
     {
-        history_stream::<T, S>(store, T::STRUCT_HASH, id, self.tenant)
+        history_stream::<T, S>(store, T::STRUCT_HASH, T::SHAPE, id, self.tenant)
     }
 
     /// Stream the living records secondary index `index` selects under
@@ -350,6 +357,7 @@ mod tests {
     use crate::index::Pivot;
     use crate::index::mem_store::MemStore;
     use crate::local_id::LocalId;
+    use crate::metadata::Succession;
     use crate::permission::PermissionRef;
     use crate::traits::{NonUniqueStruct, Shape, WaveDbStruct};
     use crate::u48::U48;
@@ -374,6 +382,7 @@ mod tests {
     struct DocPivot {
         current: LocalId,
         dead: LocalId,
+        recency: LocalId,
         permission: Option<PermissionRef>,
     }
 
@@ -385,6 +394,9 @@ mod tests {
         fn dead(&self) -> LocalId {
             self.dead
         }
+        fn recency(&self) -> LocalId {
+            self.recency
+        }
         fn secondaries(&self) -> &[LocalId] {
             &[]
         }
@@ -395,11 +407,13 @@ mod tests {
             &self,
             current: LocalId,
             dead: LocalId,
+            recency: LocalId,
             _secondaries: &[LocalId],
         ) -> Self {
             Self {
                 current,
                 dead,
+                recency,
                 permission: self.permission.clone(),
             }
         }
@@ -427,6 +441,7 @@ mod tests {
     struct TaggedPivot {
         current: LocalId,
         dead: LocalId,
+        recency: LocalId,
         secondaries: [LocalId; 1],
         permission: Option<PermissionRef>,
     }
@@ -439,6 +454,9 @@ mod tests {
         fn dead(&self) -> LocalId {
             self.dead
         }
+        fn recency(&self) -> LocalId {
+            self.recency
+        }
         fn secondaries(&self) -> &[LocalId] {
             &self.secondaries
         }
@@ -449,6 +467,7 @@ mod tests {
             &self,
             current: LocalId,
             dead: LocalId,
+            recency: LocalId,
             secondaries: &[LocalId],
         ) -> Self {
             let mut s = self.secondaries;
@@ -456,6 +475,7 @@ mod tests {
             Self {
                 current,
                 dead,
+                recency,
                 secondaries: s,
                 permission: self.permission.clone(),
             }
@@ -618,27 +638,32 @@ mod tests {
                 "history must walk newest-first"
             );
 
-            // Chain shape: live → a2 → a1; forward links a1 → a2 → (live).
+            // Chain shape (instants, not addresses): the live version
+            // authored at t3 chains back to t2; each archive's forward
+            // instant names its successor; the first version, authored at
+            // the anchor's own key, has no predecessor.
             let (live_meta, _) = &versions[0];
             let (v2_meta, _) = &versions[1];
             let (v1_meta, _) = &versions[2];
-            let a2 = live_meta.old_modification_id.expect("live chains back");
-            assert!(live_meta.new_modification_id.is_none(), "live = None");
+            let Succession::CreatedAt(t3) = live_meta.succession else {
+                panic!("the live record must carry CreatedAt");
+            };
+            let t2 = live_meta.previous.expect("live chains back");
+            assert_eq!(v2_meta.succession, Succession::Next(t3));
+            let t1 = v2_meta.previous.expect("middle version chains back");
+            assert_eq!(v1_meta.succession, Succession::Next(t2));
+            assert!(v1_meta.previous.is_none(), "first version");
+            assert!(t1 < t2 && t2 < t3, "authoring instants strictly rise");
+            assert_eq!(
+                t1,
+                id.key(),
+                "the first authoring instant is the anchor's own key"
+            );
             assert_eq!(
                 live_meta.pivot_id,
                 Some(pivot),
                 "insert stamps the pivot back-link, saves carry it"
             );
-            assert!(
-                v2_meta.new_modification_id.is_none(),
-                "newest archive's successor is the live record"
-            );
-            assert_eq!(
-                v1_meta.new_modification_id,
-                Some(a2),
-                "older archive forward-links the archive that superseded it"
-            );
-            assert!(v1_meta.old_modification_id.is_none(), "first version");
 
             // The live read is unaffected; `get` still yields the value only.
             assert_eq!(col.get(&store, id).await.unwrap(), Some(Doc { n: 3 }));
@@ -679,7 +704,7 @@ mod tests {
                 vec![3, 2, 1]
             );
             assert!(versions[0].1.volume == 3);
-            assert!(versions.last().unwrap().0.old_modification_id.is_none());
+            assert!(versions.last().unwrap().0.previous.is_none());
         });
     }
 
@@ -789,6 +814,318 @@ mod tests {
                 by_label(fresh, &store, "bulk").await,
                 (0..40).collect::<Vec<u64>>()
             );
+        });
+    }
+
+    // Two plans reading one live version derive the SAME archive slot; the
+    // Expect guard must refuse the loser whole — a lost race may cost a
+    // retry, never history.
+    #[test]
+    fn concurrent_saves_of_one_anchor_conflict_not_overwrite() {
+        use futures::TryStreamExt;
+
+        block_on(async {
+            let store = MemStore::default();
+            let pivot =
+                Collection::<Doc>::create(&store, tenant()).await.unwrap();
+            let col = Collection::<Doc>::at(pivot, tenant());
+            let id = col.insert(&store, &Doc { n: 1 }).await.unwrap();
+
+            // A plan against the current live version…
+            let plan = crate::record::SavePlan {
+                hash: Doc::STRUCT_HASH,
+                shape: Doc::SHAPE,
+                live_id: id,
+                tenant: tenant(),
+                user: tenant(),
+                pivot_id: Some(pivot),
+                imposed: None,
+                floor: 0,
+            };
+            let (stale, _, _) = crate::record::plan_chained_save::<Doc, _>(
+                &store,
+                &plan,
+                &Doc { n: 99 },
+            )
+            .await
+            .unwrap();
+            // …loses the race to a committed save…
+            col.save(&store, id, &Doc { n: 2 }).await.unwrap();
+            // …and must refuse whole at commit time.
+            let err = crate::store::Store::apply(&store, &stale)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Conflict(at) if at == id));
+            assert_eq!(col.get(&store, id).await.unwrap(), Some(Doc { n: 2 }));
+            let versions: Vec<(crate::metadata::Metadata, Doc)> =
+                col.history(&store, id).try_collect().await.unwrap();
+            assert_eq!(
+                versions.iter().map(|(_, d)| d.n).collect::<Vec<_>>(),
+                vec![2, 1],
+                "history must hold exactly the committed versions"
+            );
+        });
+    }
+
+    // The recency log holds exactly one entry per LIVING record, keyed by
+    // its live version's instant; the dead log records removals keyed by
+    // removal time. Between them, a tail scan from any cursor is precisely
+    // "everything that changed since".
+    #[test]
+    fn recency_and_dead_logs_track_the_living_set() {
+        use futures::StreamExt;
+
+        async fn recency_ids(
+            col: Collection<Doc>,
+            store: &MemStore,
+        ) -> Vec<crate::id::Id> {
+            let pivot = col.load_pivot(store).await.unwrap();
+            col.sec_tree(pivot.recency())
+                .search(store, crate::index::Bound::All)
+                .map(|r| r.unwrap())
+                .collect()
+                .await
+        }
+
+        block_on(async {
+            let store = MemStore::default();
+            let pivot =
+                Collection::<Doc>::create(&store, tenant()).await.unwrap();
+            let col = Collection::<Doc>::at(pivot, tenant());
+            let a = col.insert(&store, &Doc { n: 1 }).await.unwrap();
+            let b = col.insert(&store, &Doc { n: 2 }).await.unwrap();
+            assert_eq!(recency_ids(col, &store).await, vec![a, b]);
+
+            // A save re-keys the one entry to the new version's instant —
+            // `a` moves to the log's tail, still a single entry.
+            col.save(&store, a, &Doc { n: 10 }).await.unwrap();
+            assert_eq!(recency_ids(col, &store).await, vec![b, a]);
+            let (meta, _) = col.load_record(&store, a).await.unwrap();
+            let live_instant = meta.succession.instant();
+            assert!(live_instant > b.key(), "the log tail is the newest");
+            let keyed_at_live: Vec<crate::id::Id> = col
+                .sec_tree(col.load_pivot(&store).await.unwrap().recency())
+                .search(
+                    &store,
+                    crate::index::Bound::Exact(
+                        live_instant.to_be_bytes().to_vec(),
+                    ),
+                )
+                .map(|r| r.unwrap())
+                .collect()
+                .await;
+            assert_eq!(
+                keyed_at_live,
+                vec![a],
+                "the entry sits exactly at the live version's instant"
+            );
+
+            // A removal deletes the recency entry and logs the removal —
+            // keyed above every instant the collection minted before it.
+            assert!(col.remove(&store, b).await.unwrap());
+            assert_eq!(recency_ids(col, &store).await, vec![a]);
+            let pivot_rec = col.load_pivot(&store).await.unwrap();
+            let dead: Vec<crate::id::Id> = col
+                .sec_tree(pivot_rec.dead())
+                .search(&store, crate::index::Bound::All)
+                .map(|r| r.unwrap())
+                .collect()
+                .await;
+            assert_eq!(dead, vec![b]);
+            let removed_at = col
+                .sec_tree(pivot_rec.dead())
+                .max_key(&store)
+                .await
+                .unwrap()
+                .map(|k| u64::from_be_bytes(k.field.try_into().unwrap()))
+                .unwrap();
+            assert!(removed_at > live_instant);
+        });
+    }
+
+    // A mirror can impose node instants from a faster clock (equivalently:
+    // this clock rewound). The persisted floor must keep every locally
+    // minted instant above them — a catch-up cursor a client already
+    // advanced can never be written under.
+    #[test]
+    fn imposed_future_instants_floor_local_minting() {
+        block_on(async {
+            let store = MemStore::default();
+            let pivot =
+                Collection::<Doc>::create(&store, tenant()).await.unwrap();
+            let col = Collection::<Doc>::at(pivot, tenant());
+
+            let future =
+                wavedb_platform::time::key_nanos() + 3_600_000 * 1_000_000; // an hour ahead of this clock
+            let id = crate::id::Id::new(
+                future,
+                tenant(),
+                false,
+                crate::record::type_salt(Doc::STRUCT_HASH),
+            );
+            let meta = crate::metadata::Metadata {
+                succession: Succession::CreatedAt(future),
+                pivot_id: Some(pivot),
+                user: tenant(),
+                ..Default::default()
+            };
+            col.adopt_with(&store, id, meta, &Doc { n: 1 })
+                .await
+                .unwrap();
+
+            let local = col.insert(&store, &Doc { n: 2 }).await.unwrap();
+            assert!(local.key() > future, "insert must clear the floor");
+
+            col.save(&store, local, &Doc { n: 3 }).await.unwrap();
+            let (meta, _) = col.load_record(&store, local).await.unwrap();
+            assert!(
+                meta.succession.instant() > local.key(),
+                "a save's version instant keeps climbing past the floor"
+            );
+        });
+    }
+
+    // Archive addresses are pure functions of (type, shape, instant): the
+    // superseded version is readable at the derived slot — flipped FLAG,
+    // type salt — without any stored pointer.
+    #[test]
+    fn archives_resolve_at_their_derived_slots() {
+        use crate::record::archive_id;
+
+        block_on(async {
+            let store = MemStore::default();
+            let pivot =
+                Collection::<Doc>::create(&store, tenant()).await.unwrap();
+            let col = Collection::<Doc>::at(pivot, tenant());
+            let id = col.insert(&store, &Doc { n: 1 }).await.unwrap();
+            col.save(&store, id, &Doc { n: 2 }).await.unwrap();
+
+            // NonUnique: the minted anchor carries the type salt; the first
+            // version's instant IS the anchor key, so its archive sits at
+            // the same key with the FLAG flipped.
+            assert_eq!(id.salt(), (Doc::STRUCT_HASH & 0x7FFF) as u16);
+            assert!(!id.flag());
+            let slot =
+                archive_id(Doc::STRUCT_HASH, Doc::SHAPE, id.key(), tenant());
+            assert!(slot.flag(), "a NonUnique archive flips to FLAG = 1");
+            assert_eq!(
+                col.get(&store, slot).await.unwrap(),
+                Some(Doc { n: 1 }),
+                "the superseded version resolves at the derived slot"
+            );
+
+            // Unique: anchor FLAG = 1, so archives flip to the time
+            // namespace (FLAG = 0) — derived from the instant the live
+            // version chains back to.
+            save_unique(&store, tenant(), &Settings { volume: 1 })
+                .await
+                .unwrap();
+            save_unique(&store, tenant(), &Settings { volume: 2 })
+                .await
+                .unwrap();
+            let anchor =
+                crate::id::Id::new(Settings::STRUCT_HASH, tenant(), true, 0);
+            let (live_meta, _) = crate::record::decode_record::<Settings>(
+                Settings::STRUCT_HASH,
+                &crate::store::Store::get_of(
+                    &store,
+                    Settings::STRUCT_HASH,
+                    anchor,
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
+            let first = live_meta.previous.expect("live chains back");
+            let slot = archive_id(
+                Settings::STRUCT_HASH,
+                Settings::SHAPE,
+                first,
+                tenant(),
+            );
+            assert!(!slot.flag(), "a Unique archive flips to FLAG = 0");
+            let (_, archived) = crate::record::decode_record::<Settings>(
+                Settings::STRUCT_HASH,
+                &crate::store::Store::get_of(
+                    &store,
+                    Settings::STRUCT_HASH,
+                    slot,
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(archived, Settings { volume: 1 });
+        });
+    }
+
+    // The Unique mirror writes the node's metadata verbatim; a version the
+    // cache never held stays a MISS (the cache is state, not full history).
+    #[test]
+    fn adopt_unique_mirrors_node_metadata_verbatim() {
+        use crate::record::adopt_unique;
+        use crate::store::Store as _;
+
+        block_on(async {
+            let node = MemStore::default();
+            save_unique(&node, tenant(), &Settings { volume: 1 })
+                .await
+                .unwrap();
+            save_unique(&node, tenant(), &Settings { volume: 2 })
+                .await
+                .unwrap();
+            let anchor =
+                crate::id::Id::new(Settings::STRUCT_HASH, tenant(), true, 0);
+            let (node_meta, _) = crate::record::decode_record::<Settings>(
+                Settings::STRUCT_HASH,
+                &node.get(anchor).await.unwrap().unwrap(),
+            )
+            .unwrap();
+
+            let cache = MemStore::default();
+            adopt_unique::<Settings, _>(
+                &cache,
+                tenant(),
+                node_meta.clone(),
+                &Settings { volume: 2 },
+            )
+            .await
+            .unwrap();
+            let (cache_meta, cached) =
+                crate::record::decode_record::<Settings>(
+                    Settings::STRUCT_HASH,
+                    &cache.get(anchor).await.unwrap().unwrap(),
+                )
+                .unwrap();
+            assert_eq!(cache_meta, node_meta, "chain data verbatim");
+            assert_eq!(cached, Settings { volume: 2 });
+
+            // The cache never held V1 — its archive slot stays a MISS.
+            let slot = crate::record::archive_id(
+                Settings::STRUCT_HASH,
+                Settings::SHAPE,
+                node_meta.previous.expect("chains back"),
+                tenant(),
+            );
+            assert_eq!(cache.get(slot).await.unwrap(), None);
+
+            // Re-adopting the identical version writes nothing new.
+            adopt_unique::<Settings, _>(
+                &cache,
+                tenant(),
+                node_meta.clone(),
+                &Settings { volume: 2 },
+            )
+            .await
+            .unwrap();
+            let (again, _) = crate::record::decode_record::<Settings>(
+                Settings::STRUCT_HASH,
+                &cache.get(anchor).await.unwrap().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(again, node_meta);
         });
     }
 
