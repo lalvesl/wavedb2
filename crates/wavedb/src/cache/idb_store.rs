@@ -85,6 +85,8 @@ impl IdbStore {
                         .delete(&Self::key(*id).into())
                         .map_err(|e| backend("delete", &e))?;
                 }
+                // Validated in `apply` before anything is queued.
+                Write::Expect(..) => {}
             }
         }
         Ok(())
@@ -114,6 +116,28 @@ impl Store for IdbStore {
             return Ok(());
         }
         let (tx, store) = self.transaction(IdbTransactionMode::Readwrite)?;
+        // Guards validate inside the same readwrite transaction that will
+        // apply the writes — the transaction holds the store, so
+        // check-then-write is atomic.
+        for w in batch {
+            if let Write::Expect(id, expected) = w {
+                let request = store
+                    .get(&Self::key(*id).into())
+                    .map_err(|e| backend("get", &e))?;
+                let value = idb::settled(&request)
+                    .await
+                    .map_err(|e| backend("get", &e))?;
+                let current = if value.is_undefined() || value.is_null() {
+                    None
+                } else {
+                    Some(Uint8Array::new(&value).to_vec())
+                };
+                if current != *expected {
+                    let _ = tx.abort();
+                    return Err(wavedb_core::Error::Conflict(*id));
+                }
+            }
+        }
         if let Err(refused) = Self::queue(&store, batch) {
             // Never leave already-queued writes to auto-commit: the batch
             // is all-or-nothing.
