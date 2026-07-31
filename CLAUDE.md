@@ -105,7 +105,10 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
   name+shape+fields — any schema change = new type), emits `WaveWire`, generated
   `{Name}Pivot`/`{Name}PivotId`, per-command exec steps `__wavedb_{get,save,insert,update,remove,all}`,
   per-type `static StructStorage` slots (native only; wasm expansion omits them), and
-  secondary-index hooks from `#[wavedb::pivot(field)]`. `#[server]` emits a fn-type
+  secondary-index hooks from `#[wavedb::pivot(field)]`, and natural-key anchors
+  from `#[wavedb::key(f1, …)]` (NonUnique only; emits `natural_key()` — seahash
+  of the fields' wire bytes — and folds the declaration into the STRUCT_HASH,
+  so changing the key is a schema change). `#[server]` emits a fn-type
   (own STRUCT_HASH + dispatch), the body retyped onto `ServerDb`, and a client stub.
   `expose_server!`/`expose_client!` are the **declared allowlist registry**: one match
   per operation over exactly the listed items; unlisted/excluded/wrong-shape all refuse
@@ -136,8 +139,11 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
   it runs all POSTs, multiplexes all watches of one `(addr, identity)` over ONE
   WebSocket connection (`Hello` once, per-topic subscribe, fan-out; lifecycle owned by
   the manager loop), and can watch over plain HTTP instead ("anything new?" polls —
-  `net::sync`, reserved hash `"WDB.SYNC"` routed before the registry; node buffers per
-  token-session in `quick-node::poll`, replace-semantics topic declaration).
+  `net::sync`, reserved hash `"WDB.SYNC"` routed before the registry; **stateless**:
+  each declared topic carries an instant cursor and the node answers by navigating
+  the recency/dead logs or the Unique chain (`Command::Changes`) — no per-session
+  node state, an outage or restart loses nothing; same-record writes within one tick
+  coalesce to the live state).
 - **wavedb-quick-node** — library (no bin): `Server::new(REGISTRY).data_dir(d).serve(addr)`.
   `expose_server!` also emits `StorageRegistry`, so `.registry(REGISTRY)` alone opens
   the `PageStore`. Gates 4–6 (permission/validate/preprocess) are an M8 seam.
@@ -164,12 +170,43 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
 
 ## Data-model invariants
 
-- `save` is an upsert — there is no `create`. A save archives the old version and
-  chains it through `Metadata` (`old_modification_id`/`new_modification_id`); bytes
-  are never destroyed. Only `remove` writes the `dead` tree.
+- `save` is an upsert — there is no `create`. The live record sits at the shape's
+  **anchor** (Unique: `KEY = STRUCT_HASH`/`FLAG=1`; NonUnique: the immutable
+  insert id/`FLAG=0`); a save archives the superseded version at a **derived
+  slot** — `KEY` = that version's authoring instant, `SALT = trunc(STRUCT_HASH)`
+  (types never collide in a flat keyspace, e.g. IndexedDB), `FLAG` = the anchor's
+  bit **flipped** — and chains it through `Metadata`
+  (`previous: Option<u64>` + `Succession::{CreatedAt(u64), Next(u64)}`): links are
+  **instants, addresses are computed**, so no archive is ever repointed; a forward
+  walk that MISSes a derived slot has reached the live anchor. Bytes are never
+  destroyed; only `remove` writes the `dead` tree. Every save batch opens with a
+  `Write::Expect` guard (validated pre-batch under the commit lock, stripped
+  before journaling) — a lost race is a typed `Error::Conflict`, never
+  overwritten history. The chain records **who/when/permission per version**;
+  it is state review, not domain data, and ends at the STRUCT_HASH boundary.
 - NonUnique record identity `Id` is minted at `insert` and never changes; `save`
   re-keys only the secondary indexes whose fields changed (primary key is the
-  immutable `CREATED_AT`).
+  immutable `CREATED_AT`). All minting bottoms out in `platform::time::key_nanos()`
+  — real ms × 1e6 + a process counter in the sub-ms digits (same formula both
+  targets; collision-free even on the browser's millisecond clock).
+- `#[wavedb::key(f1, …)]` (NonUnique only) makes identity **content-derived**:
+  anchor `KEY` = seahash over the key fields' wire bytes (`core::natural_key_hash`,
+  one per-build derivation), so `insert` IS the upsert at that anchor — vacant →
+  guarded first version; living → chained save; dead → **revival** (chains onto
+  the prior history; the dead log keeps the removal as a historical event and
+  catch-up merges both tails by instant, so `Removed` then `Saved` replays in
+  order). A save addressing a foreign anchor refuses typed (`Error::KeyMismatch`)
+  — renaming = explicit `remove` + `insert`. The key declaration folds into
+  STRUCT_HASH (synthetic `#key` entry); keyed walks come out in hash order, not
+  insertion order (modification order lives in the recency log).
+- Every collection carries two instant-keyed system logs in its Pivot
+  (`[instant BE][anchor]` SecKey trees): **recency** — exactly one entry per
+  living record at its live version's instant (insert adds, save re-keys,
+  remove deletes) — and **dead**, keyed by removal instant. A tail scan from a
+  cursor over both is exactly "changed since" (the W6 catch-up structure).
+  Every collection-minted instant goes through `core::mint::mint_instant(floor)`
+  where `floor` = both logs' maxima — strictly monotone per collection even
+  against a rewound clock (Unique needs no floor: catch-up is chain-forward).
 - Every mutating collection op is exactly **one atomic `Store::apply` batch**
   (record + touched B+tree nodes + Pivot rewrite when a root moves).
 - Stored values are STRUCT_HASH-headed: user records

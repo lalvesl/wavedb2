@@ -16,6 +16,7 @@ members = [
   "examples/contact-book",
   "examples/registry-size",
   "examples/schema-smoke",
+  "examples/showcase",
   "crates/wavedb-wasm",
   "examples/todo-app/schema",
   "examples/todo-app/server",

@@ -464,6 +464,155 @@ Deliberately left as later seams:
   forward — W7's remainder is piggybacking events on ordinary responses
   + idle backoff.
 
+- **DB-1 — anchors + `Succession` chain + derived archive slots — core
+  LANDED (2026-07-17, user-directed; supersedes the journal-cursor W6
+  design, rejected the same day: rotated journals are deleted, `Batch`
+  frames are physical not logical, and the resync fallback had to exist
+  anyway — the disk itself becomes the sync log instead).** The chain
+  contract: the DB records **who wrote each version, when, and its
+  permission — nothing more**; the chain reviews state at a moment, dies
+  at the type's own `STRUCT_HASH` boundary, and is never domain data.
+  Mechanism: the live record sits at the shape's **anchor** (Unique:
+  `KEY = STRUCT_HASH`/`FLAG = 1`; NonUnique: the immutable time-keyed
+  insert id/`FLAG = 0`); every superseded version archives at a
+  **derived slot** — `KEY` = the instant that version was authored,
+  `SALT = trunc(STRUCT_HASH)` (types can't collide in a flat IndexedDB
+  keyspace), `FLAG` = the anchor's bit **flipped** (an archive can never
+  collide with an anchor, incl. a NonUnique V1 whose instant IS the
+  anchor key). `Metadata`: `previous: Option<u64>` +
+  `succession: Succession{CreatedAt(u64) | Next(u64)}` (hand WaveWire, 9
+  fixed bytes; stack 18 → 26) — chain links are **instants, addresses
+  are computed**, so no archive is ever repointed (one write saved per
+  save) and forward walks MISS→anchor. Minting:
+  `wavedb_platform::time::key_nanos()` — real milliseconds × 1e6 + a
+  process-wide atomic counter in the dead sub-ms digits (same formula
+  both targets; the browser's ms clock can't collide anymore); node ids
+  and pivot ids swept onto the same scheme. Concurrency: the batch opens
+  with `Write::Expect(id, bytes)` — commit-time compare vs the pre-batch
+  state under the journal lock, mismatch = typed `Error::Conflict`
+  (concurrent saves of one anchor would derive the SAME slot; the old
+  lost-update also dies). Guards are validated then **stripped** before
+  journaling (never in replay); `StorageError::Core` now passes typed
+  core errors through the seam instead of flattening to `Backend`.
+  Proven: chain-shape + derived-slot + conflict tests (core), guard
+  durability reopen test (storage), full workspace green (46 suites,
+  clippy 0, wasm targets). **Phase 2 LANDED (same day): Metadata over
+  the wire** — `Mutation`/`RecordEvent` carry `meta: Option<Metadata>`
+  (`Some` on saves, `None` on removals), `All` frames are `(Id,
+  Metadata, T)` triples, and the mirror paths that receive them
+  (`watch`, `cached_all`) write the node's metadata **verbatim**
+  (`Collection::adopt_with` / `adopt_unique` / imposed `SavePlan`), so a
+  mirror's live copy and its archives are byte-identical to the node's at
+  the node's own derived slots (proven: `adopt_with_carries_node_chain_
+  data_and_slots`, `adopt_unique_mirrors_node_metadata_verbatim`).
+  Plain reads (`Get`/`Save` replies are body-only) keep the meta-less
+  local-authored mirror — the catch-up cursors only ever come from
+  meta-carrying frames. **Phase 3 LANDED (2026-07-19): recency tree +
+  dead re-key + monotone floor** — every collection `Pivot` gains a
+  `recency` root: a `BpTree<SecKey>` log keyed `[modified_at BE][anchor]`
+  with exactly one entry per **living** record at its live version's
+  instant (insert adds, save re-keys via the superseded instant
+  `plan_chained_save` now returns — zero extra reads —, remove deletes);
+  the `dead` tree re-keyed the same way (`[removed_at BE][anchor]`,
+  a removal log in removal order — membership-by-id was unused). A tail
+  scan over both from a cursor is exactly "changed since", each record
+  once — the disk structure W6 navigates. Floor: `instant_floor` = max
+  of both logs' `max_key` (new O(depth) rightmost descent on `BpTree`);
+  every collection-minted instant (insert id, save version, removal key)
+  goes through `mint_instant(floor)` = `max(key_nanos(), floor+1,
+  LAST+1)` with a process-wide `AtomicU64` watermark (`core::mint`,
+  split from `record.rs`; `collection_recency.rs` split likewise) — a
+  rewound clock can never write under a cursor a client already passed,
+  and two tasks reading one floor can't mint the same instant. Unique
+  stays floor-0 (chain-forward catch-up is rewind-immune). Pivot shape
+  change ⇒ new pivot STRUCT_HASHes (pre-release: old data unsupported).
+  Proven: `recency_and_dead_logs_track_the_living_set`,
+  `imposed_future_instants_floor_local_minting`, `max_key` unit test;
+  48 suites/288 tests green, clippy 0, wasm targets, showcase e2e
+  (online + poll + offline) re-verified. **Phase 4 LANDED (2026-07-19):
+  W6 catch-up by navigation** — new wire op `Command::Changes` (payload
+  `(Option<LocalId> pivot, Option<u64> since)`; the op list grew to 8):
+  the answer is `Reply::Values` of wire-encoded `Change::{Cursor(u64),
+  Saved(Id, Metadata, Vec<u8>), Removed(Id, u64)}`, cursor ALWAYS first.
+  `since: None` is **registration** — answer the current tail, ship no
+  events (a fresh watch starts at "now", never a full-set replay).
+  NonUnique navigation (`core::expose_changes::collection_changes`) =
+  recency + dead tail scans past the cursor (new `BpTree::search_keys`
+  yields keys; `search` wraps it), merged instant-ordered; Unique
+  (`unique_changes`) = chain-forward from the cursor's derived slot via
+  `Next` links, each missed version's metadata rebuilt to live form so
+  adopting in order replays the chain **byte-identically** (proven:
+  `unique_changes_replay_the_chain_and_mirrors_converge_byte_identical`
+  compares every mirror slot to the node's); an unknown cursor degrades
+  to live-version-only. Poll sync went **stateless**:
+  `SyncRequest{topics: Vec<TopicCursor{topic, since}}` →
+  `SyncReply{events, cursors}`; the node holds ZERO poll state
+  (`quick-node::poll`/`PollTable`/TTL pruning DELETED —
+  `dispatch::sync_poll` executes `Changes` per topic through the
+  registry, so unlisted types refuse uniformly); the client's poll actor
+  owns the cursors — they survive an outage (the next tick navigates
+  past them: the pre-W6 "events during downtime are missed" gap is
+  CLOSED for the poll path) and are forgotten on last unsubscribe.
+  `MutationKind::Removed(u64)`/`EventKind::Removed(u64)` carry the
+  removal instant (a cursor can advance past a trailing removal).
+  Deliberate semantic shift: a poll tick delivers each changed record
+  ONCE at its live state — same-record writes inside one tick coalesce
+  (WS push still delivers every mutation); `live_watch_poll_e2e` and the
+  showcase drain assert convergence, not event-by-event equality.
+  Showcase client split into `client/{main,report}.rs` (file budget).
+  285 tests green, clippy 0, wasm targets, showcase e2e re-verified.
+  Remaining W6 piece: **WS reconnect catch-up** — on manager respawn,
+  issue `Changes` per resubscribed topic before trusting the resumed
+  push stream; the navigation machinery is transport-generic and ready.
+  **Phase 5 LANDED (2026-07-19): `#[wavedb::key(f1, …)]` natural-key
+  anchors (user-requested — "apenas use a seahash")** — a NonUnique
+  struct declares the fields that ARE its identity; the anchor `KEY` =
+  seahash over their wire bytes (new `core::natural_key_hash`, seahash
+  now a core dep; `mint::keyed_id`; `NonUniqueStruct::natural_key()`
+  defaulted `None`, macro-emitted for keyed types). The declaration
+  folds into STRUCT_HASH as a synthetic `#key` field entry — changing
+  the key = a new type. Semantics (user-confirmed all three):
+  `insert` = **upsert at the content anchor** (`collection_keyed.rs`:
+  vacant → guarded first version via `plan_chained_save`'s Expect(None)
+  path + full indexing; living → ordinary chained save; dead →
+  **revival**: chains onto the whole prior history, re-enters current +
+  recency + secondaries; the dead log keeps the removal as history —
+  catch-up merges tails by instant so a pre-removal cursor replays
+  Removed→Saved and converges); `save`/`update` addressing an id ≠ the
+  value's computed anchor refuses typed (`Error::KeyMismatch`, new
+  `NodeErrorKind::KeyMismatch`) — renaming = remove + insert; the
+  keyed first version's Metadata instant is MINTED (id.key() is a hash,
+  not an instant — insert_at's "key IS the authoring instant" rule
+  doesn't apply). `adopt`/`adopt_with` learned the revival branch
+  (bytes-at-anchor but not living → chain, don't overwrite), so a
+  mirror archives its dead copy at the node's own derived slot
+  byte-identically (proven:
+  `adopting_a_revival_chains_the_mirrors_dead_copy`). Keyed walks come
+  out in hash order (modification order = recency log). Macro:
+  `KeySpec` (args.rs), `natural_key.rs` (take/resolve/hash-fold, split
+  for budget), `natural_key_items` emission (generated.rs); Unique +
+  `#[wavedb::key]` = compile error; ≥1 field, at most one declaration.
+  Proven: core `collection_keyed` tests (upsert chains + re-keys
+  secondaries, KeyMismatch writes nothing, revival chains + W6
+  navigation across death, mirror revival byte-identical) +
+  schema-smoke `Setting` e2e through the real macro expansion. 289
+  tests green, clippy 0, budget ok, wasm targets ok. Then: docs sweep.
+
+- **`examples/showcase` LANDED (2026-07-18, user-requested)**: the big
+  runnable usage example — one project-tracker schema (Unique
+  `Workspace` → NonUnique `Project` (`by_name`) → nested NonUnique
+  `Task` (`by_status`); three `#[server]` fns incl. idempotent
+  server-side bootstrap), a persistent-data node (`--example node`,
+  fixed port 4780), and a narrated client tour (`--example client`):
+  typed ops, streamed walk, filtered reads via server fns, live watches
+  (WS by default, `--poll` = HTTP polling), conflict-safe save (retry on
+  `NodeErrorKind::Conflict`), `Workspace::history` printing who/when per
+  version off `Succession` (an archive's own instant = the newer
+  version's `previous` — spelled out in the code), `db.local()` peek,
+  and `--offline` (kill the node: unique read + project/task walks
+  answer from the write-through cache, an offline write refuses).
+  Verified end-to-end: online + poll + offline runs all green.
+
 _Workspace green (both targets): fmt + clippy (pedantic + nursery) clean,
 tests green, file-length gate passing. Members: wire, wire-derive, platform,
 core, macros, storage, net, quick-node, wavedb, wasm, schema-smoke,
@@ -963,25 +1112,33 @@ accept key; base64 is a ~20-line encode (encode-only, no alphabet variants).
       the full walk of a collection B never once read online (the watcher's
       mirrors alone built it).
 
-## W6 — journal cursor catch-up (reconnect)
+## W6 — catch-up by navigation (reconnect)
 
-- [ ] A monotone commit sequence per applied batch, carried on the push
-      stream; reconnect = `Resume { since }` streaming exactly the
-      tenant's deltas after it; a cursor older than the oldest retained
-      journal answers "resync" (the client re-reads its subscriptions).
-      Mechanism decision recorded when the task starts: replaying
-      journal `Batch` frames needs the W3 disambiguation, so the cursor
-      path likely logs `Mutation`s (or resolves live-vs-archive by id).
+- [x] **Poll half LANDED (2026-07-19, details in DOING)**: no journal
+      sequence — the DB-1 anchor model made the journal-cursor design
+      obsolete. Catch-up navigates the data itself: `Command::Changes`
+      walks a collection's recency/dead tails (or a Unique chain
+      forward) past an instant cursor; the poll loop is a stateless
+      cursor sync — the node keeps no per-session state, nothing to
+      prune or overflow, and a node restart loses nothing.
+- [ ] WS half: on manager reconnect, issue `Changes` per resubscribed
+      topic (cursor = the last delivered event's instant) before
+      trusting the resumed push stream — closes the downtime gap for
+      the push path too. The navigation machinery is transport-generic
+      and ready; the work is manager bookkeeping (per-topic cursors +
+      a respawn hook).
 
 ## W7 — HTTP piggyback + idle tick (POST clients)
 
 - [x] **Poll half — LANDED EARLY (2026-07-16, with the connection
-      manager; details in DOING)**: per-session (token `session` id)
-      event buffers node-side (`PollTable`), the client polls "anything
-      new?" at an adjustable interval (`Db::watch_via_polling`), full
-      topic list re-declared each tick (replace semantics — self-healing).
-      **The HTTP half of the exit holds** (`live_watch_poll_e2e.rs`: B's
-      watcher fires within one poll tick).
+      manager)**: the client polls "anything new?" at an adjustable
+      interval (`Db::watch_via_polling`), full topic list re-declared
+      each tick. W6 (2026-07-19) replaced the original node-side
+      `PollTable` buffers with stateless cursor navigation — each
+      declared topic now carries its cursor and the node navigates the
+      data itself (details in DOING). **The HTTP half of the exit
+      holds** (`live_watch_poll_e2e.rs`: B's watcher fires within one
+      poll tick).
 - [ ] Piggyback + backoff: buffered events ride back on ordinary POST
       responses (saving the poll when the app is already talking); idle
       polls back off.
