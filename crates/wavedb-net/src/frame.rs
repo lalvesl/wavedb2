@@ -78,6 +78,14 @@ pub enum NodeErrorKind {
     /// caller's tier may not perform. One uniform kind — which check failed
     /// is deliberately not distinguishable on the wire.
     Unauthorized,
+    /// A concurrent save of the same anchor won the race — the op wrote
+    /// nothing; the caller re-reads and re-plans.
+    Conflict,
+    /// The version chain at a live anchor is corrupt node-side.
+    ChainCorrupt,
+    /// A save addressed an id that is not the value's own content-derived
+    /// (`#[wavedb::key(...)]`) anchor — renaming is remove + insert.
+    KeyMismatch,
 }
 
 /// A structured node-side rejection, riding **inside** the 200 response —
@@ -111,6 +119,9 @@ impl NodeError {
             }
             CoreError::Unauthorized(_) => NodeErrorKind::Unauthorized,
             CoreError::Backend(_) => NodeErrorKind::Backend,
+            CoreError::Conflict(_) => NodeErrorKind::Conflict,
+            CoreError::ChainCorrupt(_) => NodeErrorKind::ChainCorrupt,
+            CoreError::KeyMismatch(_) => NodeErrorKind::KeyMismatch,
         };
         Self {
             kind,

@@ -17,6 +17,7 @@ mod exec_ops;
 mod expose;
 mod expose_parse;
 mod generated;
+mod natural_key;
 mod secondaries;
 mod server;
 mod server_stream;

@@ -4,18 +4,20 @@
 //!
 //! Every tick (and immediately on a new watcher — the first successful
 //! sync is the liveness ack) it POSTs a [`SyncRequest`] declaring the
-//! **whole** current topic list; the node replaces the session's set and
-//! drains its buffer, so registration self-heals across node restarts and
-//! dropped topics stop buffering — nothing incremental on either side.
-//! Buffered events fan out to watchers exactly like the WebSocket path.
+//! **whole** current topic list, each topic with its **cursor** — the
+//! greatest node instant seen there (`None` on a fresh topic: the node
+//! answers its current tail, so the watch begins at "now"). The node holds
+//! no session state: it navigates the disk past each cursor and answers
+//! the changes plus the advanced cursors, which the actor stores for the
+//! next tick. Events fan out to watchers exactly like the WebSocket path.
 //!
 //! Outage semantics differ from a pushed watch on purpose: a **transport**
 //! fault is tolerated (polling is loosely coupled — the next tick retries,
 //! watchers just see silence), while a **node refusal** (an expired token,
 //! an anonymous sync) is authoritative and ends the actor, closing every
-//! watcher's stream. Events committed while the node was down or between
-//! its restart and the next re-registering tick are missed — the honest
-//! pre-W6 gap; the journal-cursor catch-up closes it.
+//! watcher's stream. Events committed while the node was down — or before
+//! it restarted — are **not** missed: the cursor survives here, and the
+//! next successful tick navigates everything past it (W6).
 
 use core::time::Duration;
 use std::collections::HashMap;
@@ -29,7 +31,7 @@ use super::ConnKey;
 use crate::error::{Error, Result};
 use crate::frame::{CommandFrame, Request, Response, StreamFrame};
 use crate::frames::FrameReader;
-use crate::sync::{SYNC_STRUCT_HASH, SyncReply, SyncRequest};
+use crate::sync::{SYNC_STRUCT_HASH, SyncReply, SyncRequest, TopicCursor};
 use crate::ws::{RecordEvent, Topic};
 
 /// What the manager routes to a poll actor.
@@ -57,10 +59,14 @@ pub(super) fn spawn(
     tx
 }
 
-/// The watchers per topic plus the acks a next successful sync completes.
+/// The watchers per topic, each topic's sync cursor, plus the acks a next
+/// successful sync completes.
 #[derive(Default)]
 struct PollState {
     topics: HashMap<Topic, Vec<(u64, mpsc::UnboundedSender<RecordEvent>)>>,
+    /// The greatest node instant seen per topic — absent until the first
+    /// successful sync registers it (the node answers the tail).
+    cursors: HashMap<Topic, u64>,
     pending: Vec<oneshot::Sender<Result<()>>>,
 }
 
@@ -86,12 +92,14 @@ async fn run(
                     }
                     PollCmd::Unsubscribe { topic, watch } => {
                         // The manager drops this actor's channel when the
-                        // last watcher leaves (the node's session buffer
-                        // then ages out on its own — the poll TTL).
+                        // last watcher leaves. A dropped topic forgets its
+                        // cursor too — a later re-watch starts at "now",
+                        // exactly like a fresh WebSocket subscribe.
                         if let Some(subs) = state.topics.get_mut(&topic) {
                             subs.retain(|(id, _)| *id != watch);
                             if subs.is_empty() {
                                 state.topics.remove(&topic);
+                                state.cursors.remove(&topic);
                             }
                         }
                         false
@@ -122,7 +130,14 @@ async fn sync(
             // Like a function call, sync ignores the frame command.
             command: Command::Get,
             payload: to_wire(&SyncRequest {
-                subscribe: state.topics.keys().copied().collect(),
+                topics: state
+                    .topics
+                    .keys()
+                    .map(|topic| TopicCursor {
+                        topic: *topic,
+                        since: state.cursors.get(topic).copied(),
+                    })
+                    .collect(),
             }),
         },
     };
@@ -133,6 +148,13 @@ async fn sync(
                     subs.retain(|(_, tx)| {
                         tx.unbounded_send(event.clone()).is_ok()
                     });
+                }
+            }
+            // The node's advanced cursors are next tick's `since` — only
+            // for topics still watched (an unsubscribed one stays gone).
+            for (topic, cursor) in reply.cursors {
+                if state.topics.contains_key(&topic) {
+                    state.cursors.insert(topic, cursor);
                 }
             }
             for ack in state.pending.drain(..) {

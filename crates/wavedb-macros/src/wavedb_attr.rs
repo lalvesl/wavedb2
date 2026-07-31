@@ -19,6 +19,7 @@ use syn::parse::Parser;
 use syn::{Attribute, Data, DeriveInput, Fields, Ident};
 
 use crate::args::{PivotSpec, Shape, WavedbArgs};
+use crate::natural_key::take_and_fold_key;
 use crate::secondaries::ResolvedPivot;
 use crate::{exec_ops, generated, storage_statics, struct_hash, wire_derive};
 
@@ -44,7 +45,7 @@ pub fn expand(
     };
 
     // Field (name, normalised-type) pairs feed the STRUCT_HASH.
-    let hash_fields: Vec<(String, String)> = named
+    let mut hash_fields: Vec<(String, String)> = named
         .named
         .iter()
         .map(|f| {
@@ -52,6 +53,13 @@ pub fn expand(
             (name, normalise_type(&f.ty))
         })
         .collect();
+
+    let key_fields = take_and_fold_key(
+        &mut input.attrs,
+        named,
+        args.shape,
+        &mut hash_fields,
+    )?;
 
     let name = input.ident.clone();
     let hash = struct_hash::compute(
@@ -84,39 +92,17 @@ pub fn expand(
         Shape::Unique => (quote!(()), unique_ops(&name)),
         Shape::NonUnique => {
             let pivot_id = format_ident!("{}PivotId", name);
-            let types = generated::nonunique_types(&name, &secondaries)?;
+            let types = generated::nonunique_types(
+                &name,
+                &secondaries,
+                key_fields.as_deref(),
+            )?;
             (quote!(#pivot_id), types)
         }
     };
 
-    // Native-only compile-time storage: the type's own StructStorage static.
-    // The NonUnique variant's Pivot slot and `storage_entries()` are emitted
-    // with the pivot types in `generated::nonunique_types`.
-    let struct_hash_expr =
-        quote!(<#name as ::wavedb_core::WaveDbStruct>::STRUCT_HASH);
-    let storage_slot =
-        storage_statics::statics_for(&name, &struct_hash_expr, args.compress);
-    let storage_entries = match args.shape {
-        Shape::Unique => storage_statics::entries_for(&name, None),
-        Shape::NonUnique => TokenStream::new(),
-    };
-
-    // The per-command execution steps (`__wavedb_<op>`): defined on every
-    // item, wire-reachable only once listed in an exposure declaration.
-    // NonUnique steps need the generated PivotId type, so they emit with it
-    // in `generated::nonunique_types`.
-    let exec_steps = match args.shape {
-        Shape::Unique => exec_ops::unique_ops(&name),
-        Shape::NonUnique => TokenStream::new(),
-    };
-
-    // The shape marker trait — `UniqueStruct` for the default shape (the
-    // NonUnique marker is emitted with the collection types). Client typed
-    // surfaces gate on these so `Unique` and `NonUnique` ops never overlap.
-    let shape_marker = match args.shape {
-        Shape::Unique => quote!(impl ::wavedb_core::UniqueStruct for #name {}),
-        Shape::NonUnique => TokenStream::new(),
-    };
+    let (storage_slot, storage_entries, exec_steps, shape_marker) =
+        shape_scaffolding(&name, args.shape, args.compress);
 
     Ok(quote! {
         #input
@@ -260,6 +246,36 @@ fn resolve_pivot_fields(
 fn is_pivot_attr(attr: &Attribute) -> bool {
     let segs = &attr.path().segments;
     segs.len() == 2 && segs[0].ident == "wavedb" && segs[1].ident == "pivot"
+}
+
+/// The per-shape scaffolding around the generated types: the native-only
+/// `StructStorage` static (the NonUnique variant's Pivot slot and
+/// `storage_entries()` are emitted with the pivot types in
+/// `generated::nonunique_types`), the per-command execution steps
+/// (`__wavedb_<op>` — NonUnique steps need the generated `PivotId` type,
+/// so they too emit with it), and the shape marker trait (`UniqueStruct`
+/// for the default shape; the NonUnique marker is emitted with the
+/// collection types) client typed surfaces gate on.
+fn shape_scaffolding(
+    name: &Ident,
+    shape: Shape,
+    compress: bool,
+) -> (TokenStream, TokenStream, TokenStream, TokenStream) {
+    let struct_hash_expr =
+        quote!(<#name as ::wavedb_core::WaveDbStruct>::STRUCT_HASH);
+    let storage_slot =
+        storage_statics::statics_for(name, &struct_hash_expr, compress);
+    let (storage_entries, exec_steps, shape_marker) = match shape {
+        Shape::Unique => (
+            storage_statics::entries_for(name, None),
+            exec_ops::unique_ops(name),
+            quote!(impl ::wavedb_core::UniqueStruct for #name {}),
+        ),
+        Shape::NonUnique => {
+            (TokenStream::new(), TokenStream::new(), TokenStream::new())
+        }
+    };
+    (storage_slot, storage_entries, exec_steps, shape_marker)
 }
 
 /// A whitespace-free rendering of a field type, so the same declared type always
