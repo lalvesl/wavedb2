@@ -33,7 +33,10 @@ use wavedb_core::{Id, NonUniqueStruct, PivotHandle, UniqueStruct};
 use wavedb_net::manager::{self, WatchGuard};
 use wavedb_net::ws::{EventKind, RecordEvent, Topic};
 
-use crate::client_cache::{mirror_record, mirror_remove, mirror_unique};
+use crate::client_cache::{
+    mirror_record, mirror_record_meta, mirror_remove, mirror_unique,
+    mirror_unique_meta,
+};
 use crate::db::Db;
 use crate::error::{Error, Result};
 
@@ -146,7 +149,14 @@ impl<T: UniqueStruct> UniqueWatch<T> {
         };
         let typed = decode::<T>(&event)?;
         if let WatchEvent::Saved(_, value) = &typed {
-            mirror_unique(&self.db, value).await;
+            // The event's metadata is the node's chain data — adopt it
+            // verbatim (a meta-less event falls back to authoring locally).
+            match event.meta {
+                Some(meta) => {
+                    mirror_unique_meta(&self.db, meta, value).await;
+                }
+                None => mirror_unique(&self.db, value).await,
+            }
         }
         Ok(Some(typed))
     }
@@ -167,9 +177,12 @@ impl<T: NonUniqueStruct> CollectionWatch<T> {
         };
         let typed = decode::<T>(&event)?;
         match &typed {
-            WatchEvent::Saved(id, value) => {
-                mirror_record(&self.db, pivot, *id, value).await;
-            }
+            WatchEvent::Saved(id, value) => match event.meta {
+                Some(meta) => {
+                    mirror_record_meta(&self.db, pivot, *id, meta, value).await;
+                }
+                None => mirror_record(&self.db, pivot, *id, value).await,
+            },
             WatchEvent::Removed(id) => {
                 mirror_remove::<T>(&self.db, pivot, *id).await;
             }
@@ -189,6 +202,8 @@ fn decode<T: wavedb_core::WaveDbStruct>(
                 .map_err(Error::Core)?;
             Ok(WatchEvent::Saved(event.id, value))
         }
-        EventKind::Removed => Ok(WatchEvent::Removed(event.id)),
+        // The removal instant is cursor bookkeeping (the manager's poll
+        // loop consumed it); the typed surface names the record alone.
+        EventKind::Removed(_) => Ok(WatchEvent::Removed(event.id)),
     }
 }
