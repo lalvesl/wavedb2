@@ -235,6 +235,7 @@ mod tests {
             topic,
             id: Id::new(topic.struct_hash, U48::from(1u32), false, 0),
             kind: EventKind::Saved,
+            meta: None,
             body: vec![1],
         }
     }

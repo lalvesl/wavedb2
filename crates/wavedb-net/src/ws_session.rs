@@ -166,6 +166,7 @@ mod tests {
             topic: TOPIC,
             id: Id::new(n, U48::from(1u32), false, 0),
             kind: EventKind::Saved,
+            meta: None,
             body: vec![7],
         }
     }

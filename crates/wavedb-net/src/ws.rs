@@ -37,8 +37,10 @@ pub struct Topic {
 pub enum EventKind {
     /// Inserted, updated, or Unique-saved — `body` is the new state.
     Saved,
-    /// Moved to the dead tree — `body` is empty.
-    Removed,
+    /// Moved to the dead tree — `body` is empty. Carries the removal
+    /// instant (the node's dead-log key), so a catch-up cursor advances
+    /// past the removal instead of re-receiving it forever.
+    Removed(u64),
 }
 
 /// One mutation, pushed to every subscriber of its topic.
@@ -50,6 +52,12 @@ pub struct RecordEvent {
     pub id: Id,
     /// Saved or removed.
     pub kind: EventKind,
+    /// The new live version's [`Metadata`] (`None` on a removal) — riding
+    /// the event lets a mirror adopt the node's authoritative chain data
+    /// verbatim instead of minting its own.
+    ///
+    /// [`Metadata`]: wavedb_core::Metadata
+    pub meta: Option<wavedb_core::Metadata>,
     /// The record's new body wire bytes (empty for a removal).
     pub body: Vec<u8>,
 }
@@ -133,6 +141,11 @@ mod tests {
                 },
                 id: Id::new(7, U48::from(2u32), false, 1),
                 kind: EventKind::Saved,
+                meta: Some(wavedb_core::Metadata {
+                    succession: wavedb_core::Succession::CreatedAt(42),
+                    user: U48::from(2u32),
+                    ..wavedb_core::Metadata::default()
+                }),
                 body: vec![9],
             }),
             ServerMsg::TopicOk(Topic {
@@ -152,7 +165,8 @@ mod tests {
                 pivot: Some(LocalId::new(1, false, 0)),
             },
             id: Id::new(1, U48::from(1u32), false, 0),
-            kind: EventKind::Removed,
+            kind: EventKind::Removed(41),
+            meta: None,
             body: Vec::new(),
         }));
         assert!(from_wire::<ServerMsg>(&bytes[..bytes.len() - 1]).is_err());
