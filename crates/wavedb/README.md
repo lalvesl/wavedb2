@@ -25,7 +25,7 @@ clients, and (compiled to WASM) browsers.
 > refuse (no queue until M7 sync). No cluster front door / failover URL, no
 > `another_tenant` (today: `as_tenant`), no Drop notification, no
 > `tokio::broadcast`; the typed surface lives on `Db` (`db.get::<T>()`), see
-> `todo.md` on the `T::get(&db)` unification.
+> [RFC 0024](../../rfcs/0024-client-db-and-cache.md) on the `T::get(&db)` unification.
 
 ## Entry points
 

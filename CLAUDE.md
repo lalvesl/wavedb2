@@ -9,10 +9,14 @@ This is a clean rebuild of WaveDB. Every README (root and per-crate) describes t
 mechanism exists:
 
 1. Check `Cargo.toml` workspace `members` vs `exclude` — excluded crates do not build.
-2. Check `todo.md` (remaining work + DOING) and `todo_done.md` (what actually landed).
+2. Check `rfcs/` — the numbered design + progress record. `rfcs/README.md` indexes
+   every idea with its status and opens with a "Current state" snapshot; filename
+   markers (`WIP`/`PLANNED`/`PLANNED-LOW`/`DEPRECATED`) show what is in flight,
+   planned, or dropped. (This corpus replaced the former `todo.md`/`todo_done.md`.)
 
-When a milestone lands, update `todo.md`'s DOING/DONE. READMEs carry `> Status:` blocks
-where a documented mechanism isn't built yet — keep that honesty when editing docs.
+When an idea lands or changes, add or update its RFC in `rfcs/` (process in
+`rfcs/0000-rfc-process.md`). READMEs carry `> Status:` blocks where a documented
+mechanism isn't built yet — keep that honesty when editing docs.
 
 ## Commands
 

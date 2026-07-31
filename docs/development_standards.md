@@ -175,5 +175,6 @@ review (`results/README.md` has the scenarios).
   doesn't.
 - READMEs in this repo describe the **target** design; when a documented
   mechanism isn't built yet, the doc says so explicitly (see the
-  `> Status:` blocks). Keep that honesty when editing docs — and update
-  `todo.md`'s DOING/DONE when a milestone lands.
+  `> Status:` blocks). Keep that honesty when editing docs — and add or update
+  the relevant RFC in `rfcs/` when an idea lands or changes (the RFC corpus is
+  the design + progress record; process in `rfcs/0000-rfc-process.md`).
