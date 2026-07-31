@@ -134,17 +134,50 @@ impl<K: NodeKey> BpTree<K> {
         }
     }
 
-    /// Stream the record `Id`s in key order whose keys satisfy `bound`.
+    /// The greatest key in the tree (`None` = empty): the rightmost leaf's
+    /// last entry — an O(depth) descent, no scan.
+    ///
+    /// # Errors
+    /// Propagates a [`Store`] failure.
+    pub async fn max_key<S: Store>(&self, store: &S) -> Result<Option<K>> {
+        let mut node = self.root;
+        loop {
+            match self.load(store, node).await? {
+                NodeBody::Leaf(keys) => return Ok(keys.last().cloned()),
+                NodeBody::Internal { leftmost, entries } => {
+                    node = entries.last().map_or(leftmost, |(_, child)| *child);
+                }
+            }
+        }
+    }
+
+    /// Stream the record `Id`s in key order whose keys satisfy `bound` —
+    /// [`search_keys`](Self::search_keys) resolved to the record pointers.
     ///
     /// Two-phase resolution (index → `Id`s → caller fetch) lives above this: the
     /// stream yields the record `Id`s; resolving them to bytes is the caller's
-    /// `Store::get`. The descent prunes subtrees whose separator window cannot
-    /// intersect the bound (see [`NodeKey::may_intersect`]).
+    /// `Store::get`.
     pub fn search<'a, S: Store>(
         &self,
         store: &'a S,
         bound: Bound,
     ) -> impl Stream<Item = Result<Id>> + use<'a, S, K> {
+        use futures::StreamExt;
+        let tenant = self.tenant;
+        self.search_keys(store, bound)
+            .map(move |r| r.map(|k| k.record().to_id(tenant)))
+    }
+
+    /// Stream the **keys** in order that satisfy `bound` — what the
+    /// instant-keyed system logs scan, where the key itself (not just the
+    /// record it points at) carries the answer. The descent prunes subtrees
+    /// whose separator window cannot intersect the bound (see
+    /// [`NodeKey::may_intersect`]).
+    pub fn search_keys<'a, S: Store>(
+        &self,
+        store: &'a S,
+        bound: Bound,
+    ) -> impl Stream<Item = Result<K>> + use<'a, S, K> {
         let mut nodes: VecDeque<LocalId> = VecDeque::new();
         nodes.push_back(self.root);
         let init = WalkState::<K> {
@@ -157,8 +190,8 @@ impl<K: NodeKey> BpTree<K> {
 
         futures::stream::unfold(init, move |mut st| async move {
             loop {
-                if let Some(id) = st.ready.pop_front() {
-                    return Some((Ok(id), st));
+                if let Some(key) = st.ready.pop_front() {
+                    return Some((Ok(key), st));
                 }
                 let node = st.nodes.pop_front()?;
                 let bytes = match store
@@ -175,7 +208,7 @@ impl<K: NodeKey> BpTree<K> {
                     Ok(NodeBody::Leaf(keys)) => {
                         for k in keys {
                             if k.matches(&st.bound) {
-                                st.ready.push_back(k.record().to_id(st.tenant));
+                                st.ready.push_back(k);
                             }
                         }
                     }
@@ -222,10 +255,10 @@ pub(super) struct PathFrame<K: NodeKey> {
     pub child_idx: usize,
 }
 
-/// State threaded through the `search` walk.
+/// State threaded through the `search_keys` walk.
 struct WalkState<K: NodeKey> {
     nodes: VecDeque<LocalId>,
-    ready: VecDeque<Id>,
+    ready: VecDeque<K>,
     bound: Bound,
     tenant: U48,
     _key: PhantomData<fn() -> K>,
@@ -428,6 +461,25 @@ mod tests {
                 .collect()
                 .await;
             assert_eq!(got, vec![123]);
+        });
+    }
+
+    #[test]
+    fn max_key_is_the_rightmost_leaf_last_entry() {
+        block_on(async {
+            let store = MemStore::default();
+            let mut tree: BpTree = BpTree::create(&store, U48::from(TENANT))
+                .await
+                .unwrap()
+                .with_caps(4, 4);
+            assert_eq!(tree.max_key(&store).await.unwrap(), None);
+            for k in [50u64, 10, 90, 30, 70, 20, 80, 60, 40] {
+                tree.insert(&store, rec(k)).await.unwrap();
+            }
+            let max = |k: Option<LocalId>| k.map(LocalId::key);
+            assert_eq!(max(tree.max_key(&store).await.unwrap()), Some(90));
+            assert!(tree.remove(&store, rec(90)).await.unwrap());
+            assert_eq!(max(tree.max_key(&store).await.unwrap()), Some(80));
         });
     }
 

@@ -1,8 +1,12 @@
 //! The HTTP-poll watch end-to-end: a client that cannot hold a WebSocket
 //! open ([`Db::watch_via_polling`]) sees remote mutations within one poll
-//! tick — typed, in order, through the same watch API — and its cache
-//! answers warm after the node dies, exactly like the pushed path
-//! (`live_watch_e2e`). Both watches of the identity ride ONE poll loop.
+//! tick — typed, through the same watch API — and its cache answers warm
+//! after the node dies, exactly like the pushed path (`live_watch_e2e`).
+//! Both watches of the identity ride ONE poll loop.
+//!
+//! Poll semantics are **cursor catch-up** (W6): each tick navigates
+//! "changed since" — every changed record arrives once, at its live
+//! state. Same-record writes inside one tick coalesce to the newest.
 //!
 //! Two processes for the same reason as every cache e2e: B's `Db::open`
 //! engine owns this process's slots, so the node is a re-executed child.
@@ -75,7 +79,8 @@ fn spawn_node(dir: &std::path::Path) -> (Child, SocketAddr) {
     (child, addr)
 }
 
-/// A signed access token — the poll buffer is keyed by its session claim.
+/// A signed access token — the sync route (like every watch) refuses the
+/// anonymous tier.
 fn access_token() -> Vec<u8> {
     use wavedb_net::auth::{AccessClaims, TokenPurpose, sign, unix_now};
     sign(
@@ -145,7 +150,7 @@ async fn polling_watcher_sees_mutations_and_keeps_the_cache_warm() {
         .await
         .expect("watch collection");
 
-    // A mutates; B's next ticks drain the buffered events in order.
+    // A mutates; B's next tick navigates everything past its cursor.
     let col = Contact::collection(book.contacts);
     let grace_nyc = contact("Grace", "555-0001", "NYC");
     let grace_ldn = contact("Grace", "555-0001", "London");
@@ -159,14 +164,14 @@ async fn polling_watcher_sees_mutations_and_keeps_the_cache_warm() {
     };
     renamed.save(&a).await.expect("save the holder");
 
-    assert_eq!(
-        next_event!(contact_watch),
-        WatchEvent::Saved(grace_id, grace_nyc)
-    );
-    assert_eq!(
-        next_event!(contact_watch),
-        WatchEvent::Saved(grace_id, grace_ldn.clone())
-    );
+    // Both writes usually land inside one tick window and coalesce to the
+    // live state; a tick between them delivers both states. Either way the
+    // watcher converges on London — the guaranteed contract.
+    let mut event = next_event!(contact_watch);
+    if event == WatchEvent::Saved(grace_id, grace_nyc.clone()) {
+        event = next_event!(contact_watch);
+    }
+    assert_eq!(event, WatchEvent::Saved(grace_id, grace_ldn.clone()));
     let WatchEvent::Saved(_, seen) = next_event!(book_watch) else {
         panic!("the anchor watcher must see the save");
     };

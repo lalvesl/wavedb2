@@ -19,6 +19,7 @@
 #![allow(clippy::future_not_send)]
 
 pub mod alloc;
+mod apply;
 pub mod block;
 pub mod block_file;
 mod chain;

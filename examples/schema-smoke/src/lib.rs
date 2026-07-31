@@ -59,6 +59,20 @@ pub struct Note {
     pub pinned: bool,
 }
 
+/// NonUnique with a **natural key**: the anchor is derived from `slug`
+/// (SeaHash over its wire bytes), so `insert` is an upsert — one key
+/// value, one record, in any process.
+///
+/// The declaration folds into the STRUCT_HASH: changing the key is a
+/// schema change like any other.
+#[wavedb(NonUnique)]
+#[wavedb::key(slug)]
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct Setting {
+    pub slug: String,
+    pub value: String,
+}
+
 /// A struct in a submodule — items are named by path, not found by a scanner.
 pub mod billing {
     use wavedb_macros::wavedb;
@@ -153,6 +167,13 @@ mod tests {
             async fn apply(&self, batch: &[Write]) -> Result<()> {
                 let mut m = self.0.lock().unwrap();
                 for w in batch {
+                    if let Write::Expect(id, expected) = w
+                        && m.get(&id.raw()) != expected.as_ref()
+                    {
+                        return Err(wavedb_core::Error::Conflict(*id));
+                    }
+                }
+                for w in batch {
                     match w {
                         Write::Put(id, b) => {
                             m.insert(id.raw(), b.clone());
@@ -160,6 +181,7 @@ mod tests {
                         Write::Remove(id) => {
                             m.remove(&id.raw());
                         }
+                        Write::Expect(..) => {}
                     }
                 }
                 drop(m);
@@ -596,6 +618,71 @@ mod tests {
             let pinned: Vec<Note> =
                 col.by_pinned(&db, &true).try_collect().await.unwrap();
             assert_eq!(by_body(pinned), vec!["later"]);
+        });
+    }
+
+    // The `#[wavedb::key(...)]` derive end-to-end: the anchor is derived
+    // from the key field through core's one hash fn, insert is an upsert at
+    // it, a save addressing a foreign anchor refuses typed, and a removed
+    // key written again revives chaining onto its whole history.
+    #[test]
+    fn derived_natural_key_upserts_at_the_content_anchor() {
+        use futures::TryStreamExt;
+        use futures::executor::block_on;
+        use wavedb_core::{NonUniqueStruct as _, U48};
+
+        use super::Setting;
+
+        let s = |value: &str| Setting {
+            slug: "theme".into(),
+            value: value.into(),
+        };
+        // The generated `natural_key`: SeaHash over the key field's wire
+        // bytes — every build derives the same anchor from the same value.
+        assert_eq!(
+            s("dark").natural_key(),
+            Some(wavedb_core::natural_key_hash(&wavedb_core::to_wire(
+                &"theme".to_string()
+            ))),
+        );
+
+        block_on(async {
+            let store = mem::MemStore::default();
+            let db = wavedb_core::LocalHandle::new(&store, U48::from(21u32));
+            let pivot = Setting::create_pivot(&db).await.unwrap();
+            let col = Setting::collection(pivot);
+
+            // Insert twice = upsert: same id, the live state converges,
+            // the superseded version chains.
+            let a = col.insert(&db, &s("dark")).await.unwrap();
+            let b = col.insert(&db, &s("light")).await.unwrap();
+            assert_eq!(a, b, "one key value = one anchor");
+            let all: Vec<Setting> = col.all(&db).try_collect().await.unwrap();
+            assert_eq!(all, vec![s("light")]);
+
+            // The identity IS the key: a save addressing `a` with another
+            // slug refuses — renaming is remove + insert.
+            let err = col
+                .save(
+                    &db,
+                    a,
+                    &Setting {
+                        slug: "lang".into(),
+                        value: "pt".into(),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, wavedb_core::Error::KeyMismatch(_)));
+
+            // A removed key written again revives at the same anchor,
+            // chained onto its whole prior history.
+            assert!(col.remove(&db, a).await.unwrap());
+            let back = col.insert(&db, &s("dark again")).await.unwrap();
+            assert_eq!(back, a, "same key, same anchor, through death");
+            let versions: Vec<(wavedb_core::Metadata, Setting)> =
+                col.history(&db, a).try_collect().await.unwrap();
+            assert_eq!(versions.len(), 3, "v1, v2, and the revival chain");
         });
     }
 

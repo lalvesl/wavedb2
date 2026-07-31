@@ -67,12 +67,12 @@
 use std::path::Path;
 
 use parking_lot::Mutex;
-use wavedb_core::{Id, Result as CoreResult, Store, Write};
+use wavedb_core::Id;
 
 use crate::block::BlockAllocator;
 use crate::block_file::BlockFile;
 use crate::directory::Directory;
-use crate::error::{StorageError, StorageResult};
+use crate::error::StorageResult;
 use crate::struct_storage::{BPTREE_NODE_STORAGE, EngineClaim, StructStorage};
 
 /// A bucket page spanning more blocks than this triggers one linear-hashing
@@ -179,154 +179,15 @@ impl PageStore {
     }
 
     /// The registered slot for `struct_hash`, if listed at open.
-    fn slot_of(&self, struct_hash: u64) -> Option<&'static StructStorage> {
+    pub(crate) fn slot_of(
+        &self,
+        struct_hash: u64,
+    ) -> Option<&'static StructStorage> {
         self.types
             .binary_search_by_key(&struct_hash, |s| s.struct_hash())
             .ok()
             .map(|i| self.types[i])
     }
-
-    /// Journal first (durable fsync), then commit to the per-type caches and
-    /// queue the touched ids for the settle drain. The batch is durable when
-    /// this returns; the page write happens later
-    /// ([`drain`](Self::drain)) — a crash before it replays from the journal.
-    // The journal guard deliberately spans the cache commit — releasing it
-    // earlier (the lint's suggestion) would let two applies commit their
-    // caches in the opposite order to their journal frames, so replay could
-    // disagree with what live readers saw. The pending-queue push also stays
-    // under it: eviction relies on "empty queue under its lock ⇒ every
-    // committed id is settled" (see `evict_settled`).
-    #[allow(clippy::significant_drop_tightening)]
-    fn apply_inner(&self, batch: &[Write]) -> StorageResult<()> {
-        // Refuse unroutable writes *before* the journal sees the batch, so the
-        // log never holds a batch replay would choke on.
-        self.route_batch(batch)?;
-        let mut journal = self.journal.lock();
-        journal.append(&crate::journal::JournalFrame::Batch(batch.to_vec()))?; // durability point
-        // Commit under the journal lock: cache order == journal order.
-        let touched = self.commit_to_caches(batch)?;
-        merge_touched(&mut self.pending.lock(), touched);
-        Ok(())
-    }
-
-    /// Verify every `Put` in `batch` routes to a registered slot.
-    fn route_batch(&self, batch: &[Write]) -> StorageResult<()> {
-        for w in batch {
-            if let Write::Put(_, bytes) = w {
-                let sh = struct_hash_of(bytes)?;
-                if self.slot_of(sh).is_none() {
-                    return Err(StorageError::UnregisteredStructHash(sh));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Apply `batch` to the per-type caches (routing validated beforehand),
-    /// returning the touched ids per slot. Runs under the journal lock, so
-    /// commits are ordered and each type's write guard is held only briefly.
-    ///
-    /// A page probe (routing a `Remove` whose owner is not cached) can fail
-    /// on a disk fault — *after* the durability point. The live state then
-    /// under-applies the batch, but the journal holds it whole: a reopen
-    /// replays it correctly, which is the strongest promise a broken disk
-    /// leaves available.
-    fn commit_to_caches(&self, batch: &[Write]) -> StorageResult<Touched> {
-        let mut touched: Touched = Vec::new();
-        for w in batch {
-            match w {
-                Write::Put(id, bytes) => {
-                    let sh = struct_hash_of(bytes)
-                        .expect("route_batch validated the head");
-                    let idx = self
-                        .types
-                        .binary_search_by_key(&sh, |s| s.struct_hash())
-                        .expect("route_batch validated registration");
-                    self.types[idx]
-                        .mem_cache()
-                        .write()
-                        .insert(id.raw(), bytes.clone());
-                    // A Put supersedes any unsettled remove of the same id.
-                    self.types[idx].clear_removed(*id);
-                    note_touched(&mut touched, idx, *id);
-                }
-                Write::Remove(id) => {
-                    if let Some(idx) = self.owner_of(*id)? {
-                        self.types[idx].mem_cache().write().remove(&id.raw());
-                        // The page still holds the bytes until the settle
-                        // lands — tombstone so reads don't resurrect them.
-                        self.types[idx].mark_removed(*id);
-                        note_touched(&mut touched, idx, *id);
-                    }
-                }
-            }
-        }
-        Ok(touched)
-    }
-}
-
-impl Store for PageStore {
-    async fn get(&self, id: Id) -> CoreResult<Option<Vec<u8>>> {
-        // Untyped fallback: the id alone names no type, so probe every slot —
-        // caches first (cheap), then settled pages. Typed callers use
-        // `get_of` and skip this scan entirely.
-        if let Some(bytes) = self.types.iter().find_map(|s| s.get(id)) {
-            return Ok(Some(bytes));
-        }
-        for slot in &self.types {
-            if let Some(bytes) = self.read_from_pages(slot, id)? {
-                return Ok(Some(bytes));
-            }
-        }
-        Ok(None)
-    }
-
-    async fn get_of(
-        &self,
-        struct_hash: u64,
-        id: Id,
-    ) -> CoreResult<Option<Vec<u8>>> {
-        // One binary search on the route table, then this type's own cache
-        // read lock — a cached read of one type never contends with another
-        // type's. A miss reads through to the settled page.
-        let Some(slot) = self.slot_of(struct_hash) else {
-            return Ok(None);
-        };
-        if let Some(bytes) = slot.get(id) {
-            return Ok(Some(bytes));
-        }
-        Ok(self.read_from_pages(slot, id)?)
-    }
-
-    async fn apply(&self, batch: &[Write]) -> CoreResult<()> {
-        self.apply_inner(batch)?; // StorageError → core::Error::Backend
-        Ok(())
-    }
-}
-
-/// Record `id` as touched under slot `idx`.
-fn note_touched(touched: &mut Touched, idx: usize, id: Id) {
-    match touched.iter_mut().find(|(i, _)| *i == idx) {
-        Some((_, ids)) => ids.push(id),
-        None => touched.push((idx, vec![id])),
-    }
-}
-
-/// Merge one batch's touched ids into the pending queue (slot-grouped).
-fn merge_touched(pending: &mut Touched, touched: Touched) {
-    for (idx, ids) in touched {
-        for id in ids {
-            note_touched(pending, idx, id);
-        }
-    }
-}
-
-/// The `STRUCT_HASH` at the head of a wire-encoded record (`[STRUCT_HASH][…]`).
-fn struct_hash_of(bytes: &[u8]) -> StorageResult<u64> {
-    if bytes.len() < 8 {
-        return Err(StorageError::Corrupt("record shorter than STRUCT_HASH"));
-    }
-    Ok(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
 }
 
 #[cfg(test)]
@@ -442,6 +303,52 @@ mod tests {
             let s = open(d.path());
             assert_eq!(s.get(nonunique(1)).await.unwrap(), None);
             assert_eq!(s.cache_len(), 0);
+        });
+    }
+
+    // The `Expect` guard: a satisfied guard commits its batch minus the
+    // guard (the journal never holds one, so replay re-applies only the
+    // effective writes); a violated guard refuses the whole batch as a
+    // typed conflict *before* the durability point.
+    #[test]
+    fn expect_guard_commits_clean_and_conflicts_before_journaling() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        block_on(async {
+            {
+                let s = open(d.path());
+                s.apply(&[Write::Put(nonunique(1), rec(SH, b"v1"))])
+                    .await
+                    .unwrap();
+                // Satisfied guards (present + absent) ride with a Put.
+                s.apply(&[
+                    Write::Expect(nonunique(1), Some(rec(SH, b"v1"))),
+                    Write::Expect(nonunique(2), None),
+                    Write::Put(nonunique(1), rec(SH, b"v2")),
+                ])
+                .await
+                .unwrap();
+                // A stale expectation refuses the whole batch, typed.
+                let err = s
+                    .apply(&[
+                        Write::Expect(nonunique(1), Some(rec(SH, b"v1"))),
+                        Write::Put(nonunique(1), rec(SH, b"lost-race")),
+                    ])
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    err,
+                    wavedb_core::Error::Conflict(at) if at == nonunique(1)
+                ));
+            }
+            // Replay: the guarded commit landed, the refused one never
+            // reached the log.
+            let s = open(d.path());
+            assert_eq!(
+                s.get(nonunique(1)).await.unwrap(),
+                Some(rec(SH, b"v2")),
+                "the guarded batch must survive a reopen"
+            );
         });
     }
 
