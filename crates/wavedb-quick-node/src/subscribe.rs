@@ -91,8 +91,9 @@ impl SubTable {
             id: m.id,
             kind: match m.kind {
                 MutationKind::Saved => EventKind::Saved,
-                MutationKind::Removed => EventKind::Removed,
+                MutationKind::Removed(at) => EventKind::Removed(at),
             },
+            meta: m.meta.clone(),
             body: m.body.clone(),
         });
         subs.retain(|s| s.tx.send(event.clone()).is_ok());
@@ -106,33 +107,28 @@ impl SubTable {
 /// into the [`NotifyStore`] publisher and every WebSocket session.
 pub type Subscriptions = Rc<RefCell<SubTable>>;
 
-/// A shared handle to the node's poll-session buffers — the HTTP half of
-/// the same publish fan-out.
-pub type Polls = Rc<RefCell<crate::poll::PollTable>>;
-
 /// The engine store wrapped so committed mutations reach subscribers.
 ///
 /// Forwards every [`Store`] read/write to the inner engine (a shared
 /// `Rc<PageStore>` — the node's maintenance loop and final commit drive the
 /// same engine directly) and overrides
-/// [`note_mutation`](Store::note_mutation) to publish — to the WebSocket
-/// subscribers (pushed now) and to the poll-session buffers (drained on
-/// the client's next tick). The node serves **through** this wrapper, so a
-/// mutation driven by any transport — a POST command, a WebSocket `Call`,
-/// or a `#[server]` body — reaches the live watchers; node-side seeding
-/// (which touches the raw engine before serving) does not, and neither do
-/// cache mirrors (a different store).
+/// [`note_mutation`](Store::note_mutation) to push to the WebSocket
+/// subscribers. (HTTP poll-watches need no publish half: each sync
+/// navigates the disk from the client's cursor.) The node serves
+/// **through** this wrapper, so a mutation driven by any transport — a
+/// POST command, a WebSocket `Call`, or a `#[server]` body — reaches the
+/// live watchers; node-side seeding (which touches the raw engine before
+/// serving) does not, and neither do cache mirrors (a different store).
 pub struct NotifyStore<S> {
     inner: Rc<S>,
     subs: Subscriptions,
-    polls: Polls,
 }
 
 impl<S> NotifyStore<S> {
     /// Wrap a shared engine handle, publishing mutations into `subs` (the
-    /// WebSocket push) and `polls` (the HTTP buffers).
-    pub const fn new(inner: Rc<S>, subs: Subscriptions, polls: Polls) -> Self {
-        Self { inner, subs, polls }
+    /// WebSocket push).
+    pub const fn new(inner: Rc<S>, subs: Subscriptions) -> Self {
+        Self { inner, subs }
     }
 }
 
@@ -156,10 +152,9 @@ impl<S: Store> Store for NotifyStore<S> {
     fn note_mutation(&self, mutation: impl FnOnce() -> Mutation) {
         // Building the event costs a body clone; only the node pays it (an
         // ordinary store's default drops the closure unbuilt), and only on
-        // writes. Both publishes are exact-match routing — no data scan.
+        // writes. The publish is exact-match routing — no data scan.
         let mutation = mutation();
         self.subs.borrow_mut().publish(&mutation);
-        self.polls.borrow_mut().publish(&mutation);
     }
 }
 
@@ -194,16 +189,13 @@ mod tests {
             pivot,
             id: Id::new(7, tenant, false, 1),
             kind: MutationKind::Saved,
+            meta: None,
             body: vec![1, 2, 3],
         }
     }
 
     fn table() -> Rc<RefCell<SubTable>> {
         Rc::new(RefCell::new(SubTable::default()))
-    }
-
-    fn polls() -> super::Polls {
-        Rc::new(RefCell::new(crate::poll::PollTable::default()))
     }
 
     fn unique_topic() -> Topic {
@@ -235,7 +227,7 @@ mod tests {
             other_tx,
         );
 
-        let store = NotifyStore::new(Rc::new(NullStore), subs, polls());
+        let store = NotifyStore::new(Rc::new(NullStore), subs);
         store.note_mutation(|| mutation(tenant, None));
 
         let ServerMsg::Event(event) = rx.recv().await.unwrap() else {
@@ -254,7 +246,7 @@ mod tests {
         let conn = subs.borrow_mut().new_conn();
         subs.borrow_mut()
             .subscribe(U48::from(3u32), unique_topic(), conn, tx);
-        let store = NotifyStore::new(Rc::new(NullStore), subs, polls());
+        let store = NotifyStore::new(Rc::new(NullStore), subs);
         // Same topic shape, foreign tenant — the key differs.
         store.note_mutation(|| mutation(U48::from(4u32), None));
         assert!(rx.try_recv().is_err());
@@ -270,8 +262,7 @@ mod tests {
         subs.borrow_mut().subscribe(tenant, topic, conn, tx);
         subs.borrow_mut().unsubscribe(tenant, topic, conn);
 
-        let store =
-            NotifyStore::new(Rc::new(NullStore), Rc::clone(&subs), polls());
+        let store = NotifyStore::new(Rc::new(NullStore), Rc::clone(&subs));
         store.note_mutation(|| mutation(tenant, None));
         assert!(rx.try_recv().is_err(), "unsubscribed conn hears nothing");
         assert!(subs.borrow().by_topic.is_empty());
@@ -287,8 +278,7 @@ mod tests {
             .subscribe(tenant, unique_topic(), conn, tx);
         drop(rx); // the session task ended without unregistering.
 
-        let store =
-            NotifyStore::new(Rc::new(NullStore), Rc::clone(&subs), polls());
+        let store = NotifyStore::new(Rc::new(NullStore), Rc::clone(&subs));
         store.note_mutation(|| mutation(tenant, None));
         assert!(
             subs.borrow().by_topic.is_empty(),

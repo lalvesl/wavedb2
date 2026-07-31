@@ -32,14 +32,12 @@ use crate::{dispatch, serve_ws};
 ///
 /// # Errors
 /// A fatal accept fault (the listener socket broke).
-#[allow(clippy::too_many_arguments)]
 pub async fn run<E, S, F, M>(
     listener: TcpListener,
     registry: E,
     store: Rc<S>,
     secret: [u8; 32],
     subs: Rc<RefCell<SubTable>>,
-    polls: crate::subscribe::Polls,
     maintenance: M,
     shutdown: F,
 ) -> wavedb_net::Result<()>
@@ -66,12 +64,11 @@ where
                 };
                 let store = Rc::clone(&store);
                 let subs = Rc::clone(&subs);
-                let polls = Rc::clone(&polls);
                 spawn_local(async move {
                     // A per-connection fault is dropped: it never takes the
                     // node down. (No tracing dep yet — silent.)
                     let _ = serve_connection(
-                        sock, &registry, &*store, &secret, &subs, &polls,
+                        sock, &registry, &*store, &secret, &subs,
                     )
                     .await;
                 });
@@ -89,7 +86,6 @@ async fn serve_connection<E, S>(
     store: &S,
     secret: &[u8; 32],
     subs: &Rc<RefCell<SubTable>>,
-    polls: &crate::subscribe::Polls,
 ) -> wavedb_net::Result<()>
 where
     E: Exposure,
@@ -101,10 +97,9 @@ where
         Some(Incoming::Post(body)) => {
             match from_wire::<Request>(&body) {
                 Ok(request) => {
-                    let response = dispatch::handle(
-                        registry, store, secret, polls, request,
-                    )
-                    .await;
+                    let response =
+                        dispatch::handle(registry, store, secret, request)
+                            .await;
                     write_response(&mut writer, response).await
                 }
                 // The envelope is malformed — a transport-level client

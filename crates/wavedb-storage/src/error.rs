@@ -61,11 +61,17 @@ pub type StorageResult<T> = core::result::Result<T, StorageError>;
 
 /// Flatten an engine error into [`wavedb_core::Error::Backend`] at the [`Store`]
 /// boundary — core declares the trait but stays I/O-free, so it can't name a
-/// concrete disk fault.
+/// concrete disk fault. A core error that merely passed *through* the engine
+/// (a [`Write::Expect`] conflict, a codec fault) keeps its own type: callers
+/// branch on those (a conflict means "re-plan", never "disk broke").
 ///
 /// [`Store`]: wavedb_core::Store
+/// [`Write::Expect`]: wavedb_core::Write::Expect
 impl From<StorageError> for wavedb_core::Error {
     fn from(e: StorageError) -> Self {
-        Self::Backend(e.to_string())
+        match e {
+            StorageError::Core(inner) => inner,
+            other => Self::Backend(other.to_string()),
+        }
     }
 }

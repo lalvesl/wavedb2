@@ -78,9 +78,7 @@ where
         reader.abort();
         return Ok(());
     };
-    // The session id only keys HTTP-poll buffers; a pushed connection
-    // needs no buffer.
-    let Ok((caller, _session)) = dispatch::identify(&auth, secret) else {
+    let Ok(caller) = dispatch::identify(&auth, secret) else {
         close(&mut write).await;
         reader.abort();
         return Ok(());
