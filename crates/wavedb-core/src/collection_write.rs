@@ -51,8 +51,8 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// Returns the minted `Id`.
     ///
     /// # Errors
-    /// Propagates a [`Store`] failure, [`Error::PivotMissing`] on a stale
-    /// handle, or a decode fault on a corrupt pivot.
+    /// Propagates a [`Store`] failure, [`Error::PivotMissing`](crate::Error::PivotMissing)
+    /// on a stale handle, or a decode fault on a corrupt pivot.
     pub async fn insert<S: Store>(&self, store: &S, value: &T) -> Result<Id> {
         let pivot = self.load_pivot(store).await?;
         // A `#[wavedb::key(...)]` type's identity is its key fields —
@@ -155,9 +155,10 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// in `current`.
     ///
     /// # Errors
-    /// Propagates a [`Store`] failure, [`Error::PivotMissing`] on a stale
-    /// handle, [`Error::RecordMissing`] if a living record's bytes are gone
-    /// (index out of sync), or a decode fault on a corrupt pivot.
+    /// Propagates a [`Store`] failure, [`Error::PivotMissing`](crate::Error::PivotMissing)
+    /// on a stale handle, [`Error::RecordMissing`](crate::Error::RecordMissing) if a
+    /// living record's bytes are gone (index out of sync), or a decode fault on
+    /// a corrupt pivot.
     pub async fn remove<S: Store>(&self, store: &S, id: Id) -> Result<bool> {
         let pivot = self.load_pivot(store).await?;
         let mut current = self.tree(pivot.current());

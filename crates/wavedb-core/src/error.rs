@@ -77,5 +77,5 @@ pub enum Error {
     Backend(String),
 }
 
-/// Shorthand for a `Result` carrying the workspace [`Error`].
+/// Shorthand for a `Result` carrying the workspace [`Error`](enum@Error).
 pub type Result<T> = core::result::Result<T, Error>;

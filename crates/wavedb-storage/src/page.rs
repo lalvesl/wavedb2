@@ -151,12 +151,10 @@ impl SlotPage {
     }
 
     /// Serialise, framed `[len][checked envelope]`. With `compress` the body
-    /// is zstd'd against `dict`'s **latest** state — but stored [`Raw`] anyway
+    /// is zstd'd against `dict`'s **latest** state — but stored `Raw` anyway
     /// when zstd cannot shrink it (a page never grows for having been
     /// "compressed"). Without `compress` (a hot page type opting out), zstd
     /// never runs.
-    ///
-    /// [`Raw`]: PagePayload::Raw
     ///
     /// # Errors
     /// [`StorageError::Io`] if zstd fails (allocation-class faults only).
@@ -203,7 +201,7 @@ impl SlotPage {
 
     /// Parse a page from bytes (typically a whole zero-padded run): length
     /// prefix, crc + envelope decode through the checked codec, then — for a
-    /// [`Zstd`](PagePayload::Zstd) payload — decompress against the dictionary
+    /// `Zstd` payload — decompress against the dictionary
     /// state the page was written under.
     ///
     /// # Errors

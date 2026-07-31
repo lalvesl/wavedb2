@@ -1,4 +1,4 @@
-//! [`Overlay`] — a plan-time read view of a [`Store`] with one batch's pending
+//! `Overlay` — a plan-time read view of a [`Store`] with one batch's pending
 //! [`Write`]s layered on top.
 //!
 //! Planning two tree mutations on the **same** tree inside one atomic batch (a

@@ -38,7 +38,7 @@ pub trait NodeKey: Clone + Ord + core::fmt::Debug + WaveWire {
 /// The primary key: the record's `LocalId` itself.
 ///
 /// Bounds carry the 8-byte big-endian `CREATED_AT`; pruning compares the
-/// window's key range against [`Bound::created_at_range`].
+/// window's key range against `Bound::created_at_range`.
 impl NodeKey for LocalId {
     fn record(&self) -> LocalId {
         *self

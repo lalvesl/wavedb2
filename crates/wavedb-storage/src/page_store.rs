@@ -1,4 +1,4 @@
-//! [`PageStore`] — the node's authoritative [`Store`] backend.
+//! [`PageStore`] — the node's authoritative [`Store`](wavedb_core::Store) backend.
 //!
 //! This is the disk-optimised key→value store the `Store`-generic
 //! `Pivot`/`BpTree` layer in [`wavedb_core`] runs over. It ties together the
@@ -82,9 +82,11 @@ const DEFAULT_SPLIT_THRESHOLD_BLOCKS: u64 = 8; // 32 KiB
 /// Ids one batch touched, grouped by registry slot — what the settle consumes.
 pub(crate) type Touched = Vec<(usize, Vec<Id>)>;
 
-/// The native, page-backed [`Store`]. One instance per process (the node
-/// model: one process, one `data.bin`); state lives in the per-type
-/// [`StructStorage`] statics registered at [`open`](Self::open).
+/// The native, page-backed [`Store`](wavedb_core::Store).
+///
+/// One instance per process (the node model: one process, one `data.bin`);
+/// state lives in the per-type [`StructStorage`] statics registered at
+/// [`open`](Self::open).
 #[derive(Debug)]
 pub struct PageStore {
     pub(crate) file: BlockFile,
@@ -112,10 +114,10 @@ impl PageStore {
     /// every slot's cache and pages.
     ///
     /// The registry is an allowlist: a write whose `STRUCT_HASH` has no listed
-    /// slot fails with [`StorageError::UnregisteredStructHash`].
+    /// slot fails with [`StorageError::UnregisteredStructHash`](crate::StorageError::UnregisteredStructHash).
     ///
     /// # Errors
-    /// [`StorageError::EngineBusy`] if this process already has an open store;
+    /// [`StorageError::EngineBusy`](crate::StorageError::EngineBusy) if this process already has an open store;
     /// otherwise any filesystem / corruption fault during open or replay.
     pub fn open(
         dir: impl AsRef<Path>,

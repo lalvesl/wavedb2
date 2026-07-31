@@ -55,7 +55,7 @@ use subscribe::{NotifyStore, SubTable};
 /// A node, configured but not yet bound.
 ///
 /// `E` is a schema crate's `expose_server!` registry: it is both the
-/// [`Exposure`](wavedb_core::expose::Exposure) dispatch surface and the
+/// [`Exposure`] dispatch surface and the
 /// [`StorageRegistry`] that names the engine's per-type slots.
 #[derive(Debug, Clone)]
 pub struct Server<E> {

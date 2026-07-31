@@ -48,5 +48,5 @@ pub enum Error {
     Node(#[from] crate::frame::NodeError),
 }
 
-/// Shorthand for a `Result` carrying the transport [`Error`].
+/// Shorthand for a `Result` carrying the transport [`Error`](enum@Error).
 pub type Result<T> = core::result::Result<T, Error>;

@@ -32,7 +32,7 @@ mod enums;
 
 use enums::expand_enum;
 
-/// Derive [`WaveWire`](wavedb_wire::WaveWire) for a struct or enum.
+/// Derive `WaveWire` for a struct or enum.
 #[proc_macro_derive(WaveWire)]
 pub fn wave_wire(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

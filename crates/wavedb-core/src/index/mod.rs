@@ -4,7 +4,7 @@
 //! [`Pivot`] roots holder, the concrete [`BpTree`], and [`IdStreamExt`] set
 //! algebra over `Id` streams.
 //!
-//! Everything here depends only on [`Store`] (`get` + `apply`), so the same code
+//! Everything here depends only on [`Store`](crate::Store) (`get` + `apply`), so the same code
 //! compiles for the node (`PageStore` in `wavedb-storage`) and the browser
 //! (IndexedDB). Pages, blocks, and the journal are backend internals and are
 //! never named here.

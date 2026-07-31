@@ -1,5 +1,5 @@
 //! Stored-record plumbing shared by the collection layer: the envelopes, id
-//! minting, the plan-time [`Overlay`] view, and the `Unique`-anchor
+//! minting, the plan-time `Overlay` view, and the `Unique`-anchor
 //! operations.
 //!
 //! ## Envelopes
@@ -20,7 +20,7 @@
 //! Saving never destroys the old bytes; the live record always sits at the
 //! shape's **anchor** and every superseded version archives at a **derived
 //! slot**: `KEY` = the instant that version was authored (its
-//! [`Succession::CreatedAt`]), `SALT` = the type's [`type_salt`], `FLAG` =
+//! [`Succession::CreatedAt`]), `SALT` = the type's `type_salt`, `FLAG` =
 //! the anchor's bit **flipped**. Because the address is a pure function of
 //! `(type, shape, instant)`, chain links are bare instants (`Metadata`'s
 //! `previous` / [`Succession::Next`]) and a link written once is correct

@@ -82,7 +82,7 @@ pub enum Error {
     },
 }
 
-/// Shorthand for a `Result` carrying the wire [`Error`].
+/// Shorthand for a `Result` carrying the wire [`Error`](enum@Error).
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// A forward-only byte cursor over a borrowed buffer, used for both the stack

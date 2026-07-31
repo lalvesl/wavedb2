@@ -13,7 +13,7 @@
 //! as it arrives.
 //!
 //! Every event **mirrors into the M6 cache before it is yielded**
-//! ([`crate::client_cache`]'s `mirror_*` — best-effort, absent when the
+//! (`client_cache`'s `mirror_*` — best-effort, absent when the
 //! handle has no cache): a watcher is the live half of sync, keeping local
 //! reads warm. Events decode to the watched type; the record's
 //! authoritative id rides along ([`WatchEvent`]).

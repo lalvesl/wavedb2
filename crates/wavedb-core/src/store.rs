@@ -94,6 +94,7 @@ pub trait Store {
 /// [`Rc`] not [`Arc`].
 ///
 /// [`Rc`]: std::rc::Rc
+/// [`Arc`]: std::sync::Arc
 impl<S: Store + ?Sized> Store for std::rc::Rc<S> {
     async fn get(&self, id: Id) -> Result<Option<Vec<u8>>> {
         (**self).get(id).await

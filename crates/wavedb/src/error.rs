@@ -67,5 +67,5 @@ impl From<Error> for wavedb_core::Error {
     }
 }
 
-/// Shorthand for a `Result` carrying the client [`Error`].
+/// Shorthand for a `Result` carrying the client [`Error`](enum@Error).
 pub type Result<T> = core::result::Result<T, Error>;

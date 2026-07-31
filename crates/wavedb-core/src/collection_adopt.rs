@@ -98,7 +98,7 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// **verbatim** — the mirror then carries authoritative chain data
     /// (who/when/permission) and its archives land at the node's own
     /// derived slots. Used by the paths whose frames ship metadata (watch
-    /// events, the `All` walk); plain read mirrors keep [`adopt`].
+    /// events, the `All` walk); plain read mirrors keep [`adopt`](Self::adopt).
     ///
     /// # Errors
     /// As [`adopt`](Self::adopt).

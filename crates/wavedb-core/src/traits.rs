@@ -70,7 +70,7 @@ pub trait WaveDbStruct: WaveWire {
     /// The typed handle into this type's collection.
     ///
     /// For a `NonUnique` type the macro generates a concrete `PivotId` (a wrapper
-    /// over a [`LocalId`](crate::local_id::LocalId)) that callers store in a field
+    /// over a [`LocalId`]) that callers store in a field
     /// to reference the collection. A `Unique` type has no collection, so its
     /// `PivotId` is `()`.
     type PivotId;

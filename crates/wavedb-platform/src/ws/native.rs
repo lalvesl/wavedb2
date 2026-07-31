@@ -156,7 +156,7 @@ impl Conn {
     /// Split into independently owned halves — what the connection
     /// manager's per-connection actor needs: a dedicated reader task (frame
     /// reads are not cancel-safe) while sends stay with the actor. Pings
-    /// surface on the receiving half ([`Received::Ping`]) for the sending
+    /// surface on the receiving half ([`Received::Ping`](super::Received::Ping)) for the sending
     /// half to [`pong`](SendHalf::pong).
     #[must_use]
     pub fn split(self) -> (RecvHalf, SendHalf) {
