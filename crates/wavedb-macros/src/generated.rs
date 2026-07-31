@@ -52,29 +52,60 @@ fn pivot_id_tokens(pivot_id: &Ident) -> syn::Result<TokenStream> {
     })
 }
 
-/// Emit the `PivotId` newtype and the `Pivot` roots holder for a NonUnique struct
-/// named `name` with the given resolved secondary indexes.
-pub fn nonunique_types(
-    name: &Ident,
-    secondaries_specs: &[ResolvedPivot],
-) -> syn::Result<TokenStream> {
-    let num_secondaries = secondaries_specs.len();
-    let pivot_id = format_ident!("{}PivotId", name);
-    let pivot = format_ident!("{}Pivot", name);
+/// The `natural_key` impl item of a `#[wavedb::key(...)]` type: the anchor
+/// is SeaHash over the declared key fields' wire bytes, declaration order —
+/// derived through core's one `natural_key_hash` fn so every build maps the
+/// same field values to the same address.
+fn natural_key_items(key_fields: Option<&[(Ident, syn::Type)]>) -> TokenStream {
+    key_fields.map_or_else(TokenStream::new, |fields| {
+        let extends = fields.iter().map(|(f, _)| {
+            quote! {
+                bytes.extend_from_slice(
+                    &::wavedb_core::wire::to_wire(&self.#f),
+                );
+            }
+        });
+        quote! {
+            fn natural_key(&self) -> ::core::option::Option<u64> {
+                let mut bytes = ::std::vec::Vec::new();
+                #(#extends)*
+                ::core::option::Option::Some(
+                    ::wavedb_core::natural_key_hash(&bytes),
+                )
+            }
+        }
+    })
+}
 
-    // The pivot record's own identity: hashed like any struct, under the
-    // reserved `Pivot` shape discriminator so it can never collide with a
-    // user-declared `Unique`/`NonUnique` type of the same name and fields.
-    let pivot_hash = struct_hash::compute(
+/// The pivot record's own identity: hashed like any struct, under the
+/// reserved `Pivot` shape discriminator so it can never collide with a
+/// user-declared `Unique`/`NonUnique` type of the same name and fields.
+fn pivot_identity(pivot: &Ident, num_secondaries: usize) -> u64 {
+    struct_hash::compute(
         &pivot.to_string(),
         "Pivot",
         &[
             ("current".into(), "LocalId".into()),
             ("dead".into(), "LocalId".into()),
+            ("recency".into(), "LocalId".into()),
             ("secondaries".into(), format!("[LocalId;{num_secondaries}]")),
             ("permission".into(), "Option<PermissionRef>".into()),
         ],
-    );
+    )
+}
+
+/// Emit the `PivotId` newtype and the `Pivot` roots holder for a NonUnique struct
+/// named `name` with the given resolved secondary indexes and (for a
+/// `#[wavedb::key(...)]` type) natural-key fields.
+pub fn nonunique_types(
+    name: &Ident,
+    secondaries_specs: &[ResolvedPivot],
+    key_fields: Option<&[(Ident, syn::Type)]>,
+) -> syn::Result<TokenStream> {
+    let num_secondaries = secondaries_specs.len();
+    let pivot_id = format_ident!("{}PivotId", name);
+    let pivot = format_ident!("{}Pivot", name);
+    let pivot_hash = pivot_identity(&pivot, num_secondaries);
 
     let pivot_id_tokens = pivot_id_tokens(&pivot_id)?;
 
@@ -93,6 +124,7 @@ pub fn nonunique_types(
     // Secondary-index hooks + the typed `by_<field>` lookup surface.
     let secondary_items = secondaries::trait_items(secondaries_specs);
     let by_lookups = secondaries::by_lookups(name, secondaries_specs);
+    let key_items = natural_key_items(key_fields);
 
     // The per-command execution steps (`__wavedb_<op>`) — defined here,
     // wire-reachable only once listed in an exposure declaration.
@@ -105,6 +137,7 @@ pub fn nonunique_types(
         pub struct #pivot {
             pub current: ::wavedb_core::LocalId,
             pub dead: ::wavedb_core::LocalId,
+            pub recency: ::wavedb_core::LocalId,
             pub secondaries: [::wavedb_core::LocalId; #num_secondaries],
             pub permission: ::core::option::Option<::wavedb_core::PermissionRef>,
         }
@@ -120,6 +153,7 @@ pub fn nonunique_types(
         impl ::wavedb_core::NonUniqueStruct for #name {
             type Pivot = #pivot;
             #secondary_items
+            #key_items
         }
 
         #by_lookups
@@ -160,6 +194,7 @@ pub fn nonunique_types(
 
             fn current(&self) -> ::wavedb_core::LocalId { self.current }
             fn dead(&self) -> ::wavedb_core::LocalId { self.dead }
+            fn recency(&self) -> ::wavedb_core::LocalId { self.recency }
             fn secondaries(&self) -> &[::wavedb_core::LocalId] { &self.secondaries }
             fn permission(&self) -> ::core::option::Option<&::wavedb_core::PermissionRef> {
                 self.permission.as_ref()
@@ -168,6 +203,7 @@ pub fn nonunique_types(
                 &self,
                 current: ::wavedb_core::LocalId,
                 dead: ::wavedb_core::LocalId,
+                recency: ::wavedb_core::LocalId,
                 secondaries: &[::wavedb_core::LocalId],
             ) -> Self {
                 let mut secs = self.secondaries;
@@ -178,6 +214,7 @@ pub fn nonunique_types(
                 Self {
                     current,
                     dead,
+                    recency,
                     secondaries: secs,
                     permission: ::core::clone::Clone::clone(&self.permission),
                 }

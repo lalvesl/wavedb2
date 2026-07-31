@@ -113,8 +113,15 @@ pub trait Pivot: WaveWire + Sized {
 
     /// Root of the living-records B+tree.
     fn current(&self) -> LocalId;
-    /// Root of the deleted-records B+tree.
+    /// Root of the removed-records B+tree, keyed `[removed_at BE][anchor]`
+    /// — the collection's removal log, in removal order (membership by id
+    /// is not its job; record bytes stay resolvable by address anyway).
     fn dead(&self) -> LocalId;
+    /// Root of the recency B+tree: exactly one `[modified_at BE][anchor]`
+    /// entry per **living** record, keyed by its live version's authoring
+    /// instant — the collection's modification log, what a reconnect
+    /// catch-up scans as "changed since cursor".
+    fn recency(&self) -> LocalId;
     /// One root per `#[wavedb::pivot(...)]` secondary index.
     fn secondaries(&self) -> &[LocalId];
     /// Collection-default access rule: seeds new inserts and gates
@@ -122,16 +129,17 @@ pub trait Pivot: WaveWire + Sized {
     /// `Metadata.permission` overrides it (authoritative per record).
     /// `None` = tenant-only.
     fn permission(&self) -> Option<&PermissionRef>;
-    /// A copy of this pivot with every root replaced (`current`, `dead`, and
-    /// one entry per secondary index) and everything else (permission)
-    /// preserved — what the engine writes back when a B+tree root moves.
-    /// `secondaries` must hold exactly as many roots as
+    /// A copy of this pivot with every root replaced (`current`, `dead`,
+    /// `recency`, and one entry per secondary index) and everything else
+    /// (permission) preserved — what the engine writes back when a B+tree
+    /// root moves. `secondaries` must hold exactly as many roots as
     /// [`secondaries`](Self::secondaries) returns.
     #[must_use]
     fn replace_roots(
         &self,
         current: LocalId,
         dead: LocalId,
+        recency: LocalId,
         secondaries: &[LocalId],
     ) -> Self;
 }

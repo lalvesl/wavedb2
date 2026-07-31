@@ -8,8 +8,8 @@ use syn::{Ident, Path, Token, braced};
 
 /// The per-item ops an entry can override or exclude — one per wire
 /// [`Command`](wavedb_core::expose::Command).
-pub const OPS: [&str; 7] = [
-    "get", "save", "insert", "update", "remove", "all", "history",
+pub const OPS: [&str; 8] = [
+    "get", "save", "insert", "update", "remove", "all", "history", "changes",
 ];
 
 /// What a declared entry contributes.
