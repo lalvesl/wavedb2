@@ -38,6 +38,8 @@ pub const fn is_transport(err: &Error) -> bool {
 }
 
 /// Mirror a Unique value the node acknowledged, skipping unchanged bytes.
+/// The read paths' mirror — their replies carry no metadata, so the local
+/// copy authors its own; the watch path uses [`mirror_unique_meta`].
 pub async fn mirror_unique<T: UniqueStruct>(db: &Db, value: &T) {
     let Some(local) = db.local() else { return };
     let unchanged = matches!(
@@ -47,6 +49,25 @@ pub async fn mirror_unique<T: UniqueStruct>(db: &Db, value: &T) {
     if !unchanged {
         let _ = local.save_unique(value).await;
     }
+}
+
+/// Mirror a Unique version with the node's [`Metadata`] written verbatim —
+/// the watch path, whose events carry the authoritative chain data.
+///
+/// [`Metadata`]: wavedb_core::Metadata
+pub async fn mirror_unique_meta<T: UniqueStruct>(
+    db: &Db,
+    meta: wavedb_core::Metadata,
+    value: &T,
+) {
+    let Some(local) = db.local() else { return };
+    let _ = wavedb_core::collection::adopt_unique::<T, _>(
+        local.store(),
+        db.tenant(),
+        meta,
+        value,
+    )
+    .await;
 }
 
 /// Serve a Unique read from the cache after the transport fault `err`.
@@ -63,7 +84,9 @@ pub async fn unique_fallback<T: UniqueStruct>(
 }
 
 /// Mirror a **living** record the node acknowledged under its node-minted
-/// identity: bootstrap the local pivot copy if needed, then adopt.
+/// identity: bootstrap the local pivot copy if needed, then adopt. The
+/// read/write paths' mirror — their replies carry no metadata; the frames
+/// that do (watch events, the `All` walk) use [`mirror_record_meta`].
 pub async fn mirror_record<T: NonUniqueStruct>(
     db: &Db,
     pivot: LocalId,
@@ -78,6 +101,30 @@ pub async fn mirror_record<T: NonUniqueStruct>(
     {
         let _ = Collection::<T>::at(pivot, tenant)
             .adopt(store, id, value)
+            .await;
+    }
+}
+
+/// Mirror a living record with the node's [`Metadata`] written verbatim —
+/// the local copy then carries authoritative chain data and archives at
+/// the node's own derived slots.
+///
+/// [`Metadata`]: wavedb_core::Metadata
+pub async fn mirror_record_meta<T: NonUniqueStruct>(
+    db: &Db,
+    pivot: LocalId,
+    id: Id,
+    meta: wavedb_core::Metadata,
+    value: &T,
+) {
+    let Some(local) = db.local() else { return };
+    let (store, tenant) = (local.store(), DbHandle::tenant(&local));
+    if Collection::<T>::adopt_pivot(store, tenant, pivot)
+        .await
+        .is_ok()
+    {
+        let _ = Collection::<T>::at(pivot, tenant)
+            .adopt_with(store, id, meta, value)
             .await;
     }
 }
@@ -110,9 +157,10 @@ pub async fn record_fallback<T: NonUniqueStruct>(
 }
 
 /// The collection walk with the cache in the loop: stream the node's
-/// `(Id, T)` frames, mirroring each living record as it passes; when the
-/// *transport* fails and the local collection copy exists, serve the warm
-/// walk instead (same ids, same order — the mirror adopted the node's).
+/// `(Id, Metadata, T)` frames, mirroring each living record (chain data
+/// verbatim) as it passes; when the *transport* fails and the local
+/// collection copy exists, serve the warm walk instead (same ids, same
+/// order — the mirror adopted the node's).
 pub fn cached_all<T: NonUniqueStruct + 'static>(
     db: &Db,
     pivot: LocalId,
@@ -124,10 +172,11 @@ pub fn cached_all<T: NonUniqueStruct + 'static>(
         match node {
             Ok(items) => items
                 .and_then(move |bytes| async move {
-                    let (id, value) = from_wire::<(Id, T)>(&bytes)
-                        .map_err(wavedb_core::Error::from)
-                        .map_err(Error::Core)?;
-                    mirror_record(db, pivot, id, &value).await;
+                    let (id, meta, value) =
+                        from_wire::<(Id, wavedb_core::Metadata, T)>(&bytes)
+                            .map_err(wavedb_core::Error::from)
+                            .map_err(Error::Core)?;
+                    mirror_record_meta(db, pivot, id, meta, &value).await;
                     Ok(value)
                 })
                 .left_stream()
