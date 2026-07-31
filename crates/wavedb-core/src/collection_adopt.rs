@@ -71,7 +71,16 @@ impl<T: NonUniqueStruct> Collection<T> {
             .contains(store, LocalId::from_id(id))
             .await?;
         if !living {
-            return self.insert_at(store, id, value).await;
+            // A non-living anchor that still holds bytes is a locally-dead
+            // record coming back — only a keyed type's anchor can recur.
+            // Revive it as a chained version so the dead copy archives
+            // instead of being overwritten.
+            if store.get_of(T::STRUCT_HASH, id).await?.is_some() {
+                return self
+                    .chain_into_living(store, &pivot, id, None, value)
+                    .await;
+            }
+            return self.insert_at(store, &pivot, id, value).await;
         }
         // No `PartialEq` bound on record types — unchanged is decided on the
         // wire bytes, the identity the store actually holds.
@@ -83,6 +92,49 @@ impl<T: NonUniqueStruct> Collection<T> {
             return Ok(());
         }
         self.save(store, id, value).await
+    }
+
+    /// [`adopt`](Self::adopt) with the node's [`Metadata`] written
+    /// **verbatim** — the mirror then carries authoritative chain data
+    /// (who/when/permission) and its archives land at the node's own
+    /// derived slots. Used by the paths whose frames ship metadata (watch
+    /// events, the `All` walk); plain read mirrors keep [`adopt`].
+    ///
+    /// # Errors
+    /// As [`adopt`](Self::adopt).
+    ///
+    /// [`Metadata`]: crate::Metadata
+    pub async fn adopt_with<S: Store>(
+        &self,
+        store: &S,
+        id: Id,
+        meta: crate::metadata::Metadata,
+        value: &T,
+    ) -> Result<()> {
+        let pivot = self.load_pivot(store).await?;
+        let living = self
+            .tree(pivot.current())
+            .contains(store, LocalId::from_id(id))
+            .await?;
+        if !living {
+            // A revived keyed anchor: chain the node's version onto the
+            // locally-dead copy, archiving it at the node's derived slot.
+            if store.get_of(T::STRUCT_HASH, id).await?.is_some() {
+                return self
+                    .chain_into_living(store, &pivot, id, Some(meta), value)
+                    .await;
+            }
+            return self.insert_with_meta(store, &pivot, id, meta, value).await;
+        }
+        let unchanged = matches!(
+            self.load_record(store, id).await,
+            Ok((existing, body)) if existing == meta
+                && to_wire(&body) == to_wire(value)
+        );
+        if unchanged {
+            return Ok(());
+        }
+        self.save_with_meta(store, id, meta, value).await
     }
 }
 
@@ -130,6 +182,7 @@ mod tests {
     struct ItemPivot {
         current: LocalId,
         dead: LocalId,
+        recency: LocalId,
         secondaries: [LocalId; 1],
         permission: Option<PermissionRef>,
     }
@@ -141,6 +194,9 @@ mod tests {
         fn dead(&self) -> LocalId {
             self.dead
         }
+        fn recency(&self) -> LocalId {
+            self.recency
+        }
         fn secondaries(&self) -> &[LocalId] {
             &self.secondaries
         }
@@ -151,6 +207,7 @@ mod tests {
             &self,
             current: LocalId,
             dead: LocalId,
+            recency: LocalId,
             secondaries: &[LocalId],
         ) -> Self {
             let mut s = self.secondaries;
@@ -158,6 +215,7 @@ mod tests {
             Self {
                 current,
                 dead,
+                recency,
                 secondaries: s,
                 permission: self.permission.clone(),
             }
@@ -169,6 +227,78 @@ mod tests {
             label: label.into(),
             n,
         }
+    }
+
+    // With the node's Metadata riding along, the mirror is byte-faithful:
+    // the live copy carries the node's chain data verbatim, and archiving
+    // a superseded mirrored version lands at the NODE's own derived slot
+    // (addresses are pure functions of the instants both sides share).
+    #[test]
+    fn adopt_with_carries_node_chain_data_and_slots() {
+        block_on(async {
+            let tenant = U48::from(5u32);
+            let node = MemStore::default();
+            let pivot =
+                Collection::<Item>::create(&node, tenant).await.unwrap();
+            let node_col = Collection::<Item>::at(pivot, tenant);
+            let id = node_col.insert(&node, &item("a", 1)).await.unwrap();
+            let (v1_meta, _) = node_col.load_record(&node, id).await.unwrap();
+
+            let cache = MemStore::default();
+            Collection::<Item>::adopt_pivot(&cache, tenant, pivot)
+                .await
+                .unwrap();
+            let cache_col = Collection::<Item>::at(pivot, tenant);
+            cache_col
+                .adopt_with(&cache, id, v1_meta.clone(), &item("a", 1))
+                .await
+                .unwrap();
+            assert_eq!(
+                cache_col.load_record(&cache, id).await.unwrap(),
+                (v1_meta.clone(), item("a", 1)),
+                "the mirror must carry the node's metadata verbatim"
+            );
+
+            // The node saves V2; the mirror adopts it — and must archive
+            // its V1 copy at the node's own derived slot.
+            node_col.save(&node, id, &item("a", 2)).await.unwrap();
+            let (v2_meta, _) = node_col.load_record(&node, id).await.unwrap();
+            cache_col
+                .adopt_with(&cache, id, v2_meta.clone(), &item("a", 2))
+                .await
+                .unwrap();
+            assert_eq!(
+                cache_col.load_record(&cache, id).await.unwrap(),
+                (v2_meta.clone(), item("a", 2))
+            );
+            let slot = crate::record::archive_id(
+                Item::STRUCT_HASH,
+                Item::SHAPE,
+                v2_meta.previous.expect("v2 chains back"),
+                tenant,
+            );
+            let node_archive = crate::store::Store::get(&node, slot)
+                .await
+                .unwrap()
+                .expect("node archived v1");
+            let cache_archive = crate::store::Store::get(&cache, slot)
+                .await
+                .unwrap()
+                .expect("cache archived v1 at the node's slot");
+            assert_eq!(
+                cache_archive, node_archive,
+                "mirror archives must be byte-identical to the node's"
+            );
+
+            // Re-adopting the same version is a no-op (unchanged skip).
+            cache_col
+                .adopt_with(&cache, id, v2_meta.clone(), &item("a", 2))
+                .await
+                .unwrap();
+            let versions: Vec<(crate::metadata::Metadata, Item)> =
+                cache_col.history(&cache, id).try_collect().await.unwrap();
+            assert_eq!(versions.len(), 2, "no phantom version on a re-adopt");
+        });
     }
 
     // The "node" mints ids in one store; the "cache" adopts them in another

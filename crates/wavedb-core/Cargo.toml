@@ -10,6 +10,9 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+# Natural-key anchors (`#[wavedb::key(...)]`): the pinned identity hash the
+# generated `natural_key` impls derive record addresses with.
+seahash.workspace = true
 # Wall-clock reads for id minting — `SystemTime::now()` panics on
 # wasm32-unknown-unknown, so the clock routes through the platform seam.
 wavedb-platform.workspace = true

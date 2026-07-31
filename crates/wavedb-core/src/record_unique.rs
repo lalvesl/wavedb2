@@ -65,16 +65,20 @@ where
     S: Store,
 {
     let anchor = unique_anchor::<T>(tenant);
-    let (writes, _old) = plan_chained_save::<T, S>(
-        store,
-        T::STRUCT_HASH,
-        anchor,
+    let plan = crate::record::SavePlan {
+        hash: T::STRUCT_HASH,
+        shape: T::SHAPE,
+        live_id: anchor,
         tenant,
         user,
-        value,
-        None,
-    )
-    .await?;
+        pivot_id: None,
+        imposed: None,
+        // No collection, no persisted watermark: the chain guard alone
+        // keeps a Unique walkable (catch-up is chain-forward navigation).
+        floor: 0,
+    };
+    let (writes, _old, live_meta) =
+        plan_chained_save::<T, S>(store, &plan, value).await?;
     store.apply(&writes).await?;
     store.note_mutation(|| crate::notify::Mutation {
         struct_hash: T::STRUCT_HASH,
@@ -82,9 +86,55 @@ where
         pivot: None,
         id: anchor,
         kind: crate::notify::MutationKind::Saved,
+        meta: Some(live_meta),
         body: crate::wire::to_wire(value),
     });
     Ok(())
+}
+
+/// Mirror a node-acknowledged `Unique` version into a **local cache
+/// store**, its [`Metadata`] written verbatim.
+///
+/// The mirror then carries the node's authoritative chain data, and its
+/// archives land at the node's own derived slots. Skips entirely when the
+/// anchor already holds exactly this version (meta and bytes), so
+/// read-path mirroring never grows the store. Never notes a mutation (a
+/// mirrored record is not a new one).
+///
+/// # Errors
+/// Propagates a [`Store`] failure or a decode fault on the existing local
+/// record.
+pub async fn adopt_unique<T, S>(
+    store: &S,
+    tenant: U48,
+    meta: Metadata,
+    value: &T,
+) -> Result<()>
+where
+    T: crate::traits::WaveDbStruct,
+    S: Store,
+{
+    let anchor = unique_anchor::<T>(tenant);
+    if let Some(bytes) = store.get_of(T::STRUCT_HASH, anchor).await? {
+        let (existing, body) =
+            crate::record::split_record(T::STRUCT_HASH, &bytes)?;
+        if existing == meta && body == crate::wire::to_wire(value) {
+            return Ok(());
+        }
+    }
+    let plan = crate::record::SavePlan {
+        hash: T::STRUCT_HASH,
+        shape: T::SHAPE,
+        live_id: anchor,
+        tenant,
+        user: meta.user,
+        pivot_id: None,
+        imposed: Some(meta),
+        floor: 0,
+    };
+    let (writes, _old, _live) =
+        plan_chained_save::<T, S>(store, &plan, value).await?;
+    store.apply(&writes).await
 }
 
 /// Stream a `Unique` record's versions **newest-first** (the live record,
@@ -107,10 +157,14 @@ where
             .map(|b| b.is_some())
     })
     .flat_map(move |exists| match exists {
-        Ok(true) => {
-            history_stream::<T, S>(store, T::STRUCT_HASH, anchor, tenant)
-                .left_stream()
-        }
+        Ok(true) => history_stream::<T, S>(
+            store,
+            T::STRUCT_HASH,
+            T::SHAPE,
+            anchor,
+            tenant,
+        )
+        .left_stream(),
         Ok(false) => futures::stream::empty().left_stream().right_stream(),
         Err(e) => futures::stream::once(async move { Err(e) })
             .right_stream()

@@ -153,8 +153,11 @@ async fn unique_phase(db: &Db) {
         "timeline newest-first"
     );
     assert!(
-        versions[0].0.new_modification_id.is_none(),
-        "the live version has no successor"
+        matches!(
+            versions[0].0.succession,
+            wavedb_core::Succession::CreatedAt(_)
+        ),
+        "the live version carries its authoring instant, not a successor"
     );
 }
 
