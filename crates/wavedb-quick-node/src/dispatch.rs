@@ -41,17 +41,13 @@ fn unauthorized(struct_hash: u64) -> Response {
 }
 
 /// Gate 1: resolve the request's identity claim into the [`Caller`] the
-/// engine executes as, plus the token's session id (`None` for the
-/// anonymous tier — the poll-sync route requires one). `Err(())` = refuse
-/// (bad/expired/foreign token, or a token before the node has a secret).
-/// Shared by the HTTP path ([`handle`]) and the WebSocket `Hello`
-/// (`serve_ws`), which binds it once for the connection.
-pub(crate) fn identify(
-    auth: &Auth,
-    secret: &[u8; 32],
-) -> Result<(Caller, Option<u128>), ()> {
+/// engine executes as. `Err(())` = refuse (bad/expired/foreign token, or a
+/// token before the node has a secret). Shared by the HTTP path
+/// ([`handle`]) and the WebSocket `Hello` (`serve_ws`), which binds it
+/// once for the connection.
+pub(crate) fn identify(auth: &Auth, secret: &[u8; 32]) -> Result<Caller, ()> {
     match auth {
-        Auth::Anonymous { tenant } => Ok((Caller::anonymous(*tenant), None)),
+        Auth::Anonymous { tenant } => Ok(Caller::anonymous(*tenant)),
         Auth::Token(token) => {
             let claims = auth::verify(
                 secret,
@@ -60,13 +56,10 @@ pub(crate) fn identify(
                 TokenPurpose::Access,
             )
             .map_err(|_| ())?;
-            Ok((
-                Caller {
-                    user: claims.user,
-                    tenant: claims.tenant,
-                },
-                Some(claims.session),
-            ))
+            Ok(Caller {
+                user: claims.user,
+                tenant: claims.tenant,
+            })
         }
     }
 }
@@ -79,7 +72,6 @@ pub async fn handle<E, S>(
     registry: &E,
     store: &S,
     secret: &[u8; 32],
-    polls: &crate::subscribe::Polls,
     request: Request,
 ) -> Response
 where
@@ -89,33 +81,42 @@ where
     let Request { auth, frame } = request;
 
     // Gate 1 — identity.
-    let Ok((caller, session)) = identify(&auth, secret) else {
+    let Ok(caller) = identify(&auth, secret) else {
         return unauthorized(frame.struct_hash);
     };
 
     // The reserved sync exchange (HTTP-poll watch) routes before the
     // registry — no schema hash can reach it, and it can shadow none.
     if frame.struct_hash == wavedb_net::sync::SYNC_STRUCT_HASH {
-        return sync_poll(polls, caller, session, &frame.payload);
+        return sync_poll(registry, store, caller, &frame.payload).await;
     }
     execute(registry, store, caller, frame).await
 }
 
-/// The "anything new?" answer: replace the session's declared topics,
-/// drain its buffer. Requires an authenticated identity — the session id
-/// keys the buffer — so the anonymous tier refuses uniformly.
-fn sync_poll(
-    polls: &crate::subscribe::Polls,
+/// The "anything new?" answer — **stateless**: each declared topic rides
+/// the caller's cursor, and the node answers by navigating the disk (the
+/// type's `Changes` step through the registry match), so nothing is
+/// buffered node-side and nothing can be missed or expire. Requires an
+/// authenticated identity, matching the WebSocket subscribe; an unlisted
+/// topic hash refuses the whole sync exactly like a command would.
+async fn sync_poll<E, S>(
+    registry: &E,
+    store: &S,
     caller: Caller,
-    session: Option<u128>,
     payload: &[u8],
-) -> Response {
+) -> Response
+where
+    E: Exposure,
+    S: Store,
+{
+    use wavedb_core::expose::{Change, Command, Reply};
     use wavedb_core::wire::{from_wire, to_wire};
     use wavedb_net::sync::{SYNC_STRUCT_HASH, SyncReply, SyncRequest};
+    use wavedb_net::ws::{EventKind, RecordEvent};
 
-    let Some(session) = session else {
+    if caller.is_anonymous() {
         return unauthorized(SYNC_STRUCT_HASH);
-    };
+    }
     let request: SyncRequest = match from_wire(payload) {
         Ok(request) => request,
         Err(e) => {
@@ -125,10 +126,72 @@ fn sync_poll(
             ));
         }
     };
-    let events = polls.borrow_mut().sync(caller.tenant, session, &request);
-    Response::Ok(wavedb_core::expose::Reply::Returned(to_wire(&SyncReply {
-        events,
-    })))
+    let mut reply = SyncReply {
+        events: Vec::new(),
+        cursors: Vec::new(),
+    };
+    for declared in request.topics {
+        let topic = declared.topic;
+        let changes = to_wire(&(topic.pivot, declared.since));
+        let outcome = registry
+            .execute(
+                store,
+                caller,
+                topic.struct_hash,
+                Command::Changes,
+                &changes,
+            )
+            .await;
+        let entries = match outcome {
+            Ok(Reply::Values(entries)) => entries,
+            Ok(_) => {
+                return Response::Err(NodeError::from_core(
+                    topic.struct_hash,
+                    &Error::Backend(
+                        "changes answered with a non-values reply".into(),
+                    ),
+                ));
+            }
+            Err(err) => {
+                return Response::Err(NodeError::from_core(
+                    topic.struct_hash,
+                    &err,
+                ));
+            }
+        };
+        for entry in entries {
+            match from_wire::<Change>(&entry) {
+                Ok(Change::Cursor(cursor)) => {
+                    reply.cursors.push((topic, cursor));
+                }
+                Ok(Change::Saved(id, meta, body)) => {
+                    reply.events.push(RecordEvent {
+                        topic,
+                        id,
+                        kind: EventKind::Saved,
+                        meta: Some(meta),
+                        body,
+                    });
+                }
+                Ok(Change::Removed(id, at)) => {
+                    reply.events.push(RecordEvent {
+                        topic,
+                        id,
+                        kind: EventKind::Removed(at),
+                        meta: None,
+                        body: Vec::new(),
+                    });
+                }
+                Err(e) => {
+                    return Response::Err(NodeError::from_core(
+                        topic.struct_hash,
+                        &Error::from(e),
+                    ));
+                }
+            }
+        }
+    }
+    Response::Ok(Reply::Returned(to_wire(&reply)))
 }
 
 /// Gates 2–3 for an already-identified [`Caller`].
@@ -200,6 +263,13 @@ mod tests {
         async fn apply(&self, batch: &[Write]) -> Result<()> {
             let mut m = self.0.lock().unwrap();
             for w in batch {
+                if let Write::Expect(id, expected) = w
+                    && m.get(&id.raw()) != expected.as_ref()
+                {
+                    return Err(wavedb_core::Error::Conflict(*id));
+                }
+            }
+            for w in batch {
                 match w {
                     Write::Put(id, b) => {
                         m.insert(id.raw(), b.clone());
@@ -207,6 +277,7 @@ mod tests {
                     Write::Remove(id) => {
                         m.remove(&id.raw());
                     }
+                    Write::Expect(..) => {}
                 }
             }
             drop(m);
@@ -214,7 +285,10 @@ mod tests {
         }
     }
 
-    /// A registry that knows exactly one hash and echoes a fixed reply.
+    /// A registry that knows exactly one hash and echoes a fixed reply;
+    /// its `Changes` arm answers a canned navigation (what a generated
+    /// `__wavedb_changes` step would), so the sync translation is testable
+    /// without an engine.
     #[derive(Clone, Copy)]
     struct OneHash;
 
@@ -234,17 +308,42 @@ mod tests {
             _: &S,
             caller: Caller,
             struct_hash: u64,
-            _: Command,
-            _: &[u8],
+            command: Command,
+            payload: &[u8],
         ) -> Result<Reply> {
-            if struct_hash == 0x1234 {
-                // Echo the resolved user so tests can see gate 1's output.
-                Ok(Reply::Value(Some(vec![
-                    u8::try_from(caller.user.get() & 0xFF).unwrap(),
-                ])))
-            } else {
-                Err(Error::UnknownStructHash(struct_hash))
+            if struct_hash != 0x1234 {
+                return Err(Error::UnknownStructHash(struct_hash));
             }
+            if command == Command::Changes {
+                use wavedb_core::expose::Change;
+                use wavedb_core::wire::{from_wire, to_wire};
+                let (_pivot, since): (
+                    Option<wavedb_core::LocalId>,
+                    Option<u64>,
+                ) = from_wire(payload)?;
+                // Registration answers the tail alone; a cursored call
+                // answers one saved + one removed change past it.
+                let entries = since.map_or_else(
+                    || vec![to_wire(&Change::Cursor(40))],
+                    |c| {
+                        let id = Id::new(9, caller.tenant, false, 0);
+                        vec![
+                            to_wire(&Change::Cursor(c + 2)),
+                            to_wire(&Change::Saved(
+                                id,
+                                wavedb_core::Metadata::default(),
+                                vec![7],
+                            )),
+                            to_wire(&Change::Removed(id, c + 2)),
+                        ]
+                    },
+                );
+                return Ok(Reply::Values(entries));
+            }
+            // Echo the resolved user so tests can see gate 1's output.
+            Ok(Reply::Value(Some(vec![
+                u8::try_from(caller.user.get() & 0xFF).unwrap(),
+            ])))
         }
     }
 
@@ -279,15 +378,9 @@ mod tests {
         }
     }
 
-    fn polls() -> crate::subscribe::Polls {
-        std::rc::Rc::new(std::cell::RefCell::new(
-            crate::poll::PollTable::default(),
-        ))
-    }
-
-    /// A sync frame declaring one watched topic.
-    fn sync_request(auth: Auth) -> Request {
-        use wavedb_net::sync::{SYNC_STRUCT_HASH, SyncRequest};
+    /// A sync frame declaring one watched topic at `since`.
+    fn sync_request(auth: Auth, since: Option<u64>) -> Request {
+        use wavedb_net::sync::{SYNC_STRUCT_HASH, SyncRequest, TopicCursor};
         use wavedb_net::ws::Topic;
         Request {
             auth,
@@ -295,9 +388,12 @@ mod tests {
                 struct_hash: SYNC_STRUCT_HASH,
                 command: Command::Get,
                 payload: wavedb_core::wire::to_wire(&SyncRequest {
-                    subscribe: vec![Topic {
-                        struct_hash: 0x1234,
-                        pivot: None,
+                    topics: vec![TopicCursor {
+                        topic: Topic {
+                            struct_hash: 0x1234,
+                            pivot: None,
+                        },
+                        since,
                     }],
                 }),
             },
@@ -305,56 +401,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_answers_an_authenticated_session_with_its_events() {
-        use wavedb_core::notify::{Mutation, MutationKind};
+    async fn sync_navigates_each_topic_from_its_cursor() {
         use wavedb_net::sync::SyncReply;
+        use wavedb_net::ws::EventKind;
 
         let store = MemStore::default();
-        let polls = polls();
         let auth =
             Auth::Token(token(42, unix_now() + 60, TokenPurpose::Access));
-        // First sync registers the topic (drains nothing)…
-        let Response::Ok(Reply::Returned(bytes)) = handle(
-            &OneHash,
-            &store,
-            &SECRET,
-            &polls,
-            sync_request(auth.clone()),
-        )
-        .await
+        // A `None` cursor registers: the tail comes back, no events.
+        let Response::Ok(Reply::Returned(bytes)) =
+            handle(&OneHash, &store, &SECRET, sync_request(auth.clone(), None))
+                .await
         else {
             panic!("sync must answer with a return");
         };
         let reply: SyncReply = wavedb_core::wire::from_wire(&bytes).unwrap();
         assert!(reply.events.is_empty());
+        assert_eq!(reply.cursors.first().map(|(_, c)| *c), Some(40));
 
-        // …a mutation lands in the buffer…
-        polls.borrow_mut().publish(&Mutation {
-            struct_hash: 0x1234,
-            tenant: U48::from(42u32),
-            pivot: None,
-            id: wavedb_core::Id::new(7, U48::from(42u32), false, 0),
-            kind: MutationKind::Saved,
-            body: vec![9],
-        });
-
-        // …and the next poll drains it.
+        // A cursored sync navigates: the canned step answers one saved and
+        // one removed change past it, and the cursor advances.
         let Response::Ok(Reply::Returned(bytes)) =
-            handle(&OneHash, &store, &SECRET, &polls, sync_request(auth)).await
+            handle(&OneHash, &store, &SECRET, sync_request(auth, Some(40)))
+                .await
         else {
             panic!("sync must answer with a return");
         };
         let reply: SyncReply = wavedb_core::wire::from_wire(&bytes).unwrap();
-        assert_eq!(reply.events.len(), 1);
-        assert_eq!(reply.events[0].body, vec![9]);
+        assert_eq!(reply.events.len(), 2);
+        assert_eq!(reply.events[0].kind, EventKind::Saved);
+        assert!(
+            reply.events[0].meta.is_some(),
+            "navigated saves carry the node metadata for verbatim adoption"
+        );
+        assert_eq!(reply.events[1].kind, EventKind::Removed(42));
+        assert_eq!(reply.cursors.first().map(|(_, c)| *c), Some(42));
     }
 
     #[tokio::test]
     async fn anonymous_sync_is_unauthorized() {
         let store = MemStore::default();
         let Response::Err(e) =
-            handle(&OneHash, &store, &SECRET, &polls(), sync_request(anon()))
-                .await
+            handle(&OneHash, &store, &SECRET, sync_request(anon(), None)).await
         else {
             panic!("must refuse");
         };
@@ -367,8 +455,7 @@ mod tests {
         let auth =
             Auth::Token(token(42, unix_now() + 60, TokenPurpose::Access));
         let resp =
-            handle(&OneHash, &store, &SECRET, &polls(), request(auth, 0x1234))
-                .await;
+            handle(&OneHash, &store, &SECRET, request(auth, 0x1234)).await;
         assert_eq!(resp, Response::Ok(Reply::Value(Some(vec![42]))));
     }
 
@@ -377,14 +464,8 @@ mod tests {
         // The tier itself passes gate 1; refusing non-public work is the
         // engine arms' guard (proven in the macro/e2e layers).
         let store = MemStore::default();
-        let resp = handle(
-            &OneHash,
-            &store,
-            &SECRET,
-            &polls(),
-            request(anon(), 0x1234),
-        )
-        .await;
+        let resp =
+            handle(&OneHash, &store, &SECRET, request(anon(), 0x1234)).await;
         assert_eq!(resp, Response::Ok(Reply::Value(Some(vec![0xFF]))));
     }
 
@@ -393,8 +474,7 @@ mod tests {
         let store = MemStore::default();
         let auth = Auth::Token(token(42, unix_now() - 1, TokenPurpose::Access));
         let Response::Err(e) =
-            handle(&OneHash, &store, &SECRET, &polls(), request(auth, 0x1234))
-                .await
+            handle(&OneHash, &store, &SECRET, request(auth, 0x1234)).await
         else {
             panic!("must refuse");
         };
@@ -407,8 +487,7 @@ mod tests {
         let auth =
             Auth::Token(token(42, unix_now() + 60, TokenPurpose::Refresh));
         let Response::Err(e) =
-            handle(&OneHash, &store, &SECRET, &polls(), request(auth, 0x1234))
-                .await
+            handle(&OneHash, &store, &SECRET, request(auth, 0x1234)).await
         else {
             panic!("must refuse");
         };
@@ -433,7 +512,6 @@ mod tests {
             &OneHash,
             &store,
             &SECRET,
-            &polls(),
             request(Auth::Token(forged), 0x1234),
         )
         .await
@@ -446,14 +524,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_hash_refused_at_the_header_gate() {
         let store = MemStore::default();
-        let Response::Err(e) = handle(
-            &OneHash,
-            &store,
-            &SECRET,
-            &polls(),
-            request(anon(), 0x9999),
-        )
-        .await
+        let Response::Err(e) =
+            handle(&OneHash, &store, &SECRET, request(anon(), 0x9999)).await
         else {
             panic!("must refuse");
         };

@@ -94,6 +94,21 @@ pub fn unique_ops(name: &Ident) -> TokenStream {
             .await
         },
     );
+    let changes = op_fn(
+        "changes",
+        &quote! {
+            // The pivot half of the payload is a collection's address — a
+            // Unique topic carries none and ignores one.
+            let (_pivot, since): (
+                ::core::option::Option<::wavedb_core::LocalId>,
+                ::core::option::Option<u64>,
+            ) = ::wavedb_core::wire::from_wire(payload)?;
+            ::wavedb_core::expose::unique_changes::<#name, S>(
+                store, caller.tenant, since,
+            )
+            .await
+        },
+    );
     quote! {
         impl #name {
             #get
@@ -103,8 +118,32 @@ pub fn unique_ops(name: &Ident) -> TokenStream {
             #remove
             #all
             #history
+            #changes
         }
     }
+}
+
+/// The NonUnique `changes` step: catch-up navigation over the collection's
+/// recency/dead logs, addressed by the payload's pivot (a pivot-less topic
+/// on a NonUnique type does not exist).
+fn nonunique_changes_step(name: &Ident) -> TokenStream {
+    let refuse = refuse(name);
+    op_fn(
+        "changes",
+        &quote! {
+            let (pivot, since): (
+                ::core::option::Option<::wavedb_core::LocalId>,
+                ::core::option::Option<u64>,
+            ) = ::wavedb_core::wire::from_wire(payload)?;
+            let ::core::option::Option::Some(pivot) = pivot else {
+                return #refuse;
+            };
+            ::wavedb_core::expose::collection_changes::<#name, S>(
+                store, pivot, caller.tenant, since,
+            )
+            .await
+        },
+    )
 }
 
 /// The `NonUnique` shape's execution steps: the collection ops real (a
@@ -184,6 +223,7 @@ pub fn nonunique_ops(name: &Ident) -> TokenStream {
         "history",
         &quote!(let _ = (store, caller, payload); #refuse),
     );
+    let changes = nonunique_changes_step(name);
     quote! {
         impl #name {
             #get
@@ -193,6 +233,7 @@ pub fn nonunique_ops(name: &Ident) -> TokenStream {
             #save
             #all
             #history
+            #changes
         }
     }
 }
