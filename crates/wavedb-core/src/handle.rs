@@ -355,6 +355,7 @@ mod tests {
     struct NotePivot {
         current: LocalId,
         dead: LocalId,
+        recency: LocalId,
         secondaries: [LocalId; 1],
         permission: Option<PermissionRef>,
     }
@@ -366,6 +367,9 @@ mod tests {
         fn dead(&self) -> LocalId {
             self.dead
         }
+        fn recency(&self) -> LocalId {
+            self.recency
+        }
         fn secondaries(&self) -> &[LocalId] {
             &self.secondaries
         }
@@ -376,6 +380,7 @@ mod tests {
             &self,
             current: LocalId,
             dead: LocalId,
+            recency: LocalId,
             secondaries: &[LocalId],
         ) -> Self {
             let mut s = self.secondaries;
@@ -383,6 +388,7 @@ mod tests {
             Self {
                 current,
                 dead,
+                recency,
                 secondaries: s,
                 permission: self.permission.clone(),
             }

@@ -41,6 +41,17 @@ impl Shape {
     pub const fn is_unique(self) -> bool {
         matches!(self, Self::Unique)
     }
+
+    /// The `FLAG` bit of this shape's **live anchor** ids: hash-keyed
+    /// anchors (`Unique`) sit at `FLAG = 1`, time-keyed anchors
+    /// (`NonUnique`) at `FLAG = 0`. Archives always take the **flipped**
+    /// bit, so an archive can never collide with a live anchor — in
+    /// particular a NonUnique first version, whose authoring instant *is*
+    /// its anchor's key.
+    #[must_use]
+    pub const fn anchor_flag(self) -> bool {
+        matches!(self, Self::Unique)
+    }
 }
 
 /// Implemented by every `#[wavedb]` struct (by the proc-macro). The single source
@@ -101,5 +112,18 @@ pub trait NonUniqueStruct: WaveDbStruct {
     fn secondary_key(&self, index: usize) -> Vec<u8> {
         let _ = index;
         Vec::new()
+    }
+
+    /// The content-derived anchor key of a `#[wavedb::key(...)]` type —
+    /// SeaHash over the declared key fields' wire bytes in declaration
+    /// order (the macro implements it via
+    /// [`natural_key_hash`](crate::natural_key_hash)). `None` (the
+    /// default) means the type is instant-keyed: identity minted at
+    /// `insert`, never derived. For a keyed type the identity IS these
+    /// field values — `insert` becomes an upsert at the derived anchor and
+    /// a save may never address a different one.
+    #[must_use]
+    fn natural_key(&self) -> Option<u64> {
+        None
     }
 }
