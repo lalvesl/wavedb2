@@ -44,6 +44,9 @@ pub(super) async fn sync_once(
                     .collect(),
             }),
         },
+        // The dedicated sync exchange carries its topics in the payload, not
+        // as a command piggyback — never a `Sync` frame on this path.
+        sync: Vec::new(),
     };
     let stream = wavedb_platform::http::post(addr, &to_wire(&request)).await?;
     let mut frames = FrameReader::new(stream);
@@ -61,6 +64,11 @@ pub(super) async fn sync_once(
         StreamFrame::End(Response::Err(refusal)) => Err(Error::Node(refusal)),
         StreamFrame::Item(_) => {
             Err(Error::Http("item frame on a scalar command"))
+        }
+        // A piggyback delta only rides a command reply, never the dedicated
+        // sync exchange — its presence here is off-protocol.
+        StreamFrame::Sync(_) => {
+            Err(Error::Http("sync frame on the sync exchange"))
         }
     }
 }
