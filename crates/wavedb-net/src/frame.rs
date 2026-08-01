@@ -10,6 +10,8 @@ use wavedb_core::expose::{Command, Reply};
 use wavedb_core::{Error as CoreError, U48};
 use wavedb_wire::WaveWire;
 
+use crate::sync::TopicCursor;
+
 /// One operation to run on the node.
 ///
 /// Which item (`struct_hash`), which op (`command` — ignored by a
@@ -50,6 +52,11 @@ pub struct Request {
     pub auth: Auth,
     /// The operation.
     pub frame: CommandFrame,
+    /// Poll subscriptions to piggyback a sync delta onto the reply (W7):
+    /// each declared topic with the caller's cursor. Empty = no piggyback,
+    /// the node answers the command alone. Stays stateless — the cursors ride
+    /// here, the node holds nothing.
+    pub sync: Vec<TopicCursor>,
 }
 
 /// What kind of node-side failure a [`NodeError`] reports — the typed half
@@ -157,17 +164,26 @@ impl Response {
 
 /// One frame of a response body.
 ///
-/// Every response is a **sequence** of these (`[len u32 LE][wire]` each):
-/// zero or more [`Item`](Self::Item)s — a walk's records, written as the
-/// node produces them — then exactly one [`End`](Self::End) carrying the
-/// exchange's final word. A scalar command is the degenerate case: no items,
-/// just the `End`. A fault mid-walk ends the stream early with
-/// `End(Err(..))` after the items already shipped.
+/// Every response is a **sequence** of these (`[len u32 LE][wire]` each): an
+/// optional **leading** [`Sync`](Self::Sync) piggyback delta (W7), then zero
+/// or more [`Item`](Self::Item)s — a walk's records, written as the node
+/// produces them — then exactly one [`End`](Self::End) carrying the exchange's
+/// final word. A scalar command is the degenerate case: no items, just the
+/// `End`. A fault mid-walk ends the stream early with `End(Err(..))` after the
+/// items already shipped.
 #[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
 pub enum StreamFrame {
     /// One walk item's wire bytes (a record body, or a `(Metadata, body)`
     /// pair for a history walk).
     Item(Vec<u8>),
+    /// A piggybacked sync delta (W7): the wire-encoded [`SyncReply`] for the
+    /// request's declared poll topics. When present it **leads** the response
+    /// (before any item), so the connection manager peels it off the front
+    /// without parsing the command's own frames. Absent unless the request
+    /// carried a `sync` declaration.
+    ///
+    /// [`SyncReply`]: crate::sync::SyncReply
+    Sync(Vec<u8>),
     /// The final word; nothing follows on the connection.
     End(Response),
 }
@@ -180,6 +196,7 @@ mod tests {
 
     use super::{
         Auth, CommandFrame, NodeError, NodeErrorKind, Request, Response,
+        StreamFrame,
     };
 
     fn request() -> Request {
@@ -192,6 +209,7 @@ mod tests {
                 command: Command::Save,
                 payload: vec![1, 2, 3],
             },
+            sync: Vec::new(),
         }
     }
 
@@ -199,6 +217,37 @@ mod tests {
     fn request_roundtrips_on_the_wire() {
         let r = request();
         assert_eq!(from_wire::<Request>(&to_wire(&r)).unwrap(), r);
+    }
+
+    #[test]
+    fn request_with_a_piggyback_declaration_roundtrips() {
+        use crate::sync::TopicCursor;
+        use crate::ws::Topic;
+
+        let mut r = request();
+        r.sync = vec![
+            TopicCursor {
+                topic: Topic {
+                    struct_hash: 0x1234,
+                    pivot: None,
+                },
+                since: Some(7),
+            },
+            TopicCursor {
+                topic: Topic {
+                    struct_hash: 0x1234,
+                    pivot: None,
+                },
+                since: None,
+            },
+        ];
+        assert_eq!(from_wire::<Request>(&to_wire(&r)).unwrap(), r);
+    }
+
+    #[test]
+    fn sync_frame_roundtrips_on_the_wire() {
+        let f = StreamFrame::Sync(vec![9, 8, 7]);
+        assert_eq!(from_wire::<StreamFrame>(&to_wire(&f)).unwrap(), f);
     }
 
     #[test]
