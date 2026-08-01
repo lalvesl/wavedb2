@@ -36,7 +36,7 @@ use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
 
 use crate::error::{Error, Result};
-use crate::frame::Auth;
+use crate::frame::{Auth, CommandFrame};
 use crate::ws::{RecordEvent, Topic};
 
 /// How a watch's events reach the client.
@@ -72,11 +72,14 @@ impl PostFrames {
 
 /// What the manager task routes.
 enum Cmd {
-    /// POST `body` to `addr`; `connected` resolves once the response head
-    /// is in — with the frame channel, or the establishment fault.
+    /// POST a command `frame` under `auth` to `addr`; `connected` resolves
+    /// once the response head is in — with the frame channel, or the
+    /// establishment fault. The manager builds the `Request` so it can
+    /// piggyback the identity's live poll cursors (W7).
     Post {
         addr: String,
-        body: Vec<u8>,
+        auth: Auth,
+        frame: CommandFrame,
         connected: oneshot::Sender<Result<PostFrames>>,
     },
     /// Register a watcher; `ack` resolves once the subscription is live.
@@ -111,15 +114,22 @@ impl Handle {
     }
 }
 
-/// POST one request body through the manager. Resolves once the response
-/// head is in, preserving the establish-vs-mid-stream error split the
-/// callers rely on (a cache falls back on an establishment fault).
-pub(crate) async fn post(addr: &str, body: Vec<u8>) -> Result<PostFrames> {
+/// POST one command through the manager. Resolves once the response head is
+/// in, preserving the establish-vs-mid-stream error split the callers rely on
+/// (a cache falls back on an establishment fault). The manager assembles the
+/// wire `Request`, attaching the identity's live poll cursors when one is
+/// watching (W7 piggyback), and peels any returned delta back to that watch.
+pub(crate) async fn post(
+    addr: &str,
+    auth: Auth,
+    frame: CommandFrame,
+) -> Result<PostFrames> {
     let handle = boot::handle()?;
     let (connected, ready) = oneshot::channel();
     handle.send(Cmd::Post {
         addr: addr.to_owned(),
-        body,
+        auth,
+        frame,
         connected,
     })?;
     ready.await.map_err(|_| Error::ManagerUnavailable)?
@@ -207,15 +217,15 @@ mod tests {
 
     use tokio::net::TcpListener;
     use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-    use wavedb_core::expose::Reply;
+    use wavedb_core::expose::{Command, Reply};
     use wavedb_core::{Id, Metadata, Succession, U48};
     use wavedb_platform::ws::codec::{self, Messages, Msg, OP_BINARY};
     use wavedb_wire::{from_wire, to_wire};
 
     use futures::StreamExt as _;
 
-    use super::{WatchMode, watch};
-    use crate::frame::{Auth, Request, Response, StreamFrame};
+    use super::{WatchMode, post, watch};
+    use crate::frame::{Auth, CommandFrame, Request, Response, StreamFrame};
     use crate::http;
     use crate::sync::{SYNC_STRUCT_HASH, SyncReply};
     use crate::ws::{ClientMsg, EventKind, RecordEvent, ServerMsg, Topic};
@@ -480,6 +490,109 @@ mod tests {
         assert!(
             ws_conns.load(Ordering::SeqCst) >= 2,
             "the watch re-dialed after the socket dropped"
+        );
+    }
+
+    /// An HTTP mini-node for the piggyback path: it answers a poll register
+    /// (SYNC hash, `since: None`) with the tail cursor and no events, and any
+    /// other command by leading its reply with a `Sync` delta carrying one
+    /// event — after asserting the command actually declared the poll cursor.
+    async fn piggyback_node() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        tokio::spawn(async move {
+            loop {
+                let (sock, _) = listener.accept().await.expect("accept");
+                tokio::spawn(async move {
+                    let (mut r, mut w) = sock.into_split();
+                    let Ok(Some(http::Incoming::Post(body))) =
+                        http::read_request(&mut r).await
+                    else {
+                        return;
+                    };
+                    let request = from_wire::<Request>(&body).expect("request");
+                    http::write_ok_head(&mut w).await.expect("ok head");
+                    if request.frame.struct_hash == SYNC_STRUCT_HASH {
+                        // Poll register: seed the cursor at tail 100, no events.
+                        let reply = SyncReply {
+                            events: Vec::new(),
+                            cursors: vec![(TOPIC_A, 100)],
+                        };
+                        let end = StreamFrame::End(Response::Ok(
+                            Reply::Returned(to_wire(&reply)),
+                        ));
+                        http::write_frame(&mut w, &to_wire(&end))
+                            .await
+                            .expect("end");
+                    } else {
+                        assert!(
+                            request
+                                .sync
+                                .iter()
+                                .any(|c| c.topic == TOPIC_A
+                                    && c.since == Some(100)),
+                            "the command carried the live poll cursor"
+                        );
+                        let delta = SyncReply {
+                            events: vec![saved_event(TOPIC_A, 150)],
+                            cursors: vec![(TOPIC_A, 150)],
+                        };
+                        http::write_frame(
+                            &mut w,
+                            &to_wire(&StreamFrame::Sync(to_wire(&delta))),
+                        )
+                        .await
+                        .expect("sync frame");
+                        let end = StreamFrame::End(Response::Ok(Reply::Value(
+                            Some(vec![1]),
+                        )));
+                        http::write_frame(&mut w, &to_wire(&end))
+                            .await
+                            .expect("end");
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_command_piggybacks_the_delta_to_a_live_poll_watch() {
+        macro_rules! within {
+            ($fut:expr) => {
+                tokio::time::timeout(Duration::from_secs(30), $fut)
+                    .await
+                    .expect("timed out")
+            };
+        }
+
+        let addr = piggyback_node().await;
+        let auth = Auth::Anonymous {
+            tenant: U48::from(5u32),
+        };
+        // A long interval so no automatic tick fires — the only delivery is
+        // the one piggybacked onto the command below.
+        let mode = WatchMode::HttpPoll(Duration::from_secs(1_000));
+        let (mut events, _guard) =
+            within!(watch(&addr, auth.clone(), mode, TOPIC_A))
+                .expect("poll watch registered");
+
+        // Issue an ordinary command; the manager attaches the live cursor and
+        // routes the returned delta back to the watch.
+        let frame = CommandFrame {
+            struct_hash: 0x1234,
+            command: Command::Get,
+            payload: Vec::new(),
+        };
+        let mut frames = within!(post(&addr, auth, frame)).expect("command");
+        // Drain the command's own frames to the End (the caller's behaviour);
+        // the leading Sync frame was already peeled by the manager.
+        while let Ok(Some(_)) = frames.next_frame().await {}
+
+        assert_eq!(
+            within!(events.next()),
+            Some(saved_event(TOPIC_A, 150)),
+            "the watch saw the event the command piggybacked — no dedicated poll"
         );
     }
 }
