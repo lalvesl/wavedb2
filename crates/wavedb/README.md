@@ -22,7 +22,7 @@ clients, and (compiled to WASM) browsers.
 > native / IndexedDB wasm, under node-minted ids via `Collection::adopt`),
 > and reads serve locally only on a transport fault the cache can answer —
 > absence propagates the fault, refusals never fall back, offline writes
-> refuse (no queue yet — [RFC 0036](../../rfcs/0036-offline-write-queue-PLANNED.md)).
+> refuse (no queue yet — [RFC 0036](../../rfcs/0036-offline-write-queue-WIP.md)).
 > No cluster front door / failover URL, no Drop notification, no
 > `tokio::broadcast`; cross-tenant work is `db.as_tenant(t)`, and the typed
 > surface is `T::get(&db)` / `v.save(&db)` / `T::collection(pivot)`
