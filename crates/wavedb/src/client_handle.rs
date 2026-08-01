@@ -91,12 +91,30 @@ impl DbHandle for Db {
     }
 
     async fn save_unique<T: UniqueStruct>(&self, value: &T) -> Result<()> {
-        let r = self
+        // Node-first: flush any older offline writes before this one (W8).
+        self.drain_offline_queue().await;
+        match self
             .command(T::STRUCT_HASH, Command::Save, to_wire(value))
-            .await?;
-        reply::done(&r)?;
-        cache::mirror_unique(self, value).await;
-        Ok(())
+            .await
+        {
+            Ok(r) => {
+                reply::done(&r)?;
+                cache::mirror_unique(self, value).await;
+                Ok(())
+            }
+            // Offline with a cache: queue for replay and mirror locally, so the
+            // save succeeds provisionally instead of losing the work (W8).
+            Err(err) if cache::is_transport(&err) && self.local().is_some() => {
+                self.enqueue_offline(
+                    T::STRUCT_HASH,
+                    Command::Save,
+                    to_wire(value),
+                );
+                cache::mirror_unique(self, value).await;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn unique_history<T: UniqueStruct + 'static>(
