@@ -41,6 +41,7 @@ mod client_cache;
 mod client_handle;
 mod db;
 mod error;
+mod offline_queue;
 mod reply;
 mod server_db;
 pub mod watch;
