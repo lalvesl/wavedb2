@@ -17,12 +17,10 @@
 
 use futures::Stream;
 use wavedb_core::expose::{Command, Reply};
-use wavedb_wire::{from_wire, to_wire};
+use wavedb_wire::from_wire;
 
 use crate::error::{Error, Result};
-use crate::frame::{
-    Auth, CommandFrame, NodeError, Request, Response, StreamFrame,
-};
+use crate::frame::{Auth, CommandFrame, NodeError, Response, StreamFrame};
 use crate::manager::PostFrames;
 
 /// A thin client bound to one node address. Cheap to clone/rebuild — it holds
@@ -61,15 +59,18 @@ impl NetClient {
         command: Command,
         payload: Vec<u8>,
     ) -> Result<PostFrames> {
-        let request = Request {
+        // The manager assembles the `Request` (it owns the poll cursors it
+        // piggybacks onto the frame — W7), so the client hands it the parts.
+        crate::manager::post(
+            &self.addr,
             auth,
-            frame: CommandFrame {
+            CommandFrame {
                 struct_hash,
                 command,
                 payload,
             },
-        };
-        crate::manager::post(&self.addr, to_wire(&request)).await
+        )
+        .await
     }
 
     /// Send one scalar command under `auth` and await the node's answer.
@@ -87,14 +88,21 @@ impl NetClient {
     ) -> Result<Executed> {
         let mut frames =
             self.exchange(auth, struct_hash, command, payload).await?;
-        let bytes = frames
-            .next_frame()
-            .await?
-            .ok_or(Error::Http("response ended before its End frame"))?;
-        match from_wire::<StreamFrame>(&bytes)? {
-            StreamFrame::End(response) => Ok(response.into_result()),
-            StreamFrame::Item(_) => {
-                Err(Error::Http("item frame on a scalar command"))
+        loop {
+            let bytes = frames
+                .next_frame()
+                .await?
+                .ok_or(Error::Http("response ended before its End frame"))?;
+            match from_wire::<StreamFrame>(&bytes)? {
+                StreamFrame::End(response) => {
+                    return Ok(response.into_result());
+                }
+                // A piggyback delta (W7) is not consumed on this scalar path
+                // yet — skip it and read on to the End.
+                StreamFrame::Sync(_) => {}
+                StreamFrame::Item(_) => {
+                    return Err(Error::Http("item frame on a scalar command"));
+                }
             }
         }
     }
@@ -134,24 +142,29 @@ impl NetClient {
         let frames = self.exchange(auth, struct_hash, command, payload).await?;
         Ok(futures::stream::unfold(Some(frames), |state| async move {
             let mut frames = state?;
-            let item = match frames.next_frame().await {
-                Ok(Some(bytes)) => match from_wire::<StreamFrame>(&bytes) {
-                    Ok(StreamFrame::Item(item)) => {
-                        return Some((Ok(item), Some(frames)));
+            loop {
+                let item = match frames.next_frame().await {
+                    Ok(Some(bytes)) => match from_wire::<StreamFrame>(&bytes) {
+                        Ok(StreamFrame::Item(item)) => {
+                            return Some((Ok(item), Some(frames)));
+                        }
+                        // A piggyback delta (W7) is not consumed on this path
+                        // yet — skip it and read on.
+                        Ok(StreamFrame::Sync(_)) => continue,
+                        Ok(StreamFrame::End(Response::Ok(_))) => return None,
+                        Ok(StreamFrame::End(Response::Err(e))) => {
+                            Err(Error::Node(e))
+                        }
+                        Err(e) => Err(e.into()),
+                    },
+                    Ok(None) => {
+                        Err(Error::Http("response ended before its End frame"))
                     }
-                    Ok(StreamFrame::End(Response::Ok(_))) => return None,
-                    Ok(StreamFrame::End(Response::Err(e))) => {
-                        Err(Error::Node(e))
-                    }
-                    Err(e) => Err(e.into()),
-                },
-                Ok(None) => {
-                    Err(Error::Http("response ended before its End frame"))
-                }
-                Err(e) => Err(e),
-            };
-            // Terminal: yield the fault once, then end the stream.
-            Some((item, None))
+                    Err(e) => Err(e),
+                };
+                // Terminal: yield the fault once, then end the stream.
+                return Some((item, None));
+            }
         }))
     }
 }
