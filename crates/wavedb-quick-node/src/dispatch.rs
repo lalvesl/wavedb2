@@ -24,12 +24,13 @@
 //!
 //! [`wavedb-quick-node` README]: https://docs.rs/wavedb-quick-node
 
-use wavedb_core::expose::{Caller, Exposure};
+use wavedb_core::expose::{Caller, Exposure, Reply};
 use wavedb_core::{Error, Store};
 use wavedb_net::auth::{self, TokenPurpose};
 use wavedb_net::frame::{
     Auth, CommandFrame, NodeError, NodeErrorKind, Request, Response,
 };
+use wavedb_net::sync::TopicCursor;
 
 /// The uniform identity refusal — which check failed stays server-side.
 fn unauthorized(struct_hash: u64) -> Response {
@@ -64,7 +65,21 @@ pub(crate) fn identify(auth: &Auth, secret: &[u8; 32]) -> Result<Caller, ()> {
     }
 }
 
-/// Run the gates and the engine for one request, producing the wire response.
+/// One request's full answer: the command's [`Response`] plus an optional
+/// piggyback delta.
+///
+/// The delta is a wire-encoded [`SyncReply`](wavedb_net::sync::SyncReply) for
+/// the request's declared poll topics (W7), which the HTTP writer ships as a
+/// [`StreamFrame::Sync`](wavedb_net::frame::StreamFrame::Sync) riding the reply.
+pub struct Answer {
+    /// The executed command's response.
+    pub response: Response,
+    /// The piggyback sync delta, or `None` when the request declared no poll
+    /// topics (or the navigation refused — the command reply still stands).
+    pub sync: Option<Vec<u8>>,
+}
+
+/// Run the gates and the engine for one request, producing the wire answer.
 ///
 /// Never returns a transport error — a refusal or engine fault is the
 /// [`Response::Err`] arm, so the caller always has bytes to send back.
@@ -73,24 +88,63 @@ pub async fn handle<E, S>(
     store: &S,
     secret: &[u8; 32],
     request: Request,
-) -> Response
+) -> Answer
 where
     E: Exposure,
     S: Store,
 {
-    let Request { auth, frame } = request;
+    let Request { auth, frame, sync } = request;
 
     // Gate 1 — identity.
     let Ok(caller) = identify(&auth, secret) else {
-        return unauthorized(frame.struct_hash);
+        return Answer {
+            response: unauthorized(frame.struct_hash),
+            sync: None,
+        };
     };
 
     // The reserved sync exchange (HTTP-poll watch) routes before the
-    // registry — no schema hash can reach it, and it can shadow none.
+    // registry — no schema hash can reach it, and it can shadow none. It
+    // carries its own topics, so it never also piggybacks.
     if frame.struct_hash == wavedb_net::sync::SYNC_STRUCT_HASH {
-        return sync_poll(registry, store, caller, &frame.payload).await;
+        let response = sync_poll(registry, store, caller, &frame.payload).await;
+        return Answer {
+            response,
+            sync: None,
+        };
     }
-    execute(registry, store, caller, frame).await
+
+    let response = execute(registry, store, caller, frame).await;
+    let delta = piggyback(registry, store, caller, &sync).await;
+    Answer {
+        response,
+        sync: delta,
+    }
+}
+
+/// Navigate the W7 piggyback: when the request declared poll topics, run the
+/// same stateless `Changes` navigation as [`sync_poll`] and wire-encode the
+/// [`SyncReply`](wavedb_net::sync::SyncReply) for a `StreamFrame::Sync` riding
+/// the command reply. `None` when none were declared — or when the navigation
+/// refused: the delta is best-effort (the command's own reply is
+/// authoritative, and a skipped delta is picked up by the next ordinary poll).
+async fn piggyback<E, S>(
+    registry: &E,
+    store: &S,
+    caller: Caller,
+    topics: &[TopicCursor],
+) -> Option<Vec<u8>>
+where
+    E: Exposure,
+    S: Store,
+{
+    if topics.is_empty() {
+        return None;
+    }
+    match navigate(registry, store, caller, topics).await {
+        Response::Ok(Reply::Returned(bytes)) => Some(bytes),
+        _ => None,
+    }
 }
 
 /// The "anything new?" answer — **stateless**: each declared topic rides
@@ -109,10 +163,8 @@ where
     E: Exposure,
     S: Store,
 {
-    use wavedb_core::expose::{Change, Command, Reply};
-    use wavedb_core::wire::{from_wire, to_wire};
-    use wavedb_net::sync::{SYNC_STRUCT_HASH, SyncReply, SyncRequest};
-    use wavedb_net::ws::{EventKind, RecordEvent};
+    use wavedb_core::wire::from_wire;
+    use wavedb_net::sync::{SYNC_STRUCT_HASH, SyncRequest};
 
     if caller.is_anonymous() {
         return unauthorized(SYNC_STRUCT_HASH);
@@ -126,11 +178,35 @@ where
             ));
         }
     };
+    navigate(registry, store, caller, &request.topics).await
+}
+
+/// The stateless "what changed?" navigation shared by the HTTP-poll exchange
+/// ([`sync_poll`]) and the W7 command piggyback ([`piggyback`]): each declared
+/// topic rides the caller's cursor and the node answers by navigating the disk
+/// (the type's `Changes` step through the registry match), holding no session
+/// state. The wire-`SyncReply` comes back inside `Reply::Returned`, or a
+/// `Response::Err` if a topic's navigation refused.
+async fn navigate<E, S>(
+    registry: &E,
+    store: &S,
+    caller: Caller,
+    topics: &[TopicCursor],
+) -> Response
+where
+    E: Exposure,
+    S: Store,
+{
+    use wavedb_core::expose::{Change, Command};
+    use wavedb_core::wire::{from_wire, to_wire};
+    use wavedb_net::sync::SyncReply;
+    use wavedb_net::ws::{EventKind, RecordEvent};
+
     let mut reply = SyncReply {
         events: Vec::new(),
         cursors: Vec::new(),
     };
-    for declared in request.topics {
+    for declared in topics {
         let topic = declared.topic;
         let changes = to_wire(&(topic.pivot, declared.since));
         let outcome = registry
@@ -249,7 +325,20 @@ mod tests {
         Auth, CommandFrame, NodeErrorKind, Request, Response,
     };
 
-    use super::handle;
+    /// Test shim: the HTTP [`handle`](super::handle) reduced to its command
+    /// [`Response`], so the existing gate tests read unchanged. The W7
+    /// piggyback delta is asserted through `super::handle` directly (see
+    /// `a_command_piggybacks_the_sync_delta_for_declared_topics`).
+    async fn handle<E: Exposure, S: Store>(
+        registry: &E,
+        store: &S,
+        secret: &[u8; 32],
+        request: Request,
+    ) -> Response {
+        super::handle(registry, store, secret, request)
+            .await
+            .response
+    }
 
     const SECRET: [u8; 32] = [9; 32];
 
@@ -355,6 +444,7 @@ mod tests {
                 command: Command::Get,
                 payload: Vec::new(),
             },
+            sync: Vec::new(),
         }
     }
 
@@ -397,6 +487,7 @@ mod tests {
                     }],
                 }),
             },
+            sync: Vec::new(),
         }
     }
 
@@ -436,6 +527,52 @@ mod tests {
         );
         assert_eq!(reply.events[1].kind, EventKind::Removed(42));
         assert_eq!(reply.cursors.first().map(|(_, c)| *c), Some(42));
+    }
+
+    #[tokio::test]
+    async fn a_command_piggybacks_the_sync_delta_for_declared_topics() {
+        use wavedb_net::sync::{SyncReply, TopicCursor};
+        use wavedb_net::ws::{EventKind, Topic};
+
+        let store = MemStore::default();
+        let auth =
+            Auth::Token(token(42, unix_now() + 60, TokenPurpose::Access));
+
+        // A plain command with no declared topics: the reply alone, no delta.
+        let plain = super::handle(
+            &OneHash,
+            &store,
+            &SECRET,
+            request(auth.clone(), 0x1234),
+        )
+        .await;
+        assert_eq!(plain.response, Response::Ok(Reply::Value(Some(vec![42]))));
+        assert!(plain.sync.is_none(), "no topics declared → no piggyback");
+
+        // The same command now declares a watched topic at cursor 40: the
+        // command still answers, and the navigation past 40 rides alongside.
+        let mut req = request(auth, 0x1234);
+        req.sync = vec![TopicCursor {
+            topic: Topic {
+                struct_hash: 0x1234,
+                pivot: None,
+            },
+            since: Some(40),
+        }];
+        let answer = super::handle(&OneHash, &store, &SECRET, req).await;
+        assert_eq!(
+            answer.response,
+            Response::Ok(Reply::Value(Some(vec![42]))),
+            "the command's own reply is unchanged by the piggyback"
+        );
+        let delta: SyncReply = wavedb_core::wire::from_wire(
+            &answer.sync.expect("a sync delta rides the reply"),
+        )
+        .unwrap();
+        assert_eq!(delta.events.len(), 2, "the canned saved + removed changes");
+        assert_eq!(delta.events[0].kind, EventKind::Saved);
+        assert_eq!(delta.events[1].kind, EventKind::Removed(42));
+        assert_eq!(delta.cursors.first().map(|(_, c)| *c), Some(42));
     }
 
     #[tokio::test]
