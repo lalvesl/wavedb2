@@ -18,10 +18,13 @@ use std::collections::{HashMap, HashSet};
 
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
+use wavedb_wire::{from_wire, to_wire};
 
 use super::{Cmd, ConnKey, PostFrames, WatchMode, poll, ws_conn};
 use crate::Result;
+use crate::frame::{Auth, CommandFrame, Request, StreamFrame};
 use crate::frames::FrameReader;
+use crate::sync::{SyncReply, TopicCursor};
 
 /// One live actor: its channel plus the watch ids riding it. The set (not
 /// a bare count) makes stale unregistrations — a guard of a connection
@@ -41,11 +44,20 @@ pub(super) async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>) {
         match cmd {
             Cmd::Post {
                 addr,
-                body,
+                auth,
+                frame,
                 connected,
             } => {
+                // Piggyback (W7): if a poll watch of this identity is live,
+                // hand its channel to the exchange so it can declare the
+                // cursors and route any returned delta straight back to it.
+                let key = ConnKey {
+                    addr: addr.clone(),
+                    auth: auth.clone(),
+                };
+                let poll = polls.get(&key).map(|entry| entry.tx.clone());
                 wavedb_platform::task::spawn_local(run_post(
-                    addr, body, connected,
+                    addr, auth, frame, connected, poll,
                 ));
             }
             Cmd::Watch {
@@ -157,13 +169,23 @@ fn unregister<C>(
     }
 }
 
-/// One POSTed exchange: dial + send, answer `connected` with the outcome,
-/// then pump the response frames into the caller's channel.
+/// One POSTed command exchange: snapshot the identity's live poll cursors (if
+/// any) to piggyback (W7), build + send the `Request`, answer `connected`,
+/// then pump the response frames to the caller — peeling a **leading**
+/// piggyback `Sync` frame off the front and routing its delta back to the poll
+/// actor, so only that first frame is ever inspected.
 async fn run_post(
     addr: String,
-    body: Vec<u8>,
+    auth: Auth,
+    frame: CommandFrame,
     connected: oneshot::Sender<Result<PostFrames>>,
+    poll: Option<mpsc::UnboundedSender<poll::PollCmd>>,
 ) {
+    let sync = match &poll {
+        Some(handle) => snapshot(handle).await,
+        None => Vec::new(),
+    };
+    let body = to_wire(&Request { auth, frame, sync });
     let mut frames = match wavedb_platform::http::post(&addr, &body).await {
         Ok(stream) => FrameReader::new(stream),
         Err(e) => {
@@ -175,10 +197,16 @@ async fn run_post(
     if connected.send(Ok(PostFrames { rx })).is_err() {
         return; // The caller went away before the head arrived.
     }
+    let mut lead = poll.as_ref(); // set until the first frame is classified
     loop {
         match frames.next_frame().await {
-            Ok(Some(frame)) => {
-                if tx.unbounded_send(Ok(frame)).is_err() {
+            Ok(Some(bytes)) => {
+                if let Some(handle) = lead.take()
+                    && route_piggyback(handle, &bytes)
+                {
+                    continue; // leading Sync consumed — do not forward it
+                }
+                if tx.unbounded_send(Ok(bytes)).is_err() {
                     return; // The caller stopped reading mid-stream.
                 }
             }
@@ -190,4 +218,36 @@ async fn run_post(
             }
         }
     }
+}
+
+/// Ask a poll actor for its current cursor declaration to piggyback on a
+/// command POST; empty if the actor is gone (no piggyback — the command still
+/// runs, and the next ordinary tick catches the watch up).
+async fn snapshot(
+    handle: &mpsc::UnboundedSender<poll::PollCmd>,
+) -> Vec<TopicCursor> {
+    let (reply, answer) = oneshot::channel();
+    if handle
+        .unbounded_send(poll::PollCmd::Snapshot { reply })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    answer.await.unwrap_or_default()
+}
+
+/// Classify the leading response frame: a piggyback `Sync` delta is routed to
+/// the poll actor and reported as `true` (consumed); anything else is `false`,
+/// so the caller forwards it as an ordinary response frame.
+fn route_piggyback(
+    handle: &mpsc::UnboundedSender<poll::PollCmd>,
+    bytes: &[u8],
+) -> bool {
+    let Ok(StreamFrame::Sync(delta)) = from_wire::<StreamFrame>(bytes) else {
+        return false;
+    };
+    if let Ok(reply) = from_wire::<SyncReply>(&delta) {
+        let _ = handle.unbounded_send(poll::PollCmd::ApplyDelta(reply));
+    }
+    true // even an undecodable delta was a Sync frame — never forward it
 }
