@@ -13,9 +13,11 @@
 //!   authoritative-looking `None`. Node refusals ([`Error::Node`]) are
 //!   authoritative and never fall back.
 //!
-//! Offline writes refuse (the transport error propagates): write-through
-//! keeps the cache strictly *behind* the node, never divergent, so
-//! reconnection needs no merge. Queued offline writes are M7's sync problem.
+//! Offline writes (W8): a Unique `save` is **queued** for node-first replay
+//! ([`crate::offline_queue`]) and mirrored locally, so it succeeds
+//! provisionally instead of losing the work; the queue drains FIFO when the
+//! node returns, so the cache converges without a merge. NonUnique writes
+//! (whose ids are node-minted) still refuse for now — a later W8 phase.
 //!
 //! [`Db::open`]: crate::Db::open
 //! [`Error::Node`]: crate::Error::Node
