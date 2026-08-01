@@ -39,6 +39,10 @@ pub struct Db {
     /// How watches transport their events (WebSocket push by default;
     /// [`watch_via_polling`](Self::watch_via_polling) switches to POSTs).
     watch_mode: wavedb_net::WatchMode,
+    /// Writes that refused transport, awaiting node-first FIFO replay (W8).
+    /// Shared across clones and [`as_tenant`](Self::as_tenant) re-scopes so any
+    /// handle drains what any queued.
+    offline: Arc<crate::offline_queue::OfflineQueue>,
 }
 
 impl Db {
@@ -63,6 +67,7 @@ impl Db {
             access_token: None,
             cache: None,
             watch_mode: wavedb_net::WatchMode::WebSocket,
+            offline: Arc::new(crate::offline_queue::OfflineQueue::default()),
         })
     }
 
@@ -162,10 +167,13 @@ impl Db {
         self
     }
 
-    /// Deliver this handle's watches by "anything new?" POST polls `every`
-    /// so often, instead of a pushed WebSocket — for clients whose path to
-    /// the node cannot hold one open. Larger intervals cost latency, not
-    /// correctness: the node buffers per session between polls.
+    /// Deliver this handle's watches over "anything new?" POST polls instead
+    /// of a pushed WebSocket — for clients whose path to the node cannot hold
+    /// one open. `every` is the base interval: a busy watch polls at it, a
+    /// quiet one backs off beyond it (W7 idle backoff). Larger intervals cost
+    /// latency, not correctness — the node is **stateless**, so each poll
+    /// navigates the disk past the client's cursor and nothing committed
+    /// during an outage is missed.
     #[must_use]
     pub const fn watch_via_polling(mut self, every: Duration) -> Self {
         self.watch_mode = wavedb_net::WatchMode::HttpPoll(every);
@@ -215,6 +223,7 @@ impl Db {
             access_token: self.access_token.clone(),
             cache: self.cache.clone(),
             watch_mode: self.watch_mode,
+            offline: self.offline.clone(),
         }
     }
 
@@ -250,6 +259,14 @@ impl Db {
             .call(self.auth(), struct_hash, command, payload)
             .await?
             .map_err(Error::Node)
+    }
+
+    /// The offline write queue this handle shares (W8) — the
+    /// [`offline_queue`](crate::offline_queue) module hangs `enqueue`/`drain`
+    /// off it.
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) fn offline_queue(&self) -> &crate::offline_queue::OfflineQueue {
+        &self.offline
     }
 
     /// Send a walk-shaped command and stream its item frames back as the
