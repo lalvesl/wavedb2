@@ -41,20 +41,26 @@ async fn cold_cache_propagates_the_fault_and_a_warm_one_answers() {
     local.save_unique(&profile).await.expect("local save");
     assert_eq!(AboutUser::get(&db).await.expect("warm read"), Some(profile));
 
-    // Writes stay write-through: no node, no write — cache still warm.
-    let refused = AboutUser {
+    // W8: an offline Unique save no longer refuses — it queues for node-first
+    // replay and mirrors locally, so it succeeds provisionally (the queue
+    // drains when a node returns).
+    let queued = AboutUser {
         name: "Grace".into(),
         city: "NYC".into(),
     }
     .save(&db)
     .await;
-    assert!(matches!(refused, Err(wavedb::Error::Transport(_))));
+    assert!(
+        queued.is_ok(),
+        "an offline Unique save queues instead of refusing: {queued:?}"
+    );
+    assert_eq!(db.offline_pending(), 1, "the save is queued for replay");
     assert_eq!(
         AboutUser::get(&db)
             .await
             .expect("still warm")
             .map(|p| p.city),
-        Some(String::from("London")),
-        "a refused write must not have touched the cache"
+        Some(String::from("NYC")),
+        "the queued offline save mirrored into the cache"
     );
 }
