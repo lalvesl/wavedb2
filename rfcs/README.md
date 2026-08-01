@@ -24,13 +24,15 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   client `Db` + write-through cache, the wasm/IndexedDB target, and auth. RFCs
   0003–0026 are *Implemented* (except the two Partial and one Planned noted
   below).
-- **In progress:** [0036](0036-offline-write-queue-WIP.md) — W8 offline write
-  queue, the last piece of the client story (offline writes still refuse).
 - **Planned next:** [0014](0014-schema-evolution-hooks-PLANNED.md)
   (schema-evolution hooks).
-- **Deferred (low priority):** [0037](0037-multi-node-cluster-PLANNED-LOW.md)
-  (multi-node cluster), [0038](0038-argon2-and-oauth-credentials-PLANNED-LOW.md)
-  (Argon2/OAuth), [0039](0039-developer-experience-PLANNED-LOW.md) (M9 dev tooling).
+- **Deferred (low priority):**
+  [0036](0036-offline-write-queue-PLANNED-LOW.md) — W8 offline write queue
+  (slice 1, Unique offline, *shipped*; the NonUnique/durable/conflict-surface
+  remainder is deferred — the near-term focus is online + small offline),
+  [0037](0037-multi-node-cluster-PLANNED-LOW.md) (multi-node cluster),
+  [0038](0038-argon2-and-oauth-credentials-PLANNED-LOW.md) (Argon2/OAuth),
+  [0039](0039-developer-experience-PLANNED-LOW.md) (M9 dev tooling).
 - **Partial seams:** [0013](0013-permissions.md) (per-record grants, gate 4),
   [0023](0023-quick-node-and-gates.md) (node gates 5–6).
 
@@ -100,8 +102,8 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 |---|-------|--------|
 | [0034](0034-ws-reconnect-catchup.md) | W6: WebSocket reconnect catch-up | Implemented |
 | [0035](0035-http-piggyback-and-idle-backoff.md) | W7: HTTP piggyback + idle backoff | Implemented |
-| [0036](0036-offline-write-queue-WIP.md) | W8: Offline write queue | **In progress** (`WIP`) |
 | [0014](0014-schema-evolution-hooks-PLANNED.md) | Schema-evolution lookup hooks | Planned |
+| [0036](0036-offline-write-queue-PLANNED-LOW.md) | W8: Offline write queue (slice 1 shipped) | Planned (low) |
 | [0037](0037-multi-node-cluster-PLANNED-LOW.md) | Multi-node cluster | Planned (low) |
 | [0038](0038-argon2-and-oauth-credentials-PLANNED-LOW.md) | Argon2 & OAuth/OIDC credentials | Planned (low) |
 | [0039](0039-developer-experience-PLANNED-LOW.md) | Developer experience (M9) | Planned (low) |
