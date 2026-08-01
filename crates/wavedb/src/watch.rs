@@ -20,9 +20,9 @@
 //!
 //! A watch needs an authenticated handle
 //! ([`with_access_token`](Db::with_access_token)) — the node refuses
-//! anonymous subscriptions (and the poll buffer is keyed by the token's
-//! session claim), so the refusal here is typed and immediate instead of
-//! a closed socket.
+//! anonymous subscriptions (tenant isolation is bound to the verified
+//! token), so the refusal here is typed and immediate instead of a closed
+//! socket.
 
 use std::marker::PhantomData;
 
