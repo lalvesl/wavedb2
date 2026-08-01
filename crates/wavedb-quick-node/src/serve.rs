@@ -97,10 +97,10 @@ where
         Some(Incoming::Post(body)) => {
             match from_wire::<Request>(&body) {
                 Ok(request) => {
-                    let response =
+                    let answer =
                         dispatch::handle(registry, store, secret, request)
                             .await;
-                    write_response(&mut writer, response).await
+                    write_response(&mut writer, answer).await
                 }
                 // The envelope is malformed — a transport-level client
                 // error, not a WaveDB refusal (no struct_hash to refuse).
@@ -124,12 +124,19 @@ where
 /// the clients already speak frames.)
 async fn write_response<W>(
     w: &mut W,
-    response: Response,
+    answer: dispatch::Answer,
 ) -> wavedb_net::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    let dispatch::Answer { response, sync } = answer;
     http::write_ok_head(w).await?;
+    // The W7 piggyback delta **leads** the response, so the manager peels it
+    // off the front without parsing the command's own item frames; a request
+    // that declared no topics gets none.
+    if let Some(delta) = sync {
+        http::write_frame(w, &to_wire(&StreamFrame::Sync(delta))).await?;
+    }
     let end = match response {
         Response::Ok(Reply::Values(entries)) => {
             for entry in entries {
