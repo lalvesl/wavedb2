@@ -21,8 +21,11 @@ clients, and (compiled to WASM) browsers.
 > acknowledged results mirror into the local engine (journal + `data.bin`
 > native / IndexedDB wasm, under node-minted ids via `Collection::adopt`),
 > and reads serve locally only on a transport fault the cache can answer —
-> absence propagates the fault, refusals never fall back, offline writes
-> refuse (no queue yet — [RFC 0036](../../rfcs/0036-offline-write-queue-WIP.md)).
+> absence propagates the fault, refusals never fall back. An offline **Unique**
+> save no longer refuses: it queues for node-first replay on reconnect
+> (`db.drain_offline_queue()`), mirroring locally in the meantime; NonUnique
+> offline and a durable-across-restart queue stay deferred
+> ([RFC 0036](../../rfcs/0036-offline-write-queue-PLANNED-LOW.md)).
 > No cluster front door / failover URL, no Drop notification, no
 > `tokio::broadcast`; cross-tenant work is `db.as_tenant(t)`, and the typed
 > surface is `T::get(&db)` / `v.save(&db)` / `T::collection(pivot)`
