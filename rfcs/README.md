@@ -14,22 +14,22 @@ statuses, the filename-marker convention).
 
 _A snapshot for orientation; each RFC's status header is authoritative._
 
-- **Shipped (M1–M6, M8):** the wire codec, type identity, the platform seam, the
+- **Shipped (M1–M7, M8):** the wire codec, type identity, the platform seam, the
   full data model (anchors + `Succession` history, B+tree collections, natural
   keys), the macro & exposure system, the storage engine + journal-rooted
-  recovery, the HTTP + WebSocket transport, the connection manager, the client
-  `Db` + write-through cache, the wasm/IndexedDB target, and auth. RFCs 0003–0026
-  are *Implemented* (except the two Partial and one Planned noted below).
-- **In progress:** [0034](0034-ws-reconnect-catchup-WIP.md) — W6 WebSocket
-  reconnect catch-up, the last piece of live sync (M7).
-- **Planned next:** [0035](0035-http-piggyback-and-idle-backoff-PLANNED.md) (W7),
-  [0036](0036-offline-write-queue-PLANNED.md) (W8),
+  recovery, the HTTP + WebSocket transport, the connection manager, live sync by
+  navigation catch-up over both poll and WebSocket (including W6 reconnect —
+  [0034](0034-ws-reconnect-catchup.md)), the client `Db` + write-through cache,
+  the wasm/IndexedDB target, and auth. RFCs 0003–0026 are *Implemented* (except
+  the two Partial and one Planned noted below).
+- **In progress:** [0035](0035-http-piggyback-and-idle-backoff-WIP.md) — W7 HTTP
+  piggyback + idle backoff, the efficiency remainder of the poll path.
+- **Planned next:** [0036](0036-offline-write-queue-PLANNED.md) (W8),
   [0014](0014-schema-evolution-hooks-PLANNED.md) (schema-evolution hooks).
 - **Deferred (low priority):** [0037](0037-multi-node-cluster-PLANNED-LOW.md)
   (multi-node cluster), [0038](0038-argon2-and-oauth-credentials-PLANNED-LOW.md)
   (Argon2/OAuth), [0039](0039-developer-experience-PLANNED-LOW.md) (M9 dev tooling).
 - **Partial seams:** [0013](0013-permissions.md) (per-record grants, gate 4),
-  [0022](0022-live-sync-navigation-catchup.md) (WS reconnect, via 0034),
   [0023](0023-quick-node-and-gates.md) (node gates 5–6).
 
 ## Index
@@ -83,7 +83,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 |---|-------|--------|
 | [0020](0020-net-transport-dumb-tunnel.md) | The net transport (dumb tunnel) | Implemented |
 | [0021](0021-connection-manager.md) | The connection manager | Implemented |
-| [0022](0022-live-sync-navigation-catchup.md) | Live sync by navigation catch-up | Partial |
+| [0022](0022-live-sync-navigation-catchup.md) | Live sync by navigation catch-up | Implemented |
 | [0023](0023-quick-node-and-gates.md) | The quick-node and enforcement gates | Partial |
 
 ### Client & targets
@@ -96,8 +96,8 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 ### Roadmap — in progress & planned
 | # | Title | Status |
 |---|-------|--------|
-| [0034](0034-ws-reconnect-catchup-WIP.md) | W6: WebSocket reconnect catch-up | **In progress** (`WIP`) |
-| [0035](0035-http-piggyback-and-idle-backoff-PLANNED.md) | W7: HTTP piggyback + idle backoff | Planned |
+| [0034](0034-ws-reconnect-catchup.md) | W6: WebSocket reconnect catch-up | Implemented |
+| [0035](0035-http-piggyback-and-idle-backoff-WIP.md) | W7: HTTP piggyback + idle backoff | **In progress** (`WIP`) |
 | [0036](0036-offline-write-queue-PLANNED.md) | W8: Offline write queue | Planned |
 | [0014](0014-schema-evolution-hooks-PLANNED.md) | Schema-evolution lookup hooks | Planned |
 | [0037](0037-multi-node-cluster-PLANNED-LOW.md) | Multi-node cluster | Planned (low) |
