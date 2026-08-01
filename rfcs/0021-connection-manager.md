@@ -44,10 +44,11 @@ cursor and the future offline queue.
 
 ## Known seam
 
-The manager is the intended home for **WS reconnect catch-up** — today a
-transient socket loss ends the watch streams; making them survive is
-[RFC 0034](0034-ws-reconnect-catchup.md) — and for the future **offline write
-queue** ([RFC 0036](0036-offline-write-queue-WIP.md)).
+The manager is the home for **WS reconnect catch-up** — a transient socket loss
+no longer ends the watch streams ([RFC 0034](0034-ws-reconnect-catchup.md),
+landed). The **offline write queue** ([RFC 0036](0036-offline-write-queue-PLANNED-LOW.md))
+shipped its first slice (Unique offline) but its drain lives in `Db`, **not**
+here: the manager is `wavedb-net` and cannot see the `wavedb` cache/queue.
 
 ## Alternatives
 
