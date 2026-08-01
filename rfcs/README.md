@@ -19,13 +19,15 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   keys), the macro & exposure system, the storage engine + journal-rooted
   recovery, the HTTP + WebSocket transport, the connection manager, live sync by
   navigation catch-up over both poll and WebSocket (including W6 reconnect —
-  [0034](0034-ws-reconnect-catchup.md)), the client `Db` + write-through cache,
-  the wasm/IndexedDB target, and auth. RFCs 0003–0026 are *Implemented* (except
-  the two Partial and one Planned noted below).
-- **In progress:** [0035](0035-http-piggyback-and-idle-backoff-WIP.md) — W7 HTTP
-  piggyback + idle backoff, the efficiency remainder of the poll path.
-- **Planned next:** [0036](0036-offline-write-queue-PLANNED.md) (W8),
-  [0014](0014-schema-evolution-hooks-PLANNED.md) (schema-evolution hooks).
+  [0034](0034-ws-reconnect-catchup.md)) and W7 poll efficiency (idle backoff +
+  command piggyback — [0035](0035-http-piggyback-and-idle-backoff.md)), the
+  client `Db` + write-through cache, the wasm/IndexedDB target, and auth. RFCs
+  0003–0026 are *Implemented* (except the two Partial and one Planned noted
+  below).
+- **In progress:** [0036](0036-offline-write-queue-WIP.md) — W8 offline write
+  queue, the last piece of the client story (offline writes still refuse).
+- **Planned next:** [0014](0014-schema-evolution-hooks-PLANNED.md)
+  (schema-evolution hooks).
 - **Deferred (low priority):** [0037](0037-multi-node-cluster-PLANNED-LOW.md)
   (multi-node cluster), [0038](0038-argon2-and-oauth-credentials-PLANNED-LOW.md)
   (Argon2/OAuth), [0039](0039-developer-experience-PLANNED-LOW.md) (M9 dev tooling).
@@ -97,8 +99,8 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | # | Title | Status |
 |---|-------|--------|
 | [0034](0034-ws-reconnect-catchup.md) | W6: WebSocket reconnect catch-up | Implemented |
-| [0035](0035-http-piggyback-and-idle-backoff-WIP.md) | W7: HTTP piggyback + idle backoff | **In progress** (`WIP`) |
-| [0036](0036-offline-write-queue-PLANNED.md) | W8: Offline write queue | Planned |
+| [0035](0035-http-piggyback-and-idle-backoff.md) | W7: HTTP piggyback + idle backoff | Implemented |
+| [0036](0036-offline-write-queue-WIP.md) | W8: Offline write queue | **In progress** (`WIP`) |
 | [0014](0014-schema-evolution-hooks-PLANNED.md) | Schema-evolution lookup hooks | Planned |
 | [0037](0037-multi-node-cluster-PLANNED-LOW.md) | Multi-node cluster | Planned (low) |
 | [0038](0038-argon2-and-oauth-credentials-PLANNED-LOW.md) | Argon2 & OAuth/OIDC credentials | Planned (low) |
