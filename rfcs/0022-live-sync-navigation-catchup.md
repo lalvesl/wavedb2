@@ -1,7 +1,7 @@
 # RFC 0022 — Live sync by navigation catch-up
 
-- **Status:** Partial (poll path + navigation landed; WS reconnect catch-up is
-  [RFC 0034](0034-ws-reconnect-catchup-WIP.md))
+- **Status:** Implemented (poll path + navigation, and WS reconnect catch-up via
+  [RFC 0034](0034-ws-reconnect-catchup.md), landed 2026-07-24)
 - **Supersedes:** [RFC 0028 — journal commit-cursor sync](0028-journal-commit-cursor-sync-DEPRECATED.md),
   [RFC 0029 — Bloom-filter screen-sync](0029-bloom-filter-screen-sync-DEPRECATED.md),
   [RFC 0032 — node-side poll buffer](0032-node-side-poll-buffer-DEPRECATED.md)
