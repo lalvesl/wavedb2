@@ -47,7 +47,7 @@ cursor and the future offline queue.
 The manager is the intended home for **WS reconnect catch-up** — today a
 transient socket loss ends the watch streams; making them survive is
 [RFC 0034](0034-ws-reconnect-catchup.md) — and for the future **offline write
-queue** ([RFC 0036](0036-offline-write-queue-PLANNED.md)).
+queue** ([RFC 0036](0036-offline-write-queue-WIP.md)).
 
 ## Alternatives
 
