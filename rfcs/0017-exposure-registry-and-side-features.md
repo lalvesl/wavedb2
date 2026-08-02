@@ -65,6 +65,30 @@ not dead-code stripping. Hand-written server-only helpers carry
 a `wasm32 + server-side` build. Defaults keep **both on** so a schema crate's own
 tests drive the full loop; deployments opt *down*.
 
+## The collision guard (compile time)
+
+The exposure list is the one place that enumerates *every* dispatchable type, so
+it is where identity clashes are caught. Each macro emits, per declared pair, two
+const-evaluated checks — no test run involved, `cargo check` is enough:
+
+| Clash | Verdict | Why |
+|-------|---------|-----|
+| Full 64-bit `STRUCT_HASH` | **error** | The two are one identity on the wire; one arm would silently shadow the other in every dispatch `match`. |
+| Low 15 bits (`type_salt`) | **warning** | Reads stay correct (the full head is verified on decode), but the pair shares archive slots and loses its separation in the browser's flat keyspace. |
+
+`fn` entries join the 64-bit check — functions and structs share one dispatch
+hash space — and sit out the salt check, since functions are never stored. Both
+diagnostics are spanned at the offending entry, so the compiler underlines the
+line in the declaration that has to change; the remedy is to rename the type or a
+field, which reshuffles the hash. The warning is emitted by instantiating
+`wavedb_core::expose::SaltGuard<false>`, whose `check()` is `#[deprecated]` —
+only the clashing arm is, so a clean registry stays silent.
+
+*Not yet covered:* the generated `{Type}Pivot` types. The exposure macro sees
+opaque entry paths, not each type's shape, so it cannot name them; a
+`#[wavedb]`-contributed pivot-hash const would close the gap. Pivots are already
+collision-safe on the full hash via their reserved shape discriminator.
+
 ## Deferred
 
 - **`update_call` exposure kind** — a declared entry exposing a mutating-call
