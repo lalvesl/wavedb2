@@ -1,49 +1,34 @@
 # RFC 0014 — Schema-evolution lookup hooks
 
-- **Status:** Planned (the hook seam; `first_try` / `fallback_not_found`)
+- **Status:** Deprecated
+- **Superseded by:** [RFC 0040](0040-schema-migration-and-version-skew-PLANNED.md)
 - **Crates:** `wavedb-core` (surface), application code (bodies)
-- **Depends on:** [RFC 0004](0004-struct-hash-and-schema-evolution.md)
 
-## Summary
+## What it proposed
 
-`STRUCT_HASH` makes a changed struct a *new type*, so old and new bytes coexist
-with no migration. *Bridging* them — reading a V1 record where the code now
-wants V2 — is done by two optional **application hooks**, not an engine walk:
+Two optional, per-type **application hooks** to bridge a `STRUCT_HASH` version
+skew without an engine-wide migration walk: `first_try` (a read *pre-empt* — decode
+the older hash and map it forward before storage is touched) and
+`fallback_not_found` (a read *post-miss* — synthesise or fetch a default). The seam
+was `LookupHooks<Db>` in `wavedb-core::hooks`; it was never wired into a read path.
 
-- **`first_try`** runs *before* a read hits storage — synthesise the value
-  (e.g. decode the older `STRUCT_HASH` and map it forward);
-- **`fallback_not_found`** runs *after* a miss — fetch or derive a default.
+## Why superseded
 
-## Motivation
+The hook seam was the right *instinct* but only half the story. Working the design
+out revealed that transparent evolution across a node/client version skew needs a
+whole mechanism the two hooks alone did not carry: a **naming convention** that
+keeps a nested holder's `STRUCT_HASH` stable when a member evolves (numbered types
++ a `pub type` alias), **per-version addressing** by SALT derivation so old bytes
+stay reachable and the holder is never rewritten, a **downgrade converter** for a
+node serving an older client, a **collision guard**, and the discipline/warnings
+around stranded intermediate versions.
 
-The alternative to migrations is coexistence ([RFC 0004](0004-struct-hash-and-schema-evolution.md)),
-but coexistence still needs an answer to "the code asks for `AboutUser` V2 and
-only a V1 record exists." A global upgrade walk is exactly the migration step
-this design exists to avoid. Two small, *application-owned* hooks put the
-bridging logic where the domain knowledge is, and only on the paths that need
-it — no cost for types that never changed.
+[RFC 0040](0040-schema-migration-and-version-skew-PLANNED.md) folds these hooks in —
+renamed `prefer_current` (was `first_try`) and `upgrade_on_miss` (was
+`fallback_not_found`), paired with the new `UpgradeFrom` / `DowngradeFrom`
+converters — as part of that fuller design.
 
-## Design (target)
+---
 
-- Both hooks are **per-type, application-supplied**, defaulting to nothing.
-- `first_try` is a read *pre-empt*: if it returns a value, storage is never
-  touched. This is where a V1→V2 shim lives (read the old hash, map fields).
-- `fallback_not_found` is a read *post-miss*: last chance to synthesise a
-  default or fetch from elsewhere before returning `None`.
-- They compose with the client cache's node-first reads
-  ([RFC 0024](0024-client-db-and-cache.md)) — the hook is a property of the typed
-  read, above the transport.
-
-## Status
-
-The hooks are **documented target, not yet built** — recorded here so the idea
-is not lost between "schema evolution by hash" (built) and the M9 developer-
-experience milestone (the schema-evolution cookbook: the `first_try` /
-`fallback_not_found` patterns). This RFC is the placeholder that keeps the
-bridging story explicit until the seam lands.
-
-## Alternatives
-
-- **A global migration walk / version-upgrade chain** — the classic approach,
-  rejected as the very friction [RFC 0004](0004-struct-hash-and-schema-evolution.md)
-  removes.
+> **Note:** this idea migrated into a new, from-scratch RFC. See
+> [RFC 0040 — Schema migration across node/client version skew](0040-schema-migration-and-version-skew-PLANNED.md).
