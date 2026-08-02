@@ -9,6 +9,7 @@
 //! concrete arms).
 
 use crate::error::{Error, Result};
+use crate::id::Id;
 use crate::local_id::LocalId;
 use crate::mint::type_salt;
 use crate::store::Store;
@@ -48,28 +49,55 @@ pub trait DowngradeFrom: Versioned {
     fn downgrade_from(current: Self) -> Self::Prev;
 }
 
-/// Resolve the current shape `T` from `base` (a holder-stored id whose `SALT` is a
-/// base), walking the version chain until a shape is found on disk and lifting it
-/// forward (RFC 0040 §3/§3.1).
+/// Decode a stored **user record** to its value (the record-level walk).
 ///
-/// Probes `T`'s derived slot first (`prefer_current`); on a miss it recurses to
+/// Drops the within-version [`Metadata`](crate::Metadata) chain — a walk lifts the
+/// value alone, and materialising the current version authors fresh metadata. The
+/// macro-emitted [`Versioned::from_stored`] for a record type calls this.
+///
+/// # Errors
+/// [`Error::UnknownStructHash`] on a head that is not `hash`, or a wire fault.
+pub fn value_from_record<V: crate::wire::WaveWire>(
+    hash: u64,
+    bytes: &[u8],
+) -> Result<V> {
+    crate::record::decode_record::<V>(hash, bytes).map(|(_meta, value)| value)
+}
+
+/// Decode a stored **bare envelope** (`[hash][wire]` — a Pivot) to its value; the
+/// macro-emitted [`Versioned::from_stored`] for a Pivot type calls this.
+///
+/// # Errors
+/// [`Error::UnknownStructHash`] on a head that is not `hash`, or a wire fault.
+pub fn value_from_envelope<V: crate::wire::WaveWire>(
+    hash: u64,
+    bytes: &[u8],
+) -> Result<V> {
+    crate::record::decode_envelope::<V>(hash, bytes)
+}
+
+/// Resolve the current shape `T`, walking the version chain (RFC 0040 §3).
+///
+/// `addr_of` maps a version's `STRUCT_HASH` to its on-disk slot — the addressing
+/// differs by shape (a `Unique` anchor is self-addressed at `KEY = hash`; a
+/// NonUnique record / Pivot swaps the 15-bit `SALT`), so the walk itself is one
+/// function. Probes `T`'s slot first (`prefer_current`); on a miss it recurses to
 /// `T::Prev` and applies [`UpgradeFrom`] on the way back up (`upgrade_on_miss`). A
 /// head mismatch at a probed slot (a 15-bit `SALT` collision) is treated as a miss.
 /// Returns `None` only when no version holds the record.
 ///
+/// Prefer the shape-specific [`resolve_unique`] / [`resolve_from_base`] wrappers.
+///
 /// # Errors
 /// Propagates any [`Store`] fault, or a non-collision decode error from
 /// [`Versioned::from_stored`].
-pub async fn resolve<T, S>(
-    store: &S,
-    base: LocalId,
-    tenant: U48,
-) -> Result<Option<T>>
+pub async fn resolve<T, S, F>(store: &S, addr_of: &F) -> Result<Option<T>>
 where
     T: UpgradeFrom,
     S: Store,
+    F: Fn(u64) -> Id,
 {
-    let addr = base.with_salt(type_salt(T::STRUCT_HASH)).to_id(tenant);
+    let addr = addr_of(T::STRUCT_HASH);
     if let Some(bytes) = store.get_of(T::STRUCT_HASH, addr).await? {
         match T::from_stored(&bytes) {
             Ok(value) => return Ok(Some(value)),
@@ -83,13 +111,49 @@ where
     }
     // Box the recursion: the future would otherwise be infinitely sized (the first
     // version's `Prev = Self` makes it self-referential). One box per chain level.
-    let prev = Box::pin(resolve::<T::Prev, S>(store, base, tenant)).await?;
+    let prev = Box::pin(resolve::<T::Prev, S, F>(store, addr_of)).await?;
     Ok(prev.map(T::upgrade_from))
+}
+
+/// The version walk for a **Unique** type: each version sits at its own
+/// self-addressed anchor (`KEY = STRUCT_HASH`, `FLAG = 1`, `SALT = 0`).
+///
+/// # Errors
+/// As [`resolve`].
+pub async fn resolve_unique<T, S>(store: &S, tenant: U48) -> Result<Option<T>>
+where
+    T: UpgradeFrom,
+    S: Store,
+{
+    resolve::<T, S, _>(store, &|hash| Id::new(hash, tenant, true, 0)).await
+}
+
+/// The version walk from a holder-stored `base` id (a NonUnique record or a
+/// Pivot): each version's slot swaps the 15-bit `SALT` to `type_salt(hash)`.
+///
+/// # Errors
+/// As [`resolve`].
+pub async fn resolve_from_base<T, S>(
+    store: &S,
+    base: LocalId,
+    tenant: U48,
+) -> Result<Option<T>>
+where
+    T: UpgradeFrom,
+    S: Store,
+{
+    resolve::<T, S, _>(store, &|hash| {
+        base.with_salt(type_salt(hash)).to_id(tenant)
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DowngradeFrom, UpgradeFrom, Versioned, resolve};
+    use super::{
+        DowngradeFrom, UpgradeFrom, Versioned, resolve_from_base,
+        resolve_unique,
+    };
     use crate::error::Result;
     use crate::id::Id;
     use crate::local_id::LocalId;
@@ -228,7 +292,8 @@ mod tests {
         futures::executor::block_on(async {
             let s = MemStore::default();
             put(&s, &V3 { seed: 7, hops: 0 });
-            let got: Option<V3> = resolve(&s, base(), tenant()).await.unwrap();
+            let got: Option<V3> =
+                resolve_from_base(&s, base(), tenant()).await.unwrap();
             assert_eq!(got, Some(V3 { seed: 7, hops: 0 }));
         });
     }
@@ -238,7 +303,8 @@ mod tests {
         futures::executor::block_on(async {
             let s = MemStore::default();
             put(&s, &V1 { seed: 7 }); // only the oldest slot holds data
-            let got: Option<V3> = resolve(&s, base(), tenant()).await.unwrap();
+            let got: Option<V3> =
+                resolve_from_base(&s, base(), tenant()).await.unwrap();
             // Chain ran V1 -> V2 (upgraded) -> V3 (hops == 2).
             assert_eq!(got, Some(V3 { seed: 7, hops: 2 }));
         });
@@ -255,7 +321,8 @@ mod tests {
                     upgraded: false,
                 },
             );
-            let got: Option<V3> = resolve(&s, base(), tenant()).await.unwrap();
+            let got: Option<V3> =
+                resolve_from_base(&s, base(), tenant()).await.unwrap();
             assert_eq!(got, Some(V3 { seed: 5, hops: 1 }));
         });
     }
@@ -264,7 +331,8 @@ mod tests {
     fn absent_everywhere_is_none() {
         futures::executor::block_on(async {
             let s = MemStore::default();
-            let got: Option<V3> = resolve(&s, base(), tenant()).await.unwrap();
+            let got: Option<V3> =
+                resolve_from_base(&s, base(), tenant()).await.unwrap();
             assert_eq!(got, None);
         });
     }
@@ -279,8 +347,58 @@ mod tests {
                 .unwrap()
                 .insert(v3slot.raw(), envelope(0xDEAD, &[1, 2, 3]));
             put(&s, &V1 { seed: 9 });
-            let got: Option<V3> = resolve(&s, base(), tenant()).await.unwrap();
+            let got: Option<V3> =
+                resolve_from_base(&s, base(), tenant()).await.unwrap();
             assert_eq!(got, Some(V3 { seed: 9, hops: 2 }));
         });
+    }
+
+    #[test]
+    fn resolve_unique_walks_self_addressed_anchors() {
+        futures::executor::block_on(async {
+            let s = MemStore::default();
+            // A Unique version's anchor is KEY = its hash, FLAG = 1, SALT = 0 —
+            // each version at a different KEY, not a SALT swap.
+            let anchor = Id::new(H1, tenant(), true, 0);
+            s.0.lock()
+                .unwrap()
+                .insert(anchor.raw(), envelope(H1, &to_wire(&V1 { seed: 4 })));
+            let got: Option<V3> = resolve_unique(&s, tenant()).await.unwrap();
+            assert_eq!(got, Some(V3 { seed: 4, hops: 2 }));
+        });
+    }
+
+    #[test]
+    fn value_helpers_decode_both_envelopes() {
+        use crate::metadata::Metadata;
+        use crate::record::{encode_envelope, encode_record};
+
+        let v = V2 {
+            seed: 3,
+            upgraded: true,
+        };
+        // Bare envelope — the Pivot path.
+        let bare = encode_envelope(H2, &v);
+        assert_eq!(
+            super::value_from_envelope::<V2>(H2, &bare).unwrap(),
+            V2 {
+                seed: 3,
+                upgraded: true
+            }
+        );
+        // Record envelope — the user-record path the macro's `from_stored` uses.
+        let rec = encode_record(H2, &Metadata::default(), &v);
+        assert_eq!(
+            super::value_from_record::<V2>(H2, &rec).unwrap(),
+            V2 {
+                seed: 3,
+                upgraded: true
+            }
+        );
+        // A foreign head is `UnknownStructHash` (what the walk reads as a miss).
+        assert!(matches!(
+            super::value_from_record::<V2>(0xBAD, &rec),
+            Err(crate::Error::UnknownStructHash(_))
+        ));
     }
 }
