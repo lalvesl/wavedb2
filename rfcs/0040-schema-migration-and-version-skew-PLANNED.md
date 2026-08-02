@@ -216,14 +216,23 @@ collision makes two types indistinguishable at dispatch. The exposure registry
 ([RFC 0017](0017-exposure-registry-and-side-features.md)) is the one place that
 already enumerates *every* type, so it is where the guard belongs:
 
-> **`expose_server!` / `expose_client!` emit a `#[cfg(test)] #[test]` that asserts,
-> across every listed type _and its generated `Pivot`_, that both the 64-bit
-> `STRUCT_HASH` and the 15-bit `type_salt` are pairwise unique — failing the test
-> suite (naming the offenders) on any collision.**
+> **`expose_server!` / `expose_client!` emit a `#[cfg(test)] #[test]` that asserts
+> the listed items are pairwise unique on the full 64-bit `STRUCT_HASH` (over
+> every entry — types, `store` types, and `#[server]` fns, which share the
+> dispatch hash space) and on the 15-bit `type_salt` (over the *stored* entries —
+> `fn`s aren't stored) — failing the suite, naming the offenders, on any clash.**
+
+**Landed** (2026-07-25) as `expose_collision::collision_check`, emitted at the
+invocation scope so entry paths resolve as written; proven by a coexisting
+`Contact1`/`Contact2` pair in the schema-smoke registry.
 
 Reads stay safe regardless (§3, head-verify); the test makes a collision **loud at
 dev time** instead of a silent stranded-write risk, and it catches the SALT clash
-between `Task1`/`Task2`/`Task3` that must coexist during a migration.
+between `Task1`/`Task2`/`Task3` that must coexist during a migration. *Deferred:*
+the generated `Pivot` types are not yet in the set — the exposure macro sees only
+opaque entry paths, not each type's shape, so it cannot name a `{Type}Pivot`; a
+`#[wavedb]`-contributed pivot-hash const would close that gap (pivots are already
+collision-safe on the full hash via the reserved `Pivot` shape discriminator).
 
 ### 7. Developer discipline & warnings (advisory, never blocking)
 
