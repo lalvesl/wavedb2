@@ -82,6 +82,15 @@ impl LocalId {
     pub const fn is_unique_anchor(self) -> bool {
         self.flag()
     }
+
+    /// The same id with its `SALT` replaced (low 15 bits kept); `KEY` and `FLAG`
+    /// unchanged. The primitive for version addressing (RFC 0040): a schema
+    /// version's slot is `base.with_salt(type_salt(V::STRUCT_HASH))`, derived —
+    /// never stored — so a holder is never rewritten when a member evolves.
+    #[must_use]
+    pub const fn with_salt(self, salt: u16) -> Self {
+        Self::new(self.key, self.flag(), salt)
+    }
 }
 
 impl fmt::Debug for LocalId {
@@ -149,5 +158,18 @@ mod tests {
         let lo = LocalId::new(10, true, 0x7FFF);
         let hi = LocalId::new(11, false, 0);
         assert!(hi > lo);
+    }
+
+    #[test]
+    fn with_salt_replaces_only_salt() {
+        let base = LocalId::new(0xDEAD_BEEF, true, 0x0111);
+        let swapped = base.with_salt(0x0222);
+        assert_eq!(swapped.key(), base.key());
+        assert_eq!(swapped.flag(), base.flag());
+        assert_eq!(swapped.salt(), 0x0222);
+        // Masks to 15 bits like `new`.
+        assert_eq!(base.with_salt(0xFFFF).salt(), 0x7FFF);
+        // Idempotent back to the original salt.
+        assert_eq!(swapped.with_salt(base.salt()), base);
     }
 }
