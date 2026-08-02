@@ -7,7 +7,6 @@
 //! #[wavedb(NonUnique)]                       // NonUnique shape
 //! #[wavedb(validate = path, preprocess = p)] // hook fns (either shape)
 //! #[wavedb(compress = false)]                // opt this type's pages out of zstd
-//! #[wavedb(prev = Task1)]                     // this shape's predecessor version
 //! ```
 
 use syn::punctuated::Punctuated;
@@ -44,10 +43,6 @@ pub struct WavedbArgs {
     /// Whether this type's pages run through zstd (storage policy — not part
     /// of the schema, so it never feeds the `STRUCT_HASH`).
     pub compress: bool,
-    /// The immediately preceding schema version this shape supersedes (RFC 0040).
-    /// Wiring, not identity — a version link never feeds the `STRUCT_HASH`.
-    /// `None` = a first (or never-evolved) version, the chain's terminator.
-    pub prev: Option<Path>,
 }
 
 impl Default for WavedbArgs {
@@ -57,7 +52,6 @@ impl Default for WavedbArgs {
             validate: None,
             preprocess: None,
             compress: true,
-            prev: None,
         }
     }
 }
@@ -86,15 +80,12 @@ impl WavedbArgs {
                 Meta::NameValue(nv) if nv.path.is_ident("compress") => {
                     args.compress = expr_as_bool(&nv.value)?;
                 }
-                Meta::NameValue(nv) if nv.path.is_ident("prev") => {
-                    args.prev = Some(expr_as_path(&nv.value)?);
-                }
                 other => {
                     return Err(syn::Error::new_spanned(
                         other,
                         "unsupported #[wavedb(...)] argument; expected `NonUnique`, \
                          `Unique`, `validate = fn`, `preprocess = fn`, \
-                         `compress = bool`, or `prev = Type`",
+                         or `compress = bool`",
                     ));
                 }
             }
