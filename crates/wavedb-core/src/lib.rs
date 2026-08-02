@@ -79,5 +79,8 @@ pub use traits::{
     NonUniqueStruct, PivotHandle, Shape, UniqueStruct, WaveDbStruct,
 };
 pub use u48::U48;
-pub use version::{DowngradeFrom, UpgradeFrom, Versioned, resolve};
+pub use version::{
+    DowngradeFrom, UpgradeFrom, Versioned, resolve, resolve_from_base,
+    resolve_unique,
+};
 pub use wire::{Cursor, WaveWire, from_wire, to_wire};
