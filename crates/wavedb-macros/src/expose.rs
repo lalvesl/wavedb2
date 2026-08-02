@@ -63,7 +63,7 @@ fn op_call(entry: &Entry, op: &str) -> TokenStream {
 
 /// The `STRUCT_HASH` expression for an entry (structs read it off
 /// `WaveDbStruct`, `#[server]` fn-types carry it inherently).
-fn hash_expr(entry: &Entry) -> TokenStream {
+pub fn hash_expr(entry: &Entry) -> TokenStream {
     let path = &entry.path;
     if entry.kind == Kind::Fn {
         quote!(#path::STRUCT_HASH)
@@ -173,6 +173,10 @@ pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
     );
     let decode_arms = wire_entries.iter().copied().map(decode_arm);
     let execute_arms = wire_entries.iter().copied().map(execute_arm);
+    let collision_test = crate::expose_collision::collision_check(
+        "__wavedb_server_collision_check",
+        &decl.entries,
+    );
 
     Ok(quote! {
         // The declared server surface is server code: everything below
@@ -239,6 +243,7 @@ pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
         }
 
         #storage_impl
+        #collision_test
     })
 }
 
@@ -279,6 +284,10 @@ pub fn expand_client(input: TokenStream) -> syn::Result<TokenStream> {
         &struct_paths,
         "client-side",
     );
+    let collision_test = crate::expose_collision::collision_check(
+        "__wavedb_client_collision_check",
+        &decl.entries,
+    );
 
     Ok(quote! {
         /// The client-side allowlist `expose_client!` declared: which items
@@ -312,5 +321,6 @@ pub fn expand_client(input: TokenStream) -> syn::Result<TokenStream> {
         }
 
         #storage_impl
+        #collision_test
     })
 }
