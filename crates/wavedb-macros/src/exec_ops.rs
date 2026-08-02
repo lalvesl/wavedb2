@@ -59,13 +59,13 @@ pub fn unique_ops(name: &Ident) -> TokenStream {
         "get",
         &quote! {
             let _ = payload;
-            // Version-aware read (RFC 0040): probes the current anchor, then
-            // walks older versions and lifts forward. A single-version type
-            // takes the same single probe.
-            ::wavedb_core::expose::get_unique_versioned::<#name, S>(
-                store, caller.tenant,
-            )
-            .await
+            let anchor = ::wavedb_core::Id::new(
+                <#name as ::wavedb_core::WaveDbStruct>::STRUCT_HASH,
+                caller.tenant,
+                true,
+                0,
+            );
+            ::wavedb_core::expose::get_value::<#name, S>(store, anchor).await
         },
     );
     let save = op_fn(
