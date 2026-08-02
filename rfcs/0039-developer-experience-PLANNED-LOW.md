@@ -2,7 +2,7 @@
 
 - **Status:** Planned (low priority) — the M9 milestone
 - **Crates:** tooling / templates / docs (no single crate)
-- **Depends on:** [RFC 0014](0014-schema-evolution-hooks-PLANNED.md),
+- **Depends on:** [RFC 0040](0040-schema-migration-and-version-skew-PLANNED.md),
   [RFC 0002](0002-architectural-hard-rules.md)
 
 ## Summary
@@ -29,10 +29,11 @@ the engine is done without it.
   ([RFC 0017](0017-exposure-registry-and-side-features.md)) so a newcomer starts
   compliant.
 - **"Building an app on WaveDB" guide** + a **schema-evolution cookbook** — the
-  `first_try` / `fallback_not_found` patterns
-  ([RFC 0014](0014-schema-evolution-hooks-PLANNED.md)) shown against a concrete
-  V1→V2 change, plus the `expose_server!` / `expose_client!` allowlist as a
-  security surface.
+  numbered-type + `pub type` alias convention, `UpgradeFrom` / `DowngradeFrom`, and
+  the `prefer_current` / `upgrade_on_miss` hooks
+  ([RFC 0040](0040-schema-migration-and-version-skew-PLANNED.md)) shown against a
+  concrete `Task1`→`Task2` change, plus the `expose_server!` / `expose_client!`
+  allowlist as a security surface.
 - **Versioning policy** — the point where `FORMAT_VERSION` is unpinned from `1`
   and version discipline begins ([RFC 0002 §8](0002-architectural-hard-rules.md)).
   Until then, on-disk layouts change freely; M9 is where that stops.
