@@ -173,10 +173,8 @@ pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
     );
     let decode_arms = wire_entries.iter().copied().map(decode_arm);
     let execute_arms = wire_entries.iter().copied().map(execute_arm);
-    let collision_test = crate::expose_collision::collision_check(
-        "__wavedb_server_collision_check",
-        &decl.entries,
-    );
+    let collision_guard =
+        crate::expose_collision::collision_guard(&decl.entries);
 
     Ok(quote! {
         // The declared server surface is server code: everything below
@@ -243,7 +241,7 @@ pub fn expand_server(input: TokenStream) -> syn::Result<TokenStream> {
         }
 
         #storage_impl
-        #collision_test
+        #collision_guard
     })
 }
 
@@ -284,10 +282,8 @@ pub fn expand_client(input: TokenStream) -> syn::Result<TokenStream> {
         &struct_paths,
         "client-side",
     );
-    let collision_test = crate::expose_collision::collision_check(
-        "__wavedb_client_collision_check",
-        &decl.entries,
-    );
+    let collision_guard =
+        crate::expose_collision::collision_guard(&decl.entries);
 
     Ok(quote! {
         /// The client-side allowlist `expose_client!` declared: which items
@@ -321,6 +317,6 @@ pub fn expand_client(input: TokenStream) -> syn::Result<TokenStream> {
         }
 
         #storage_impl
-        #collision_test
+        #collision_guard
     })
 }
