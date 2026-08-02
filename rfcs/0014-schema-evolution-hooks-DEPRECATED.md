@@ -1,7 +1,7 @@
 # RFC 0014 — Schema-evolution lookup hooks
 
 - **Status:** Deprecated
-- **Superseded by:** [RFC 0040](0040-schema-migration-and-version-skew-PLANNED.md)
+- **Superseded by:** [RFC 0040](0040-schema-migration-and-version-skew-DEPRECATED.md)
 - **Crates:** `wavedb-core` (surface), application code (bodies)
 
 ## What it proposed
@@ -23,12 +23,11 @@ stay reachable and the holder is never rewritten, a **downgrade converter** for 
 node serving an older client, a **collision guard**, and the discipline/warnings
 around stranded intermediate versions.
 
-[RFC 0040](0040-schema-migration-and-version-skew-PLANNED.md) folds these hooks in —
-renamed `prefer_current` (was `first_try`) and `upgrade_on_miss` (was
-`fallback_not_found`), paired with the new `UpgradeFrom` / `DowngradeFrom`
-converters — as part of that fuller design.
+[RFC 0040](0040-schema-migration-and-version-skew-DEPRECATED.md) folded these hooks
+into that fuller design — and was then dropped in turn.
 
 ---
 
-> **Note:** this idea migrated into a new, from-scratch RFC. See
-> [RFC 0040 — Schema migration across node/client version skew](0040-schema-migration-and-version-skew-PLANNED.md).
+> **Note:** this idea migrated into a new, from-scratch RFC, which was itself
+> deprecated: the engine runs **no** schema migration, by decision. See
+> [RFC 0040](0040-schema-migration-and-version-skew-DEPRECATED.md).
