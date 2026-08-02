@@ -3,6 +3,60 @@
 //! round-trips, shape consts, the generated NonUnique collection types, and
 //! the **exposure declarations** (`expose_server!` / `expose_client!`): the
 //! lists ARE the registry, and only listed items are dispatchable.
+//!
+//! # The exposure collision guard
+//!
+//! Both halves of the guard resolve while the schema compiles — these doctests
+//! are the proof, since neither outcome is observable from a test body.
+//!
+//! Two entries that hash to the same 64-bit `STRUCT_HASH` are **one identity**
+//! on the wire; the guard refuses the build:
+//!
+//! ```compile_fail
+//! use wavedb_macros::{expose_server, wavedb};
+//!
+//! // Same name, same shape, same fields ⇒ same STRUCT_HASH, whatever the path.
+//! mod first {
+//!     #[wavedb_macros::wavedb]
+//!     pub struct Twin { pub n: u64 }
+//! }
+//! mod second {
+//!     #[wavedb_macros::wavedb]
+//!     pub struct Twin { pub n: u64 }
+//! }
+//!
+//! expose_server! { first::Twin, second::Twin }
+//! ```
+//!
+//! Sharing only the low 15 bits (`type_salt`) still reads correctly, so it is a
+//! **warning**, not an error — here promoted to one by `deny`:
+//!
+//! ```compile_fail
+//! #![deny(deprecated)]
+//! use wavedb_macros::{expose_server, wavedb};
+//!
+//! // A searched-for pair: distinct hashes, identical low 15 bits.
+//! #[wavedb]
+//! pub struct Probe184 { pub n: u64 }
+//! #[wavedb]
+//! pub struct Probe248 { pub n: u64 }
+//!
+//! expose_server! { Probe184, Probe248 }
+//! ```
+//!
+//! A registry with no clash stays silent under the same `deny`:
+//!
+//! ```
+//! #![deny(deprecated)]
+//! use wavedb_macros::{expose_server, wavedb};
+//!
+//! #[wavedb]
+//! pub struct Probe184 { pub n: u64 }
+//! #[wavedb]
+//! pub struct Probe185 { pub n: u64 }
+//!
+//! expose_server! { Probe184, Probe185 }
+//! ```
 
 use wavedb_macros::{expose_client, expose_server, wavedb};
 
@@ -17,10 +71,6 @@ expose_server! {
     Note,
     billing::Invoice { save: audited_invoice_save, get: never },
     store Attachment,
-    // A versioned pair coexists in the registry during migration (RFC 0040) —
-    // the generated collision test proves they stay distinct on the 15-bit salt.
-    Contact1,
-    Contact2,
 }
 
 expose_client! { AboutUser, Note }
@@ -96,47 +146,6 @@ pub struct Attachment {
     pub media: Vec<u8>,
 }
 
-// ── A versioned pair (RFC 0040) ──────────────────────────────────────────────
-//
-// `Contact2` supersedes `Contact1`; `pub type Contact = Contact2` names the
-// current shape that relations and call sites reference. `Contact1` stays only
-// to decode bytes written at v1 and to feed the migration converters — its
-// `STRUCT_HASH` is frozen (its code never changes again). `prev = Contact1` is
-// wiring, not identity, so it does not feed `Contact2`'s hash.
-
-/// v1 of the contact shape — the chain terminator (no `prev`).
-#[wavedb]
-#[derive(Debug, PartialEq, Eq, Clone, Default)]
-pub struct Contact1 {
-    pub name: String,
-}
-
-/// v2 — adds `email`; supersedes [`Contact1`].
-#[wavedb(prev = Contact1)]
-#[derive(Debug, PartialEq, Eq, Clone, Default)]
-pub struct Contact2 {
-    pub name: String,
-    pub email: String,
-}
-
-/// The current shape — every relation and call site uses this alias.
-pub type Contact = Contact2;
-
-impl wavedb_core::UpgradeFrom for Contact2 {
-    fn upgrade_from(prev: Contact1) -> Self {
-        Self {
-            name: prev.name,
-            email: String::new(),
-        }
-    }
-}
-
-impl wavedb_core::DowngradeFrom for Contact2 {
-    fn downgrade_from(current: Self) -> Contact1 {
-        Contact1 { name: current.name }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::billing::Invoice;
@@ -144,37 +153,6 @@ mod tests {
     use wavedb_core::traits::Shape;
     use wavedb_core::wire::{from_wire, to_wire};
     use wavedb_core::{LocalId, WaveDbStruct};
-
-    // The `#[wavedb(prev = …)]` version chain (RFC 0040): the macro links each
-    // shape to its predecessor and terminates the first version with an identity
-    // `UpgradeFrom`; the developer writes the real converters.
-    #[test]
-    fn version_chain_links_and_upgrades() {
-        use super::{Contact1, Contact2};
-        use wavedb_core::{DowngradeFrom, UpgradeFrom, Versioned};
-
-        // The chain terminates at v1 and continues at v2 (compile-time consts).
-        const { assert!(<Contact1 as Versioned>::IS_FIRST) };
-        const { assert!(!<Contact2 as Versioned>::IS_FIRST) };
-        // The trait hash matches the type's own const; a `prev` link never
-        // feeds it, and the added field makes v2 a distinct identity.
-        assert_eq!(<Contact2 as Versioned>::STRUCT_HASH, Contact2::STRUCT_HASH);
-        assert_ne!(Contact1::STRUCT_HASH, Contact2::STRUCT_HASH);
-
-        // `Contact2::Prev` resolves to `Contact1` — only type-checks if equal.
-        let _prev: <Contact2 as Versioned>::Prev = Contact1::default();
-
-        let v1 = Contact1 { name: "Ada".into() };
-        let v2 = Contact2::upgrade_from(v1.clone());
-        assert_eq!(
-            v2,
-            Contact2 {
-                name: "Ada".into(),
-                email: String::new(),
-            }
-        );
-        assert_eq!(Contact2::downgrade_from(v2), v1);
-    }
 
     // Every declared struct round-trips through its derive-emitted WaveWire
     // impl, and its STRUCT_HASH is a distinct compile-time const.
