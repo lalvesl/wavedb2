@@ -47,6 +47,7 @@ mod record_unique;
 pub mod store;
 pub mod traits;
 pub mod u48;
+pub mod version;
 pub mod wire;
 
 pub use collection::Collection;
@@ -78,4 +79,5 @@ pub use traits::{
     NonUniqueStruct, PivotHandle, Shape, UniqueStruct, WaveDbStruct,
 };
 pub use u48::U48;
+pub use version::{DowngradeFrom, UpgradeFrom, Versioned, resolve};
 pub use wire::{Cursor, WaveWire, from_wire, to_wire};
