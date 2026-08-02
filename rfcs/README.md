@@ -22,11 +22,15 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   [0034](0034-ws-reconnect-catchup.md)) and W7 poll efficiency (idle backoff +
   command piggyback — [0035](0035-http-piggyback-and-idle-backoff.md)), the
   client `Db` + write-through cache, the wasm/IndexedDB target, and auth. RFCs
-  0003–0026 are *Implemented* (except the two Partial noted below; 0014 is now
-  *Deprecated*, superseded by 0040).
-- **Planned next:** [0040](0040-schema-migration-and-version-skew-PLANNED.md)
-  (schema migration across node/client version skew — supersedes the old 0014
-  hook seam).
+  0003–0026 are *Implemented* (except the two Partial noted below; 0014 and 0040
+  are both *Deprecated* — see the next bullet).
+- **Schema migration is the developer's, entirely.** Both engine-side designs —
+  the 0014 hook seam and the 0040 version chain — are *Deprecated*; a changed
+  struct is simply a new type ([0004](0004-struct-hash-and-schema-evolution.md))
+  and moving data between two types is application code. What survived is the
+  exposure registry's **compile-time** collision guard (full-`STRUCT_HASH` clash
+  = error, 15-bit `type_salt` clash = warning), recorded in
+  [0040](0040-schema-migration-and-version-skew-DEPRECATED.md).
 - **Deferred (low priority):**
   [0036](0036-offline-write-queue-PLANNED-LOW.md) — W8 offline write queue
   (slice 1, Unique offline, *shipped*; the NonUnique/durable/conflict-surface
@@ -68,7 +72,6 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0011](0011-bptree-index-and-collections.md) | B+tree index, collections, and Pivots | Implemented |
 | [0012](0012-natural-keys.md) | Natural keys (`#[wavedb::key]`) | Implemented |
 | [0013](0013-permissions.md) | Permissions | Partial |
-| [0040](0040-schema-migration-and-version-skew-PLANNED.md) | Schema migration & node/client version skew | Planned |
 
 ### Macros & exposure
 | # | Title | Status |
@@ -103,7 +106,6 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 |---|-------|--------|
 | [0034](0034-ws-reconnect-catchup.md) | W6: WebSocket reconnect catch-up | Implemented |
 | [0035](0035-http-piggyback-and-idle-backoff.md) | W7: HTTP piggyback + idle backoff | Implemented |
-| [0040](0040-schema-migration-and-version-skew-PLANNED.md) | Schema migration & node/client version skew | Planned |
 | [0036](0036-offline-write-queue-PLANNED-LOW.md) | W8: Offline write queue (slice 1 shipped) | Planned (low) |
 | [0037](0037-multi-node-cluster-PLANNED-LOW.md) | Multi-node cluster | Planned (low) |
 | [0038](0038-argon2-and-oauth-credentials-PLANNED-LOW.md) | Argon2 & OAuth/OIDC credentials | Planned (low) |
@@ -112,7 +114,8 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 ### Deprecated / superseded
 | # | Title | Superseded by |
 |---|-------|---------------|
-| [0014](0014-schema-evolution-hooks-DEPRECATED.md) | Schema-evolution lookup hooks | [0040](0040-schema-migration-and-version-skew-PLANNED.md) |
+| [0014](0014-schema-evolution-hooks-DEPRECATED.md) | Schema-evolution lookup hooks | [0040](0040-schema-migration-and-version-skew-DEPRECATED.md) |
+| [0040](0040-schema-migration-and-version-skew-DEPRECATED.md) | Schema migration & node/client version skew | *dropped* — migration is the developer's ([0004](0004-struct-hash-and-schema-evolution.md)) |
 | [0027](0027-doubly-linked-modification-chain-DEPRECATED.md) | Doubly-linked modification chain | [0009](0009-anchors-succession-and-history.md) |
 | [0028](0028-journal-commit-cursor-sync-DEPRECATED.md) | Journal commit-cursor sync | [0022](0022-live-sync-navigation-catchup.md) |
 | [0029](0029-bloom-filter-screen-sync-DEPRECATED.md) | Bloom-filter screen-sync | [0022](0022-live-sync-navigation-catchup.md) |
