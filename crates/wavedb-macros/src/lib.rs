@@ -15,6 +15,7 @@ use proc_macro::TokenStream;
 mod args;
 mod exec_ops;
 mod expose;
+mod expose_collision;
 mod expose_parse;
 mod generated;
 mod natural_key;
