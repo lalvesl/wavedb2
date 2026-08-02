@@ -182,6 +182,25 @@ where
     }
 }
 
+/// Like [`get_value`] but version-aware for a `Unique` type (RFC 0040).
+///
+/// Walks the version chain from the current shape's anchor and lifts an older
+/// on-disk record forward via [`UpgradeFrom`](crate::version::UpgradeFrom). The
+/// wire result is identical — the current shape's value bytes — so a caller
+/// never learns a migration happened.
+///
+/// # Errors
+/// As [`crate::version::resolve_unique`].
+pub async fn get_unique_versioned<T, S>(store: &S, tenant: U48) -> Result<Reply>
+where
+    T: crate::version::UpgradeFrom + WaveWire,
+    S: Store,
+{
+    let resolved =
+        crate::version::resolve_unique::<T, S>(store, tenant).await?;
+    Ok(Reply::Value(resolved.map(|value| to_wire(&value))))
+}
+
 /// Walk a NonUnique collection in `CREATED_AT` order and buffer each record
 /// as the wire pair `(Id, T)` — the shared tail of the generated `All` step.
 ///
@@ -331,5 +350,117 @@ mod tests {
 
         assert!(decode_check::<Probe>(&to_wire(&Probe { n: 4 })).is_ok());
         assert!(decode_check::<Probe>(&[1, 2]).is_err());
+    }
+
+    // Version-chain fixtures (RFC 0040): a first version `W1` and its successor
+    // `W2`, decoding real record envelopes like the macro-emitted impls do.
+    mod ver {
+        use crate::id::Id;
+        use crate::store::{Store, Write};
+        use crate::version::{UpgradeFrom, Versioned};
+        use crate::wire::WaveWire;
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+
+        pub const W1_HASH: u64 = 0x0000_0000_00AA_0001;
+        pub const W2_HASH: u64 = 0x0000_0000_00BB_0002;
+
+        #[derive(Debug, PartialEq, Eq, WaveWire)]
+        pub struct W1 {
+            pub n: u32,
+        }
+        #[derive(Debug, PartialEq, Eq, WaveWire)]
+        pub struct W2 {
+            pub n: u32,
+            pub doubled: u32,
+        }
+
+        impl Versioned for W1 {
+            type Prev = Self;
+            const IS_FIRST: bool = true;
+            const STRUCT_HASH: u64 = W1_HASH;
+            fn from_stored(b: &[u8]) -> crate::Result<Self> {
+                crate::version::value_from_record::<Self>(W1_HASH, b)
+            }
+        }
+        impl UpgradeFrom for W1 {
+            fn upgrade_from(prev: Self) -> Self {
+                prev
+            }
+        }
+        impl Versioned for W2 {
+            type Prev = W1;
+            const IS_FIRST: bool = false;
+            const STRUCT_HASH: u64 = W2_HASH;
+            fn from_stored(b: &[u8]) -> crate::Result<Self> {
+                crate::version::value_from_record::<Self>(W2_HASH, b)
+            }
+        }
+        impl UpgradeFrom for W2 {
+            fn upgrade_from(prev: W1) -> Self {
+                Self {
+                    n: prev.n,
+                    doubled: prev.n * 2,
+                }
+            }
+        }
+
+        #[derive(Default)]
+        pub struct MemStore(pub Mutex<BTreeMap<u128, Vec<u8>>>);
+        impl Store for MemStore {
+            async fn get(&self, id: Id) -> crate::Result<Option<Vec<u8>>> {
+                Ok(self.0.lock().unwrap().get(&id.raw()).cloned())
+            }
+            async fn apply(&self, batch: &[Write]) -> crate::Result<()> {
+                {
+                    let mut m = self.0.lock().unwrap();
+                    for w in batch {
+                        match w {
+                            Write::Put(id, b) => {
+                                m.insert(id.raw(), b.clone());
+                            }
+                            Write::Remove(id) => {
+                                m.remove(&id.raw());
+                            }
+                            Write::Expect(..) => {}
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // A Unique `get` walks the version chain and lifts an older on-disk record
+    // forward — the wire result is the current shape's value (RFC 0040 §3).
+    #[test]
+    fn unique_get_walks_and_upgrades_older_versions() {
+        use super::get_unique_versioned;
+        use crate::id::Id;
+        use crate::metadata::Metadata;
+        use crate::record::encode_record;
+        use crate::store::{Store, Write};
+        use crate::u48::U48;
+        use ver::{MemStore, W1, W1_HASH, W2};
+
+        futures::executor::block_on(async {
+            let tenant = U48::from(1u32);
+            let s = MemStore::default();
+            // A v1 record sits at v1's Unique anchor; the current shape is W2.
+            let anchor = Id::new(W1_HASH, tenant, true, 0);
+            let rec =
+                encode_record(W1_HASH, &Metadata::default(), &W1 { n: 21 });
+            s.apply(&[Write::Put(anchor, rec)]).await.unwrap();
+
+            let reply =
+                get_unique_versioned::<W2, _>(&s, tenant).await.unwrap();
+            let super::Reply::Value(Some(wire)) = reply else {
+                panic!("expected a value reply");
+            };
+            assert_eq!(
+                from_wire::<W2>(&wire).unwrap(),
+                W2 { n: 21, doubled: 42 }
+            );
+        });
     }
 }
