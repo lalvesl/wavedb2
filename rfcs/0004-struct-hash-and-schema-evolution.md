@@ -55,9 +55,12 @@ Two problems collapse into one mechanism:
 
 ## Schema-evolution *bridging* is a separate concern
 
-The hash makes old and new coexist; *reconciling* them (reading V1 bytes into a
-V2 shape) is done by application hooks, not an engine walk — see
-[RFC 0014](0014-schema-evolution-hooks-PLANNED.md) (`first_try` / `fallback_not_found`).
+The hash makes old and new coexist; *reconciling* them (reading `Task1` bytes into
+a `Task2` shape) is done by developer-written converters run automatically by the
+engine, not a global walk — see
+[RFC 0040](0040-schema-migration-and-version-skew-PLANNED.md) (numbered types +
+alias, `UpgradeFrom` / `DowngradeFrom`, the `prefer_current` / `upgrade_on_miss`
+hooks).
 
 ## Alternatives & prior art
 
