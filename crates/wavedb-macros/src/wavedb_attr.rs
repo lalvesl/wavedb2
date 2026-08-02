@@ -104,8 +104,6 @@ pub fn expand(
     let (storage_slot, storage_entries, exec_steps, shape_marker) =
         shape_scaffolding(&name, args.shape, args.compress);
 
-    let version_impl = version_impls(&name, hash, args.prev.as_ref());
-
     Ok(quote! {
         #input
 
@@ -139,52 +137,9 @@ pub fn expand(
         #storage_slot
         #storage_entries
         #exec_steps
-        #version_impl
 
         #generated_types
     })
-}
-
-/// The version-chain wiring (RFC 0040): a [`Versioned`] impl linking this shape to
-/// its predecessor (`prev = …`), or to `Self` for a first / never-evolved version
-/// — which also gets the identity [`UpgradeFrom`] terminating the walk. A later
-/// version's `UpgradeFrom` / `DowngradeFrom` are written by the developer.
-///
-/// [`Versioned`]: wavedb_core::version::Versioned
-/// [`UpgradeFrom`]: wavedb_core::version::UpgradeFrom
-fn version_impls(
-    name: &Ident,
-    hash: u64,
-    prev: Option<&syn::Path>,
-) -> TokenStream {
-    let is_first = prev.is_none();
-    let prev_ty = prev.map_or_else(|| quote!(Self), |p| quote!(#p));
-    // The first version terminates the walk and gets the identity converter;
-    // a later version's `UpgradeFrom` / `DowngradeFrom` are developer-written.
-    let terminator = if is_first {
-        quote! {
-            impl ::wavedb_core::UpgradeFrom for #name {
-                fn upgrade_from(prev: Self::Prev) -> Self {
-                    prev
-                }
-            }
-        }
-    } else {
-        TokenStream::new()
-    };
-    quote! {
-        impl ::wavedb_core::Versioned for #name {
-            type Prev = #prev_ty;
-            const IS_FIRST: bool = #is_first;
-            const STRUCT_HASH: u64 = #hash;
-            fn from_stored(
-                bytes: &[u8],
-            ) -> ::wavedb_core::Result<Self> {
-                ::wavedb_core::version::value_from_record::<Self>(#hash, bytes)
-            }
-        }
-        #terminator
-    }
 }
 
 /// The `Unique` anchor ops: `get` / `save` / `history` inherent fns over any
