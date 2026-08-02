@@ -55,12 +55,13 @@ Two problems collapse into one mechanism:
 
 ## Schema-evolution *bridging* is a separate concern
 
-The hash makes old and new coexist; *reconciling* them (reading `Task1` bytes into
-a `Task2` shape) is done by developer-written converters run automatically by the
-engine, not a global walk — see
-[RFC 0040](0040-schema-migration-and-version-skew-PLANNED.md) (numbered types +
-alias, `UpgradeFrom` / `DowngradeFrom`, the `prefer_current` / `upgrade_on_miss`
-hooks).
+The hash makes old and new coexist; *reconciling* them (moving `Task1` bytes into
+a `Task2` shape) is **entirely the developer's** — ordinary application code
+reading one type and writing the other, on whatever schedule the app wants. The
+engine has no migration mechanism at all: an engine-run converter chain was
+designed and dropped, and [RFC 0040](0040-schema-migration-and-version-skew-DEPRECATED.md)
+records both the decision and the design, along with the one piece that survived
+— the registry's compile-time collision guard.
 
 ## Alternatives & prior art
 
