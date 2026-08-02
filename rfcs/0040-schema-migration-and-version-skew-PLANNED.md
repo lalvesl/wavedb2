@@ -125,16 +125,72 @@ read at current version V_cur:
          exhausted, nothing on disk → CRITICAL FAILURE
 ```
 
-- The head-verify already raises `Error::UnknownStructHash(got)` carrying the hash
-  **found on disk** (`record::decode_envelope` / `split_record`), so the walk
-  dispatches on `got` — no new error type. A 15-bit `SALT` collision that lands on
-  the wrong slot is caught here (full 64-bit head mismatch → treated as a miss,
-  walk continues), so **reads are collision-safe by construction.**
+- The walk is **structural, not `got`-dispatched.** It descends the version chain
+  (§3.1) and probes each version's *statically-known* `SALT` slot; the hit level is
+  decoded as its own concrete type. The head-verify's `Error::UnknownStructHash(got)`
+  (`record::decode_envelope` / `split_record`) is only the **miss/collision signal**:
+  a 15-bit `SALT` collision that lands on a foreign slot fails the full 64-bit head
+  check → treated as a miss, walk continues → **reads are collision-safe by
+  construction.**
 - **Cost.** Pre-migration: up to *N* disk reads, where *N* is the number of
   versions the **current code** declares — once per collection/record. Post-
   migration: O(1); the current-version slot hits first. The permanent overhead is
   the CPU of `hash & 0x7FFF`, not an extra disk hop — there is no stored
   indirection to chase.
+
+### 3.1 Rust realization — a compile-time chain, monomorphized
+
+The walk must reach `TaskN-1` (a type that may live in another module) **without the
+generated code ever naming it** — and without a `dyn` table or runtime registry
+([RFC 0002](0002-architectural-hard-rules.md)). The chain is a compile-time linked
+list through an **associated type**, and the walk is a **generic recursion** the
+compiler monomorphizes into concrete arms:
+
+```rust
+// core traits. `#[wavedb(prev = Task2)]` on Task3 emits the `Versioned` impl;
+// the FIRST version gets a macro-emitted identity terminator (`type Prev = Self`).
+trait Versioned: WaveWire + Sized {
+    type Prev: Versioned;          // predecessor; first version → Self
+    const IS_FIRST: bool;
+    const STRUCT_HASH: u64;
+}
+trait UpgradeFrom: Versioned { fn upgrade_from(prev: Self::Prev) -> Self; }     // dev-written, pairwise
+trait DowngradeFrom: Versioned { fn downgrade_from(cur: Self) -> Self::Prev; }  // dev-written, pairwise
+
+fn resolve<T: UpgradeFrom>(store: &S, base: LocalId) -> Result<Option<T>> {
+    let addr = base.with_salt(type_salt(T::STRUCT_HASH));
+    match store.get_of(T::STRUCT_HASH, addr)? {
+        Some(bytes) => decode::<T>(bytes).map(Some),      // hit at this version
+        None if T::IS_FIRST => Ok(None),                  // genuine miss (or CRITICAL if a version was deleted)
+        None => match resolve::<T::Prev>(store, base)? {  // recurse DOWN via Prev
+            Some(prev) => Ok(Some(T::upgrade_from(prev))), // UpgradeFrom on the way UP
+            None => Ok(None),
+        },
+    }
+}
+// entry is ALWAYS the current alias:  Task = Task3  →  resolve::<Task3>(store, base)
+```
+
+Why this answers "`TaskN-1` is in another module":
+
+- **The generated code never names an intermediate.** `resolve` traverses the middle
+  by `T::Prev` — a projection the trait system resolves — so its source mentions only
+  the type parameter. The *only* place `Task2` is spelled is the developer's
+  `#[wavedb(prev = Task2)]` (or their `UpgradeFrom` impl), a normal Rust path resolved
+  the normal way; cross-module is a non-issue there.
+- **The base case is a runtime test, not a type-level `From == To`** (which Rust
+  cannot express without specialization): each level probes its own slot and decodes
+  as its own concrete type; upgrades apply on the unwind.
+- **`resolve::<Task3>` monomorphizes to `{Task3, Task2, Task1}`** — concrete static
+  calls, no `dyn`, no fn-pointer table, no runtime registration. `Task1::Prev = Self`
+  makes the base frame's `resolve::<Task1::Prev>` a guarded, dead self-reference (no
+  infinite monomorphization).
+
+The inverse direction reuses the **same** `Prev` chain: an older client's write is
+lifted to the current anchor by descending until `T::STRUCT_HASH` matches the
+written hash, decoding there, then unwinding through `upgrade_from`; serving an older
+reader descends from the current alias applying `downgrade_from` until it reaches the
+version the registry arm was generated for. No `Next` chain is ever needed.
 
 ### 4. Serving older peers: `DowngradeFrom`, automatic
 
