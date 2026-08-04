@@ -31,6 +31,13 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   exposure registry's **compile-time** collision guard (full-`STRUCT_HASH` clash
   = error, 15-bit `type_salt` clash = warning), recorded in
   [0040](0040-schema-migration-and-version-skew-DEPRECATED.md).
+- **In flight — the storage write path:**
+  [0041](0041-single-barrier-checkpoint-WIP.md) turns a checkpoint into one
+  sequential write + one fsync (plan in RAM grouped per bucket → one contiguous
+  window → descriptor swap; the `Commit` frame rides the next `Batch` fsync),
+  with [0042](0042-free-space-defragmentation-PLANNED.md) keeping such windows
+  available. The per-mutation path is already one append + fsync and does not
+  change.
 - **Deferred (low priority):**
   [0036](0036-offline-write-queue-PLANNED-LOW.md) — W8 offline write queue
   (slice 1, Unique offline, *shipped*; the NonUnique/durable/conflict-surface
@@ -110,6 +117,8 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0037](0037-multi-node-cluster-PLANNED-LOW.md) | Multi-node cluster | Planned (low) |
 | [0038](0038-argon2-and-oauth-credentials-PLANNED-LOW.md) | Argon2 & OAuth/OIDC credentials | Planned (low) |
 | [0039](0039-developer-experience-PLANNED-LOW.md) | Developer experience (M9) | Planned (low) |
+| [0041](0041-single-barrier-checkpoint-WIP.md) | Single-barrier checkpoint | In progress |
+| [0042](0042-free-space-defragmentation-PLANNED.md) | Free-space defragmentation | Planned |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |
