@@ -92,6 +92,66 @@ impl BlockAllocator {
         self.by_pos.len()
     }
 
+    /// Blocks in the **largest** free extent — the gauge that decides whether
+    /// a checkpoint's window will land in a hole or grow the tail, and so the
+    /// trigger for defragmentation
+    /// ([RFC 0042](../../../rfcs/0042-free-space-defragmentation.md)).
+    #[must_use]
+    pub fn largest_free_extent(&self) -> u64 {
+        self.by_size
+            .iter()
+            .next_back()
+            .map_or(0, |&(count, _)| count)
+    }
+
+    /// Free blocks immediately before and immediately after `run` — how much
+    /// would coalesce if `run` moved away.
+    #[must_use]
+    pub fn free_neighbours(&self, run: Run) -> (u64, u64) {
+        let before = self
+            .by_pos
+            .range(..run.start)
+            .next_back()
+            .filter(|&(&start, &count)| start + count == run.start)
+            .map_or(0, |(_, &count)| count);
+        let after = self.by_pos.get(&run.end()).copied().unwrap_or(0);
+        (before, after)
+    }
+
+    /// Allocate `count` blocks **at the tail**, never from a hole.
+    ///
+    /// The defragmenter relocates live runs with this: best-fit would happily
+    /// drop a page back beside the hole it was meant to vacate, which defeats
+    /// the point. Writing forward instead leaves the vacated neighbourhood to
+    /// coalesce into the large window ordinary checkpoints then consume.
+    ///
+    /// # Panics
+    /// Panics if `count == 0`.
+    pub fn alloc_tail(&mut self, count: u64) -> Run {
+        assert!(count > 0, "cannot allocate a zero-length run");
+        // Consume the trailing free extent first — it *is* the tail; leaving
+        // it stranded behind the new run would fragment on purpose.
+        match self.by_pos.iter().next_back() {
+            Some((&start, &n))
+                if start + n == self.total_blocks
+                    && !self.is_protected(Run::new(start, count.min(n))) =>
+            {
+                self.remove_extent(start, n);
+                if n > count {
+                    self.insert_extent(start + count, n - count);
+                } else {
+                    self.total_blocks = start + count;
+                }
+                Run::new(start, count)
+            }
+            _ => {
+                let start = self.total_blocks;
+                self.total_blocks += count;
+                Run::new(start, count)
+            }
+        }
+    }
+
     /// Allocate a contiguous run of `count` blocks (best-fit; grows the file
     /// if no hole fits). `count` must be `>= 1`.
     ///
