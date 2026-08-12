@@ -21,7 +21,6 @@
 
 use wavedb_core::wire::{WaveWire, from_wire_checked, to_wire_checked};
 
-use crate::alloc::BlockAllocator;
 use crate::block::{BLOCK_SIZE, Run};
 use crate::block_file::BlockFile;
 use crate::error::{StorageError, StorageResult};
@@ -46,44 +45,45 @@ const fn node_capacity() -> usize {
     (BLOCK_SIZE - overhead) / 8
 }
 
-/// Write `addresses` as a fresh chain (copy-on-write: only newly allocated
-/// blocks), returning the root block index. An empty list writes a single
-/// empty node — the root still names the type as "settled, zero buckets"
-/// (which `Directory` forbids anyway; callers pass ≥1 bucket).
+/// How many nodes a directory of `addresses` addresses needs. Known before
+/// the addresses themselves are, which is what lets the checkpoint reserve a
+/// chain's space in the same window as the pages it describes.
+pub const fn node_count(addresses: usize) -> usize {
+    if addresses == 0 {
+        1 // the root still names the type as "settled, zero buckets"
+    } else {
+        addresses.div_ceil(node_capacity())
+    }
+}
+
+/// Build every chain node's byte image, given the block each node will
+/// occupy — the links are block indices, so placement is decided first
+/// ([`node_count`]) and the images are built against it.
 ///
-/// # Errors
-/// A write fault.
-pub fn write_chain(
-    file: &BlockFile,
-    alloc: &mut BlockAllocator,
-    addresses: &[u64],
-) -> StorageResult<u64> {
+/// `blocks.len()` must equal `node_count(addresses.len())`.
+pub fn node_images(addresses: &[u64], blocks: &[u64]) -> Vec<Vec<u8>> {
     let per_node = node_capacity();
     let chunks: Vec<&[u64]> = if addresses.is_empty() {
         vec![&[]]
     } else {
         addresses.chunks(per_node).collect()
     };
-    // Allocate every node up front so links can be written in one pass.
-    let blocks: Vec<u64> =
-        chunks.iter().map(|_| alloc.alloc(1).start).collect();
-    for (i, chunk) in chunks.iter().enumerate() {
-        let node = ChainNode {
-            next: if i + 1 < blocks.len() {
-                blocks[i + 1]
-            } else {
-                0
-            },
-            prev: if i > 0 { blocks[i - 1] } else { 0 },
-            addresses: chunk.to_vec(),
-        };
-        let payload = to_wire_checked(&node);
-        let mut bytes = Vec::with_capacity(LEN_PREFIX + payload.len());
-        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&payload);
-        file.write_run(Run::new(blocks[i], 1), &bytes)?;
-    }
-    Ok(blocks[0])
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let node = ChainNode {
+                next: blocks.get(i + 1).copied().unwrap_or(0),
+                prev: if i > 0 { blocks[i - 1] } else { 0 },
+                addresses: chunk.to_vec(),
+            };
+            let payload = to_wire_checked(&node);
+            let mut bytes = Vec::with_capacity(LEN_PREFIX + payload.len());
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+            bytes
+        })
+        .collect()
 }
 
 /// Read a chain back from its root: the flattened addresses and the chain's
@@ -128,51 +128,63 @@ fn decode_node(buf: &[u8]) -> StorageResult<ChainNode> {
 
 #[cfg(test)]
 mod tests {
-    use super::{node_capacity, read_chain, write_chain};
-    use crate::alloc::BlockAllocator;
+    use super::{node_capacity, node_count, node_images, read_chain};
+    use crate::block::Run;
     use crate::block_file::{BlockFile, RESERVED_BLOCKS};
 
-    fn backed() -> (tempfile::TempDir, BlockFile, BlockAllocator) {
+    /// Write a chain the way a checkpoint window does — node count first,
+    /// blocks assigned, then the images built against them.
+    fn place(file: &BlockFile, at: u64, addresses: &[u64]) -> Vec<u64> {
+        let blocks: Vec<u64> = (0..node_count(addresses.len()) as u64)
+            .map(|i| at + i)
+            .collect();
+        for (block, image) in blocks.iter().zip(node_images(addresses, &blocks))
+        {
+            file.write_run(Run::new(*block, 1), &image).unwrap();
+        }
+        blocks
+    }
+
+    fn backed() -> (tempfile::TempDir, BlockFile) {
         let d = tempfile::tempdir().unwrap();
         let bf = BlockFile::open(d.path().join("data.bin")).unwrap();
-        let mut alloc = BlockAllocator::new();
-        alloc.alloc(RESERVED_BLOCKS);
-        (d, bf, alloc)
+        (d, bf)
     }
 
     #[test]
     fn single_block_roundtrip() {
-        let (_d, bf, mut alloc) = backed();
+        let (_d, bf) = backed();
         let addrs: Vec<u64> = (100..150).collect();
-        let root = write_chain(&bf, &mut alloc, &addrs).unwrap();
-        assert_ne!(root, 0, "block 0 is the superblock");
-        let (got, blocks) = read_chain(&bf, root).unwrap();
+        let placed = place(&bf, RESERVED_BLOCKS, &addrs);
+        assert_eq!(placed.len(), 1, "fits one node");
+        let (got, blocks) = read_chain(&bf, placed[0]).unwrap();
         assert_eq!(got, addrs);
-        assert_eq!(blocks, vec![root], "fits one node");
+        assert_eq!(blocks, placed);
     }
 
     #[test]
     fn multi_block_chain_links_and_roundtrips() {
-        let (_d, bf, mut alloc) = backed();
+        let (_d, bf) = backed();
         let n = node_capacity() * 2 + 7; // forces three nodes
         let addrs: Vec<u64> = (0..n as u64).map(|i| i * 3 + 1).collect();
-        let root = write_chain(&bf, &mut alloc, &addrs).unwrap();
-        let (got, blocks) = read_chain(&bf, root).unwrap();
+        assert_eq!(node_count(addrs.len()), 3);
+        let placed = place(&bf, RESERVED_BLOCKS, &addrs);
+        let (got, blocks) = read_chain(&bf, placed[0]).unwrap();
         assert_eq!(got, addrs, "order preserved across nodes");
-        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks, placed, "links walk every node once");
     }
 
     #[test]
     fn cow_rewrite_leaves_the_old_chain_readable() {
-        let (_d, bf, mut alloc) = backed();
+        let (_d, bf) = backed();
         let v1: Vec<u64> = (1..40).collect();
-        let root1 = write_chain(&bf, &mut alloc, &v1).unwrap();
-        // A rewrite allocates fresh blocks — the old root must survive
-        // (the last durable commit may still point at it).
+        let first = place(&bf, RESERVED_BLOCKS, &v1);
+        // A rewrite lands on fresh blocks — the old root must survive (the
+        // last durable commit may still point at it).
         let v2: Vec<u64> = (100..160).collect();
-        let root2 = write_chain(&bf, &mut alloc, &v2).unwrap();
-        assert_ne!(root1, root2);
-        assert_eq!(read_chain(&bf, root1).unwrap().0, v1);
-        assert_eq!(read_chain(&bf, root2).unwrap().0, v2);
+        let second = place(&bf, RESERVED_BLOCKS + 8, &v2);
+        assert_ne!(first[0], second[0]);
+        assert_eq!(read_chain(&bf, first[0]).unwrap().0, v1);
+        assert_eq!(read_chain(&bf, second[0]).unwrap().0, v2);
     }
 }
