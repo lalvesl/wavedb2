@@ -73,6 +73,13 @@ struct Maintenance {
     checkpoint_after_bytes: u64,
     /// Cache bytes the settle task evicts down to (settled entries only).
     cache_budget_bytes: usize,
+    /// Defragment once the largest free extent falls below this many blocks —
+    /// the point where a checkpoint's window stops fitting a hole and starts
+    /// growing the tail (RFC 0042).
+    defrag_below_blocks: u64,
+    /// Blocks one defragmentation pass may copy. The cleaner's whole cost is
+    /// this, so it is a plain IO budget per tick.
+    defrag_budget_blocks: u64,
 }
 
 impl Default for Maintenance {
@@ -80,6 +87,8 @@ impl Default for Maintenance {
         Self {
             checkpoint_after_bytes: 64 * 1024 * 1024, // 64 MiB of journal
             cache_budget_bytes: 1024 * 1024 * 1024,   // 1 GiB — generous
+            defrag_below_blocks: 256, // 1 MiB of contiguous room
+            defrag_budget_blocks: 256, // ≤ 1 MiB copied per tick
         }
     }
 }
@@ -283,5 +292,12 @@ async fn maintain(store: Rc<PageStore>, policy: Maintenance) {
             return;
         }
         store.evict_settled(policy.cache_budget_bytes);
+        // Keep a window large enough for the next checkpoint to land in a
+        // hole rather than at the tail; a pass that finds nothing is free.
+        if store.largest_free_extent() < policy.defrag_below_blocks
+            && store.defragment(policy.defrag_budget_blocks).is_err()
+        {
+            return;
+        }
     }
 }
