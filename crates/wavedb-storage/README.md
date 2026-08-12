@@ -16,16 +16,22 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 | `block_file`      | `data.bin` as a block-addressed file: superblock (block 0), positioned run I/O, grow/truncate, fsync.       |
 | `dictionary`      | Per-`STRUCT_HASH` raw-content zstd dictionary (`Dictionary` + `DictState`): capped append-only buffer, version = prefix length, own run persistence. |
 | `directory`       | The per-`STRUCT_HASH` page directory container + the linear-hashing addressing math (pure addressing).      |
-| `directory_pages` | The directory's page I/O: read/rewrite/split bucket pages, compressing against the passed-in `DictState`.   |
+| `directory_pages` | The directory's page **reads**: resolving a bucket to its `SlotPage`, decompressing against the passed-in `DictState`. |
+| `plan`            | A checkpoint's phase 1: touched ids → page images grouped per bucket, splits decided, nothing written.       |
+| `checkpoint`      | Phases 2–4: one best-fit window for every image, one positioned write, then the descriptor swap.            |
+| `settle`          | The drain queue: what a round is, when it retries, and the cache-eviction budget.                           |
+| `chain`           | Directory chain blocks — the persisted address vector, copy-on-write, placed in the checkpoint's window.    |
+| `defrag`          | Relocates live pages stranded between holes to fresh tail blocks so free extents coalesce.                  |
 | `page`            | `SlotPage` — the homogeneous record page: `[len][to_wire_checked(PageEnvelope)]`, body raw or zstd.         |
 | `journal`         | Append-only WAL of `Write` batches (checked wire frames); fsync = durability; torn-tail-tolerant replay.    |
 | `struct_storage`  | `StructStorage` — one type's own cache + directory slot (`#[wavedb]` emits one `static` per type).          |
 | `page_store`      | `PageStore` — the node's authoritative `Store`: journal-first → per-type caches → settle into pages.        |
 | `error`           | `StorageError` / `StorageResult`; flattens to `wavedb_core::Error::Backend` at the `Store` seam.            |
 
-Planned (not yet a module): background settle/rebalance (settle is inline with
-`apply` today). The `Pivot`/`BpTree` index layer lives in
-`wavedb_core::index`, not here.
+Settle and rebalance are **off the mutation path**: `apply` only journals,
+commits to the caches, and queues the touched ids; the node's maintenance loop
+drains that queue and checkpoints on a journal-size threshold. The
+`Pivot`/`BpTree` index layer lives in `wavedb_core::index`, not here.
 
 ---
 
@@ -349,11 +355,23 @@ mutation → journal append → the type's own BTreeMap<Id> cache → (client co
    type's own in-memory `BTreeMap` (its `StructStorage` slot, below); reads
    serve from it directly (and, because `Id` is ordered by `KEY`,
    range/timeline reads are naturally ordered).
-3. **Background settle.** A drain task writes cached pages down into `data.bin`
-   at its own pace and can flush entries out of memory once persisted.
-4. **Background rebalance.** Because page grow happens in place without moving
-   keys, pages can get large; the rebalancer runs `split_next` off the hot path
-   to keep page sizes bounded.
+3. **Background settle — one window per round.** A drain task takes the queued
+   ids, groups them by bucket, reads each touched page once, and writes every
+   resulting image into **one contiguous window** with a single positioned write
+   ([RFC 0041](../../rfcs/0041-single-barrier-checkpoint.md)). The descriptors
+   are swapped only after the write lands, so a reader sees either the old pages
+   (still allocated — page writes are copy-on-write) or the new ones.
+4. **Rebalance is part of that plan.** Splits are decided in RAM, before
+   anything is serialised, so an over-sized bucket is repartitioned and both
+   halves are written once — never a page written twice in one round.
+
+5. **Background defragmentation.** Copy-on-write leaves holes, and what a
+   checkpoint needs is one *contiguous* window. When the largest free extent
+   falls below the policy's threshold, a pass relocates live pages stranded
+   between holes — verbatim, to fresh tail blocks — so the space they vacate
+   merges into the extent the next checkpoint lands in
+   ([RFC 0042](../../rfcs/0042-free-space-defragmentation.md)). It is budgeted
+   in blocks per tick and finds nothing to do on a packed file.
 
 On startup the directories and the block allocator rebuild by **journal replay**.
 
@@ -411,26 +429,44 @@ was never snapshot-isolated — an apply can land between two gets, exactly as
 under the old store-wide mutex. (Multi-write **server-function** transactions —
 several operations as one unit — remain a separate, later concern.)
 
-### IO cost per operation
+### IO cost
 
-Counting journal + `data.bin` IOs (the cache absorbs repeats; cold case shown):
+**Per mutation: one write, one barrier.** `Store::apply` appends the whole batch
+— the record, every touched `BpTree` node, the `Pivot` rewrite when a root moved
+— as **one** journal frame (`write_all_at` + `fsync`), commits it to the per-type
+caches, and queues the touched ids. Nothing else reaches the disk on that path,
+and how many records a batch carries changes its size, not its IO count.
 
-| Operation                         | IOs      | Breakdown                                                                                                                                                                                           |
-| --------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Unique `save`**                 | 4        | journal data entry · read the page · write the page · allocation delta in journal                                                                                                                   |
-| **NonUnique `save`** (update)     | `7 + 2N` | journal · read old page (old keys) · read `Pivot` (roots via `Metadata.pivot`) · write record page · reindex `current` **and** each of `N` secondary trees (read+write per tree) · allocation delta |
-| **NonUnique `insert` / `remove`** | `7 + 2N` | journal · read 3 pages (record, `Pivot`, `BpTree`) · write record + reindex `current` **and** each of `N` secondary trees · allocation delta                                                        |
+**Per settle round: one write, no barrier.** The pending ids are grouped by
+bucket, each touched page is read **once**, and every resulting image is placed
+in **one contiguous window** and written with a single positioned write
+([RFC 0041](../../rfcs/0041-single-barrier-checkpoint.md)). Reads are the floor:
+one per page the round modifies. No `fsync` — durability stays the journal's
+until a checkpoint.
 
-A NonUnique **`save`** is no longer a free in-place rewrite: update **force-reindexes
-every live tree** — the `current` `BpTree` _and_ every `#[wavedb::pivot(...)]`
-secondary — removing the record's old entries and reinserting for the new version,
-so it costs **insert-class** IO that scales with the secondary-index count `N`. It
-reaches the roots through **`Metadata.pivot`**; the `Pivot` itself is still
-**read, not written** unless a `BpTree` root moves (no counter). The **`dead`** tree
-is **not** touched on update — history is the `Metadata` modification chain — so
-only **`remove`** writes `dead`. The record's identity `Id` (insert anchor) stays
-stable so references don't break; the trees re-establish the live version against
-it. All allocation deltas ride in a single journal write.
+**Per checkpoint: one write, two barriers.** The same window additionally carries
+every drifted directory chain and a grown dictionary; then `data.bin` is synced
+and the `Commit` frame is appended (its own fsync) so the retired journal can be
+deleted. `BlockFile::io()` counts all of this, and the accounting is asserted in
+`page_store`'s tests.
+
+What still scales with the work rather than with the batch is the *logical* index
+maintenance above the store, which decides how many values a batch contains:
+
+| Operation                         | Values in the batch                                                                              |
+| --------------------------------- | ------------------------------------------------------------------------------------------------ |
+| **Unique `save`**                 | the live record + the archived predecessor                                                       |
+| **NonUnique `save`** (update)     | record + archive + the recency log's re-key + each of `N` secondaries **whose fields changed**   |
+| **NonUnique `insert` / `remove`** | record + `current` + recency (or `dead`) + every one of `N` secondaries · `Pivot` if a root moved |
+
+A NonUnique **`save`** never re-keys the `current` tree — its key is the record's
+immutable `CREATED_AT` identity — but it always re-keys the recency log and any
+secondary whose fields changed, reaching the roots through **`Metadata.pivot`**.
+The `Pivot` itself is **read, not written** unless a `BpTree` root moves (no
+counter). The **`dead`** tree is touched only by `remove`; an update's superseded
+version is archived at a derived slot and linked by `Metadata.succession`. The
+record's identity `Id` stays stable so references don't break. Reads of those
+tree nodes are served from the shared `BpTree` cache slot when warm.
 
 ---
 
