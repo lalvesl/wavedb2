@@ -25,6 +25,7 @@ use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use wavedb_core::wire::{
     CRC_PREFIX_LEN, WaveWire, from_wire_checked, to_wire_checked,
@@ -72,6 +73,30 @@ const BODY_CHECKED_LEN: usize =
 pub struct BlockFile {
     file: File,
     seed: [u64; 4],
+    io: IoCounts,
+}
+
+/// Disk operations issued on one [`BlockFile`] since it was opened.
+///
+/// The accounting behind RFC 0041's claim: a settle round is **one** write,
+/// a checkpoint one write plus one sync, and reads are one per touched page.
+#[derive(Debug, Default)]
+pub struct IoCounts {
+    reads: AtomicU64,
+    writes: AtomicU64,
+    syncs: AtomicU64,
+}
+
+impl IoCounts {
+    /// `(reads, writes, syncs)` so far.
+    #[must_use]
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.reads.load(Ordering::Relaxed),
+            self.writes.load(Ordering::Relaxed),
+            self.syncs.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl BlockFile {
@@ -97,7 +122,11 @@ impl BlockFile {
         let len = file.metadata()?.len();
         if len == 0 {
             let seed = random_seed();
-            let bf = Self { file, seed };
+            let bf = Self {
+                file,
+                seed,
+                io: IoCounts::default(),
+            };
             bf.write_superblock()?;
             bf.file.sync_all()?;
             Ok(bf)
@@ -106,6 +135,7 @@ impl BlockFile {
             Ok(Self {
                 file,
                 seed: body.seed,
+                io: IoCounts::default(),
             })
         }
     }
@@ -137,6 +167,7 @@ impl BlockFile {
         }
         let mut buf = vec![0u8; run.byte_len() as usize];
         self.file.read_exact_at(&mut buf, run.byte_offset())?;
+        self.io.reads.fetch_add(1, Ordering::Relaxed);
         Ok(buf)
     }
 
@@ -158,6 +189,7 @@ impl BlockFile {
         }
         self.ensure_len(run.end() * BLOCK_SIZE as u64)?;
         self.file.write_all_at(bytes, run.byte_offset())?;
+        self.io.writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -167,7 +199,14 @@ impl BlockFile {
     /// [`StorageError::Io`] if the sync fails.
     pub fn sync(&self) -> StorageResult<()> {
         self.file.sync_all()?;
+        self.io.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Disk operations issued on this file since it was opened.
+    #[must_use]
+    pub const fn io(&self) -> &IoCounts {
+        &self.io
     }
 
     /// Truncate the file to exactly `blocks` blocks, discarding everything past
