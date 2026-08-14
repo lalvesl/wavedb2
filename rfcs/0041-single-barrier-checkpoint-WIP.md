@@ -1,10 +1,10 @@
 # RFC 0041 — Single-barrier checkpoint
 
-- **Status:** In progress (WIP — opened 2026-07-28)
+- **Status:** Implemented (landed 2026-07-28)
 - **Crates:** `wavedb-storage` (`wavedb-quick-node`'s maintenance policy is the only affected caller)
-- **Code:** `crates/wavedb-storage/src/{settle,commit,directory_pages,journal,alloc}.rs`
+- **Code:** `crates/wavedb-storage/src/{plan,checkpoint,settle,commit,chain}.rs`
 - **Builds on:** [RFC 0018](0018-storage-engine.md), [RFC 0019](0019-journal-rooted-recovery.md)
-- **Companion:** [RFC 0042](0042-free-space-defragmentation-PLANNED.md) — supplies the large
+- **Companion:** [RFC 0042](0042-free-space-defragmentation.md) — supplies the large
   contiguous windows this checkpoint consumes (not a correctness dependency:
   without it the window falls back to growing the tail)
 
@@ -87,7 +87,7 @@ today; nothing has been allocated or written.
 
 Sum the blocks of everything (pages + chain blocks + a grown dictionary run) and
 call `alloc.alloc(total)` **once**. Best-fit returns the smallest free extent that
-holds the whole checkpoint — when [RFC 0042](0042-free-space-defragmentation-PLANNED.md)
+holds the whole checkpoint — when [RFC 0042](0042-free-space-defragmentation.md)
 has consolidated a large window, recycling happens here with no special case; when
 no hole fits, the file grows at the tail. The returned `Run` is carved into
 per-page `BlockDescriptor::from_run_used(...)`. The allocator is not told about
@@ -108,15 +108,24 @@ lands under `StructStorage::chain()`. Readers begin seeing the new pages — whi
 are already durable. This closes the window today's settle leaves open, where the
 directory is mutated *before* `file.sync()`.
 
-### Phase 5 — the `Commit` frame, with no barrier of its own
+### Phase 5 — the `Commit` frame
 
 `JournalFrame::Commit(CommitFrame { journal_ts, roots, dicts })` is appended to
-the **new** journal without its own fsync; it becomes durable when the next
-`Batch` fsync lands (physical order in the file is already the contract —
-`commit`'s module docs). The one consequence: the retired journal cannot be
-deleted at that moment. `old.delete()` moves behind "the `Commit` is known
-durable" — the next successful `Batch` append, or the following checkpoint;
-`restore` already deletes journals a commit covers.
+the **new** journal, and the retired journal is deleted.
+
+> **Amended while implementing (2026-07-28).** The design first called for
+> appending this frame *without* its own fsync — letting the next `Batch` fsync
+> carry it, so a checkpoint would cost exactly one barrier. That does not hold
+> together: deleting the retired journal is only safe once the frame is durable,
+> and the retired journal is the *only* place the previous `Commit` lives. A
+> crash between the unlink and the frame reaching disk would leave recovery with
+> neither. Deferring the delete instead means tracking "which journal must be
+> synced before which file may go", and back-to-back checkpoints (no `Batch` in
+> between) need an explicit sync anyway. So the frame keeps the fsync `append`
+> already does, and a checkpoint costs **two** barriers: the window, then the
+> frame naming it. Both are per *checkpoint*, not per mutation — the thing this
+> RFC actually set out to fix was the scattered per-id writes, and those are
+> gone.
 
 ### Phase 6 — release
 
@@ -164,15 +173,24 @@ is the only tuning dimension left.
 
 ### Testing
 
-- IO accounting: a checkpoint over N ids spread across B buckets performs exactly
-  B page reads, 1 write, 1 sync — asserted by counting through `BlockFile`.
-- Kill-during-write between Phases 3 and 5: reopen recovers to the previous
-  `Commit`, replays the retained journal, and the abandoned window is free space.
-- Kill between Phase 5 and the deferred `old.delete()`: reopen finds the newer
-  `Commit`, deletes the covered journal, replays nothing.
-- A checkpoint whose window fits an existing hole must not grow the file
-  (`total_blocks` unchanged).
-- Baseline recorded in `crates/wavedb-bench/results/` before and after.
+`BlockFile` counts its own reads, writes and syncs (`BlockFile::io()` →
+`IoCounts::snapshot`), so the claims are assertions rather than prose:
+
+- `a_settle_round_is_one_write_and_one_read_per_touched_page` — 40 records
+  re-settle in **one** write, **zero** syncs, at most one read per bucket.
+- `a_checkpoint_is_one_write_and_one_barrier` — pages, dictionary and chains
+  share one window write; one sync; and the result is a real recovery root
+  (reopen resolves the records).
+- The existing durability suite is unchanged and still green:
+  `torn_commit_frame_falls_back_to_the_old_journal`,
+  `covered_journal_left_behind_is_skipped_and_cleaned`,
+  `unsettled_writes_read_correctly_and_survive_reopen`,
+  `many_records_trigger_split_and_stay_readable` (splits now decided in the
+  plan), `tombstone_hides_stale_page_until_settle`.
+
+Still open as follow-ups: a kill-during-window-write test (the abandoned window
+must read back as free space), and a baseline in
+`crates/wavedb-bench/results/`.
 
 ## Alternatives
 
@@ -199,4 +217,12 @@ is the only tuning dimension left.
   metadata must be synced; a recycled window does not, and `fdatasync` would be
   cheaper. Wants a `BlockFile::sync_data` and a preallocation policy.
 - **Where the split threshold reads from** once splits are planned in RAM:
-  serialized bytes or block count.
+  serialized bytes or block count. *(Implemented as the serialized block count,
+  re-checked after each split, bounded by `MAX_SPLITS_PER_ROUND`.)*
+- **The chain is the one part that scales with the directory, not with the
+  change.** A dirty type rewrites its whole address vector — `ceil(buckets/507)`
+  blocks — even if one bucket moved, because `ChainNode` is doubly linked and
+  copy-on-writing one node cascades into its neighbours' links. Making it
+  `dirty_nodes + 1` needs a different chain shape (a root block indexing the
+  node addresses instead of node-to-node links). Deliberately left alone here;
+  it is a format change and wants its own RFC.
