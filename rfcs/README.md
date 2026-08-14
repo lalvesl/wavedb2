@@ -31,13 +31,18 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   exposure registry's **compile-time** collision guard (full-`STRUCT_HASH` clash
   = error, 15-bit `type_salt` clash = warning), recorded in
   [0040](0040-schema-migration-and-version-skew-DEPRECATED.md).
-- **In flight — the storage write path:**
-  [0041](0041-single-barrier-checkpoint-WIP.md) turns a checkpoint into one
-  sequential write + one fsync (plan in RAM grouped per bucket → one contiguous
-  window → descriptor swap; the `Commit` frame rides the next `Batch` fsync),
-  with [0042](0042-free-space-defragmentation-PLANNED.md) keeping such windows
-  available. The per-mutation path is already one append + fsync and does not
-  change.
+- **The storage write path (2026-07-28):**
+  [0041](0041-single-barrier-checkpoint.md) *(Implemented)* replaced the per-id
+  settle — which read-modify-wrote a bucket page once per record — with a
+  planned window: pages grouped per bucket in RAM, one contiguous best-fit
+  allocation, **one** positioned write covering pages + dictionary + directory
+  chains, then the descriptor swap. A settle round takes no barrier at all; a
+  checkpoint takes one for the window and one for the `Commit` frame that names
+  it. The per-mutation path was already one append + fsync and did not change.
+  [0042](0042-free-space-defragmentation.md) *(Implemented)* keeps such windows
+  available: a background pass relocates live pages stranded between holes to
+  fresh tail blocks, so the space they vacate coalesces into the extent the next
+  checkpoint's best-fit lands in.
 - **Deferred (low priority):**
   [0036](0036-offline-write-queue-PLANNED-LOW.md) — W8 offline write queue
   (slice 1, Unique offline, *shipped*; the NonUnique/durable/conflict-surface
@@ -117,8 +122,8 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0037](0037-multi-node-cluster-PLANNED-LOW.md) | Multi-node cluster | Planned (low) |
 | [0038](0038-argon2-and-oauth-credentials-PLANNED-LOW.md) | Argon2 & OAuth/OIDC credentials | Planned (low) |
 | [0039](0039-developer-experience-PLANNED-LOW.md) | Developer experience (M9) | Planned (low) |
-| [0041](0041-single-barrier-checkpoint-WIP.md) | Single-barrier checkpoint | In progress |
-| [0042](0042-free-space-defragmentation-PLANNED.md) | Free-space defragmentation | Planned |
+| [0041](0041-single-barrier-checkpoint.md) | Single-barrier checkpoint | Implemented |
+| [0042](0042-free-space-defragmentation.md) | Free-space defragmentation | Implemented |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |
