@@ -42,7 +42,23 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   [0042](0042-free-space-defragmentation.md) *(Implemented)* keeps such windows
   available: a background pass relocates live pages stranded between holes to
   fresh tail blocks, so the space they vacate coalesces into the extent the next
-  checkpoint's best-fit lands in.
+  checkpoint's best-fit lands in. And
+  [0043](0043-descriptors-in-the-commit-frame.md) *(Implemented)* moved the
+  addressing state **into** the `Commit` frame — one journal append carries every
+  type's descriptor vector plus the retired journal's DONE marker, so `data.bin`
+  holds pages and dictionaries and nothing else, and the copy-on-write directory
+  chain is gone.
+- **Proposed next (storage & query):**
+  [0046](0046-directory-deltas-in-the-window-PLANNED.md) — the one place left
+  where a checkpoint's cost scales with the *database* instead of the *change*:
+  0043's frame carries every bucket of every type (1 MiB per checkpoint at
+  2 GiB, 100 MiB at 200 GiB), so the descriptor changes move into the settle
+  window itself — metadata for **zero** extra IOps, and the frame keeps only a
+  snapshot address and the list of deltas since it;
+  [0044](0044-page-cache-PLANNED-LOW.md) — a page-granular cache so the read
+  that precedes a write also serves the settle's read-modify-write;
+  [0045](0045-vector-search-PLANNED.md) — nearest-neighbour search as a
+  declared index kind (IVF over the existing `BpTree`, per-tenant centroids).
 - **Deferred (low priority):**
   [0036](0036-offline-write-queue-PLANNED-LOW.md) — W8 offline write queue
   (slice 1, Unique offline, *shipped*; the NonUnique/durable/conflict-surface
@@ -124,6 +140,10 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0039](0039-developer-experience-PLANNED-LOW.md) | Developer experience (M9) | Planned (low) |
 | [0041](0041-single-barrier-checkpoint.md) | Single-barrier checkpoint | Implemented |
 | [0042](0042-free-space-defragmentation.md) | Free-space defragmentation | Implemented |
+| [0043](0043-descriptors-in-the-commit-frame.md) | Descriptors in the `Commit` frame | Implemented |
+| [0044](0044-page-cache-PLANNED-LOW.md) | The page cache | Planned (low) |
+| [0045](0045-vector-search-PLANNED.md) | Vector search | Planned |
+| [0046](0046-directory-deltas-in-the-window-PLANNED.md) | Directory deltas in the settle window | Planned |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |
