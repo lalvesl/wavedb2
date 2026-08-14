@@ -1,29 +1,37 @@
-//! Deferred retirement — the second half of a checkpoint, held until its
-//! `Commit` frame is durable ([RFC 0046]).
+//! Deferred retirement — the second half of a checkpoint, disposed of by the
+//! checkpoint that follows it ([RFC 0047]).
 //!
-//! Since the frame carries only *pointers* into an addressing log `data.bin`
-//! already made durable, it needs no barrier of its own: it is written
-//! unsynced and the next ordinary `Batch` append's `fsync` carries it, since
-//! `fsync` flushes the file rather than one write. A checkpoint therefore
-//! costs **one** barrier — the `data.bin` sync — instead of two.
+//! A checkpoint's `Commit` frame is written unsynced ([RFC 0046]): it is a
+//! *pointer* into an addressing log `data.bin` already made durable, so it
+//! needs no barrier of its own and the next ordinary `Batch` append carries it
+//! (`fsync` flushes the file, not one write). A checkpoint therefore costs
+//! **one** barrier — the `data.bin` sync.
 //!
 //! What has to wait for that durability is everything the frame *authorises*:
 //!
-//! - **deleting the retired journal.** If the frame is torn, recovery falls
-//!   back to the previous `Commit`, and that journal's batches are the only
-//!   record of what happened since.
-//! - **rolling the allocator's protected set forward.** Rolling it releases
-//!   the frees deferred under the *previous* commit — the runs a fallback
-//!   recovery would still read.
+//! - **deleting the retired journal.** If the frame is torn or never lands,
+//!   recovery falls back to the previous `Commit`, and that journal's batches
+//!   are the only record of what happened since.
+//! - **dropping the older generation's block protection.** The allocator
+//!   protects the last *two* checkpoints' runs precisely because either can be
+//!   the root a crash reopens from; releasing the older one asserts that it
+//!   cannot (`BlockAllocator::release_previous`).
 //!
-//! Both are held in a [`Retiring`] until [`PageStore::finish_retirement`]
-//! observes the frame durable. There is at most one at a time:
-//! [`commit_journal`](PageStore::commit_journal) forces any pending one before
-//! it rotates, so the pending frame always lives in the *current* journal.
+//! Both are held in a [`Retiring`] until the **next checkpoint**. Waiting is
+//! free: a retained journal is disk, and disk is not the scarce resource.
+//! Chasing the durability is not free — completing from the write path puts a
+//! lock and an `unlink` inside a batch, and completing from an idle timer pays
+//! a whole barrier for housekeeping.
+//!
+//! The next checkpoint is also where the proof is cheapest. The frame lives in
+//! the journal that checkpoint rotates *out*, and [`Journal::barriers`] counts
+//! that file's `fsync`s — so comparing it against the count recorded when the
+//! frame was appended says whether an ordinary write already carried it. On any
+//! node that reached its checkpoint threshold by writing, it did.
 //!
 //! [RFC 0046]: ../../../rfcs/0046-directory-deltas-in-the-window.md
+//! [RFC 0047]: ../../../rfcs/0047-generational-journal-retirement-PLANNED.md
 
-use crate::block::Run;
 use crate::error::StorageResult;
 use crate::journal::Journal;
 use crate::page_store::PageStore;
@@ -33,61 +41,90 @@ use crate::page_store::PageStore;
 pub struct Retiring {
     /// The retired journal, deleted once the frame that retires it is durable.
     pub journal: Journal,
-    /// The protected set that frame implies — the next durable checkpoint's
-    /// runs.
-    pub used: Vec<Run>,
+    /// Barriers taken by the journal *carrying* the frame, read immediately
+    /// after appending it. The frame is durable once that journal's count has
+    /// moved past this.
+    ///
+    /// Read **after** the append and under the same guard, deliberately:
+    /// `commit_journal` rotates before it appends, so a concurrent writer can
+    /// `fsync` a batch into the new journal in between — a bare "any barrier at
+    /// all" test would read that sync as proof of a frame not yet written.
+    pub frame_barrier: u64,
 }
 
 impl PageStore {
-    /// Complete a pending retirement whose frame the caller just made durable
-    /// (an ordinary `Batch` append). A no-op when nothing is pending.
+    /// Dispose of the generation the previous checkpoint left pending, given
+    /// `carrier` — the journal this checkpoint just rotated out, which is the
+    /// one holding that pending frame.
     ///
-    /// Costs one `unlink`, no barrier — the accounting that makes deferral
-    /// worth it.
+    /// Free in the ordinary case: a checkpoint fires because its journal grew,
+    /// growth means `Batch` appends, and every `Batch` append `fsync`s. The
+    /// fallback barrier is reached only by a checkpoint with no writes to
+    /// settle at all.
     ///
     /// # Errors
-    /// [`StorageError::Io`](crate::StorageError::Io) if the unlink fails —
-    /// a broken data directory, which the next write would hit anyway. The
-    /// protection roll happens **first** precisely so that failure cannot
-    /// strand the deferred frees; the leftover file is then cleaned up by
-    /// recovery, which sees it covered by the durable frame.
-    pub(crate) fn finish_retirement(&self) -> StorageResult<()> {
-        // Take on its own line, deliberately: `commit_journal` publishes the
-        // retirement while holding the allocator, so this path must never
-        // hold `retiring` *across* `alloc.lock()` — folding these two
-        // statements into one `if let` would nest them the other way round
-        // and deadlock a checkpoint against a concurrent write.
-        let taken = self.retiring.lock().take();
-        let Some(retiring) = taken else {
+    /// A sync or unlink fault. The protection roll happens **first** precisely
+    /// so an unlink failure cannot strand the deferred frees; the leftover file
+    /// is then cleaned up by recovery, which sees it covered by the durable
+    /// frame. A fault here drops the pending record — safe in the same way, and
+    /// the reason the caller claims it before it can be observed half-done.
+    pub(crate) fn retire_previous(
+        &self,
+        pending: Option<Retiring>,
+        carrier: &mut Journal,
+    ) -> StorageResult<()> {
+        let Some(retiring) = pending else {
             return Ok(());
         };
-        // The frame's durability is what authorises both steps, so their
-        // order is free — and the infallible one goes first.
-        self.alloc.lock().set_protected(&retiring.used);
-        retiring.journal.delete()
+        if carrier.barriers() <= retiring.frame_barrier {
+            // Nothing has flushed this file since the frame was appended, so it
+            // is still only in the page cache. One barrier, in the case where
+            // the checkpoint had no work anyway.
+            carrier.sync()?;
+        }
+        self.dispose(retiring)
     }
 
     /// Make a pending checkpoint's frame durable **now** and complete it.
     ///
-    /// A no-op when nothing is pending — the ordinary case on a busy node,
-    /// where a `Batch` append has already carried the frame for free. Call it
-    /// when no such append is coming: an idle maintenance tick, a graceful
-    /// shutdown, or before the next checkpoint rotates.
+    /// A no-op when nothing is pending. Not needed on a running engine — the
+    /// next checkpoint disposes of the generation for free. Call it when there
+    /// is no next checkpoint: a graceful shutdown, where the engine is about to
+    /// be dropped and a clean data directory is worth one barrier.
     ///
     /// # Errors
     /// A sync or unlink fault. Nothing acked is at risk: until this succeeds
     /// the retired journal is still on disk and still rules.
     pub fn force_retirement(&self) -> StorageResult<()> {
-        if self.retiring.lock().is_none() {
+        if !self.is_retiring() {
             return Ok(());
         }
+        // The pending frame lives in the current journal — `commit_journal`
+        // claims the record before it rotates, so there is no state in which a
+        // retirement is observable while its carrier is not `self.journal`.
         self.journal.lock().sync()?;
-        self.finish_retirement()
+        let taken = self.retiring.lock().take();
+        let Some(retiring) = taken else {
+            return Ok(()); // someone else got there first
+        };
+        self.dispose(retiring)
     }
 
-    /// Whether a checkpoint is still waiting for its frame to become durable.
+    /// Whether a checkpoint is still waiting for its frame to become durable —
+    /// the steady state between checkpoints, not an anomaly.
     #[must_use]
     pub fn is_retiring(&self) -> bool {
         self.retiring.lock().is_some()
+    }
+
+    /// Drop the older generation's protection and the retired file. The frame's
+    /// durability is what authorises both, so their order is free — and the
+    /// infallible one goes first.
+    ///
+    /// Takes the record by value: `retiring` is never held across another
+    /// lock, which is what keeps the lock graph acyclic (see `page_store`).
+    fn dispose(&self, retiring: Retiring) -> StorageResult<()> {
+        self.alloc.lock().release_previous();
+        retiring.journal.delete()
     }
 }
