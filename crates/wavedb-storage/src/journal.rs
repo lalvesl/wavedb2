@@ -57,21 +57,27 @@ pub enum JournalFrame {
     Commit(CommitFrame),
 }
 
-/// "Journal `journal_ts` is fully settled into `data.bin`" — plus where
-/// every registered type's on-disk metadata lives.
+/// "Journal `journal_ts` is **done**" — its writes are settled into
+/// `data.bin` — plus the whole addressing state that makes those pages
+/// findable.
 ///
-/// Appended **after** every settle and chain write completed (physical
-/// order in the file is the contract: any later `Batch` fsync also makes
-/// this durable).
+/// The frame carries the directories themselves, not pointers to them: one
+/// append puts every type's bucket-descriptor vector and the retirement
+/// marker on disk together, so a checkpoint's metadata costs **one journal
+/// IOp** and `data.bin` holds no directory structure at all
+/// ([RFC 0043](../../../rfcs/0043-descriptors-in-the-commit-frame.md)).
+///
+/// Appended **after** the page window is synced: physical order is the
+/// contract, and a frame is only meaningful once the blocks it addresses
+/// are durable.
 #[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
 pub struct CommitFrame {
-    /// Timestamp of the journal this commit retires.
+    /// Timestamp of the journal this commit retires — the DONE marker.
     pub journal_ts: u64,
-    /// `(STRUCT_HASH, directory-chain root block)` for **every** registered
-    /// type — untouched types repeat their previous root (`0` = the type
-    /// never settled anything). All of them, every commit: the retired
-    /// journal may hold the only older mention.
-    pub roots: Vec<(u64, u64)>,
+    /// `(STRUCT_HASH, every bucket's raw BlockDescriptor)` for **every**
+    /// registered type. All of them, every commit: the retired journal is
+    /// deleted right after, so this frame must be self-sufficient.
+    pub slots: Vec<(u64, Vec<u64>)>,
     /// `(STRUCT_HASH, dictionary run descriptor raw)` — `0` = no dictionary.
     pub dicts: Vec<(u64, u64)>,
 }
