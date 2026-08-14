@@ -19,7 +19,7 @@
 //! rides the same window write, the vacated runs are freed through the
 //! allocator's protected set — so a run the last durable `Commit` still names
 //! is only released after the next one — and the directory is merely marked
-//! dirty, leaving the persisted chain pointing at the old, still-intact
+//! dirty, leaving the last committed delta pointing at the old, still-intact
 //! locations until a checkpoint rewrites it.
 //!
 //! [RFC 0041]: ../../../rfcs/0041-single-barrier-checkpoint.md

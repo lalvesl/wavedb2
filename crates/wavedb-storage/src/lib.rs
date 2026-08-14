@@ -28,12 +28,14 @@ mod defrag;
 pub mod dictionary;
 pub mod directory;
 mod directory_pages;
+mod edit;
 pub mod error;
 pub mod journal;
 pub mod page;
 pub mod page_store;
 mod plan;
 mod read_through;
+mod retire;
 mod settle;
 pub mod struct_storage;
 

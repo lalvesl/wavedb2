@@ -51,7 +51,13 @@ impl PageStore {
         // Commit under the journal lock: cache order == journal order.
         let touched = self.commit_to_caches(&effective)?;
         merge_touched(&mut self.pending.lock(), touched);
-        Ok(())
+        drop(journal);
+        // That fsync flushed the file, so a checkpoint's deferred `Commit`
+        // frame is now durable too — this batch just paid a barrier the
+        // checkpoint did not have to (RFC 0046). Taken after the journal
+        // guard drops: the retirement needs the allocator, and nothing else
+        // holds those two nested.
+        self.finish_retirement()
     }
 
     /// Read `id`'s current bytes without knowing its type: caches first,
