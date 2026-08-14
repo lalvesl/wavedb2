@@ -67,36 +67,22 @@ impl PageStore {
             std::mem::replace(&mut *journal, fresh)
         };
 
-        // 2. Everything the old journal holds settles into pages. (Writes
-        // landing in the new journal may settle too — harmless: their
-        // journal survives and re-settling converges.)
-        self.drain()?;
+        // 2 + 3. Everything the old journal holds settles into pages, and
+        // every drifted directory persists a fresh copy-on-write chain — one
+        // planned window, one positioned write (RFC 0041). Writes landing in
+        // the new journal may settle too: harmless, their journal survives
+        // and re-settling converges.
+        self.settle_and_persist_chains()?;
 
-        // 3 + snapshot. Fresh chains for dirty directories; collect every
-        // block the commit will reference (the next protected set).
+        // Snapshot: every block the commit will reference (the next
+        // protected set), plus the roots the frame names.
         let mut alloc = self.alloc.lock();
         let mut roots = Vec::with_capacity(self.types.len());
         let mut dicts = Vec::with_capacity(self.types.len());
         let mut used = vec![Run::new(0, RESERVED_BLOCKS)];
         for slot in &self.types {
             let dir_guard = slot.directory().lock();
-            let mut track = slot.chain().lock();
-            if track.dirty
-                && let Some(dir) = dir_guard.as_ref()
-            {
-                let addresses: Vec<u64> =
-                    dir.slots().iter().map(|d| d.raw()).collect();
-                let root =
-                    chain::write_chain(&self.file, &mut alloc, &addresses)?;
-                // CoW: free the superseded chain (deferred while the
-                // previous commit still protects it).
-                for block in std::mem::take(&mut track.blocks) {
-                    alloc.free(Run::new(block, 1));
-                }
-                track.root = root;
-                track.blocks = chain::read_chain(&self.file, root)?.1;
-                track.dirty = false;
-            }
+            let track = slot.chain().lock();
             used.extend(track.blocks.iter().map(|&b| Run::new(b, 1)));
             if let Some(dir) = dir_guard.as_ref() {
                 used.extend(
@@ -113,7 +99,8 @@ impl PageStore {
             roots.push((slot.struct_hash(), track.root));
             dicts.push((slot.struct_hash(), dict.descriptor().raw()));
         }
-        // Pages + chains must be on disk before the frame naming them.
+        // The window must be durable before the frame naming its blocks —
+        // the checkpoint's one barrier.
         self.file.sync()?;
 
         // 4. The atomic commit: one crc-framed append (fsync inside).
