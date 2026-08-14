@@ -287,23 +287,17 @@ async fn maintain(store: Rc<PageStore>, policy: Maintenance) {
         if store.drain().is_err() {
             return;
         }
-        let checkpointed = store.journal_len() > policy.checkpoint_after_bytes;
-        if checkpointed && store.commit_journal().is_err() {
-            return;
-        }
-        store.evict_settled(policy.cache_budget_bytes);
-        // A checkpoint leaves its `Commit` frame unsynced for the next write
-        // to carry, for free (RFC 0046). Give that a whole tick to happen —
-        // forcing in the same tick would pay the barrier the deferral exists
-        // to avoid. Only when a tick passes with no write at all (an idle
-        // node, where nobody is coming) is it worth paying, rather than
-        // leaving a retired journal on disk indefinitely.
-        if !checkpointed
-            && !store.has_pending()
-            && store.force_retirement().is_err()
+        if store.journal_len() > policy.checkpoint_after_bytes
+            && store.commit_journal().is_err()
         {
             return;
         }
+        store.evict_settled(policy.cache_budget_bytes);
+        // A checkpoint leaves its `Commit` frame unsynced for the next write to
+        // carry, for free, and its retired journal on disk until the next
+        // checkpoint disposes of it (RFC 0047). Maintenance has nothing to do
+        // about either: forcing the barrier here would spend the IOp the
+        // deferral exists to save, to reclaim disk — the abundant resource.
         // Keep a window large enough for the next checkpoint to land in a
         // hole rather than at the tail; a pass that finds nothing is free.
         if store.largest_free_extent() < policy.defrag_below_blocks
