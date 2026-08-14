@@ -48,22 +48,18 @@ pub struct SlotPlan {
     pub(crate) dict: Option<Vec<u8>>,
     /// Ids whose page write clears an unsettled-remove tombstone.
     pub(crate) cleared: Vec<Id>,
-    /// Chain nodes this plan persists (`0` = leave the chain as it is; a
-    /// checkpoint sets it, an ordinary settle round does not).
-    pub(crate) chain_nodes: usize,
 }
 
 impl SlotPlan {
-    /// A plan that only re-persists a slot's directory chain — for a type
-    /// whose pages settled in an earlier round but whose chain still lags.
-    pub(crate) const fn chain_only(idx: usize, dir: Directory) -> Self {
+    /// A plan carrying pages that are already serialised — the
+    /// defragmenter, which moves stored bytes verbatim.
+    pub(crate) const fn verbatim(idx: usize, dir: Directory) -> Self {
         Self {
             idx,
             dir,
             pages: BTreeMap::new(),
             dict: None,
             cleared: Vec::new(),
-            chain_nodes: 0,
         }
     }
 }
@@ -135,7 +131,6 @@ impl PageStore {
             pages,
             dict: dict_grew.then(|| dict.image()),
             cleared,
-            chain_nodes: 0,
         })
     }
 
