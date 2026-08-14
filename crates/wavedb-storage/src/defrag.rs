@@ -100,7 +100,7 @@ impl PageStore {
                     else {
                         continue;
                     };
-                    v.insert(SlotPlan::chain_only(candidate.slot, dir))
+                    v.insert(SlotPlan::verbatim(candidate.slot, dir))
                 }
             };
             plan.pages.insert(candidate.bucket, bytes);
