@@ -9,13 +9,24 @@
 //!
 //! ## Checkpoint protection
 //!
-//! Runs named by the last **durable checkpoint** must survive until the next
-//! checkpoint commits — a crash in between reopens *from* that checkpoint,
+//! Runs a **recovery root** names must survive — a crash reopens *from* one,
 //! so overwriting a run it points at would corrupt the reopened state.
 //! [`set_protected`](BlockAllocator::set_protected) registers those runs;
-//! freeing one is **deferred** (held in a pending list) and released when a
-//! later `set_protected` drops its protection. With no checkpoint (a fresh
-//! or rebuild-on-open store) nothing is protected and frees are immediate.
+//! freeing one is **deferred** (held in a pending list) and released once
+//! protection lifts. With no checkpoint (a fresh or rebuild-on-open store)
+//! nothing is protected and frees are immediate.
+//!
+//! **Two generations, not one.** A checkpoint's `Commit` frame is written
+//! without a barrier ([RFC 0046]), so until an ordinary write flushes it there
+//! are *two* possible roots: the new frame and the one before it. Both sets are
+//! therefore protected — `set_protected` installs the new one and keeps the old
+//! as `previous`, which [`release_previous`](BlockAllocator::release_previous)
+//! drops once the next checkpoint proves the frame durable ([RFC 0047]).
+//! Protecting only the newest would let a settle round in that interval free —
+//! and reuse — a run the older root still points at.
+//!
+//! [RFC 0046]: ../../../rfcs/0046-directory-deltas-in-the-window.md
+//! [RFC 0047]: ../../../rfcs/0047-generational-journal-retirement.md
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -30,8 +41,11 @@ pub struct BlockAllocator {
     by_size: BTreeSet<(u64, u64)>,
     /// Current file length, in blocks.
     total_blocks: u64,
-    /// start → count of the last durable checkpoint's runs (see module docs).
+    /// start → count of the newest checkpoint's runs (see module docs).
     protected: BTreeMap<u64, u64>,
+    /// The checkpoint before it, retained while its successor's frame is
+    /// unproven — the other root a crash could reopen from.
+    previous: BTreeMap<u64, u64>,
     /// Frees deferred because the run was protected at the time.
     pending: Vec<Run>,
 }
@@ -83,6 +97,14 @@ impl BlockAllocator {
     #[must_use]
     pub fn free_blocks(&self) -> u64 {
         self.by_size.iter().map(|&(count, _)| count).sum()
+    }
+
+    /// Blocks held back by deferred frees — runs a live generation still
+    /// protects. Zero when no checkpoint is reachable (a fresh store), and the
+    /// gauge that says protection is actually engaged.
+    #[must_use]
+    pub fn deferred_blocks(&self) -> u64 {
+        self.pending.iter().map(|r| r.count).sum()
     }
 
     /// Number of distinct free extents (a fragmentation gauge, for
@@ -233,28 +255,51 @@ impl BlockAllocator {
         self.insert_extent(start, count);
     }
 
-    /// Replace the protected set with the (new) checkpoint's runs, then
-    /// retry every deferred free — anything no longer protected returns to
-    /// the pool. Called right after a checkpoint's superblock pointer lands
-    /// (the durability point that retires the previous checkpoint).
+    /// Install a checkpoint's runs as the newest protected set, demoting the
+    /// one it supersedes to `previous` — which stays protected until
+    /// [`release_previous`](Self::release_previous), because that older
+    /// checkpoint is still a reachable recovery root (see module docs).
+    ///
+    /// Called as a checkpoint publishes, so nothing can free into the state it
+    /// is about to name.
     pub fn set_protected(&mut self, runs: &[Run]) {
-        self.protected = runs
+        let fresh = runs
             .iter()
             .filter(|r| r.count > 0)
             .map(|r| (r.start, r.count))
             .collect();
+        self.previous = std::mem::replace(&mut self.protected, fresh);
+        self.retry_pending();
+    }
+
+    /// Drop the older generation's protection and return whatever it alone was
+    /// holding to the pool. Called once the newest checkpoint's `Commit` frame
+    /// is known durable, which makes it the only reachable root.
+    pub fn release_previous(&mut self) {
+        self.previous.clear();
+        self.retry_pending();
+    }
+
+    /// Re-offer every deferred free — anything no longer protected returns to
+    /// the pool.
+    fn retry_pending(&mut self) {
         let pending = std::mem::take(&mut self.pending);
         for run in pending {
             self.free(run); // re-checks protection
         }
     }
 
-    /// Whether `run` intersects a protected run.
+    /// Whether `run` intersects a run either live generation protects.
     fn is_protected(&self, run: Run) -> bool {
-        // The candidate protected run is the last one starting at or before
-        // `run`'s end; runs never overlap, so one probe suffices.
-        self.protected
-            .range(..run.end())
+        Self::covers(&self.protected, run) || Self::covers(&self.previous, run)
+    }
+
+    /// Whether one generation's set covers any block of `run`. Within a single
+    /// set the runs are a snapshot of live allocations and so never overlap,
+    /// which is what lets a single probe decide it.
+    fn covers(set: &BTreeMap<u64, u64>, run: Run) -> bool {
+        // The candidate is the last run starting at or before `run`'s end.
+        set.range(..run.end())
             .next_back()
             .is_some_and(|(&start, &count)| start + count > run.start)
     }
@@ -383,8 +428,13 @@ mod tests {
         a.free(page); // unprotected → immediate
         assert_eq!(a.free_blocks(), 3);
 
-        // The next checkpoint retires the old protection.
+        // The next checkpoint installs its own set — but the old one is only
+        // *demoted*, still a reachable root, so the deferred free stays held.
         a.set_protected(&[Run::new(5, 2)]);
+        assert_eq!(a.free_blocks(), 3, "a demoted set still protects");
+
+        // Proving that frame durable is what finally retires it.
+        a.release_previous();
         assert_eq!(a.free_blocks(), 5, "deferred free must release");
     }
 
