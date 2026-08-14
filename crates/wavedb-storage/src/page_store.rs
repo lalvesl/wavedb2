@@ -31,6 +31,12 @@
 //! on the read-through path. No path takes them in a conflicting order, so
 //! the graph is acyclic.
 //!
+//! `retiring` is the one lock taken on both sides of `alloc`: a checkpoint
+//! publishes under it (`alloc → retiring`), and a write completing that
+//! retirement takes it first (`retiring`, released, then `alloc`). The
+//! release is what keeps the graph acyclic, so `crate::retire` never holds
+//! `retiring` across `alloc.lock()` — see the comment there.
+//!
 //! ## Reads
 //!
 //! The cache is a **cache**, not the dataset: a read serves from the type's
@@ -47,7 +53,8 @@
 //! roots in the newest valid `Commit` frame (journal-rooted — see
 //! [`PageStore::commit_journal`] and the `commit` module docs). On
 //! [`open`](PageStore::open): with a durable `Commit`, the
-//! directories/dictionaries/allocator load from its chains, the caches start
+//! directories/dictionaries/allocator replay from the addressing log it
+//! names, the caches start
 //! **empty** (reads fall through to the pages), and only the uncovered
 //! `Batch` frames replay; without one (first generation), the data file is
 //! truncated back to its superblock and every committed batch replays
@@ -95,6 +102,12 @@ pub struct PageStore {
     pub(crate) data_dir: std::path::PathBuf,
     pub(crate) journal: Mutex<crate::journal::Journal>,
     pub(crate) alloc: Mutex<BlockAllocator>,
+    /// The addressing log written into the settle windows (RFC 0046): the
+    /// last full snapshot chunk and every delta chunk after it.
+    pub(crate) meta: Mutex<crate::edit::MetaLog>,
+    /// A checkpoint whose `Commit` frame is written but not yet durable —
+    /// the retired journal and the protection roll it authorises (RFC 0046).
+    pub(crate) retiring: Mutex<Option<crate::retire::Retiring>>,
     /// The registered slots, sorted by `STRUCT_HASH` (deduped) — a lock-free,
     /// read-only route table after open.
     pub(crate) types: Vec<&'static StructStorage>,
@@ -152,6 +165,8 @@ impl PageStore {
             data_dir: dir.to_path_buf(),
             journal: Mutex::new(recovered.journal),
             alloc: Mutex::new(recovered.alloc),
+            meta: Mutex::new(recovered.meta),
+            retiring: Mutex::new(None),
             types,
             seed,
             split_threshold_blocks: DEFAULT_SPLIT_THRESHOLD_BLOCKS,
@@ -202,9 +217,12 @@ mod tests {
     use wavedb_core::{Id, Store, U48, Write};
 
     const SH: u64 = 0x1122_3344_5566_7788;
+    const SH2: u64 = 0x99AA_BBCC_DDEE_FF00;
 
     /// The test slot every raw record routes to (`SH`-headed).
     static TEST_SLOT: StructStorage = StructStorage::new(SH);
+    /// A second registered type, for the multi-slot paths.
+    static OTHER_SLOT: StructStorage = StructStorage::new(SH2);
 
     /// The per-struct slots are process-global statics, so only one store may
     /// live at a time — serialise the tests that open one.
@@ -265,8 +283,11 @@ mod tests {
         });
     }
 
-    /// A checkpoint adds exactly one barrier, and still only one write: the
-    /// pages, the dictionary and every drifted chain share the window.
+    /// A checkpoint costs **one** write and **one** barrier, counting both
+    /// files: the pages, the dictionary and the round's descriptor delta
+    /// share the window write and its `data.bin` sync, and the `Commit` frame
+    /// takes no barrier of its own — the next ordinary write carries it, and
+    /// only then is the retirement completed (RFC 0046).
     #[test]
     fn a_checkpoint_is_one_write_and_one_barrier() {
         let _g = engine_gate();
@@ -281,8 +302,23 @@ mod tests {
             let (_, writes, syncs) = s.file.io().snapshot();
             s.commit_journal().unwrap();
             let (_, w, sy) = s.file.io().snapshot();
-            assert_eq!(w - writes, 1, "pages + chains ride one window write");
-            assert_eq!(sy - syncs, 1, "exactly one durability barrier");
+            assert_eq!(w - writes, 1, "pages + delta ride one window write");
+            assert_eq!(sy - syncs, 1, "one `data.bin` barrier…");
+            assert_eq!(
+                s.journal.lock().barriers(),
+                0,
+                "…and none on the fresh journal: the frame is deferred"
+            );
+            assert!(s.is_retiring());
+
+            // The next ordinary write pays a barrier it was paying anyway,
+            // and that fsync carries the frame — no extra IO at all.
+            s.apply(&[Write::Put(nonunique(99), rec(SH, b"carrier"))])
+                .await
+                .unwrap();
+            assert_eq!(s.journal.lock().barriers(), 1, "the batch's own fsync");
+            assert!(!s.is_retiring(), "which completed the retirement");
+            assert_eq!(journals(d.path()).len(), 1);
         });
         // And the commit is a real recovery root.
         drop(s);
@@ -291,6 +327,100 @@ mod tests {
             assert_eq!(
                 s.get(nonunique(7)).await.unwrap(),
                 Some(rec(SH, b"payload"))
+            );
+        });
+    }
+
+    /// RFC 0046: the descriptors ride the settle window, so the `Commit` frame
+    /// only *names* the addressing log. Its cost must therefore stay below the
+    /// 8 bytes per bucket RFC 0043 spent carrying the directory itself — every
+    /// checkpoint, for every type, forever.
+    #[test]
+    fn a_commit_frame_tracks_the_log_not_the_directory() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let mut s = open(d.path());
+        // One block per bucket: a wide directory for little data, which is
+        // exactly the shape this claim is about.
+        s.split_threshold_blocks = 1;
+        block_on(async {
+            for chunk in (0..200u64).step_by(50) {
+                // Batched applies keep the fsync count sane.
+                let batch: Vec<Write> = (chunk..chunk + 50)
+                    .map(|k| Write::Put(nonunique(k), rec(SH, &noise(k))))
+                    .collect();
+                s.apply(&batch).await.unwrap();
+                s.drain().unwrap();
+            }
+            s.commit_journal().unwrap();
+
+            // The fresh journal holds exactly the Commit frame, so its length
+            // *is* the frame's cost.
+            let (buckets, frame) = (s.bucket_count(SH), s.journal_len());
+            assert!(buckets >= 16, "expected a wide directory, got {buckets}");
+            assert!(
+                frame < 8 * buckets as u64,
+                "a {buckets}-bucket directory framed in {frame} bytes — \
+                 carrying the descriptors would have cost {} plus overhead",
+                8 * buckets
+            );
+        });
+    }
+
+    /// Compaction keeps the log bounded: without it every checkpoint would
+    /// add another chunk address to the frame forever. And the whole chain —
+    /// snapshot plus the deltas folded over it — must still restore.
+    ///
+    /// A second type that only ever writes *before* the compaction guards the
+    /// snapshot's other half: a full chunk must carry the resident state of
+    /// the types its round never touched, or that type is lost at the next
+    /// reopen.
+    #[test]
+    fn compaction_bounds_the_log_and_the_chain_still_restores() {
+        const ROUNDS: u64 = 120;
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let open2 = |path: &std::path::Path| {
+            PageStore::open(path, &[&TEST_SLOT, &OTHER_SLOT]).unwrap()
+        };
+        block_on(async {
+            let s = open2(d.path());
+            s.apply(&[Write::Put(nonunique(7), rec(SH2, b"untouched"))])
+                .await
+                .unwrap();
+            s.drain().unwrap();
+
+            let mut widest = 0;
+            for k in 0..ROUNDS {
+                s.apply(&[Write::Put(nonunique(k), rec(SH, b"round"))])
+                    .await
+                    .unwrap();
+                s.commit_journal().unwrap(); // drains, then frames the log
+                widest = widest.max(s.journal_len());
+            }
+            // Unbounded growth would reach ~8 bytes per round on top of the
+            // frame's fixed head; compaction caps it far below that.
+            assert!(
+                widest < 8 * ROUNDS,
+                "the log must compact: widest frame was {widest} bytes over \
+                 {ROUNDS} checkpoints"
+            );
+            drop(s);
+
+            // Reopen: the snapshot chunk plus every delta after it.
+            let s = open2(d.path());
+            assert_eq!(s.cache_len(), 0, "a committed open starts cold");
+            for k in 0..ROUNDS {
+                assert_eq!(
+                    s.get(nonunique(k)).await.unwrap(),
+                    Some(rec(SH, b"round")),
+                    "record {k} lost across the delta chain"
+                );
+            }
+            assert_eq!(
+                s.get_of(SH2, nonunique(7)).await.unwrap(),
+                Some(rec(SH2, b"untouched")),
+                "a snapshot must carry the types its round did not touch"
             );
         });
     }
@@ -678,10 +808,18 @@ mod tests {
                 .unwrap();
                 s.apply(&[Write::Remove(nonunique(2))]).await.unwrap();
                 s.commit_journal().unwrap();
+                // The frame is written but unsynced, so the retirement it
+                // authorises is still pending (RFC 0046) — the old journal
+                // stays until something makes the frame durable.
+                assert!(s.is_retiring());
+                assert_eq!(journals(d.path()).len(), 2);
+                s.force_retirement().unwrap();
+                assert!(!s.is_retiring());
                 assert_eq!(
                     journals(d.path()).len(),
                     1,
-                    "the retired journal must be deleted"
+                    "the retired journal must be deleted once the frame is \
+                     durable"
                 );
             }
             let s = open(d.path());
@@ -773,6 +911,48 @@ mod tests {
                 1,
                 "recovery must clean the covered leftover"
             );
+        });
+    }
+
+    /// The deferral's safety net (RFC 0046): a `Commit` frame written without
+    /// a barrier may simply never reach the disk. Because the retirement waits
+    /// for it, the retired journal is still there — and every acked write
+    /// replays out of it.
+    #[test]
+    fn a_deferred_commit_that_never_lands_replays_the_retained_journal() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        block_on(async {
+            {
+                let s = open(d.path());
+                for k in 0..5u64 {
+                    s.apply(&[Write::Put(nonunique(k), rec(SH, b"acked"))])
+                        .await
+                        .unwrap();
+                }
+                s.commit_journal().unwrap();
+                assert!(s.is_retiring(), "the frame must still be pending");
+            }
+            // The unsynced frame never made it: the new journal comes back
+            // empty, exactly as a crash in that window would leave it.
+            let mut files = journals(d.path());
+            assert_eq!(files.len(), 2, "the retired journal must be retained");
+            let newest = files.pop().unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&newest)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+
+            let s = open(d.path());
+            for k in 0..5u64 {
+                assert_eq!(
+                    s.get(nonunique(k)).await.unwrap(),
+                    Some(rec(SH, b"acked")),
+                    "record {k} lost with the deferred commit"
+                );
+            }
         });
     }
 
