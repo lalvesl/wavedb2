@@ -20,7 +20,7 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 | `plan`            | A checkpoint's phase 1: touched ids → page images grouped per bucket, splits decided, nothing written.       |
 | `checkpoint`      | Phases 2–4: one best-fit window for every image, one positioned write, then the descriptor swap.            |
 | `edit`            | The addressing delta riding each window (`EditChunk`), its recovery fold (`Replay`), and the log + compaction policy (`MetaLog`). |
-| `retire`          | A checkpoint's deferred half: the retired journal + protection roll held until the `Commit` frame is durable.       |
+| `retire`          | A checkpoint's deferred half: the retired journal + protection roll, held for the *next* checkpoint to dispose of.  |
 | `settle`          | The drain queue: what a round is, when it retries, and the cache-eviction budget.                           |
 | `chain`           | Directory chain blocks — the persisted address vector, copy-on-write, placed in the checkpoint's window.    |
 | `defrag`          | Relocates live pages stranded between holes to fresh tail blocks so free extents coalesce.                  |
@@ -463,11 +463,17 @@ grown dictionary; then `data.bin` is synced — and that is the only barrier. Th
 since it) into state that sync already made durable, so it is appended
 **unsynced** and the next ordinary write's fsync carries it. Its size tracks
 rounds settled since the last compaction, **not** the size of the database, so a
-wide directory no longer costs 8 bytes per bucket per checkpoint. Deleting the
-retired journal and rolling the allocator's protection wait for that durability
-(`retire`); `force_retirement()` pays the barrier explicitly when no write is
-coming. `BlockFile::io()` and `Journal::barriers()` count all of this, and the
-accounting is asserted in `page_store`'s tests.
+wide directory no longer costs 8 bytes per bucket per checkpoint.
+
+Deleting the retired journal and rolling the allocator's protection wait for that
+durability, and are then done by the **next** checkpoint — which holds the
+journal carrying the frame and reads its barrier count to know
+([RFC 0047](../../rfcs/0047-generational-journal-retirement.md)). So two journals
+on disk is the steady state, nothing is chased from the write path, and **no
+barrier is paid anywhere on a checkpoint's behalf**; `force_retirement()` remains
+for shutdown, where there is no next checkpoint. `BlockFile::io()` and
+`Journal::barriers()` count all of this, and the accounting is asserted in
+`page_store`'s tests.
 
 What still scales with the work rather than with the batch is the *logical* index
 maintenance above the store, which decides how many values a batch contains:

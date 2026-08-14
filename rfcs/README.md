@@ -59,6 +59,13 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   needs no barrier of its own — a checkpoint costs **one**, the `data.bin`
   sync, with the retirement it authorises deferred until an ordinary write's
   fsync carries the frame.
+  [0047](0047-generational-journal-retirement.md) *(Implemented)* closed the
+  accounting: that retirement is now disposed of by the **next** checkpoint,
+  which holds the journal carrying the frame and can read its barrier count,
+  rather than being chased from the write path (a lock and an `unlink` inside a
+  batch) or from an idle timer (a whole barrier for housekeeping). Two journals
+  on disk is the steady state — disk being the abundant resource — and no
+  barrier is paid anywhere on a checkpoint's behalf.
 - **Proposed next (storage & query):**
   [0044](0044-page-cache-PLANNED-LOW.md) — a page-granular cache so the read
   that precedes a write also serves the settle's read-modify-write;
@@ -149,6 +156,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0044](0044-page-cache-PLANNED-LOW.md) | The page cache | Planned (low) |
 | [0045](0045-vector-search-PLANNED.md) | Vector search | Planned |
 | [0046](0046-directory-deltas-in-the-window.md) | Directory deltas in the settle window | Implemented |
+| [0047](0047-generational-journal-retirement.md) | Generational journal retirement | Implemented |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |

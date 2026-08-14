@@ -156,6 +156,14 @@ The cost of deferral is that a retired journal lingers until the next write.
 Recovery already handles a retained-but-covered journal (it deletes it), and on
 an idle node the maintenance tick forces within one period.
 
+> **Followed by [RFC 0047](0047-generational-journal-retirement.md)**
+> (Implemented 2026-07-29).
+> That forcing is the one barrier this design still pays on a checkpoint's
+> behalf, just from a different call site — and completing the retirement from
+> `apply` puts a lock and an `unlink` on the write path. 0047 drops both by
+> holding the retirement until the *next* checkpoint, where the journal that
+> carries the frame is the one being rotated out.
+
 ### Compaction
 
 When `edits` grows past its threshold, the next settle round emits, alongside
