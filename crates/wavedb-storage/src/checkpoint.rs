@@ -10,9 +10,11 @@
 //! a reader either sees the previous pages (still allocated, still valid:
 //! page writes are copy-on-write) or the new ones, never a half-written run.
 //!
-//! The *addressing* state is not written here at all: a checkpoint puts every
-//! type's descriptor vector straight into its `Commit` frame
-//! ([RFC 0043]), so `data.bin` holds pages and dictionaries and nothing else.
+//! The window's last target is the round's own [`EditChunk`](crate::edit):
+//! the descriptor changes these pages caused, riding the same write
+//! ([RFC 0046]). Its length is fixed by the round's *shape*, so a reservation
+//! pass over the same plans predicts it exactly; the second pass, after
+//! `install`, fills in the addresses.
 //!
 //! Nothing on disk records that these blocks were written together: the window
 //! is an allocation-time concept only, and each page keeps its own descriptor.
@@ -20,10 +22,13 @@
 //! back into a large hole.
 //!
 //! [RFC 0041]: ../../../rfcs/0041-single-barrier-checkpoint.md
-//! [RFC 0043]: ../../../rfcs/0043-descriptors-in-the-commit-frame.md
+//! [RFC 0046]: ../../../rfcs/0046-directory-deltas-in-the-window.md
+
+use std::collections::BTreeMap;
 
 use crate::block::{BLOCK_SIZE, BlockAllocator, BlockDescriptor, Run};
-use crate::error::StorageResult;
+use crate::edit;
+use crate::error::{StorageError, StorageResult};
 use crate::page_store::{PageStore, Touched};
 use crate::plan::{SlotPlan, blocks_of};
 
@@ -40,8 +45,15 @@ enum Placement {
 
 /// Where a placed image's descriptor is installed once the window is written.
 enum Target {
-    Page { plan: usize, bucket: usize },
-    Dict { plan: usize },
+    Page {
+        plan: usize,
+        bucket: usize,
+    },
+    Dict {
+        plan: usize,
+    },
+    /// The round's addressing delta — always last, always exactly one.
+    Edit,
 }
 
 impl PageStore {
@@ -78,8 +90,15 @@ impl PageStore {
         self.place_in(plans, Placement::Tail)
     }
 
-    /// Phases 2–4 + 6: carve one window for every planned image, write it,
-    /// swap the descriptors in, and release the superseded runs.
+    /// Phases 2–4 + 6: carve one window for every planned image *and* the
+    /// round's edit chunk, write it, swap the descriptors in, and release the
+    /// superseded runs.
+    ///
+    /// # Errors
+    /// The window write's fault, or [`StorageError::Corrupt`] if the filled
+    /// edit chunk outgrew the space its skeleton reserved (unreachable: both
+    /// passes build the same shape). Either way nothing has been written,
+    /// freed, or published.
     // The allocator guard deliberately spans carve → write → free: the window
     // must not be handed out twice, and a superseded run must not return to
     // the pool before the page replacing it is on disk.
@@ -89,17 +108,25 @@ impl PageStore {
         mut plans: Vec<SlotPlan>,
         placement: Placement,
     ) -> StorageResult<()> {
-        let targets = targets_of(&plans);
+        let mut targets = targets_of(&plans);
         if targets.is_empty() {
             return Ok(());
         }
         let mut alloc = self.alloc.lock();
-        let sizes: Vec<u64> =
-            targets.iter().map(|t| size_of(&plans, t)).collect();
+        let mut meta = self.meta.lock();
+
+        // Pass one: the chunk's shape fixes its length, so a skeleton built
+        // from the same plans reserves exactly what the filled one needs.
+        let full = meta.wants_snapshot();
+        let reserved =
+            edit::encode(&edit::chunk_of(self, &plans, full, &BTreeMap::new()));
+        targets.push(Target::Edit);
+        let sizes: Vec<u64> = targets
+            .iter()
+            .map(|t| size_of(&plans, t, &reserved))
+            .collect();
         let total: u64 = sizes.iter().sum();
 
-        // Nothing to place (every planned page emptied out) still repoints
-        // descriptors — it just needs no window.
         let window = (total > 0).then(|| match placement {
             Placement::BestFit => alloc.alloc(total),
             Placement::Tail => alloc.alloc_tail(total),
@@ -107,14 +134,28 @@ impl PageStore {
         let runs = window
             .map_or_else(|| vec![None; targets.len()], |w| carve(w, &sizes));
         let freed = install(&mut plans, &targets, &runs);
+
+        // Pass two: the same shape, now naming the runs just handed out.
+        let dicts = dict_descriptors(&plans, &targets, &runs);
+        let chunk = edit::encode(&edit::chunk_of(self, &plans, full, &dicts));
+        if chunk.len() > reserved.len() {
+            return Err(StorageError::Corrupt("edit chunk outgrew its window"));
+        }
+
         if let Some(window) = window {
-            let buf = assemble(window, &plans, &targets, &runs);
+            let buf = assemble(window, &plans, &targets, &runs, &chunk);
             self.file.write_run(window, &buf)?; // the round's one write
         }
         for run in freed {
             alloc.free(run);
         }
-        self.publish(plans, &targets, &runs, &mut alloc);
+        if let Some(run) = runs.last().copied().flatten() {
+            let desc = BlockDescriptor::from_run_used(run, chunk.len() as u64);
+            for stale in meta.record(desc, full) {
+                alloc.free(stale);
+            }
+        }
+        self.publish(plans, &dicts, &mut alloc);
         Ok(())
     }
 
@@ -123,19 +164,14 @@ impl PageStore {
     fn publish(
         &self,
         plans: Vec<SlotPlan>,
-        targets: &[Target],
-        runs: &[Option<Run>],
+        dicts: &BTreeMap<usize, BlockDescriptor>,
         alloc: &mut BlockAllocator,
     ) {
         for (plan, work) in plans.iter().enumerate() {
-            let Some(run) = dict_run(targets, runs, plan) else {
+            let Some(&desc) = dicts.get(&plan) else {
                 continue;
             };
-            let used = work.dict.as_ref().map_or(0, Vec::len) as u64;
-            let old = self.types[work.idx]
-                .dictionary()
-                .lock()
-                .repoint(BlockDescriptor::from_run_used(run, used));
+            let old = self.types[work.idx].dictionary().lock().repoint(desc);
             if old.is_allocated() {
                 alloc.free(old.run());
             }
@@ -150,7 +186,8 @@ impl PageStore {
     }
 }
 
-/// Everything this round places, in window order.
+/// Everything this round places, in window order (the edit chunk is appended
+/// by the caller once its size is known).
 fn targets_of(plans: &[SlotPlan]) -> Vec<Target> {
     let mut targets = Vec::new();
     for (plan, work) in plans.iter().enumerate() {
@@ -169,7 +206,7 @@ fn targets_of(plans: &[SlotPlan]) -> Vec<Target> {
 
 /// Blocks a target occupies. An emptied page occupies none — its bucket
 /// simply becomes vacant.
-fn size_of(plans: &[SlotPlan], target: &Target) -> u64 {
+fn size_of(plans: &[SlotPlan], target: &Target, chunk: &[u8]) -> u64 {
     match target {
         Target::Page { plan, bucket } => {
             plans[*plan].pages.get(bucket).map_or(0, |b| blocks_of(b))
@@ -177,6 +214,7 @@ fn size_of(plans: &[SlotPlan], target: &Target) -> u64 {
         Target::Dict { plan } => {
             plans[*plan].dict.as_deref().map_or(0, blocks_of)
         }
+        Target::Edit => blocks_of(chunk),
     }
 }
 
@@ -220,12 +258,30 @@ fn install(
     freed
 }
 
+/// The dictionary descriptor each plan whose dictionary grew was just given.
+fn dict_descriptors(
+    plans: &[SlotPlan],
+    targets: &[Target],
+    runs: &[Option<Run>],
+) -> BTreeMap<usize, BlockDescriptor> {
+    let mut out = BTreeMap::new();
+    for (plan, work) in plans.iter().enumerate() {
+        let Some(run) = dict_run(targets, runs, plan) else {
+            continue;
+        };
+        let used = work.dict.as_ref().map_or(0, Vec::len) as u64;
+        out.insert(plan, BlockDescriptor::from_run_used(run, used));
+    }
+    out
+}
+
 /// Fill the window: every image at its carved offset, zero-padded between.
 fn assemble(
     window: Run,
     plans: &[SlotPlan],
     targets: &[Target],
     runs: &[Option<Run>],
+    chunk: &[u8],
 ) -> Vec<u8> {
     let mut buf = vec![0u8; window.byte_len() as usize];
     for (target, run) in targets.iter().zip(runs) {
@@ -237,6 +293,7 @@ fn assemble(
             Target::Dict { plan } => {
                 plans[*plan].dict.as_deref().unwrap_or(&[])
             }
+            Target::Edit => chunk,
         };
         let at = ((run.start - window.start) * BLOCK_SIZE as u64) as usize;
         buf[at..at + bytes.len()].copy_from_slice(bytes);
