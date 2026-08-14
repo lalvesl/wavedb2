@@ -3,7 +3,7 @@
 //!
 //! Durability lives here: a batch is durable once [`Journal::append`]
 //! returns, because append writes the frame and `fsync`s before yielding.
-//! Everything else in the engine — pages, directory chains, the allocator —
+//! Everything else in the engine — pages, the page directories, the allocator —
 //! is a reconstruction rooted in journal frames.
 //!
 //! ## Files
@@ -25,10 +25,10 @@
 //! - [`JournalFrame::Batch`] — one all-or-nothing batch of [`Write`]s (the
 //!   unit [`Store::apply`](wavedb_core::Store::apply) commits);
 //! - [`JournalFrame::Commit`] — "journal `<ts>` is fully settled into
-//!   `data.bin`": the retired journal's timestamp plus every registered
-//!   type's directory-chain root and dictionary run address. One frame, so
-//!   the framing crc makes the whole commit atomic — a torn commit is
-//!   ignored and the retired journal (still on disk) rules.
+//!   `data.bin`": the retired journal's timestamp plus the addressing log's
+//!   snapshot and delta addresses. One frame, so the framing crc makes the
+//!   whole commit atomic — a torn commit is ignored and the retired journal
+//!   (still on disk) rules.
 //!
 //! Replay stops at the first frame whose length runs past EOF, whose crc
 //! fails, or whose payload does not decode — a torn tail from a crash
@@ -58,14 +58,15 @@ pub enum JournalFrame {
 }
 
 /// "Journal `journal_ts` is **done**" — its writes are settled into
-/// `data.bin` — plus the whole addressing state that makes those pages
-/// findable.
+/// `data.bin` — plus where to find the addressing state that makes those
+/// pages findable.
 ///
-/// The frame carries the directories themselves, not pointers to them: one
-/// append puts every type's bucket-descriptor vector and the retirement
-/// marker on disk together, so a checkpoint's metadata costs **one journal
-/// IOp** and `data.bin` holds no directory structure at all
-/// ([RFC 0043](../../../rfcs/0043-descriptors-in-the-commit-frame.md)).
+/// The frame is a **pointer**, not the state: the descriptors themselves ride
+/// the settle windows that changed them, so this names the last full snapshot
+/// and every delta chunk written since
+/// ([RFC 0046](../../../rfcs/0046-directory-deltas-in-the-window.md)).
+/// Its size tracks how many rounds have settled since the last compaction, not
+/// how large the database is.
 ///
 /// Appended **after** the page window is synced: physical order is the
 /// contract, and a frame is only meaningful once the blocks it addresses
@@ -74,12 +75,12 @@ pub enum JournalFrame {
 pub struct CommitFrame {
     /// Timestamp of the journal this commit retires — the DONE marker.
     pub journal_ts: u64,
-    /// `(STRUCT_HASH, every bucket's raw BlockDescriptor)` for **every**
-    /// registered type. All of them, every commit: the retired journal is
-    /// deleted right after, so this frame must be self-sufficient.
-    pub slots: Vec<(u64, Vec<u64>)>,
-    /// `(STRUCT_HASH, dictionary run descriptor raw)` — `0` = no dictionary.
-    pub dicts: Vec<(u64, u64)>,
+    /// Raw descriptor of the full-state snapshot chunk (`0` = none yet, i.e.
+    /// the deltas start from an empty directory).
+    pub snapshot: u64,
+    /// Raw descriptors of every delta chunk written after that snapshot,
+    /// oldest first.
+    pub edits: Vec<u64>,
 }
 
 /// An append-only log of [`JournalFrame`]s in one timestamped file.
@@ -90,6 +91,8 @@ pub struct Journal {
     ts: u64,
     /// Byte offset of the end of the last whole frame (next append lands here).
     end: u64,
+    /// Barriers taken on this file (see [`syncs`](Self::syncs)).
+    syncs: u64,
 }
 
 /// The journal files under `dir`, sorted by timestamp (oldest first).
@@ -132,6 +135,7 @@ impl Journal {
             path,
             ts,
             end: 0,
+            syncs: 0,
         })
     }
 
@@ -148,6 +152,7 @@ impl Journal {
             path: path.to_path_buf(),
             ts,
             end,
+            syncs: 0,
         })
     }
 
@@ -163,18 +168,62 @@ impl Journal {
         self.end
     }
 
-    /// Append one frame and `fsync`. Durable once this returns.
+    /// Append one frame and `fsync`. Durable once this returns — **and so is
+    /// every frame appended before it**, including any left deferred by
+    /// [`append_deferred`](Self::append_deferred): `fsync` flushes the file,
+    /// not one write.
     ///
     /// # Errors
     /// [`StorageError::Io`] if the write or sync fails.
     pub fn append(&mut self, frame: &JournalFrame) -> StorageResult<()> {
+        self.write_frame(frame)?;
+        self.sync() // the durability point
+    }
+
+    /// Append one frame **without** the barrier — the bytes are in the page
+    /// cache, durable only once someone syncs this file.
+    ///
+    /// A checkpoint's [`Commit`](JournalFrame::Commit) rides this: it is a
+    /// pointer into state `data.bin` already made durable, so it costs no
+    /// barrier of its own and the next ordinary `append` carries it
+    /// ([RFC 0046](../../../rfcs/0046-directory-deltas-in-the-window.md)).
+    /// Until then the retired journal stays on disk and rules, so a crash in
+    /// the window simply replays it.
+    ///
+    /// # Errors
+    /// [`StorageError::Io`] if the write fails.
+    pub fn append_deferred(
+        &mut self,
+        frame: &JournalFrame,
+    ) -> StorageResult<()> {
+        self.write_frame(frame)
+    }
+
+    /// `fsync` this journal, making every deferred append durable.
+    ///
+    /// # Errors
+    /// [`StorageError::Io`] if the sync fails.
+    pub fn sync(&mut self) -> StorageResult<()> {
+        self.file.sync_all()?;
+        self.syncs += 1;
+        Ok(())
+    }
+
+    /// Barriers this journal has taken — the accounting behind "a checkpoint
+    /// costs one barrier", asserted in `page_store`'s tests.
+    #[must_use]
+    pub const fn barriers(&self) -> u64 {
+        self.syncs
+    }
+
+    /// Write one framed payload at the tail, no barrier.
+    fn write_frame(&mut self, frame: &JournalFrame) -> StorageResult<()> {
         let payload = to_wire_checked(frame);
         let mut buf = Vec::with_capacity(FRAME_PREFIX + payload.len());
         buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         buf.extend_from_slice(&payload);
 
         self.file.write_all_at(&buf, self.end)?;
-        self.file.sync_all()?; // the durability point
         self.end += buf.len() as u64;
         Ok(())
     }
