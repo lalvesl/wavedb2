@@ -7,23 +7,26 @@
 //! 1. rotate: create journal_<ts+1>.log, swap under the append lock (µs —
 //!    writers redirect, no settle work under the lock)
 //! 2. drain: settle everything queued into pages — ONE window write
-//!    (RFC 0041), then fsync `data.bin`
-//! 3. append ONE `Commit { done: old_ts, slots: EVERY type's descriptor
-//!    vector, dicts }` frame to the NEW journal + fsync. The addressing
-//!    state travels *in* the frame — `data.bin` holds no directory
-//!    structure — so a checkpoint's metadata is one journal IOp
-//!    (RFC 0043)
-//! 4. delete the old journal
-//! 5. re-protect: the new commit's runs become the allocator's protected
-//!    set, releasing frees deferred under the previous one
+//!    (RFC 0041), carrying that round's descriptor changes with it
+//!    (RFC 0046) — then fsync `data.bin`
+//! 3. append ONE `Commit { done: old_ts, snapshot, edits }` frame to the NEW
+//!    journal — **no fsync**. The frame is a *pointer* into the addressing
+//!    log the windows already wrote, so its size tracks rounds settled since
+//!    the last compaction, not the size of the database, and the next
+//!    `Batch` append's barrier carries it (RFC 0046)
+//! 4+5. deleting the old journal and rolling the protected set forward are
+//!    what that frame authorises, so both wait for it to be durable — see
+//!    `crate::retire`. A checkpoint therefore costs ONE barrier: the
+//!    `data.bin` sync in step 2
 //! ```
 //!
 //! ## Recovery ( [`restore`] )
 //!
 //! Scan `journal_*.log` sorted by timestamp; the **newest decodable
-//! `Commit`** is the base: its `slots` *are* the directories (and its
-//! `dicts` the dictionary runs), the allocator derives from those page and
-//! dictionary runs, journals it covers (`ts <= journal_ts`) are skipped (and
+//! `Commit`** is the base: its snapshot chunk is read and its delta chunks
+//! folded over it in order ([`crate::edit::Replay`]) to rebuild every
+//! directory and dictionary run, the allocator derives from those runs plus
+//! the log's own, journals it covers (`ts <= journal_ts`) are skipped (and
 //! cleaned up), and every `Batch` in the remaining journals replays through
 //! the normal commit + settle path (re-settling is idempotent). A torn
 //! `Commit` frame is invisible — the retired journal is still on disk and
@@ -38,26 +41,37 @@ use crate::block::{BlockDescriptor, Run};
 use crate::block_file::{BlockFile, RESERVED_BLOCKS};
 use crate::dictionary::Dictionary;
 use crate::directory::Directory;
+use crate::edit::{MetaLog, Replay, read_chunk};
 use crate::error::{StorageError, StorageResult};
 use crate::journal::{self, CommitFrame, Journal, JournalFrame};
 use crate::page_store::PageStore;
+use crate::retire::Retiring;
 use crate::struct_storage::StructStorage;
 
 impl PageStore {
     /// Retire the current journal: rotate, settle everything it covers, then
-    /// append the atomic `Commit` frame — carrying every type's descriptor
-    /// vector and the retired journal's DONE marker — to the new journal.
-    /// After this returns the old journal file is gone and recovery roots in
-    /// the new one.
+    /// append the atomic `Commit` frame — naming the addressing log and the
+    /// retired journal's DONE marker — to the new journal.
+    ///
+    /// Costs **one** barrier (the `data.bin` sync). The frame itself is
+    /// written unsynced, so on return the retirement is *pending*: the old
+    /// journal is still on disk and recovery still roots in it until an
+    /// ordinary append — or [`force_retirement`](Self::force_retirement) —
+    /// makes the frame durable (`crate::retire`).
     ///
     /// # Errors
-    /// A write/sync fault. Until the `Commit` frame lands, the old journal
-    /// (and the previous commit) still rule — nothing acked is at risk.
+    /// A write/sync fault. Until the `Commit` frame is durable, the old
+    /// journal (and the previous commit) still rule — nothing acked is at
+    /// risk.
     // The alloc/dir guards span the snapshot loop by design: the frame must
     // name exactly the state that was just synced, with no write landing in
     // between.
     #[allow(clippy::significant_drop_tightening)]
     pub fn commit_journal(&self) -> StorageResult<()> {
+        // 0. At most one checkpoint may be waiting on its frame, so that the
+        // pending frame always lives in the *current* journal.
+        self.force_retirement()?;
+
         // 1. Rotate under the append lock — writers redirect immediately.
         let old = {
             let mut journal = self.journal.lock();
@@ -74,61 +88,61 @@ impl PageStore {
         // and re-settling converges.
         self.drain()?;
 
-        // Snapshot: the addressing state the frame will carry, and every run
-        // it references (the next protected set).
-        let mut alloc = self.alloc.lock();
-        let mut slots = Vec::with_capacity(self.types.len());
-        let mut dicts = Vec::with_capacity(self.types.len());
+        // Every run the frame will keep reachable — the next protected set.
+        // The allocator guard is held (not used) so no window can land
+        // between reading this state and syncing it.
+        let _alloc = self.alloc.lock();
+        let meta = self.meta.lock();
         let mut used = vec![Run::new(0, RESERVED_BLOCKS)];
         for slot in &self.types {
             let dir_guard = slot.directory().lock();
-            let descriptors: Vec<u64> =
-                dir_guard.as_ref().map_or_else(Vec::new, |dir| {
-                    dir.slots().iter().map(|d| d.raw()).collect()
-                });
-            used.extend(
-                descriptors
-                    .iter()
-                    .map(|&raw| BlockDescriptor::from_raw(raw))
-                    .filter(|d| d.is_allocated())
-                    .map(BlockDescriptor::run),
-            );
+            if let Some(dir) = dir_guard.as_ref() {
+                used.extend(
+                    dir.slots()
+                        .iter()
+                        .filter(|d| d.is_allocated())
+                        .map(|d| d.run()),
+                );
+            }
             let dict = slot.dictionary().lock();
             if dict.descriptor().is_allocated() {
                 used.push(dict.descriptor().run());
             }
-            slots.push((slot.struct_hash(), descriptors));
-            dicts.push((slot.struct_hash(), dict.descriptor().raw()));
         }
-        // The pages must be durable before the frame addressing them.
+        used.extend(meta.runs()); // the addressing log itself
+        // The pages — and the delta chunks describing them — must be durable
+        // before the frame addressing them.
         self.file.sync()?;
 
-        // 3. The atomic commit: the whole addressing state and the DONE
-        // marker in ONE crc-framed append (fsync inside).
-        self.journal
-            .lock()
-            .append(&JournalFrame::Commit(CommitFrame {
+        // 3. The atomic commit: where the addressing log lives, and the DONE
+        // marker, in ONE crc-framed append — written **without** a barrier.
+        // The frame only points at state the sync above already made durable,
+        // so the next `Batch` append's fsync carries it for free.
+        let (snapshot, edits) = meta.frame();
+        self.journal.lock().append_deferred(&JournalFrame::Commit(
+            CommitFrame {
                 journal_ts: old.ts(),
-                slots,
-                dicts,
-            }))?;
+                snapshot,
+                edits,
+            },
+        ))?;
 
-        // 4. The retired journal's history is now redundant.
-        old.delete()?;
-
-        // 5. Protection rolls forward; frees deferred under the previous
-        // commit release.
-        alloc.set_protected(&used);
+        // 4/5. Deleting the retired journal and rolling protection forward
+        // are what the frame *authorises*, so both wait for it to be durable
+        // (`crate::retire`). Until then the old journal still rules.
+        *self.retiring.lock() = Some(Retiring { journal: old, used });
         Ok(())
     }
 }
 
 /// What [`restore`] recovered: the allocator and the batches still to
-/// replay (in order), plus the journal to keep appending to.
+/// replay (in order), plus the journal to keep appending to and the
+/// addressing log to keep extending.
 pub struct Recovered {
     pub alloc: BlockAllocator,
     pub journal: Journal,
     pub replay: Vec<Vec<Write>>,
+    pub meta: MetaLog,
 }
 
 /// Recover engine state from the journals under `dir` (see module docs).
@@ -137,7 +151,7 @@ pub struct Recovered {
 ///
 /// # Errors
 /// [`StorageError::Corrupt`] on a lost recovery root (`data.bin` with no
-/// journal) or an unreadable chain; [`StorageError::UnregisteredStructHash`]
+/// journal) or an unreadable addressing log; [`StorageError::UnregisteredStructHash`]
 /// when a commit names a type this open's registry does not list.
 pub fn restore(
     dir: &Path,
@@ -155,6 +169,7 @@ pub fn restore(
             alloc: fresh_alloc(file)?,
             journal,
             replay: Vec::new(),
+            meta: MetaLog::default(),
         });
     }
 
@@ -172,11 +187,11 @@ pub fn restore(
         journals.push((*ts, journal, frames));
     }
 
-    let (alloc, covered_ts) = if let Some(commit) = &newest_commit {
+    let ((alloc, meta), covered_ts) = if let Some(commit) = &newest_commit {
         (load_commit(file, types, commit)?, commit.journal_ts)
     } else {
         // First generation (never rotated): rebuild pages from scratch.
-        (fresh_alloc(file)?, 0)
+        ((fresh_alloc(file)?, MetaLog::default()), 0)
     };
 
     // Batches from journals the commit does not cover, oldest first. The
@@ -205,21 +220,41 @@ pub fn restore(
         alloc,
         journal,
         replay,
+        meta,
     })
 }
 
-/// Install a `Commit`'s directories into the slots and derive the allocator
-/// from everything the commit references.
+/// Replay the addressing log a `Commit` names into the slots, and derive the
+/// allocator from everything it references.
 ///
-/// The frame *is* the addressing state — no chain to walk, no extra read.
+/// The snapshot chunk is the base; each delta chunk after it is folded on in
+/// order — the reverse of how the settle windows wrote them.
 fn load_commit(
     file: &BlockFile,
     types: &[&'static StructStorage],
     commit: &CommitFrame,
-) -> StorageResult<BlockAllocator> {
+) -> StorageResult<(BlockAllocator, MetaLog)> {
     let mut used = vec![Run::new(0, RESERVED_BLOCKS)];
-    for (hash, addresses) in &commit.slots {
-        let slot = slot_of(types, *hash)?;
+    let mut replay = Replay::default();
+    let snapshot = BlockDescriptor::from_raw(commit.snapshot);
+    if snapshot.is_allocated() {
+        replay.apply(&read_chunk(file, snapshot.run())?)?;
+        used.push(snapshot.run());
+    }
+    let mut edits = Vec::with_capacity(commit.edits.len());
+    for &raw in &commit.edits {
+        let desc = BlockDescriptor::from_raw(raw);
+        if !desc.is_allocated() {
+            continue;
+        }
+        replay.apply(&read_chunk(file, desc.run())?)?;
+        used.push(desc.run());
+        edits.push(desc);
+    }
+
+    let (slots, dicts) = replay.into_parts();
+    for (hash, addresses) in slots {
+        let slot = slot_of(types, hash)?;
         if addresses.is_empty() {
             continue; // the type never settled anything
         }
@@ -236,7 +271,7 @@ fn load_commit(
         *slot.directory().lock() =
             Some(Directory::from_slots(descriptors, file.seed()));
     }
-    for &(hash, desc_raw) in &commit.dicts {
+    for (hash, desc_raw) in dicts {
         let slot = slot_of(types, hash)?;
         let desc = BlockDescriptor::from_raw(desc_raw);
         if !desc.is_allocated() {
@@ -248,7 +283,7 @@ fn load_commit(
     }
     let mut alloc = BlockAllocator::from_layout(file.len_blocks()?, &used);
     alloc.set_protected(&used);
-    Ok(alloc)
+    Ok((alloc, MetaLog::restored(snapshot, edits)))
 }
 
 /// The registered slot for `hash` — a commit naming an unlisted type
