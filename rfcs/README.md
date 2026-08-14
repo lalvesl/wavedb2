@@ -31,14 +31,15 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   exposure registry's **compile-time** collision guard (full-`STRUCT_HASH` clash
   = error, 15-bit `type_salt` clash = warning), recorded in
   [0040](0040-schema-migration-and-version-skew-DEPRECATED.md).
-- **The storage write path (2026-07-28):**
+- **The storage write path (2026-07-28 → 07-29):**
   [0041](0041-single-barrier-checkpoint.md) *(Implemented)* replaced the per-id
   settle — which read-modify-wrote a bucket page once per record — with a
   planned window: pages grouped per bucket in RAM, one contiguous best-fit
   allocation, **one** positioned write covering pages + dictionary + directory
   chains, then the descriptor swap. A settle round takes no barrier at all; a
-  checkpoint takes one for the window and one for the `Commit` frame that names
-  it. The per-mutation path was already one append + fsync and did not change.
+  checkpoint takes one, the window's (see 0046 for how the `Commit` frame
+  stopped taking a second). The per-mutation path was already one append +
+  fsync and did not change.
   [0042](0042-free-space-defragmentation.md) *(Implemented)* keeps such windows
   available: a background pass relocates live pages stranded between holes to
   fresh tail blocks, so the space they vacate coalesces into the extent the next
@@ -48,13 +49,17 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   type's descriptor vector plus the retired journal's DONE marker, so `data.bin`
   holds pages and dictionaries and nothing else, and the copy-on-write directory
   chain is gone.
+  Finally [0046](0046-directory-deltas-in-the-window.md) *(Implemented)* fixed
+  the one cost 0043 left behind — a frame carrying every bucket of every type
+  scales with the **database**, not the change (1 MiB per checkpoint at 2 GiB,
+  100 MiB at 200 GiB) — by moving the descriptor changes into the settle
+  window itself: metadata for **zero** extra IOps, with the frame reduced to a
+  snapshot address plus the deltas since it, compacted by a periodic full
+  chunk. Because that frame is only a pointer into already-durable state it
+  needs no barrier of its own — a checkpoint costs **one**, the `data.bin`
+  sync, with the retirement it authorises deferred until an ordinary write's
+  fsync carries the frame.
 - **Proposed next (storage & query):**
-  [0046](0046-directory-deltas-in-the-window-PLANNED.md) — the one place left
-  where a checkpoint's cost scales with the *database* instead of the *change*:
-  0043's frame carries every bucket of every type (1 MiB per checkpoint at
-  2 GiB, 100 MiB at 200 GiB), so the descriptor changes move into the settle
-  window itself — metadata for **zero** extra IOps, and the frame keeps only a
-  snapshot address and the list of deltas since it;
   [0044](0044-page-cache-PLANNED-LOW.md) — a page-granular cache so the read
   that precedes a write also serves the settle's read-modify-write;
   [0045](0045-vector-search-PLANNED.md) — nearest-neighbour search as a
@@ -143,7 +148,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0043](0043-descriptors-in-the-commit-frame.md) | Descriptors in the `Commit` frame | Implemented |
 | [0044](0044-page-cache-PLANNED-LOW.md) | The page cache | Planned (low) |
 | [0045](0045-vector-search-PLANNED.md) | Vector search | Planned |
-| [0046](0046-directory-deltas-in-the-window-PLANNED.md) | Directory deltas in the settle window | Planned |
+| [0046](0046-directory-deltas-in-the-window.md) | Directory deltas in the settle window | Implemented |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |

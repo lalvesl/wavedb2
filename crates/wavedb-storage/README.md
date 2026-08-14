@@ -19,6 +19,8 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 | `directory_pages` | The directory's page **reads**: resolving a bucket to its `SlotPage`, decompressing against the passed-in `DictState`. |
 | `plan`            | A checkpoint's phase 1: touched ids → page images grouped per bucket, splits decided, nothing written.       |
 | `checkpoint`      | Phases 2–4: one best-fit window for every image, one positioned write, then the descriptor swap.            |
+| `edit`            | The addressing delta riding each window (`EditChunk`), its recovery fold (`Replay`), and the log + compaction policy (`MetaLog`). |
+| `retire`          | A checkpoint's deferred half: the retired journal + protection roll held until the `Commit` frame is durable.       |
 | `settle`          | The drain queue: what a round is, when it retries, and the cache-eviction budget.                           |
 | `chain`           | Directory chain blocks — the persisted address vector, copy-on-write, placed in the checkpoint's window.    |
 | `defrag`          | Relocates live pages stranded between holes to fresh tail blocks so free extents coalesce.                  |
@@ -364,8 +366,15 @@ mutation → journal append → the type's own BTreeMap<Id> cache → (client co
 4. **Rebalance is part of that plan.** Splits are decided in RAM, before
    anything is serialised, so an over-sized bucket is repartitioned and both
    halves are written once — never a page written twice in one round.
+5. **The window describes itself.** Its last blocks carry an `EditChunk`: the
+   descriptor changes those pages just caused
+   ([RFC 0046](../../rfcs/0046-directory-deltas-in-the-window.md)). Metadata
+   therefore costs **no IOp of its own** — same `write_run`, same `fsync` — and
+   the `Commit` frame shrinks to a snapshot address plus the deltas since it.
+   Once the deltas outweigh the state they patch, a round emits a full chunk
+   instead and the superseded runs are freed.
 
-5. **Background defragmentation.** Copy-on-write leaves holes, and what a
+6. **Background defragmentation.** Copy-on-write leaves holes, and what a
    checkpoint needs is one *contiguous* window. When the largest free extent
    falls below the policy's threshold, a pass relocates live pages stranded
    between holes — verbatim, to fresh tail blocks — so the space they vacate
@@ -444,11 +453,21 @@ in **one contiguous window** and written with a single positioned write
 one per page the round modifies. No `fsync` — durability stays the journal's
 until a checkpoint.
 
-**Per checkpoint: one write, two barriers.** The same window additionally carries
-every drifted directory chain and a grown dictionary; then `data.bin` is synced
-and the `Commit` frame is appended (its own fsync) so the retired journal can be
-deleted. `BlockFile::io()` counts all of this, and the accounting is asserted in
-`page_store`'s tests.
+**Every window also carries its own descriptor delta** — an `EditChunk` naming
+the buckets that round moved, in the same write, for no extra IOp
+([RFC 0046](../../rfcs/0046-directory-deltas-in-the-window.md)).
+
+**Per checkpoint: one write, ONE barrier.** The window additionally carries a
+grown dictionary; then `data.bin` is synced — and that is the only barrier. The
+`Commit` frame is a *pointer* (the snapshot chunk's address plus the deltas
+since it) into state that sync already made durable, so it is appended
+**unsynced** and the next ordinary write's fsync carries it. Its size tracks
+rounds settled since the last compaction, **not** the size of the database, so a
+wide directory no longer costs 8 bytes per bucket per checkpoint. Deleting the
+retired journal and rolling the allocator's protection wait for that durability
+(`retire`); `force_retirement()` pays the barrier explicitly when no write is
+coming. `BlockFile::io()` and `Journal::barriers()` count all of this, and the
+accounting is asserted in `page_store`'s tests.
 
 What still scales with the work rather than with the batch is the *logical* index
 maintenance above the store, which decides how many values a batch contains:
