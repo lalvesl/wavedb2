@@ -31,11 +31,11 @@
 //! on the read-through path. No path takes them in a conflicting order, so
 //! the graph is acyclic.
 //!
-//! `retiring` is the one lock taken on both sides of `alloc`: a checkpoint
-//! publishes under it (`alloc → retiring`), and a write completing that
-//! retirement takes it first (`retiring`, released, then `alloc`). The
-//! release is what keeps the graph acyclic, so `crate::retire` never holds
-//! `retiring` across `alloc.lock()` — see the comment there.
+//! `retiring` sits outside that order entirely, by rule: it is **never held
+//! across another lock**. A checkpoint publishes under it (`alloc → retiring`)
+//! and claims it before rotating; `force_retirement` takes it after syncing the
+//! journal and releases it before `dispose` takes `alloc`. Since it is only
+//! ever held alone, it can join no cycle (`crate::retire`).
 //!
 //! ## Reads
 //!
@@ -284,10 +284,13 @@ mod tests {
     }
 
     /// A checkpoint costs **one** write and **one** barrier, counting both
-    /// files: the pages, the dictionary and the round's descriptor delta
-    /// share the window write and its `data.bin` sync, and the `Commit` frame
-    /// takes no barrier of its own — the next ordinary write carries it, and
-    /// only then is the retirement completed (RFC 0046).
+    /// files: the pages, the dictionary and the round's descriptor delta share
+    /// the window write and its `data.bin` sync, and the `Commit` frame takes
+    /// no barrier of its own — the next ordinary write carries it (RFC 0046).
+    ///
+    /// And nothing pays a barrier on that checkpoint's behalf afterwards: the
+    /// retirement it authorises is disposed of by the *following* checkpoint,
+    /// which is also one write and one barrier (RFC 0047).
     #[test]
     fn a_checkpoint_is_one_write_and_one_barrier() {
         let _g = engine_gate();
@@ -312,13 +315,28 @@ mod tests {
             assert!(s.is_retiring());
 
             // The next ordinary write pays a barrier it was paying anyway,
-            // and that fsync carries the frame — no extra IO at all.
+            // and that fsync carries the frame — no extra IO at all, and no
+            // retirement work on the write path (RFC 0047).
             s.apply(&[Write::Put(nonunique(99), rec(SH, b"carrier"))])
                 .await
                 .unwrap();
             assert_eq!(s.journal.lock().barriers(), 1, "the batch's own fsync");
-            assert!(!s.is_retiring(), "which completed the retirement");
-            assert_eq!(journals(d.path()).len(), 1);
+            assert!(s.is_retiring(), "disposal belongs to the next checkpoint");
+            assert_eq!(journals(d.path()).len(), 2);
+
+            // Which disposes of it for free: the carrier's barrier count moved
+            // past the frame, so nothing needs syncing to prove it.
+            let (_, w, sy) = s.file.io().snapshot();
+            s.commit_journal().unwrap();
+            let (_, w2, sy2) = s.file.io().snapshot();
+            assert_eq!(w2 - w, 1, "one window write again");
+            assert_eq!(sy2 - sy, 1, "one `data.bin` barrier again");
+            assert_eq!(
+                s.journal.lock().barriers(),
+                0,
+                "the fresh journal took none: no barrier for housekeeping"
+            );
+            assert_eq!(journals(d.path()).len(), 2, "at most two generations");
         });
         // And the commit is a real recovery root.
         drop(s);
@@ -327,6 +345,86 @@ mod tests {
             assert_eq!(
                 s.get(nonunique(7)).await.unwrap(),
                 Some(rec(SH, b"payload"))
+            );
+        });
+    }
+
+    /// A checkpoint's runs are protected from the moment it **publishes**, not
+    /// from the next write (RFC 0047). Its frame may become the recovery root
+    /// at any instant after that, so a settle round in between must not free —
+    /// and hand back for reuse — a run that frame still names.
+    #[test]
+    fn a_settle_after_a_checkpoint_cannot_reuse_its_runs() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let s = open(d.path());
+        block_on(async {
+            for k in 0..20u64 {
+                s.apply(&[Write::Put(nonunique(k), rec(SH, b"v1"))])
+                    .await
+                    .unwrap();
+            }
+            s.commit_journal().unwrap();
+            assert_eq!(
+                s.alloc.lock().deferred_blocks(),
+                0,
+                "nothing held yet — this checkpoint is the first root"
+            );
+
+            // Rewriting the same records supersedes the very pages the
+            // checkpoint just named, so the settle frees their runs.
+            for k in 0..20u64 {
+                s.apply(&[Write::Put(nonunique(k), rec(SH, b"v2"))])
+                    .await
+                    .unwrap();
+            }
+            s.drain().unwrap();
+            assert!(
+                s.alloc.lock().deferred_blocks() > 0,
+                "runs the live frame names must be held, not pooled"
+            );
+        });
+    }
+
+    /// The one case where disposal is not free (RFC 0047): two checkpoints
+    /// with no write in between. Nothing flushed the journal carrying the
+    /// first frame, so the second must sync it before deleting the journal
+    /// that frame retires — a barrier paid by a checkpoint that had no work.
+    #[test]
+    fn a_checkpoint_with_no_writes_syncs_the_carrier_before_disposing() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let s = open(d.path());
+        block_on(async {
+            s.apply(&[Write::Put(nonunique(1), rec(SH, b"acked"))])
+                .await
+                .unwrap();
+            s.commit_journal().unwrap();
+            assert_eq!(journals(d.path()).len(), 2);
+
+            // Not a single append since the frame — so its carrier has taken
+            // no barrier, and the next checkpoint cannot delete on its word.
+            s.commit_journal().unwrap();
+            assert_eq!(
+                journals(d.path()).len(),
+                2,
+                "one generation disposed of, this one's taken its place"
+            );
+            let carrier =
+                s.retiring.lock().as_ref().map(|r| r.journal.barriers());
+            assert_eq!(
+                carrier,
+                Some(1),
+                "no batch touched that journal, so the barrier is the \
+                 fallback's — the proof the delete was authorised"
+            );
+        });
+        drop(s);
+        let s = open(d.path());
+        block_on(async {
+            assert_eq!(
+                s.get(nonunique(1)).await.unwrap(),
+                Some(rec(SH, b"acked"))
             );
         });
     }
