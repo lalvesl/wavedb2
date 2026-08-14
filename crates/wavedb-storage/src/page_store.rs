@@ -228,6 +228,130 @@ mod tests {
         Id::new(key, U48::from(1u32), false, (key & 0x7FFF) as u16)
     }
 
+    /// RFC 0041's accounting: whatever a round touched, settling it is **one**
+    /// positioned write — plus one read per page it had to modify, and no
+    /// barrier at all (durability is the journal's until a checkpoint).
+    #[test]
+    fn a_settle_round_is_one_write_and_one_read_per_touched_page() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let s = open(d.path());
+        block_on(async {
+            for k in 0..40u64 {
+                s.apply(&[Write::Put(nonunique(k), rec(SH, b"first"))])
+                    .await
+                    .unwrap();
+            }
+            s.drain().unwrap(); // the pages exist from here on
+
+            let (reads, writes, syncs) = s.file.io().snapshot();
+            for k in 0..40u64 {
+                s.apply(&[Write::Put(nonunique(k), rec(SH, b"second"))])
+                    .await
+                    .unwrap();
+            }
+            s.drain().unwrap();
+            let (r, w, sy) = s.file.io().snapshot();
+
+            assert_eq!(w - writes, 1, "40 records must settle in ONE write");
+            assert_eq!(sy - syncs, 0, "a settle round takes no barrier");
+            let buckets = s.bucket_count(SH) as u64;
+            assert!(
+                r - reads <= buckets,
+                "read {} pages for {buckets} buckets — one per touched page \
+                 is the floor",
+                r - reads
+            );
+        });
+    }
+
+    /// A checkpoint adds exactly one barrier, and still only one write: the
+    /// pages, the dictionary and every drifted chain share the window.
+    #[test]
+    fn a_checkpoint_is_one_write_and_one_barrier() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let s = open(d.path());
+        block_on(async {
+            for k in 0..20u64 {
+                s.apply(&[Write::Put(nonunique(k), rec(SH, b"payload"))])
+                    .await
+                    .unwrap();
+            }
+            let (_, writes, syncs) = s.file.io().snapshot();
+            s.commit_journal().unwrap();
+            let (_, w, sy) = s.file.io().snapshot();
+            assert_eq!(w - writes, 1, "pages + chains ride one window write");
+            assert_eq!(sy - syncs, 1, "exactly one durability barrier");
+        });
+        // And the commit is a real recovery root.
+        drop(s);
+        let s = open(d.path());
+        block_on(async {
+            assert_eq!(
+                s.get(nonunique(7)).await.unwrap(),
+                Some(rec(SH, b"payload"))
+            );
+        });
+    }
+
+    /// RFC 0042: relocation moves page bytes verbatim to fresh tail blocks and
+    /// repoints the buckets — the records must survive it, including once the
+    /// caches are gone and every read comes off the moved pages.
+    #[test]
+    fn defragment_relocates_pages_without_losing_records() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let s = open(d.path());
+        block_on(async {
+            // Enough noisy records to split into several buckets…
+            for k in 0..200u64 {
+                s.apply(&[Write::Put(nonunique(k), rec(SH, &noise(k)))])
+                    .await
+                    .unwrap();
+            }
+            s.drain().unwrap();
+            s.commit_journal().unwrap();
+            // …then rewrite half of them: every settled page is written
+            // copy-on-write, so the runs they vacate pock the file.
+            for k in (0..200u64).step_by(2) {
+                s.apply(&[Write::Put(nonunique(k), rec(SH, &noise(k + 7)))])
+                    .await
+                    .unwrap();
+            }
+            s.drain().unwrap();
+            s.commit_journal().unwrap();
+
+            let report = s.defragment(4096).unwrap();
+            assert!(
+                report.largest_after >= report.largest_before,
+                "a pass must not fragment further: {report:?}"
+            );
+
+            // Force every read through the relocated pages.
+            s.commit_journal().unwrap();
+            s.evict_settled(0);
+            assert_eq!(s.cache_len(), 0);
+            for k in 0..200u64 {
+                let want = if k % 2 == 0 { k + 7 } else { k };
+                assert_eq!(
+                    s.get(nonunique(k)).await.unwrap(),
+                    Some(rec(SH, &noise(want))),
+                    "record {k} lost across relocation"
+                );
+            }
+        });
+        // And the relocation survives a reopen from the commit.
+        drop(s);
+        let s = open(d.path());
+        block_on(async {
+            assert_eq!(
+                s.get(nonunique(101)).await.unwrap(),
+                Some(rec(SH, &noise(101)))
+            );
+        });
+    }
+
     #[test]
     fn put_get_remove() {
         let _g = engine_gate();
