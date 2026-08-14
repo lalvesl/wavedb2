@@ -22,7 +22,6 @@ pub mod alloc;
 mod apply;
 pub mod block;
 pub mod block_file;
-mod chain;
 mod checkpoint;
 mod commit;
 mod defrag;
