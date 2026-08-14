@@ -28,8 +28,7 @@
 
 use wavedb_core::wire::{from_wire_checked, to_wire_checked};
 
-use crate::block::{BLOCK_SIZE, BlockAllocator, BlockDescriptor};
-use crate::block_file::BlockFile;
+use crate::block::BlockDescriptor;
 use crate::error::{StorageError, StorageResult};
 
 /// Per-run prefix: `payload_len (u32)`.
@@ -167,36 +166,32 @@ impl DictState {
         self.desc
     }
 
-    /// Warm the dictionary with a settling record (append-only, capped) and —
-    /// when the buffer actually grew — re-persist it to its own block run:
-    /// allocate + write the new run, repoint, then free the old one (the same
-    /// crash-safe ordering pages use). A disabled state is a no-op.
-    ///
-    /// # Errors
-    /// Propagates a write fault from persisting the grown buffer.
-    pub fn warm(
-        &mut self,
-        record: &[u8],
-        file: &BlockFile,
-        alloc: &mut BlockAllocator,
-    ) -> StorageResult<()> {
+    /// Warm the dictionary with a settling record (append-only, capped),
+    /// reporting whether the buffer actually grew — a grown buffer must be
+    /// re-persisted, which the checkpoint does by placing [`image`](Self::image)
+    /// in its window and then [`repoint`](Self::repoint)ing this state at it.
+    /// A disabled state never samples and never allocates a run.
+    pub(crate) fn sample(&mut self, record: &[u8]) -> bool {
         if !self.enabled {
-            return Ok(());
+            return false;
         }
         let before = self.dict.len();
         self.dict.sample(record);
-        if self.dict.len() == before {
-            return Ok(());
-        }
-        let bytes = self.dict.to_bytes();
-        let run = alloc.alloc(bytes.len().div_ceil(BLOCK_SIZE) as u64);
-        file.write_run(run, &bytes)?;
-        let old = self.desc;
-        self.desc = BlockDescriptor::from_run_used(run, bytes.len() as u64);
-        if old.is_allocated() {
-            alloc.free(old.run());
-        }
-        Ok(())
+        self.dict.len() != before
+    }
+
+    /// The buffer's current on-disk image (`[len][to_wire_checked(buf)]`).
+    pub(crate) fn image(&self) -> Vec<u8> {
+        self.dict.to_bytes()
+    }
+
+    /// Adopt the run the latest [`image`](Self::image) was written to,
+    /// returning the superseded descriptor for the caller to free.
+    pub(crate) const fn repoint(
+        &mut self,
+        desc: BlockDescriptor,
+    ) -> BlockDescriptor {
+        std::mem::replace(&mut self.desc, desc)
     }
 
     /// Adopt a checkpoint-persisted dictionary and the run it lives in —
@@ -218,38 +213,30 @@ impl DictState {
 #[cfg(test)]
 mod tests {
     use super::{DICT_CAP, DictState, Dictionary};
-    use crate::block::BlockAllocator;
-    use crate::block_file::{BlockFile, RESERVED_BLOCKS};
+    use crate::block::{BlockDescriptor, Run};
 
-    // The dictionary lives in `data.bin` too: warming allocates and repoints
-    // its own block run, round-tripping byte-identically; a disabled state
-    // never samples, never allocates.
+    // Sampling reports growth so the checkpoint knows to place a fresh image;
+    // the image round-trips byte-identically and `repoint` hands back the run
+    // to free. A disabled state never samples and never claims a run.
     #[test]
-    fn warm_persists_own_run_and_disabled_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
-        let bf = BlockFile::open(dir.path().join("data.bin")).unwrap();
-        let mut alloc = BlockAllocator::new();
-        alloc.alloc(RESERVED_BLOCKS);
-
+    fn sampling_reports_growth_and_disabled_is_noop() {
         let mut on = DictState::new(true);
         assert!(!on.descriptor().is_allocated());
-        on.warm(&[0xAB; 100], &bf, &mut alloc).unwrap();
-        assert!(
-            on.descriptor().is_allocated(),
-            "sampling must persist the dictionary"
-        );
-        let stored = Dictionary::from_bytes(
-            &bf.read_run(on.descriptor().run()).unwrap(),
-        )
-        .unwrap();
+        assert!(on.sample(&[0xAB; 100]), "a first sample grows the buffer");
+
+        let stored = Dictionary::from_bytes(&on.image()).unwrap();
         assert_eq!(stored.latest(), &[0xAB; 100][..]);
 
+        // Placing the image hands back the superseded descriptor.
+        let first = BlockDescriptor::from_run_used(Run::new(7, 1), 128);
+        assert!(!on.repoint(first).is_allocated());
+        assert_eq!(on.descriptor(), first);
+        let second = BlockDescriptor::from_run_used(Run::new(9, 1), 160);
+        assert_eq!(on.repoint(second), first, "the old run comes back to free");
+
         let mut off = DictState::new(false);
-        off.warm(&[0xCD; 100], &bf, &mut alloc).unwrap();
-        assert!(
-            !off.descriptor().is_allocated(),
-            "compression off ⇒ no dictionary run"
-        );
+        assert!(!off.sample(&[0xCD; 100]), "compression off ⇒ never grows");
+        assert!(!off.descriptor().is_allocated());
         assert!(off.dictionary().is_empty());
     }
 
