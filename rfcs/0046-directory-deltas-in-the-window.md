@@ -1,12 +1,12 @@
 # RFC 0046 — Directory deltas in the settle window
 
-- **Status:** Planned — opened 2026-07-28
+- **Status:** Implemented (landed 2026-07-29)
 - **Amends:** [RFC 0043](0043-descriptors-in-the-commit-frame.md) (which put the
   *whole* addressing state in every `Commit` frame)
 - **Builds on:** [RFC 0041](0041-single-barrier-checkpoint.md) (the one
   contiguous window a settle already writes — this rides it)
 - **Crates:** `wavedb-storage`
-- **Code (target):** `crates/wavedb-storage/src/{checkpoint,plan,commit,journal}.rs`
+- **Code:** `crates/wavedb-storage/src/{edit,retire,checkpoint,commit,journal}.rs`
 
 ## Summary
 
@@ -67,20 +67,24 @@ The **edit chunk** is a crc-framed record of exactly what this round changed:
 
 ```rust
 pub struct EditChunk {
-    /// Per type: only the buckets whose descriptor moved, plus the bucket
-    /// count after the round (so a linear-hashing split needs no record of
-    /// its own).
     pub slots: Vec<SlotEdit>,
-    /// (STRUCT_HASH, dictionary run descriptor) — only if it grew.
-    pub dicts: Vec<(u64, u64)>,
 }
 
 pub struct SlotEdit {
     pub struct_hash: u64,
+    /// Bucket count *after* the round, so a linear-hashing split needs no
+    /// record of its own — replay grows the vector to it.
     pub buckets: u32,
+    /// Only the buckets whose descriptor moved.
     pub changed: Vec<(u32, u64)>, // (bucket, raw BlockDescriptor)
+    /// The dictionary's run — `Some` only when it changed.
+    pub dict: Option<u64>,
 }
 ```
+
+On disk it is `[len u32 LE][crc32][wire]` — the same self-delimiting envelope a
+page uses, because a run is block-padded and the length prefix is what bounds
+the decode.
 
 This is one more `Target` in `targets_of`, one more entry in `carve`, one more
 `copy_from_slice` in `assemble`. **The same `write_run`, the same `fsync`.** A
@@ -121,8 +125,36 @@ buys two things: a chunk is pure payload (nothing points at anything, so the
 order in which superseded chunks are freed cannot break a link), and startup is
 bounded by construction instead of by "however far back the chain goes".
 
-Cost of the frame's own append: unchanged, one small crc-framed append + fsync,
-the same barrier today's checkpoint already pays.
+### The frame takes no barrier — a checkpoint costs one
+
+Because the frame is *only* a pointer into state the window's `fsync` already
+made durable, it does not need a barrier of its own. It is written unsynced
+(`Journal::append_deferred`) and the next ordinary `Batch` append carries it,
+since `fsync` flushes the file rather than one write. **A checkpoint therefore
+costs one barrier: the `data.bin` sync.** This was
+[RFC 0041](0041-single-barrier-checkpoint.md)'s original intent, abandoned then
+because the frame carried the addressing state itself; carrying a pointer brings
+it back.
+
+What has to wait for that durability is what the frame *authorises*
+(`crate::retire`):
+
+- **deleting the retired journal** — if the frame is torn or never lands,
+  recovery falls back to the previous `Commit`, and that journal's batches are
+  the only record of what happened since;
+- **rolling the allocator's protected set forward** — which releases frees
+  deferred under the *previous* commit, i.e. runs a fallback recovery still
+  reads.
+
+Both are held in a `Retiring` until an append makes the frame durable. There is
+at most one pending: a checkpoint forces any previous one before it rotates, so
+the pending frame always lives in the *current* journal. `force_retirement()`
+pays the barrier explicitly for the cases where no write is coming — an idle
+maintenance tick, a graceful shutdown.
+
+The cost of deferral is that a retired journal lingers until the next write.
+Recovery already handles a retained-but-covered journal (it deletes it), and on
+an idle node the maintenance tick forces within one period.
 
 ### Compaction
 
@@ -133,11 +165,26 @@ and an empty `edits`; the old snapshot run and every superseded chunk are freed
 through the allocator's existing deferred-free path, releasing when protection
 rolls forward at the following commit.
 
+A snapshot is nothing special on the wire: it is a chunk whose `changed` covers
+every bucket, so applying it over any prior state yields exactly that state.
+Replay needs no flag, and the types the compacting round did not touch
+contribute their resident directories — without that, a quiet type is lost at
+the next reopen (there is a test for exactly this).
+
 So yes — as you put it, the reclamation is a deallocation rather than an
 `unlink`. It is also the only part of this that is not free, and it is
-accepted: at the proposed threshold (edit bytes ≳ snapshot bytes) roughly one
-round in N pays it, the snapshot is a sequential image of a vector already in
-RAM, and it rides the same window write as everything else.
+accepted: at the threshold below, roughly one round in N pays it, the snapshot
+is a sequential image of a vector already in RAM, and it rides the same window
+write as everything else.
+
+**As built** (`MetaLog::wants_snapshot`), a round compacts when either
+
+- `edit_blocks >= max(snapshot_blocks, 16)` — the ratio, so the deltas never
+  outweigh the state they patch, with a 64 KiB floor so a small database does
+  not snapshot every round; or
+- `edits.len() >= 1024` — a hard cap, so a recovery's scattered reads stay
+  bounded even when the snapshot is large enough that the ratio alone would
+  allow far more.
 
 ### Recovery
 
@@ -163,7 +210,7 @@ this design deliberately spends, and it is the right place to spend.
 | …at 2 GiB / 131 072 buckets | 1 MiB | a few KiB |
 | …at 200 GiB | ~100 MiB | a few KiB |
 | **extra write IOps for metadata** | 1 (the big journal append) | **0** — rides the window |
-| barriers per checkpoint | 2 | 2 |
+| barriers per checkpoint | 2 | **1** — the `Commit` frame is deferred |
 | extra RAM | — | one chunk buffer, per round |
 | startup reads | 1 | 1 + chunks since snapshot |
 | files in the data directory | 2 kinds | 2 kinds |
@@ -218,19 +265,36 @@ addresses destroy the contiguous-window property
 [RFC 0041](0041-single-barrier-checkpoint.md) is built on. An architecture
 change, not an optimisation.
 
+## What landed
+
+`crates/wavedb-storage/src/edit.rs` — the chunk types, `chunk_of` (both passes),
+`Replay` (the recovery fold), and `MetaLog` (the log + its compaction policy).
+`checkpoint.rs` gained a `Target::Edit`, the two-pass reserve/fill, and the
+`meta.record` → free-the-superseded step; `commit.rs`'s `load_commit` became a
+replay of the log; `CommitFrame` lost `slots`/`dicts` and gained
+`snapshot`/`edits`. `retire.rs` holds the deferred half of a checkpoint, with
+`Journal::append_deferred`/`sync`/`barriers` under it and
+`PageStore::force_retirement` for when no write is coming; `apply` completes a
+pending retirement right after its own fsync.
+
+Proven by: `a_settle_round_is_one_write_and_one_read_per_touched_page` and
+`a_checkpoint_is_one_write_and_one_barrier` (the chunk rides the existing
+write), `a_commit_frame_tracks_the_log_not_the_directory`
+(a wide directory framed in fewer bytes than 8 per bucket),
+`compaction_bounds_the_log_and_the_chain_still_restores` (120 checkpoints keep
+the frame bounded, and a quiet second type survives the snapshot), plus unit
+tests for the envelope, the shape-stable length, the replay fold, and the
+thresholds. The deferral adds `a_deferred_commit_that_never_lands_replays_the_retained_journal`
+(truncate the unsynced frame away — every acked write still replays out of the
+retained journal), and `a_checkpoint_is_one_write_and_one_barrier` now asserts
+both files: one `data.bin` sync, zero journal barriers, then the next write's
+own fsync completing the retirement.
+
 ## Open questions
 
-- **The one-barrier checkpoint.** Once the edit chunk is durable inside the
-  window's own `fsync`, the `Commit` frame is only a *pointer* — so it could ride
-  the next ordinary `Batch` append instead of taking a barrier of its own,
-  making a checkpoint cost **one** dedicated barrier instead of two. The price
-  is that the retired journal cannot be deleted until that next append lands,
-  so journals linger a little. This was 0041's original intent, dropped then
-  because the frame carried the state itself; carrying only a pointer brings it
-  back within reach. Worth doing as a follow-up, not in the first slice.
-- **Compaction threshold.** Edit bytes ≳ snapshot bytes is self-scaling and the
-  proposed default; a small database probably wants a floor (`max(1 MiB, …)`).
-  Wants a measurement.
+- **Compaction threshold.** `max(snapshot_blocks, 16 blocks)` and a 1024-chunk
+  cap are reasoned defaults, not measured ones; the bench baseline should tune
+  them against real checkpoint cadence.
 - **Back-pointers after all?** If `edits` in the frame ever feels wrong — say
   the threshold is raised far enough that the list is no longer trivial — a
   back-pointer per chunk restores O(1) frame size at the cost of ordering

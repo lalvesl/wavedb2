@@ -3,9 +3,10 @@
 - **Status:** Implemented (landed 2026-07-28)
 - **Supersedes:** the directory-chain blocks of
   [RFC 0019](0019-journal-rooted-recovery.md) (the `Commit` frame's *roots*)
-- **Amended by:** [RFC 0046](0046-directory-deltas-in-the-window-PLANNED.md)
-  *(Planned)* — the "Consequences" bullet below is right that the frame grows
-  with the schema's total bucket count, and wrong that the checkpoint interval
+- **Amended by:** [RFC 0046](0046-directory-deltas-in-the-window.md)
+  *(Implemented 2026-07-29)* — the "Consequences" bullet below is right that
+  the frame grows with the schema's total bucket count, and wrong that the
+  checkpoint interval
   is enough to bound it: the volume scales with the **database**, not the
   change (1 MiB per checkpoint at 2 GiB, 100 MiB at 200 GiB, most of it types
   that did not change). 0046 keeps the conclusion that reached here — metadata

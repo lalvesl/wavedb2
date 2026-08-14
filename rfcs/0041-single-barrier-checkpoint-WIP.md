@@ -2,7 +2,7 @@
 
 - **Status:** Implemented (landed 2026-07-28)
 - **Crates:** `wavedb-storage` (`wavedb-quick-node`'s maintenance policy is the only affected caller)
-- **Code:** `crates/wavedb-storage/src/{plan,checkpoint,settle,commit,chain}.rs`
+- **Code:** `crates/wavedb-storage/src/{plan,checkpoint,settle,commit}.rs`
 - **Builds on:** [RFC 0018](0018-storage-engine.md), [RFC 0019](0019-journal-rooted-recovery.md)
 - **Companion:** [RFC 0042](0042-free-space-defragmentation.md) — supplies the large
   contiguous windows this checkpoint consumes (not a correctness dependency:
@@ -113,19 +113,20 @@ directory is mutated *before* `file.sync()`.
 `JournalFrame::Commit(CommitFrame { journal_ts, roots, dicts })` is appended to
 the **new** journal, and the retired journal is deleted.
 
-> **Amended while implementing (2026-07-28).** The design first called for
-> appending this frame *without* its own fsync — letting the next `Batch` fsync
-> carry it, so a checkpoint would cost exactly one barrier. That does not hold
-> together: deleting the retired journal is only safe once the frame is durable,
-> and the retired journal is the *only* place the previous `Commit` lives. A
-> crash between the unlink and the frame reaching disk would leave recovery with
-> neither. Deferring the delete instead means tracking "which journal must be
-> synced before which file may go", and back-to-back checkpoints (no `Batch` in
-> between) need an explicit sync anyway. So the frame keeps the fsync `append`
-> already does, and a checkpoint costs **two** barriers: the window, then the
-> frame naming it. Both are per *checkpoint*, not per mutation — the thing this
-> RFC actually set out to fix was the scattered per-id writes, and those are
-> gone.
+> **Amended while implementing (2026-07-28), then restored (2026-07-29).** The
+> design first called for appending this frame *without* its own fsync — letting
+> the next `Batch` fsync carry it, so a checkpoint would cost exactly one
+> barrier. It was implemented with the fsync instead, because deleting the
+> retired journal is only safe once the frame is durable and the retired journal
+> is the *only* place the previous `Commit` lives: a crash between the unlink and
+> the frame reaching disk would leave recovery with neither.
+>
+> The objection was to doing the *delete* eagerly, not to deferring the *fsync* —
+> and [RFC 0046](0046-directory-deltas-in-the-window.md) separated the two. Its
+> `crate::retire` holds the retired journal and the protection roll until an
+> append makes the frame durable, and forces the barrier explicitly for the two
+> cases that motivated the objection (back-to-back checkpoints, an idle node).
+> So the original intent stands: **one barrier per checkpoint**, the window's.
 
 ### Phase 6 — release
 
@@ -178,7 +179,7 @@ is the only tuning dimension left.
 
 - `a_settle_round_is_one_write_and_one_read_per_touched_page` — 40 records
   re-settle in **one** write, **zero** syncs, at most one read per bucket.
-- `a_checkpoint_is_one_write_and_one_barrier` — pages, dictionary and chains
+- `a_checkpoint_is_one_write_and_one_barrier` — pages, dictionary and delta
   share one window write; one sync; and the result is a real recovery root
   (reopen resolves the records).
 - The existing durability suite is unchanged and still green:
