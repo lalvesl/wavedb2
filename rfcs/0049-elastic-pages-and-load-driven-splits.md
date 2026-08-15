@@ -1,6 +1,6 @@
 # RFC 0049 — Elastic pages and load-driven splits
 
-- **Status:** Planned
+- **Status:** Implemented (landed 2026-07-29)
 - **Builds on:** [RFC 0018](0018-storage-engine.md) (linear-hashed page
   directories), [RFC 0041](0041-single-barrier-checkpoint.md) (splits decided in
   the plan, before anything is written)
@@ -99,20 +99,45 @@ out at 2²⁰ blocks = 4 GiB. That is what makes a large object simply a large
 page, with no out-of-line blob path, no special descriptor, and no second read
 path — the record lives in its bucket like any other.
 
-### The threshold becomes a load target
+### The threshold becomes the target for the bucket whose turn it is
 
-Split when the directory's **mean** page size exceeds the target, not when some
-page does. That is the trigger linear hashing is built for: a fixed split order
-is only coherent with a global signal, because the order cannot respond to a
-local one.
+Split while **the bucket `next_split_bucket` names** is over target — not while
+some page is.
 
-Accounting is O(1), not O(buckets): `Directory` keeps a running sum of its
-descriptors' block counts, adjusted in `set_descriptor` and `push_bucket`. On
-recovery the sum is derived once from the replayed descriptors.
+> **Changed during implementation (2026-07-29).** This section first called for
+> a *mean* trigger: split while the directory's average page size exceeds the
+> target, with a running sum kept in `Directory`. That is the textbook answer,
+> and it is wrong here for the reason this RFC exists. An outlier inflates the
+> mean, so a single 1 GiB record would demand `262144 / target` buckets before
+> the average came back down — the same cascade the RFC set out to remove,
+> arriving through the denominator instead of through `any()`. Clamping each
+> bucket's contribution would fix it and would be a fudge factor with no
+> principle behind it.
+>
+> Asking about the turn bucket is both simpler and exactly right: it is the
+> only bucket a split can affect, so it is the only one whose size is evidence
+> about whether to split. It also needs no running sum at all — `Directory` is
+> untouched.
 
-`MAX_SPLITS_PER_ROUND` stops being a safety valve against a runaway loop and
-becomes what its name says — a pacing budget. The loop now terminates because
-each split raises the bucket count and so lowers the mean.
+The check costs nothing. If the round rewrote that bucket its planned image is
+in hand; otherwise its settled span is already in the descriptor
+(`planned_blocks`), so **deciding against a split reads nothing**.
+
+The consequences fall out:
+
+- **No split is ever wasted.** A split happens only where it relieves the
+  bucket being split, so the ~N/2 innocent splits cannot occur.
+- **The loop terminates by construction.** Splitting the source is what stops
+  it qualifying; there is no state where the condition stays true forever.
+- **A bucket over target and not in turn simply waits**, spanning more blocks —
+  the elastic behaviour, arrived at by declining to act rather than by a rule
+  that permits it.
+- **`MAX_SPLITS_PER_ROUND` becomes what its name says**, a pacing budget, since
+  it no longer guards against a runaway loop.
+
+Growth still tracks load: under a uniform hash every bucket crosses the target
+in turn, so the sweep proceeds and the table doubles. What it no longer tracks
+is the worst bucket.
 
 ### What a split still does
 
@@ -132,7 +157,7 @@ that holds the data, not to the database.
 
 | | today | this |
 |---|---|---|
-| split trigger | any planned page over threshold | mean page size over target |
+| split trigger | any planned page over threshold | the turn bucket over target |
 | splits to relieve one bucket | ~N/2, each a read + 2 page writes | none — it grows |
 | a record larger than the threshold | 64 splits per touching round, forever | a page that is simply large |
 | directory growth | driven by the worst bucket | driven by total load |
@@ -178,12 +203,39 @@ quantum everywhere else; paying it per bucket is the price of that uniformity.
 cascade, reintroduced with a higher constant — and it still never terminates for
 a record larger than whatever the constant is.
 
+## What landed
+
+`plan.rs` alone, plus a rename. `plan_splits` now computes `source` first and
+tests `planned_blocks(dir, pages, source)` against the target — the whole change
+is those few lines and the helper. `split_threshold_blocks` became
+`target_blocks_per_bucket` (and `DEFAULT_SPLIT_THRESHOLD_BLOCKS` likewise, value
+unchanged at 8 blocks) because it no longer describes a limit. `Directory`,
+`BlockDescriptor`, the window, and the split mechanics are untouched — variable
+page sizing was already there, so nothing had to be added to get elastic pages;
+only the machinery fighting them had to go.
+
+Proven by `a_record_larger_than_the_target_does_not_drive_splits`: four rounds
+writing a 32 KiB incompressible record (a fresh body each round, so the
+dictionary cannot shrink it out of range) against a 4 KiB target, asserting the
+directory stays under 16 buckets. Mutation-tested against the old trigger, which
+fails it at **65 buckets by round 2** — the livelock, reproduced.
+`many_records_trigger_split_and_stay_readable` guards the path that did not
+change: an instrumented run shows the trigger stepping 35 → 17 → 19 → 8 blocks
+and stopping when the turn bucket reaches target, leaving one bucket at 10
+blocks to wait its turn — elasticity and pacing in one trace.
+
 ## Open questions
 
-- **Blocks or occupation?** The load target is proposed over `count`, the blocks
-  a page spans. `occupation` (the 4-bit gauge already in the descriptor)
-  measures bytes actually used within the run and is closer to true load; it may
-  be the better signal, at the cost of reading a coarser number.
+- **Blocks or occupation?** The target is measured in `count`, the blocks a page
+  spans. `occupation` (the 4-bit gauge already in the descriptor) measures bytes
+  actually used within the run and is closer to true load; it may be the better
+  signal, at the cost of reading a coarser number.
+- **Does growth keep up under skew?** With the turn-bucket trigger the table
+  only grows where the sweep finds pressure. Under a uniform hash that is every
+  bucket in turn; under a hash that is uniform but a *workload* that is not, a
+  hot bucket waits for its turn while the table declines to grow. That is the
+  intended trade, but it wants a benchmark against a skewed key distribution
+  before the target is tuned.
 - **Per type or global?** The target is per-`StructStorage` today by virtue of
   living on `PageStore`. A type of large records and a type of tiny ones want
   different targets, and both are known at compile time.

@@ -1,6 +1,6 @@
 # RFC 0048 — The addressing log as a chain
 
-- **Status:** Planned
+- **Status:** Implemented (landed 2026-07-29)
 - **Amends:** [RFC 0046](0046-directory-deltas-in-the-window.md) (which put the
   chunk list in the `Commit` frame, and recorded this as its escape hatch)
 - **Crates:** `wavedb-storage`
@@ -217,6 +217,31 @@ frame names the block. O(1) frame and a single extra read at startup. Rejected:
 it reintroduces a per-checkpoint write of the whole list — 4 KiB even when one
 entry changed — which is the defect in a different place, and it is a block the
 allocator must manage on top of the chunks it already does.
+
+## What landed
+
+`EditChunk` gained `prev`; `CommitFrame` lost `snapshot` and `edits` for a
+single `head`. `edit::walk` follows the chain and returns it oldest-first, which
+`load_commit` folds through the unchanged `Replay`. `MetaLog::frame()` became
+`head()`, and `restored` takes the walked chain — the first chunk read as the
+snapshot, which it is whenever a compaction has happened and which the
+`COMPACT_FLOOR_BLOCKS` floor covers when it has not. `checkpoint::place_in`
+passes `prev = if full { 0 } else { meta.head() }`, known before the carve and a
+fixed 8 bytes, so the two-pass shape agreement is untouched.
+
+`MetaLog` moved to its own `meta_log.rs`: `edit.rs` went 8 lines over the
+350-line budget, and the seam was real — one module is a wire format plus a
+fold, the other a retention policy.
+
+Proven by `a_commit_frame_tracks_the_log_not_the_directory`, extended to
+checkpoint eight more times and assert the journal length is **identical** every
+round. Mutation-tested by putting the chunk list back in the frame beside the
+head: the frame grows 65 → 73 bytes and the test fails. `the_frame_is_the_head_however_long_the_log`
+walks a 41-chunk log asserting the head is always the newest and that a restored
+log matches on head, runs and compaction state; `a_chain_that_never_snapshotted_restores_whole`
+covers the young-database case where the chain's oldest chunk is a delta over an
+empty directory. `compaction_bounds_the_log_and_the_chain_still_restores` (120
+checkpoints, two types) was already the end-to-end guard and needed no change.
 
 ## Open questions
 
