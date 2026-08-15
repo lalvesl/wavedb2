@@ -3,8 +3,13 @@
 //! A round of [`crate::checkpoint`] already writes one contiguous window and
 //! already knows, by the time it has placed its pages, exactly which buckets
 //! changed address. This module turns that into an [`EditChunk`] appended to
-//! the same window: **the metadata costs no IOp of its own**, and the `Commit`
-//! frame shrinks to a snapshot address plus the list of chunks written since.
+//! the same window: **the metadata costs no IOp of its own**.
+//!
+//! Each chunk names the one written before it ([RFC 0048]), so the log is a
+//! chain in `data.bin` and the `Commit` frame is one address — the head. The
+//! frame therefore costs the same whether the log holds one chunk or a
+//! thousand, which is what lets compaction be spaced by the ratio rule below
+//! instead of by how large a frame is affordable.
 //!
 //! ## Two passes, one shape
 //!
@@ -17,13 +22,13 @@
 //!
 //! ## Compaction
 //!
-//! [`MetaLog`] tracks the log and decides when a round should emit a **full**
+//! [`crate::meta_log::MetaLog`] decides when a round should emit a **full**
 //! chunk instead of a delta: one naming every bucket of every type, built from
-//! the directories already resident in RAM. It supersedes the previous snapshot
-//! and every chunk after it, which are freed through the allocator's ordinary
-//! deferred-free path.
+//! the directories already resident in RAM. A snapshot writes `prev = 0` — it
+//! stands alone, so it ends the chain rather than extending it.
 //!
 //! [RFC 0046]: ../../../rfcs/0046-directory-deltas-in-the-window.md
+//! [RFC 0048]: ../../../rfcs/0048-chained-addressing-log.md
 
 use std::collections::BTreeMap;
 
@@ -36,13 +41,9 @@ use crate::page_store::PageStore;
 use crate::plan::SlotPlan;
 use crate::struct_storage::StructStorage;
 
-/// Edit-chunk blocks that must accumulate before rewriting the snapshot is
-/// worth it. Without a floor a small database would snapshot every round.
-const COMPACT_FLOOR_BLOCKS: u64 = 16; // 64 KiB
-
 /// Hard cap on chunks between snapshots — bounds a recovery's scattered reads
 /// even when the snapshot is large enough that the ratio alone would not.
-const MAX_EDIT_CHUNKS: usize = 1024;
+pub const MAX_EDIT_CHUNKS: usize = 1024;
 
 /// One type's descriptor changes in a round.
 #[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
@@ -57,14 +58,61 @@ pub struct SlotEdit {
     pub dict: Option<u64>,
 }
 
-/// What one settle window changed.
+/// What one settle window changed, and where the round before it recorded its
+/// own changes.
 ///
 /// A **full** chunk names every bucket of every type, so applying it over any
 /// prior state yields exactly that state; nothing on the wire distinguishes it
-/// from a delta, and nothing needs to.
+/// from a delta, and nothing needs to — a snapshot is simply a chunk that ends
+/// the chain.
 #[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
 pub struct EditChunk {
+    /// Raw [`BlockDescriptor`] of the chunk written before this one; `0` ends
+    /// the walk ([RFC 0048]).
+    ///
+    /// A **descriptor**, not an address: a chunk spans however many blocks its
+    /// round needed, so the pointer carries the count as well as the start and
+    /// the walk reads each chunk with one positioned read of exactly N blocks —
+    /// no probe read to discover a length. It rides inside the envelope's crc
+    /// like every other field, so a corrupted pointer fails its chunk's check
+    /// before there is anything to follow.
+    ///
+    /// [RFC 0048]: ../../../rfcs/0048-chained-addressing-log.md
+    pub prev: u64,
     pub slots: Vec<SlotEdit>,
+}
+
+/// Walk the chain back from `head`, newest first, returning every live chunk
+/// **oldest first** — the order [`Replay`] folds them in.
+///
+/// Reads each chunk to learn its `prev` and reads it again to apply it (in
+/// `load_commit`): 2N reads for O(1) RAM, the trade [RFC 0048] chose, since
+/// startup reads are the resource this design already spends and holding every
+/// chunk at once is not.
+///
+/// # Errors
+/// [`StorageError::Corrupt`] on an unreadable chunk, or on a chain longer than
+/// [`MAX_EDIT_CHUNKS`] — the reader-side bound that replaces the structural one
+/// a frame-carried list gave for free, and which also stops a walk that somehow
+/// re-enters itself.
+///
+/// [RFC 0048]: ../../../rfcs/0048-chained-addressing-log.md
+pub fn walk(
+    file: &BlockFile,
+    head: BlockDescriptor,
+) -> StorageResult<Vec<BlockDescriptor>> {
+    let mut chain = Vec::new();
+    let mut cursor = head;
+    while cursor.is_allocated() {
+        if chain.len() > MAX_EDIT_CHUNKS {
+            return Err(StorageError::Corrupt("edit chain too long"));
+        }
+        chain.push(cursor);
+        cursor =
+            BlockDescriptor::from_raw(read_chunk(file, cursor.run())?.prev);
+    }
+    chain.reverse();
+    Ok(chain)
 }
 
 /// Serialise a chunk for the window: `[len u32 LE][crc32][wire]`, the same
@@ -107,6 +155,7 @@ pub fn chunk_of(
     plans: &[SlotPlan],
     full: bool,
     dicts: &BTreeMap<usize, BlockDescriptor>,
+    prev: u64,
 ) -> EditChunk {
     let mut slots: Vec<SlotEdit> = plans
         .iter()
@@ -125,7 +174,7 @@ pub fn chunk_of(
             }
         }
     }
-    EditChunk { slots }
+    EditChunk { prev, slots }
 }
 
 /// The edit for a slot this round planned — its working directory holds the
@@ -225,79 +274,9 @@ impl Replay {
     }
 }
 
-/// The log of addressing records currently on disk: the last full snapshot and
-/// every delta chunk written since it. A `Commit` frame is this, verbatim.
-#[derive(Debug, Default)]
-pub struct MetaLog {
-    snapshot: BlockDescriptor,
-    edits: Vec<BlockDescriptor>,
-    edit_blocks: u64,
-}
-
-impl MetaLog {
-    /// The log a recovered `Commit` frame described.
-    pub fn restored(
-        snapshot: BlockDescriptor,
-        edits: Vec<BlockDescriptor>,
-    ) -> Self {
-        let edit_blocks = edits.iter().map(|d| d.count()).sum();
-        Self {
-            snapshot,
-            edits,
-            edit_blocks,
-        }
-    }
-
-    /// Whether the next round should write a full snapshot instead of a delta:
-    /// once the deltas outweigh the state they patch, rewriting it costs less
-    /// than carrying them.
-    pub fn wants_snapshot(&self) -> bool {
-        self.edits.len() >= MAX_EDIT_CHUNKS
-            || self.edit_blocks
-                >= self.snapshot.count().max(COMPACT_FLOOR_BLOCKS)
-    }
-
-    /// Record the round's chunk, returning the runs it superseded (a snapshot
-    /// supersedes the previous snapshot and every chunk after it).
-    pub fn record(&mut self, chunk: BlockDescriptor, full: bool) -> Vec<Run> {
-        if !full {
-            self.edit_blocks += chunk.count();
-            self.edits.push(chunk);
-            return Vec::new();
-        }
-        let mut stale: Vec<Run> =
-            self.edits.drain(..).map(BlockDescriptor::run).collect();
-        if self.snapshot.is_allocated() {
-            stale.push(self.snapshot.run());
-        }
-        self.edit_blocks = 0;
-        self.snapshot = chunk;
-        stale
-    }
-
-    /// Every run the log occupies — part of a checkpoint's protected set.
-    pub fn runs(&self) -> Vec<Run> {
-        self.edits
-            .iter()
-            .chain(std::iter::once(&self.snapshot))
-            .filter(|d| d.is_allocated())
-            .map(|d| d.run())
-            .collect()
-    }
-
-    /// `(snapshot, edits)` as the raw descriptors a `Commit` frame carries.
-    pub fn frame(&self) -> (u64, Vec<u64>) {
-        (
-            self.snapshot.raw(),
-            self.edits.iter().map(|d| d.raw()).collect(),
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{EditChunk, MetaLog, Replay, SlotEdit, encode};
-    use crate::block::BlockDescriptor;
+    use super::{EditChunk, Replay, SlotEdit, encode};
     use wavedb_core::wire::from_wire_checked;
 
     fn edit(hash: u64, buckets: u32, changed: &[(u32, u64)]) -> SlotEdit {
@@ -312,6 +291,7 @@ mod tests {
     #[test]
     fn chunk_roundtrips_through_its_envelope() {
         let chunk = EditChunk {
+            prev: 0,
             slots: vec![SlotEdit {
                 struct_hash: 7,
                 buckets: 3,
@@ -332,9 +312,11 @@ mod tests {
     #[test]
     fn encoded_length_depends_on_shape_not_addresses() {
         let skeleton = EditChunk {
+            prev: 0,
             slots: vec![edit(7, 3, &[(0, 0), (2, 0)])],
         };
         let filled = EditChunk {
+            prev: 0,
             slots: vec![edit(7, 3, &[(0, u64::MAX), (2, 0x1234_5678)])],
         };
         assert_eq!(encode(&skeleton).len(), encode(&filled).len());
@@ -345,6 +327,7 @@ mod tests {
         let mut replay = Replay::default();
         replay
             .apply(&EditChunk {
+                prev: 0,
                 slots: vec![SlotEdit {
                     struct_hash: 7,
                     buckets: 2,
@@ -356,6 +339,7 @@ mod tests {
         // A delta: bucket 1 moves, bucket 2 is new, the dictionary is untouched.
         replay
             .apply(&EditChunk {
+                prev: 0,
                 slots: vec![edit(7, 3, &[(1, 21), (2, 30)])],
             })
             .unwrap();
@@ -370,56 +354,10 @@ mod tests {
         assert!(
             replay
                 .apply(&EditChunk {
+                    prev: 0,
                     slots: vec![edit(7, 2, &[(5, 10)])],
                 })
                 .is_err()
         );
-    }
-
-    #[test]
-    fn compaction_triggers_on_the_floor_then_on_the_ratio() {
-        let mut log = MetaLog::default();
-        assert!(!log.wants_snapshot(), "an empty log needs no snapshot");
-        // Below the floor a small database keeps appending deltas.
-        for start in 0..15 {
-            log.record(BlockDescriptor::new(start, 1, 0), false);
-        }
-        assert!(!log.wants_snapshot());
-        log.record(BlockDescriptor::new(100, 1, 0), false);
-        assert!(log.wants_snapshot(), "16 blocks of deltas hits the floor");
-
-        // Snapshotting frees everything before it and resets the count.
-        let stale = log.record(BlockDescriptor::new(200, 64, 0), true);
-        assert_eq!(stale.len(), 16, "every delta chunk is superseded");
-        assert!(!log.wants_snapshot());
-        assert_eq!(log.runs().len(), 1, "only the snapshot is live");
-
-        // Now the ratio rules: 64 blocks of snapshot want 64 of deltas.
-        for start in 0..63 {
-            log.record(BlockDescriptor::new(1000 + start, 1, 0), false);
-        }
-        assert!(!log.wants_snapshot());
-        log.record(BlockDescriptor::new(2000, 1, 0), false);
-        assert!(log.wants_snapshot());
-    }
-
-    #[test]
-    fn frame_carries_the_snapshot_and_every_delta() {
-        let mut log = MetaLog::default();
-        log.record(BlockDescriptor::new(10, 2, 0), true);
-        log.record(BlockDescriptor::new(20, 1, 0), false);
-        let (snapshot, edits) = log.frame();
-        assert_eq!(snapshot, BlockDescriptor::new(10, 2, 0).raw());
-        assert_eq!(edits, vec![BlockDescriptor::new(20, 1, 0).raw()]);
-        // And a restored log resumes with the same accounting.
-        let restored = MetaLog::restored(
-            BlockDescriptor::from_raw(snapshot),
-            edits
-                .iter()
-                .map(|&r| BlockDescriptor::from_raw(r))
-                .collect(),
-        );
-        assert_eq!(restored.frame(), log.frame());
-        assert_eq!(restored.runs().len(), 2);
     }
 }

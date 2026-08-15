@@ -118,8 +118,17 @@ impl PageStore {
         // Pass one: the chunk's shape fixes its length, so a skeleton built
         // from the same plans reserves exactly what the filled one needs.
         let full = meta.wants_snapshot();
-        let reserved =
-            edit::encode(&edit::chunk_of(self, &plans, full, &BTreeMap::new()));
+        // A snapshot stands alone, so it ends the chain rather than extending
+        // it (RFC 0048). `prev` is known before the carve and is a fixed 8
+        // bytes, so it does not disturb the shape both passes agree on.
+        let prev = if full { 0 } else { meta.head() };
+        let reserved = edit::encode(&edit::chunk_of(
+            self,
+            &plans,
+            full,
+            &BTreeMap::new(),
+            prev,
+        ));
         targets.push(Target::Edit);
         let sizes: Vec<u64> = targets
             .iter()
@@ -137,7 +146,8 @@ impl PageStore {
 
         // Pass two: the same shape, now naming the runs just handed out.
         let dicts = dict_descriptors(&plans, &targets, &runs);
-        let chunk = edit::encode(&edit::chunk_of(self, &plans, full, &dicts));
+        let chunk =
+            edit::encode(&edit::chunk_of(self, &plans, full, &dicts, prev));
         if chunk.len() > reserved.len() {
             return Err(StorageError::Corrupt("edit chunk outgrew its window"));
         }
