@@ -307,7 +307,7 @@ own fsync completing the retirement.
   the threshold is raised far enough that the list is no longer trivial — a
   back-pointer per chunk restores O(1) frame size at the cost of ordering
   constraints on frees. The list is the better default; the chain is the escape
-  hatch. *(Taken up by [RFC 0048](0048-chained-addressing-log-PLANNED.md), which
+  hatch. *(Taken up by [RFC 0048](0048-chained-addressing-log.md), which
   reaches the condition from the other side: the threshold cannot be raised
   while the list is in the frame, because the log's write cost is quadratic in
   the interval. The free-ordering objection is answered by RFC 0047's
