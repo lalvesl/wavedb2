@@ -66,20 +66,23 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   batch) or from an idle timer (a whole barrier for housekeeping). Two journals
   on disk is the steady state — disk being the abundant resource — and no
   barrier is paid anywhere on a checkpoint's behalf.
+  Alongside them, [0049](0049-elastic-pages-and-load-driven-splits.md)
+  *(Implemented)* stopped the engine enforcing a page size. Linear hashing's
+  split order is derived from the directory length and cannot be aimed, so a
+  per-page overflow trigger split ~N/2 innocent buckets to relieve one — and
+  never terminated at all for a record larger than the threshold, since splits
+  distribute whole records: every touching round burned its full 64-split
+  budget forever. The trigger now asks about the bucket whose turn it is, so a
+  split only happens where it relieves something, an over-target bucket simply
+  spans more blocks until its turn, and a large object is just a large page.
+  And [0048](0048-chained-addressing-log.md) *(Implemented)* took the last
+  recurring cost out of the frame: it was rewritten in full at every checkpoint
+  to name state the previous frame already named, so a compaction cycle of N
+  checkpoints cost 4N² journal bytes — quadratic in the interval, and therefore
+  a ceiling on it, forcing the O(database) snapshot far more often than
+  necessary. Each chunk now names the one before it, the frame names only the
+  head, and it is a fixed 16 bytes however long the log grows.
 - **Proposed next (storage & query):**
-  [0048](0048-chained-addressing-log-PLANNED.md) — give each edit chunk a
-  `prev` pointer so the `Commit` frame carries one address instead of the whole
-  chunk list. The frame is rewritten in full every checkpoint to name state the
-  previous frame already named, which makes the log's write cost quadratic in
-  the compaction interval — and therefore caps that interval, forcing the
-  O(database) snapshot far more often than it need be;
-  [0049](0049-elastic-pages-and-load-driven-splits-PLANNED.md) — stop enforcing
-  a page size. Linear hashing's split order is derived from the directory
-  length and cannot be chosen, so today's per-page overflow trigger splits
-  ~N/2 innocent buckets to relieve one — and never terminates for a record
-  larger than the threshold. Splits become load-driven and an over-target
-  bucket simply spans more blocks, which also makes a large object just a
-  large page;
   [0044](0044-page-cache-PLANNED-LOW.md) — a page-granular cache so the read
   that precedes a write also serves the settle's read-modify-write;
   [0045](0045-vector-search-PLANNED.md) — nearest-neighbour search as a
@@ -170,8 +173,8 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0045](0045-vector-search-PLANNED.md) | Vector search | Planned |
 | [0046](0046-directory-deltas-in-the-window.md) | Directory deltas in the settle window | Implemented |
 | [0047](0047-generational-journal-retirement.md) | Generational journal retirement | Implemented |
-| [0048](0048-chained-addressing-log-PLANNED.md) | The addressing log as a chain | Planned |
-| [0049](0049-elastic-pages-and-load-driven-splits-PLANNED.md) | Elastic pages and load-driven splits | Planned |
+| [0048](0048-chained-addressing-log.md) | The addressing log as a chain | Implemented |
+| [0049](0049-elastic-pages-and-load-driven-splits.md) | Elastic pages and load-driven splits | Implemented |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |
