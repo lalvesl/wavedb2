@@ -13,11 +13,12 @@
 //! 3. drain: settle everything queued into pages — ONE window write
 //!    (RFC 0041), carrying that round's descriptor changes with it
 //!    (RFC 0046) — then fsync `data.bin`
-//! 4. append ONE `Commit { done: old_ts, snapshot, edits }` frame to the NEW
-//!    journal — **no fsync**. The frame is a *pointer* into the addressing
-//!    log the windows already wrote, so its size tracks rounds settled since
-//!    the last compaction, not the size of the database, and the next
-//!    `Batch` append's barrier carries it (RFC 0046)
+//! 4. append ONE `Commit { done: old_ts, head }` frame to the NEW journal —
+//!    **no fsync**. The frame is a *pointer* into the addressing log the
+//!    windows already wrote, naming only its newest chunk since each chunk
+//!    names the one before it (RFC 0048), so it is a fixed 16 bytes however
+//!    long the log is — and the next `Batch` append's barrier carries it
+//!    (RFC 0046)
 //! 5. hold this round's own retirement for the next checkpoint's step 2
 //! ```
 //!
@@ -27,8 +28,9 @@
 //! ## Recovery ( [`restore`] )
 //!
 //! Scan `journal_*.log` sorted by timestamp; the **newest decodable
-//! `Commit`** is the base: its snapshot chunk is read and its delta chunks
-//! folded over it in order ([`crate::edit::Replay`]) to rebuild every
+//! `Commit`** is the base: the chain is walked back from the head it names
+//! ([`crate::edit::walk`]) and folded on in write order
+//! ([`crate::edit::Replay`]) to rebuild every
 //! directory and dictionary run, the allocator derives from those runs plus
 //! the log's own, journals it covers (`ts <= journal_ts`) are skipped (and
 //! cleaned up), and every `Batch` in the remaining journals replays through
@@ -45,9 +47,10 @@ use crate::block::{BlockDescriptor, Run};
 use crate::block_file::{BlockFile, RESERVED_BLOCKS};
 use crate::dictionary::Dictionary;
 use crate::directory::Directory;
-use crate::edit::{MetaLog, Replay, read_chunk};
+use crate::edit::{Replay, read_chunk, walk};
 use crate::error::{StorageError, StorageResult};
 use crate::journal::{self, CommitFrame, Journal, JournalFrame};
+use crate::meta_log::MetaLog;
 use crate::page_store::PageStore;
 use crate::retire::Retiring;
 use crate::struct_storage::StructStorage;
@@ -142,13 +145,12 @@ impl PageStore {
         // marker, in ONE crc-framed append — written **without** a barrier.
         // The frame only points at state the sync above already made durable,
         // so the next `Batch` append's fsync carries it for free.
-        let (snapshot, edits) = meta.frame();
+        let head = meta.head();
         let frame_barrier = {
             let mut journal = self.journal.lock();
             journal.append_deferred(&JournalFrame::Commit(CommitFrame {
                 journal_ts: old.ts(),
-                snapshot,
-                edits,
+                head,
             }))?;
             // Under the same guard as the append — see `Retiring`.
             journal.barriers()
@@ -258,8 +260,11 @@ pub fn restore(
 /// Replay the addressing log a `Commit` names into the slots, and derive the
 /// allocator from everything it references.
 ///
-/// The snapshot chunk is the base; each delta chunk after it is folded on in
-/// order — the reverse of how the settle windows wrote them.
+/// The frame names only the newest chunk, so the log is discovered by walking
+/// `prev` back to the snapshot ([RFC 0048]); the chunks are then folded on in
+/// write order — the reverse of the walk.
+///
+/// [RFC 0048]: ../../../rfcs/0048-chained-addressing-log.md
 fn load_commit(
     file: &BlockFile,
     types: &[&'static StructStorage],
@@ -267,20 +272,10 @@ fn load_commit(
 ) -> StorageResult<(BlockAllocator, MetaLog)> {
     let mut used = vec![Run::new(0, RESERVED_BLOCKS)];
     let mut replay = Replay::default();
-    let snapshot = BlockDescriptor::from_raw(commit.snapshot);
-    if snapshot.is_allocated() {
-        replay.apply(&read_chunk(file, snapshot.run())?)?;
-        used.push(snapshot.run());
-    }
-    let mut edits = Vec::with_capacity(commit.edits.len());
-    for &raw in &commit.edits {
-        let desc = BlockDescriptor::from_raw(raw);
-        if !desc.is_allocated() {
-            continue;
-        }
+    let chain = walk(file, BlockDescriptor::from_raw(commit.head))?;
+    for desc in &chain {
         replay.apply(&read_chunk(file, desc.run())?)?;
         used.push(desc.run());
-        edits.push(desc);
     }
 
     let (slots, dicts) = replay.into_parts();
@@ -314,7 +309,7 @@ fn load_commit(
     }
     let mut alloc = BlockAllocator::from_layout(file.len_blocks()?, &used);
     alloc.set_protected(&used);
-    Ok((alloc, MetaLog::restored(snapshot, edits)))
+    Ok((alloc, MetaLog::restored(chain)))
 }
 
 /// The registered slot for `hash` — a commit naming an unlisted type
