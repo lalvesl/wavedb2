@@ -19,7 +19,8 @@ write pipeline. This is where most of WaveDB's engineering energy lives.
 | `directory_pages` | The directory's page **reads**: resolving a bucket to its `SlotPage`, decompressing against the passed-in `DictState`. |
 | `plan`            | A checkpoint's phase 1: touched ids → page images grouped per bucket, splits decided, nothing written.       |
 | `checkpoint`      | Phases 2–4: one best-fit window for every image, one positioned write, then the descriptor swap.            |
-| `edit`            | The addressing delta riding each window (`EditChunk`), its recovery fold (`Replay`), and the log + compaction policy (`MetaLog`). |
+| `edit`            | The addressing delta riding each window (`EditChunk`, chained by `prev`), its recovery fold (`Replay`), and the chain walk (`walk`).      |
+| `meta_log`        | Which chunks are live, the `Commit` frame's `head`, and when a round should compact the chain into a fresh snapshot.                  |
 | `retire`          | A checkpoint's deferred half: the retired journal + protection roll, held for the *next* checkpoint to dispose of.  |
 | `settle`          | The drain queue: what a round is, when it retries, and the cache-eviction budget.                           |
 | `chain`           | Directory chain blocks — the persisted address vector, copy-on-write, placed in the checkpoint's window.    |
@@ -370,7 +371,7 @@ mutation → journal append → the type's own BTreeMap<Id> cache → (client co
    descriptor changes those pages just caused
    ([RFC 0046](../../rfcs/0046-directory-deltas-in-the-window.md)). Metadata
    therefore costs **no IOp of its own** — same `write_run`, same `fsync` — and
-   the `Commit` frame shrinks to a snapshot address plus the deltas since it.
+   the `Commit` frame shrinks to one address: the chain's head.
    Once the deltas outweigh the state they patch, a round emits a full chunk
    instead and the superseded runs are freed.
 
@@ -459,11 +460,13 @@ the buckets that round moved, in the same write, for no extra IOp
 
 **Per checkpoint: one write, ONE barrier.** The window additionally carries a
 grown dictionary; then `data.bin` is synced — and that is the only barrier. The
-`Commit` frame is a *pointer* (the snapshot chunk's address plus the deltas
-since it) into state that sync already made durable, so it is appended
-**unsynced** and the next ordinary write's fsync carries it. Its size tracks
-rounds settled since the last compaction, **not** the size of the database, so a
-wide directory no longer costs 8 bytes per bucket per checkpoint.
+`Commit` frame is a *pointer* into state that sync already made durable, so it
+is appended **unsynced** and the next ordinary write's fsync carries it. Each
+chunk names the one before it, so the frame names only the head
+([RFC 0048](../../rfcs/0048-chained-addressing-log.md)): a fixed 16 bytes
+whatever the database's size **and** whatever the log's length — where
+carrying the descriptors cost 8 bytes per bucket, and carrying the chunk list
+made a compaction cycle quadratic in its own interval.
 
 Deleting the retired journal and rolling the allocator's protection wait for that
 durability, and are then done by the **next** checkpoint — which holds the
