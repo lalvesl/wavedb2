@@ -25,8 +25,8 @@
 //! - [`JournalFrame::Batch`] — one all-or-nothing batch of [`Write`]s (the
 //!   unit [`Store::apply`](wavedb_core::Store::apply) commits);
 //! - [`JournalFrame::Commit`] — "journal `<ts>` is fully settled into
-//!   `data.bin`": the retired journal's timestamp plus the addressing log's
-//!   snapshot and delta addresses. One frame, so the framing crc makes the
+//!   `data.bin`": the retired journal's timestamp plus the head of the
+//!   addressing chain. One frame, so the framing crc makes the
 //!   whole commit atomic — a torn commit is ignored and the retired journal
 //!   (still on disk) rules.
 //!
@@ -62,11 +62,16 @@ pub enum JournalFrame {
 /// pages findable.
 ///
 /// The frame is a **pointer**, not the state: the descriptors themselves ride
-/// the settle windows that changed them, so this names the last full snapshot
-/// and every delta chunk written since
-/// ([RFC 0046](../../../rfcs/0046-directory-deltas-in-the-window.md)).
-/// Its size tracks how many rounds have settled since the last compaction, not
-/// how large the database is.
+/// the settle windows that changed them
+/// ([RFC 0046](../../../rfcs/0046-directory-deltas-in-the-window.md)), and each
+/// chunk names the one before it, so this needs to name only the newest
+/// ([RFC 0048](../../../rfcs/0048-chained-addressing-log.md)).
+///
+/// **Fixed size.** It was a list of every chunk since the last snapshot, which
+/// meant appending the whole list again at every checkpoint to name state the
+/// previous frame already named — quadratic in the compaction interval, and so
+/// a ceiling on that interval. Now it is 16 bytes whether the log holds one
+/// chunk or a thousand.
 ///
 /// Appended **after** the page window is synced: physical order is the
 /// contract, and a frame is only meaningful once the blocks it addresses
@@ -75,12 +80,10 @@ pub enum JournalFrame {
 pub struct CommitFrame {
     /// Timestamp of the journal this commit retires — the DONE marker.
     pub journal_ts: u64,
-    /// Raw descriptor of the full-state snapshot chunk (`0` = none yet, i.e.
-    /// the deltas start from an empty directory).
-    pub snapshot: u64,
-    /// Raw descriptors of every delta chunk written after that snapshot,
-    /// oldest first.
-    pub edits: Vec<u64>,
+    /// Raw descriptor of the newest edit chunk; the walk goes back from here
+    /// to the snapshot. `0` = no addressing log yet (a first-generation
+    /// database whose directories are still empty).
+    pub head: u64,
 }
 
 /// An append-only log of [`JournalFrame`]s in one timestamped file.

@@ -31,6 +31,7 @@ mod directory_pages;
 mod edit;
 pub mod error;
 pub mod journal;
+mod meta_log;
 pub mod page;
 pub mod page_store;
 mod plan;
