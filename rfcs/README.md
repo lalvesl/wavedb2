@@ -83,8 +83,52 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   necessary. Each chunk now names the one before it, the frame names only the
   head, and it is a fixed 16 bytes however long the log grows.
 - **Proposed next (storage & query):**
+  [0050](0050-clustered-record-chains-PLANNED.md) — the open one, and the
+  largest: a collection's records are **additionally** stored inline in a chain of
+  segments ordered by the live version's **authoring instant**, so a scan costs one
+  read per segment instead of one page read *and* one zstd decompression per record,
+  a range keeps its logarithmic descent through the chain's sparse index, and — since
+  that is exactly the key `recency` uses — **the `recency` log disappears into the
+  chain**, records inline instead of references. The record at its anchor stays put and
+  stays authoritative, so every computed address, history walk and `Expect` guard is
+  untouched; the chain is a byte-identical derived duplicate. No chain stores a pointer
+  *to* a record — position is derived from the record's own key — so splits are free of
+  consequences, and because a split can always give its new id to the *interior* side,
+  a chain's `head` and `tail` ids are permanent and a growing chain never rewrites the
+  `Pivot`. The `current` B+tree disappears (the chain is the membership set, liveness
+  moves into the anchor's `Metadata`), `dead` stays as a reference-only log chain in a
+  lane of its own with **no index at all**, since nothing ever *searches* it, and a
+  dense B+tree exists only where the developer declares one. The cost is storage,
+  duplicated write bytes, and `all()` changing from insertion to modification order;
+  [0051](0051-ordered-record-lists-PLANNED.md) — built on it, and the repair for
+  the one thing it gives up: a declared property materialises a *second* chain of
+  the same records, kept sorted at write time (affordable because K extra segment
+  rewrites still cost one barrier), with a **sparse** index above it — one B+tree
+  entry per segment instead of per record, ~200× smaller, so a million-record
+  index is three leaves and permanently resident. Ordered and range reads cost one
+  dense read per segment of hits instead of one random read per hit; the price is
+  `(K+1)` copies of every record on disk, accepted deliberately;
+  [0052](0052-segment-size-as-the-pagination-unit-PLANNED.md) — the developer
+  declares a chain's capacity as a **minimum** N, normally the page size the UI
+  renders; a segment holds N…2N records and splits at 2N, which keeps an insert to
+  one segment rewrite where an exact size would cascade. A rendered page is one
+  segment read, two when the window straddles a boundary — and the first is almost
+  certainly still cached from the previous page. Exactness is not the goal anyway:
+  `search` is an async iterable, so a tick yields whatever the segment held and the
+  row count belongs to the layer above, filters included. The sparse index carries
+  element counts (leaf and subtree), making it an order-statistic tree — "jump to
+  page k" is one descent regardless of k, and an unfiltered pager's "of M" is the
+  root's sum. Costs are quoted **cold**: WaveDB is multi-tenant, so nothing may be
+  pinned in RAM;
+  [0053](0053-tenant-fair-cache-retention-PLANNED.md) — the policy that follows
+  from that: which entries deserve to stay hot without one tenant monopolising the
+  budget (navigational vs streaming, per-tenant accounting, no pinning ever). Held
+  at *Planned* until a measured workload justifies it — the baseline of read,
+  deposit, flush, and accept the miss is already correct;
   [0044](0044-page-cache-PLANNED-LOW.md) — a page-granular cache so the read
-  that precedes a write also serves the settle's read-modify-write;
+  that precedes a write also serves the settle's read-modify-write (the weaker
+  answer to 0050's problem: it pays to tolerate a random access pattern rather
+  than removing it — still worth having);
   [0045](0045-vector-search-PLANNED.md) — nearest-neighbour search as a
   declared index kind (IVF over the existing `BpTree`, per-tenant centroids).
 - **Deferred (low priority):**
@@ -175,6 +219,10 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0047](0047-generational-journal-retirement.md) | Generational journal retirement | Implemented |
 | [0048](0048-chained-addressing-log.md) | The addressing log as a chain | Implemented |
 | [0049](0049-elastic-pages-and-load-driven-splits.md) | Elastic pages and load-driven splits | Implemented |
+| [0050](0050-clustered-record-chains-PLANNED.md) | Clustered record chains (B+trees become opt-in) | Planned |
+| [0051](0051-ordered-record-lists-PLANNED.md) | Declared orderings: sorted chains + sparse index | Planned |
+| [0052](0052-segment-size-as-the-pagination-unit-PLANNED.md) | Segment size as the pagination unit | Planned |
+| [0053](0053-tenant-fair-cache-retention-PLANNED.md) | Tenant-fair cache retention | Planned |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |
