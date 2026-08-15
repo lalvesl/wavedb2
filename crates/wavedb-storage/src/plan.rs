@@ -29,9 +29,12 @@ use crate::page::SlotPage;
 use crate::page_store::PageStore;
 use crate::struct_storage::StructStorage;
 
-/// Splits one round may perform. Bounds the work a single checkpoint does
-/// when a burst lands in one bucket; anything still over threshold is split
-/// by the next round (page size is a target, not an invariant).
+/// Splits one round may perform — a pacing budget on how fast the directory
+/// grows in one checkpoint. Page size is a target, not an invariant: a bucket
+/// still over target is split when its turn next comes round, or never, if
+/// splitting cannot relieve it ([RFC 0049]).
+///
+/// [RFC 0049]: ../../../rfcs/0049-elastic-pages-and-load-driven-splits.md
 const MAX_SPLITS_PER_ROUND: usize = 64;
 
 /// One slot's planned contribution to a checkpoint.
@@ -67,6 +70,19 @@ impl SlotPlan {
 /// Blocks a serialised image occupies (an empty image occupies none).
 pub const fn blocks_of(bytes: &[u8]) -> u64 {
     bytes.len().div_ceil(BLOCK_SIZE) as u64
+}
+
+/// Blocks `bucket` will occupy once this round lands: its planned image when
+/// the round rewrites it, its settled span otherwise. The settled case reads
+/// the descriptor, so deciding against a split costs no IO.
+fn planned_blocks(
+    dir: &Directory,
+    pages: &BTreeMap<usize, Vec<u8>>,
+    bucket: usize,
+) -> u64 {
+    pages
+        .get(&bucket)
+        .map_or_else(|| dir.descriptor(bucket).count(), |b| blocks_of(b))
 }
 
 impl PageStore {
@@ -134,12 +150,23 @@ impl PageStore {
         })
     }
 
-    /// Split buckets until no planned page exceeds the size threshold (or the
-    /// round's split budget runs out), growing the working directory.
+    /// Split while the bucket **whose turn it is** is over target, growing the
+    /// working directory, up to the round's pacing budget ([RFC 0049]).
     ///
-    /// Splits are round-robin, so the split that relieves an over-sized bucket
-    /// may take a few turns to reach it — the loop simply keeps going, exactly
-    /// as the per-id path did.
+    /// Linear hashing's split order is derived from the directory's length
+    /// (`Directory::next_split_bucket`), because addressing depends on that
+    /// length and nothing else — so a split can never be aimed at whichever
+    /// bucket happens to have overflowed. The trigger therefore asks about the
+    /// bucket that is going to be split *anyway*: a split then never happens
+    /// except where it relieves something, and the loop terminates because
+    /// splitting the source is what makes it stop qualifying.
+    ///
+    /// A bucket over target whose turn has not come simply spans more blocks
+    /// until it does — including one holding a record larger than the target,
+    /// which splitting could never relieve at all, since splits distribute
+    /// whole records.
+    ///
+    /// [RFC 0049]: ../../../rfcs/0049-elastic-pages-and-load-driven-splits.md
     fn plan_splits(
         &self,
         slot: &'static StructStorage,
@@ -149,14 +176,13 @@ impl PageStore {
         pages: &mut BTreeMap<usize, Vec<u8>>,
     ) -> StorageResult<()> {
         for _ in 0..MAX_SPLITS_PER_ROUND {
-            if !pages
-                .values()
-                .any(|b| blocks_of(b) > self.split_threshold_blocks)
+            let level = dir.split_bit();
+            let source = dir.next_split_bucket() as usize;
+            if planned_blocks(dir, pages, source)
+                <= self.target_blocks_per_bucket
             {
                 return Ok(());
             }
-            let level = dir.split_bit();
-            let source = dir.next_split_bucket() as usize;
             let page = match staged_page(self, slot, dir, dict, staged, source)
             {
                 Ok(page) => {
