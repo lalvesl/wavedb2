@@ -82,9 +82,10 @@ use crate::directory::Directory;
 use crate::error::StorageResult;
 use crate::struct_storage::{BPTREE_NODE_STORAGE, EngineClaim, StructStorage};
 
-/// A bucket page spanning more blocks than this triggers one linear-hashing
-/// `split_next` on its directory (round-robin), bounding page sizes. Tunable.
-const DEFAULT_SPLIT_THRESHOLD_BLOCKS: u64 = 8; // 32 KiB
+/// How many blocks a bucket should hold. It is a **target**, not a limit: a
+/// bucket over it is split when its turn comes round, and simply spans more
+/// blocks until then (RFC 0049). Tunable.
+const DEFAULT_TARGET_BLOCKS_PER_BUCKET: u64 = 8; // 32 KiB
 
 /// Ids one batch touched, grouped by registry slot — what the settle consumes.
 pub(crate) type Touched = Vec<(usize, Vec<Id>)>;
@@ -104,7 +105,7 @@ pub struct PageStore {
     pub(crate) alloc: Mutex<BlockAllocator>,
     /// The addressing log written into the settle windows (RFC 0046): the
     /// last full snapshot chunk and every delta chunk after it.
-    pub(crate) meta: Mutex<crate::edit::MetaLog>,
+    pub(crate) meta: Mutex<crate::meta_log::MetaLog>,
     /// A checkpoint whose `Commit` frame is written but not yet durable —
     /// the retired journal and the protection roll it authorises (RFC 0046).
     pub(crate) retiring: Mutex<Option<crate::retire::Retiring>>,
@@ -112,7 +113,7 @@ pub struct PageStore {
     /// read-only route table after open.
     pub(crate) types: Vec<&'static StructStorage>,
     pub(crate) seed: [u64; 4],
-    pub(crate) split_threshold_blocks: u64,
+    pub(crate) target_blocks_per_bucket: u64,
     /// Touched ids committed to the caches but not yet settled into pages —
     /// what [`drain`](Self::drain) consumes.
     pub(crate) pending: Mutex<Touched>,
@@ -169,7 +170,7 @@ impl PageStore {
             retiring: Mutex::new(None),
             types,
             seed,
-            split_threshold_blocks: DEFAULT_SPLIT_THRESHOLD_BLOCKS,
+            target_blocks_per_bucket: DEFAULT_TARGET_BLOCKS_PER_BUCKET,
             pending: Mutex::new(Vec::new()),
             _claim: claim,
         };
@@ -440,7 +441,7 @@ mod tests {
         let mut s = open(d.path());
         // One block per bucket: a wide directory for little data, which is
         // exactly the shape this claim is about.
-        s.split_threshold_blocks = 1;
+        s.target_blocks_per_bucket = 1;
         block_on(async {
             for chunk in (0..200u64).step_by(50) {
                 // Batched applies keep the fsync count sane.
@@ -462,6 +463,23 @@ mod tests {
                  carrying the descriptors would have cost {} plus overhead",
                 8 * buckets
             );
+
+            // RFC 0048: and it does not grow with the log either. Each round
+            // adds a chunk to the chain; the frame keeps naming just the head,
+            // so every checkpoint costs the same handful of bytes.
+            for chunk in (200..600u64).step_by(50) {
+                let batch: Vec<Write> = (chunk..chunk + 50)
+                    .map(|k| Write::Put(nonunique(k), rec(SH, &noise(k))))
+                    .collect();
+                s.apply(&batch).await.unwrap();
+                s.drain().unwrap();
+                s.commit_journal().unwrap();
+                assert_eq!(
+                    s.journal_len(),
+                    frame,
+                    "the frame must not grow as the chain does"
+                );
+            }
         });
     }
 
@@ -1175,6 +1193,59 @@ mod tests {
             .collect()
     }
 
+    /// `noise`, at an arbitrary length — bytes the dictionary cannot collapse
+    /// as long as each call gets a distinct seed.
+    fn incompressible(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// Splitting distributes whole records; it cannot divide one. A record
+    /// larger than the target leaves its bucket permanently over target, and
+    /// RFC 0049 makes that a supported outcome — the page spans more blocks —
+    /// rather than a reason to keep splitting.
+    ///
+    /// Under the pre-0049 trigger ("any planned page over threshold") this
+    /// burned the whole 64-split budget on *every* round that touched the
+    /// bucket, growing the directory by 64 buckets each time and never
+    /// relieving anything.
+    #[test]
+    fn a_record_larger_than_the_target_does_not_drive_splits() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let mut s = open(d.path());
+        s.target_blocks_per_bucket = 1; // 4 KiB
+        let mut big = Vec::new();
+        block_on(async {
+            for round in 0..4u64 {
+                // A fresh body each round, so the dictionary cannot learn it
+                // and shrink the page out of the interesting range.
+                big = rec(SH, &incompressible(32 * 1024, round + 7));
+                s.apply(&[Write::Put(nonunique(1), big.clone())])
+                    .await
+                    .unwrap();
+                s.drain().unwrap();
+                assert!(
+                    s.bucket_count(SH) < 16,
+                    "round {round}: the directory grew to {} buckets chasing \
+                     a record no split can divide",
+                    s.bucket_count(SH)
+                );
+            }
+            assert_eq!(s.get(nonunique(1)).await.unwrap(), Some(big.clone()));
+        });
+    }
+
+    /// The other half of RFC 0049's rule, unchanged by it: a bucket genuinely
+    /// over target *is* split when its turn comes, so ordinary growth still
+    /// grows the table and every record survives the repartition.
     #[test]
     fn many_records_trigger_split_and_stay_readable() {
         let _g = engine_gate();
