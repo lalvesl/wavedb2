@@ -307,7 +307,11 @@ own fsync completing the retirement.
   the threshold is raised far enough that the list is no longer trivial — a
   back-pointer per chunk restores O(1) frame size at the cost of ordering
   constraints on frees. The list is the better default; the chain is the escape
-  hatch.
+  hatch. *(Taken up by [RFC 0048](0048-chained-addressing-log-PLANNED.md), which
+  reaches the condition from the other side: the threshold cannot be raised
+  while the list is in the frame, because the log's write cost is quadratic in
+  the interval. The free-ordering objection is answered by RFC 0047's
+  two-generation protected set.)*
 - **A whole-type edit variant.** A type whose buckets nearly all moved — a large
   defrag round, a rehash storm — is cheaper as a full descriptor vector than as
   a `changed` list. Letting `SlotEdit` carry either is a small addition; worth
