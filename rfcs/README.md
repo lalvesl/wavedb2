@@ -67,6 +67,19 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   on disk is the steady state — disk being the abundant resource — and no
   barrier is paid anywhere on a checkpoint's behalf.
 - **Proposed next (storage & query):**
+  [0048](0048-chained-addressing-log-PLANNED.md) — give each edit chunk a
+  `prev` pointer so the `Commit` frame carries one address instead of the whole
+  chunk list. The frame is rewritten in full every checkpoint to name state the
+  previous frame already named, which makes the log's write cost quadratic in
+  the compaction interval — and therefore caps that interval, forcing the
+  O(database) snapshot far more often than it need be;
+  [0049](0049-elastic-pages-and-load-driven-splits-PLANNED.md) — stop enforcing
+  a page size. Linear hashing's split order is derived from the directory
+  length and cannot be chosen, so today's per-page overflow trigger splits
+  ~N/2 innocent buckets to relieve one — and never terminates for a record
+  larger than the threshold. Splits become load-driven and an over-target
+  bucket simply spans more blocks, which also makes a large object just a
+  large page;
   [0044](0044-page-cache-PLANNED-LOW.md) — a page-granular cache so the read
   that precedes a write also serves the settle's read-modify-write;
   [0045](0045-vector-search-PLANNED.md) — nearest-neighbour search as a
@@ -157,6 +170,8 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0045](0045-vector-search-PLANNED.md) | Vector search | Planned |
 | [0046](0046-directory-deltas-in-the-window.md) | Directory deltas in the settle window | Implemented |
 | [0047](0047-generational-journal-retirement.md) | Generational journal retirement | Implemented |
+| [0048](0048-chained-addressing-log-PLANNED.md) | The addressing log as a chain | Planned |
+| [0049](0049-elastic-pages-and-load-driven-splits-PLANNED.md) | Elastic pages and load-driven splits | Planned |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |
