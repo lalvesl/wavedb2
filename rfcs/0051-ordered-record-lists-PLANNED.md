@@ -2,7 +2,7 @@
 
 - **Status:** Planned — opened 2026-07-29, revised 2026-07-30
 - **Crates:** `wavedb-core`, `wavedb-macros`
-- **Builds on:** [RFC 0050](0050-clustered-record-chains-PLANNED.md) — whose built-in
+- **Builds on:** [RFC 0050](0050-clustered-record-chains-WIP.md) — whose built-in
   modification-ordered chain **is** the first instance of this RFC's mechanism; here
   it becomes general, one chain per declared ordering
 

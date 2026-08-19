@@ -2,7 +2,7 @@
 
 - **Status:** Planned — opened 2026-07-29, revised 2026-07-30
 - **Crates:** `wavedb-core`, `wavedb-macros`
-- **Builds on:** [RFC 0050](0050-clustered-record-chains-PLANNED.md) (the segment),
+- **Builds on:** [RFC 0050](0050-clustered-record-chains-WIP.md) (the segment),
   [RFC 0051](0051-ordered-record-lists-PLANNED.md) (the sparse index),
   [RFC 0049](0049-elastic-pages-and-load-driven-splits.md) (a page is however many
   blocks it needs, read in one positioned read — which is why a segment's *element*

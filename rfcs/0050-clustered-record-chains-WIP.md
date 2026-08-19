@@ -1,6 +1,6 @@
 # RFC 0050 — Clustered record chains (B+trees become opt-in)
 
-- **Status:** Planned — opened 2026-07-29, revised 2026-07-30
+- **Status:** WIP — opened 2026-07-29, revised 2026-07-30, implementation started 2026-07-30
 - **Crates:** `wavedb-core` (the index and collection layers), `wavedb-macros`
 - **Code (today):** `crates/wavedb-core/src/index/{tree,tree_insert,tree_delete,stream}.rs`,
   `collection.rs`, `collection_write.rs`, `collection_keyed.rs`, `collection_recency.rs`
@@ -56,6 +56,37 @@ is untouched; the price is storage and the bytes of a duplicated write.**
 > and the instant floor) are served better by the chain than by the tree they used.
 > The `Pivot` now also holds each chain's **head and tail**, and both ids are
 > permanent, so a growing chain never rewrites the `Pivot`.
+
+## Implementation progress
+
+Phased so the suite stays green at every step; each phase is additive until phase 4,
+which is the one that changes the on-disk layout.
+
+| # | Phase | State |
+| --- | --- | --- |
+| 1 | `index/segment.rs` — the segment value: lane identity, byte form, in-place edits | **landed 2026-07-30** |
+| 2 | Element counts on `BpTree` nodes (order-statistic descent, RFC 0052) | next |
+| 3 | `index/chain.rs` — locate / insert / remove / scan over a `Store`, split policy, separator upkeep | |
+| 4 | `Pivot` roots become `(head, tail)` pairs; `Metadata` gains liveness | |
+| 5 | Collection write paths: anchor + segment + index + logs in one batch | |
+| 6 | Collection read paths: `all` / `search` / `search_by` descend and walk | |
+| 7 | Macros: `#[wavedb::order]`, `page = N`, generated roots | |
+| 8 | Compaction pass for sparse chains (RFC 0042's shape) | |
+
+**Phase 1** landed `Lane` (the derived per-type lane hash), `mint_segment_id`, and
+`Segment<P>` with a hand-written `WaveWire` impl — hand-written because a derive would
+need an owned wire-shape twin, and copying a segment's entries to encode them would
+double the bytes a write already moves. `P` is the payload: record bytes in a record
+lane, `()` in the removal log, which the tests exercise both of. Splitting is
+deliberately a pure container operation (`split_off` moves entries and nothing else),
+leaving re-linking and id minting to phase 3 — that is what lets a split always hand
+the *new* id to the interior side and keep a head's or tail's id permanent.
+
+Proven by mutation: dropping the lane tag from the hash derivation fails three tests
+(`lanes_and_types_never_share_a_hash`, `a_foreign_lane_tag_is_refused`,
+`segment_ids_are_minted_apart_and_never_repeat`); appending instead of placing in key
+order fails `inserts_land_in_key_order_whatever_the_arrival_order`; skipping the tag
+check on decode fails `a_foreign_lane_tag_is_refused`.
 
 ## Motivation
 

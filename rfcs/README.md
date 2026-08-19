@@ -83,7 +83,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   necessary. Each chunk now names the one before it, the frame names only the
   head, and it is a fixed 16 bytes however long the log grows.
 - **Proposed next (storage & query):**
-  [0050](0050-clustered-record-chains-PLANNED.md) — the open one, and the
+  [0050](0050-clustered-record-chains-WIP.md) — the open one, and the
   largest: a collection's records are **additionally** stored inline in a chain of
   segments ordered by the live version's **authoring instant**, so a scan costs one
   read per segment instead of one page read *and* one zstd decompression per record,
@@ -219,7 +219,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0047](0047-generational-journal-retirement.md) | Generational journal retirement | Implemented |
 | [0048](0048-chained-addressing-log.md) | The addressing log as a chain | Implemented |
 | [0049](0049-elastic-pages-and-load-driven-splits.md) | Elastic pages and load-driven splits | Implemented |
-| [0050](0050-clustered-record-chains-PLANNED.md) | Clustered record chains (B+trees become opt-in) | Planned |
+| [0050](0050-clustered-record-chains-WIP.md) | Clustered record chains (B+trees become opt-in) | WIP |
 | [0051](0051-ordered-record-lists-PLANNED.md) | Declared orderings: sorted chains + sparse index | Planned |
 | [0052](0052-segment-size-as-the-pagination-unit-PLANNED.md) | Segment size as the pagination unit | Planned |
 | [0053](0053-tenant-fair-cache-retention-PLANNED.md) | Tenant-fair cache retention | Planned |
