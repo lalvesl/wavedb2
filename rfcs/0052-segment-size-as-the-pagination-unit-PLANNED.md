@@ -61,8 +61,30 @@ struct Contact {
 }
 ```
 
-Unset, it falls back to RFC 0050's byte target — the right default for a collection
-nobody paginates.
+Unset, it falls back to a **default element count**, not to a byte target:
+
+| lane | default N | why |
+| --- | --- | --- |
+| `SEG(T)` — record chains | **16** | a segment holds 16…32 whole records |
+| `DEAD(T)` — the removal log | **256** | entries are `[instant][anchor]`, ~18 bytes, and the only read is a sequential tail scan |
+
+An earlier draft said an undeclared capacity falls back to RFC 0050's byte target.
+That contradicts this RFC's own argument: with a byte target the element count
+varies with record size, and both the split (2N) and merge (N/2) rules are stated
+in elements. The count is the primitive; bytes follow from it.
+
+16 is deliberately small, and the reason is the write side rather than the read
+side. Because the built-in chain is modification-ordered, **every save rewrites
+the growth-end segment** — whole records, re-compressed. At N=16 that is 16…32
+records' bytes per save; at N=200 it would be 200…400. A collection that
+paginates declares `page = N` and pays the larger rewrite knowingly; a collection
+that does not gets the cheap default and still turns a scan into 1 read per 16
+records instead of 1 per record.
+
+The cost is a larger sparse index than this RFC's worked example: at N=16 a
+million records are ~62 500 segments rather than ~5 000, so the descent is 2–3
+nodes rather than 2. Still bounded, still cold, still logarithmic — the property
+that matters is unchanged.
 
 **Capacity does not fold into `STRUCT_HASH`.** It is a physical layout parameter,
 not part of the type's meaning: it changes neither the wire shape nor any address
@@ -88,6 +110,47 @@ no insert ever cascades.
 The same rule serves the appending case, which is RFC 0050's built-in chain: its key
 is the authoring instant and instants only increase, so arrivals concentrate at the
 tail, and a tail reaching 2N splits by sealing its older half.
+
+### Split 50/50, merge at N/2, and why the band is really N/2…2N
+
+Splitting halves at 2N: the endpoint keeps its own half **and its own id**, the
+other half is minted a fresh id and linked in as an interior segment. On the
+built-in chain, whose arrivals all land at the tail, that means the tail keeps
+the newest N and a sealed segment of N appears behind it. Only the tail is ever
+in the upper band; sealed segments start at exactly N.
+
+Symmetrically, a segment falling to **N/2 merges** with a neighbour — and the
+merge is what makes 50/50 the right split rather than a lossy one:
+
+> **Correction (2026-07-30).** An earlier draft of this section argued for sealing
+> asymmetrically (keep `k` at the growth end, seal `2N−k`) on the grounds that a
+> 50/50 seal freezes interior segments at N forever, the bottom of the band. That
+> reasoning holds only for an append-only chain, and the built-in chain is not one:
+> a save **relocates** its record to the growth end, so interior segments *drain*.
+> Sealing high buys density that evaporates at the same rate. What actually keeps
+> the chain dense is the merge rule, which the RFC previously lacked entirely.
+
+So occupancy lives in `[N/2, 2N]`, with a hysteresis factor of 4 between the two
+triggers — a segment must lose half its entries or double them to be touched
+again, which is what stops a chain from thrashing on a workload that hovers at a
+boundary. In practice the mass sits at N…1.5N.
+
+Two rules the merge needs, neither of which is a free choice:
+
+- **Combined > 2N ⇒ redistribute, don't merge.** Neighbours at N/2 and 2N sum to
+  2.5N; merging would breach the band and the next insert would split it straight
+  back. Redistributing evenly leaves both at ≥ N.
+- **If an endpoint takes part, it is the survivor.** Otherwise the left segment
+  survives. Without this the merge can delete a head or tail and undo the
+  endpoint permanence that keeps the `Pivot` from being rewritten (RFC 0050).
+
+Note what the split actually costs on the wire: **three segment writes, not two.**
+The two halves, plus the neighbour on the far side of the new segment, whose
+`next` (or `prev`) must now name it. Only a split at a chain end with no outer
+neighbour costs two. A merge costs the same three. Amortised that is one extra
+segment write per N inserts, inside the one window a batch already writes
+(RFC 0041) — bytes, not IOps — but the earlier text said "a second segment write"
+and undercounted.
 
 ### What that costs a reader, and why it is nearly free
 
@@ -186,6 +249,22 @@ For a chain with minimum N and a UI page P ≤ N:
   Rejected: RFC 0049 removed the reason to fear a large page.
 - **Offset pagination by walking `next`.** Free to build, O(k) reads. Acceptable only
   for infinite scroll that never jumps.
+- **One index entry per distinct *value* instead of per segment**, to compress the
+  long homogeneous runs a low-cardinality ordering produces. Considered and
+  **rejected**, for two reasons that only became clear once the sort key was fixed
+  as `(value, anchor)`:
+  1. *It buys no correctness.* The trailing anchor makes every separator distinct
+     even inside a run of one repeated value, so the ordinary "last separator ≤ k"
+     descent already lands exactly, and an insertion into a run needs no search for
+     where the value changes.
+  2. *It buys almost no size.* The index's entry count depends on the **segment
+     count**, never on cardinality: a million records at N=16 is ~62 500 entries
+     whether the column holds three distinct values or a million. What run
+     compression would remove is byte redundancy between neighbouring separators,
+     which the per-type zstd dictionary already models.
+
+  And it would cost the thing this RFC exists for: per-value entries break the
+  offset descent, since locating an offset *inside* a run would become a walk.
 
 ## Open questions
 
@@ -194,10 +273,10 @@ For a chain with minimum N and a UI page P ≤ N:
   aligned and one not. A per-view override cannot change the layout, so the answer is
   probably "declare the largest, let smaller views subdivide it" — worth confirming
   against a real application before committing the syntax.
-- **Split point.** Halving at 2N gives two segments of N, the minimum — so the next
-  insert into either is again a plain rewrite, but both sit at the bottom of the band.
-  Splitting 60/40 in the direction inserts are arriving may pay for itself on an
-  appending chain. Measure before choosing.
+- ~~**Split point.**~~ **Resolved (2026-07-30): 50/50, endpoint keeps its half and
+  its id, merge at N/2.** See [the section above](#split-5050-merge-at-n2-and-why-the-band-is-really-n22n)
+  — the asymmetric alternative was arguing about a density that a draining chain
+  does not preserve anyway.
 - **Do counts need to survive a crash independently?** They are derived from the
   segments they name, so replay rebuilds them; but if an index entry and its segment
   could ever disagree, a pager would be silently wrong. The single-batch rule should

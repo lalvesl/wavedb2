@@ -155,11 +155,11 @@ async fn full_client_flow_and_restart() {
     assert_eq!(
         titles(&all),
         vec![
-            ("Buy milk", false),
-            ("Write docs", false),
             ("Read the Rust book", false),
+            ("Write docs", false),
+            ("Buy milk", false),
         ],
-        "insertion order"
+        "most recently written first"
     );
 
     complete_todo(&db, id_milk).await.expect("complete");
