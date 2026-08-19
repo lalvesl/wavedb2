@@ -85,20 +85,55 @@ fn pivot_identity(pivot: &Ident, num_secondaries: usize) -> u64 {
         &pivot.to_string(),
         "Pivot",
         &[
-            ("current".into(), "LocalId".into()),
-            ("dead".into(), "LocalId".into()),
-            ("recency".into(), "LocalId".into()),
+            ("records".into(), "ChainRoots".into()),
+            ("removals".into(), "LogRoots".into()),
             ("secondaries".into(), format!("[LocalId;{num_secondaries}]")),
             ("permission".into(), "Option<PermissionRef>".into()),
         ],
     )
 }
 
+/// The `Pivot` trait impl for the generated roots holder: the B+tree roots
+/// and the chain roots that are succeeding them (RFC 0050), plus the two
+/// rewrite constructors the engine uses when a root moves.
+fn pivot_impl(pivot: &Ident, pivot_hash: u64) -> TokenStream {
+    quote! {
+        impl ::wavedb_core::index::Pivot for #pivot {
+            const STRUCT_HASH: u64 = #pivot_hash;
+
+            fn secondaries(&self) -> &[::wavedb_core::LocalId] { &self.secondaries }
+            fn records(&self) -> ::wavedb_core::ChainRoots { self.records }
+            fn removals(&self) -> ::wavedb_core::LogRoots { self.removals }
+            fn permission(&self) -> ::core::option::Option<&::wavedb_core::PermissionRef> {
+                self.permission.as_ref()
+            }
+            fn replace_roots(
+                &self,
+                secondaries: &[::wavedb_core::LocalId],
+                records: ::wavedb_core::ChainRoots,
+                removals: ::wavedb_core::LogRoots,
+            ) -> Self {
+                let mut secs = self.secondaries;
+                // The engine always passes exactly this pivot's root count
+                // (it derives the slice from `secondaries()`); a mismatch is
+                // a caller bug worth failing loudly on.
+                secs.copy_from_slice(secondaries);
+                Self {
+                    records,
+                    removals,
+                    secondaries: secs,
+                    permission: ::core::clone::Clone::clone(&self.permission),
+                }
+            }
+        }
+    }
+}
 /// Emit the `PivotId` newtype and the `Pivot` roots holder for a NonUnique struct
 /// named `name` with the given resolved secondary indexes and (for a
 /// `#[wavedb::key(...)]` type) natural-key fields.
 pub fn nonunique_types(
     name: &Ident,
+    hash: u64,
     secondaries_specs: &[ResolvedPivot],
     key_fields: Option<&[(Ident, syn::Type)]>,
 ) -> syn::Result<TokenStream> {
@@ -129,15 +164,16 @@ pub fn nonunique_types(
     // The per-command execution steps (`__wavedb_<op>`) — defined here,
     // wire-reachable only once listed in an exposure declaration.
     let exec_steps = exec_ops::nonunique_ops(name);
+    let pivot_impl = pivot_impl(&pivot, pivot_hash);
+    let lane_statics = storage_statics::lane_statics(name, hash);
 
     let pivot_def: syn::DeriveInput = parse_quote! {
         #[repr(C)]
         #[derive(::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq,
                  ::core::fmt::Debug, ::core::default::Default)]
         pub struct #pivot {
-            pub current: ::wavedb_core::LocalId,
-            pub dead: ::wavedb_core::LocalId,
-            pub recency: ::wavedb_core::LocalId,
+            pub records: ::wavedb_core::ChainRoots,
+            pub removals: ::wavedb_core::LogRoots,
             pub secondaries: [::wavedb_core::LocalId; #num_secondaries],
             pub permission: ::core::option::Option<::wavedb_core::PermissionRef>,
         }
@@ -188,37 +224,7 @@ pub fn nonunique_types(
         #pivot_storage
         #storage_entries
         #exec_steps
-
-        impl ::wavedb_core::index::Pivot for #pivot {
-            const STRUCT_HASH: u64 = #pivot_hash;
-
-            fn current(&self) -> ::wavedb_core::LocalId { self.current }
-            fn dead(&self) -> ::wavedb_core::LocalId { self.dead }
-            fn recency(&self) -> ::wavedb_core::LocalId { self.recency }
-            fn secondaries(&self) -> &[::wavedb_core::LocalId] { &self.secondaries }
-            fn permission(&self) -> ::core::option::Option<&::wavedb_core::PermissionRef> {
-                self.permission.as_ref()
-            }
-            fn replace_roots(
-                &self,
-                current: ::wavedb_core::LocalId,
-                dead: ::wavedb_core::LocalId,
-                recency: ::wavedb_core::LocalId,
-                secondaries: &[::wavedb_core::LocalId],
-            ) -> Self {
-                let mut secs = self.secondaries;
-                // The engine always passes exactly this pivot's root count
-                // (it derives the slice from `secondaries()`); a mismatch is
-                // a caller bug worth failing loudly on.
-                secs.copy_from_slice(secondaries);
-                Self {
-                    current,
-                    dead,
-                    recency,
-                    secondaries: secs,
-                    permission: ::core::clone::Clone::clone(&self.permission),
-                }
-            }
-        }
+        #pivot_impl
+        #lane_statics
     })
 }

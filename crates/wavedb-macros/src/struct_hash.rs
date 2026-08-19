@@ -58,6 +58,21 @@ pub fn compute(name: &str, shape: &str, fields: &[(String, String)]) -> u64 {
     seahash(canonical.as_bytes())
 }
 
+/// A reserved lane's `STRUCT_HASH` for the type hashing to `struct_hash` — the
+/// **same derivation** `wavedb_core::index::Lane::hash` performs at runtime.
+///
+/// Computed here rather than called there because a `static StructStorage`
+/// needs a `const` initialiser and SeaHash is not a `const fn`. Note the plain
+/// `seahash::hash`: the lane derivation uses the crate's default seeds, not
+/// this module's `STRUCT_SEED`, so it must not go through [`seahash`].
+///
+/// The two must agree exactly — see `lane_hashes_match_the_engines` in
+/// `examples/schema-smoke`, which pins it against a real generated type.
+pub fn lane_hash(tag: &[u8], struct_hash: u64) -> u64 {
+    let mut bytes = tag.to_vec();
+    bytes.extend_from_slice(&struct_hash.to_le_bytes());
+    seahash::hash(&bytes)
+}
 #[cfg(test)]
 mod tests {
     use super::compute;

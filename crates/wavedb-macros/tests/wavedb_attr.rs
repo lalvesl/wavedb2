@@ -75,8 +75,8 @@ fn nonunique_shape_and_generated_types() {
     let _: <Note as WaveDbStruct>::PivotId = handle;
 
     let pivot = NotePivot::default();
-    assert_eq!(pivot.current(), wavedb_core::LocalId::default());
-    assert_eq!(pivot.dead(), wavedb_core::LocalId::default());
+    assert_eq!(pivot.records(), wavedb_core::ChainRoots::default());
+    assert_eq!(pivot.removals(), wavedb_core::LogRoots::default());
     assert_eq!(pivot.secondaries().len(), 0); // no #[wavedb::pivot]
     assert_eq!(pivot.permission(), None, "default = tenant-only");
 }
