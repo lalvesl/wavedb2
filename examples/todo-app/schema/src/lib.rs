@@ -218,9 +218,12 @@ pub async fn add_todo(db: &Db, title: String) -> Result<Id> {
         .await
 }
 
-/// Every todo in insertion order (`CREATED_AT` ascending) — an async
-/// iterator streamed item-by-item over the wire (there is no query DSL;
-/// filtered/derived reads are functions like this).
+/// Every todo, **most recently changed first** — an async iterator streamed
+/// item-by-item over the wire (there is no query DSL; filtered/derived reads
+/// are functions like this).
+///
+/// The order is the record chain's (RFC 0050): a completed todo moves to the
+/// front, because the chain is ordered by when each record was last written.
 #[server]
 pub fn all_todos(db: &Db) -> impl Stream<Item = Result<Todo>> {
     async_profile_todos(db)

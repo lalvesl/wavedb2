@@ -186,13 +186,20 @@ mod tests {
     }
 
     // The NonUnique derive emits the collection machinery: a typed PivotId
-    // handle and a Pivot with current/dead roots plus one secondary slot per
-    // `#[wavedb::pivot(...)]`.
+    // handle and a Pivot with the record chain's and removal log's roots,
+    // plus one secondary slot per `#[wavedb::pivot(...)]`.
     #[test]
     fn nonunique_generates_pivot_types() {
         let pivot = NotePivot {
-            current: LocalId::new(10, false, 1),
-            dead: LocalId::new(20, false, 2),
+            records: wavedb_core::ChainRoots {
+                head: LocalId::new(10, false, 1),
+                tail: LocalId::new(11, false, 1),
+                index: LocalId::new(12, false, 1),
+            },
+            removals: wavedb_core::LogRoots {
+                head: LocalId::new(20, false, 2),
+                tail: LocalId::new(21, false, 2),
+            },
             ..NotePivot::default()
         };
         assert_eq!(pivot.secondaries.len(), 1, "one #[wavedb::pivot(...)]");
@@ -280,12 +287,18 @@ mod tests {
         assert!(Note::struct_storage().compress());
         assert!(!crate::Attachment::struct_storage().compress());
 
-        // Unique registers itself; NonUnique bundles its Pivot's slot too.
+        // Unique registers itself; NonUnique bundles its Pivot's slot and the
+        // three reserved lanes its collection lives in (RFC 0050) — the record
+        // chain, the removal log, and the sparse index, each its own directory
+        // so a page never mixes fat records with skinny log entries.
         assert_eq!(AboutUser::storage_entries().len(), 1);
         let entries = Note::storage_entries();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 5);
         assert!(std::ptr::eq(entries[0], Note::struct_storage()));
         assert!(std::ptr::eq(entries[1], NotePivot::struct_storage()));
+        assert!(std::ptr::eq(entries[2], Note::records_lane_storage()));
+        assert!(std::ptr::eq(entries[3], Note::dead_lane_storage()));
+        assert!(std::ptr::eq(entries[4], Note::index_lane_storage()));
 
         // The exposure's StorageRegistry flattens struct entries AND the
         // `store` entry — Attachment's slot registers with no wire surface.
@@ -788,12 +801,12 @@ mod tests {
             let walked: Vec<Note> = col.all(&db).try_collect().await.unwrap();
             assert_eq!(
                 walked.iter().map(|n| n.body.as_str()).collect::<Vec<_>>(),
-                vec!["first", "second"],
-                "insertion order"
+                vec!["second", "first"],
+                "most recently written first"
             );
 
             // Update = save at the stable Id; identity never changes.
-            let mut second = walked[1].clone();
+            let mut second = walked[0].clone();
             second.pinned = false;
             col.save(&db, b, &second).await.unwrap();
             assert_eq!(col.get(&db, b).await.unwrap(), Some(second));
@@ -805,5 +818,69 @@ mod tests {
             assert_eq!(after[0].body, "second");
             assert!(col.get(&db, a).await.unwrap().is_some());
         });
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lane_tests {
+    use super::Note;
+    use wavedb_core::index::Lane;
+
+    #[test]
+    fn lane_hashes_match_the_engines() {
+        // The macro derives each lane's `STRUCT_HASH` at expansion time —
+        // a `static StructStorage` needs a `const` initialiser and SeaHash is
+        // not a `const fn` — while the engine derives it at runtime through
+        // `Lane::hash`. Two implementations of one identity: if they drift, a
+        // chain writes into a directory nothing reads and the failure is
+        // silent, so it is pinned here against a real generated type.
+        for (lane, slot) in [
+            (Lane::Records, Note::records_lane_storage()),
+            (Lane::Dead, Note::dead_lane_storage()),
+            (Lane::Index, Note::index_lane_storage()),
+        ] {
+            assert_eq!(
+                slot.struct_hash(),
+                lane.hash(Note::STRUCT_HASH),
+                "{lane:?} lane hash drifted between the macro and the engine"
+            );
+        }
+    }
+
+    #[test]
+    fn the_lane_hashes_the_collision_guard_reads_are_the_real_ones() {
+        // `WaveDbStruct::LANE_HASHES` is what the registry's salt guard
+        // compares (a lane occupies a `type_salt` exactly as a record type
+        // does). It is a *third* derivation of the same identity, so it is
+        // pinned like the storage slots: a stale list would leave real
+        // occupants of the 15-bit space unchecked, silently.
+        use wavedb_core::WaveDbStruct as _;
+        assert_eq!(
+            Note::LANE_HASHES,
+            [
+                Lane::Records.hash(Note::STRUCT_HASH),
+                Lane::Dead.hash(Note::STRUCT_HASH),
+                Lane::Index.hash(Note::STRUCT_HASH),
+            ],
+            "the guard's lane list drifted from the engine's"
+        );
+        // A Unique type owns no collection, so it reserves no lane.
+        assert!(super::AboutUser::LANE_HASHES.is_empty());
+    }
+
+    #[test]
+    fn every_lane_a_collection_needs_is_registered() {
+        // `PageStore::open` takes exactly this list; a lane missing from it
+        // refuses at runtime with `no StructStorage registered`.
+        let registered: Vec<u64> = Note::storage_entries()
+            .iter()
+            .map(|s| s.struct_hash())
+            .collect();
+        for lane in [Lane::Records, Lane::Dead, Lane::Index] {
+            assert!(
+                registered.contains(&lane.hash(Note::STRUCT_HASH)),
+                "{lane:?} is not in Note::storage_entries()"
+            );
+        }
     }
 }
