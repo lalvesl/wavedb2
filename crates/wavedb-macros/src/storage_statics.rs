@@ -72,12 +72,21 @@ pub fn statics_for(
 /// Emit `storage_entries()` on the record type: every slot the type needs
 /// registered at `PageStore::open` — its own, plus its Pivot's for NonUnique.
 pub fn entries_for(name: &Ident, pivot: Option<&Ident>) -> TokenStream {
+    // A NonUnique type also owns three reserved lanes (RFC 0050) — the record
+    // chain, the removal log and the sparse index — each a directory of its
+    // own, so each needs its own registered slot.
     let (len, list) = pivot.map_or_else(
         || (quote!(1usize), quote!([Self::struct_storage()])),
         |pivot| {
             (
-                quote!(2usize),
-                quote!([Self::struct_storage(), #pivot::struct_storage()]),
+                quote!(5usize),
+                quote!([
+                    Self::struct_storage(),
+                    #pivot::struct_storage(),
+                    Self::records_lane_storage(),
+                    Self::dead_lane_storage(),
+                    Self::index_lane_storage(),
+                ]),
             )
         },
     );
@@ -90,6 +99,51 @@ pub fn entries_for(name: &Ident, pivot: Option<&Ident>) -> TokenStream {
             pub fn storage_entries()
             -> [&'static ::wavedb_storage::StructStorage; #len] {
                 #list
+            }
+        }
+    }
+}
+
+/// The three reserved-lane slots a NonUnique type needs registered: its record
+/// chain's segments, its removal log's, and its sparse index's (RFC 0050).
+///
+/// Each lane is its own storage directory, which is what keeps a page
+/// homogeneous — fat inline records, skinny `[instant][anchor]` pairs and
+/// navigational index nodes never share one, so each trains a dictionary on one
+/// kind of content. The hashes are derived at expansion time
+/// ([`struct_hash::lane_hash`]) because a `static` needs a `const` initialiser.
+pub fn lane_statics(name: &Ident, hash: u64) -> TokenStream {
+    let records = crate::struct_hash::lane_hash(b"WDB.SEG", hash);
+    let dead = crate::struct_hash::lane_hash(b"WDB.DEAD", hash);
+    let index = crate::struct_hash::lane_hash(b"WDB.IDX", hash);
+    quote! {
+        #[cfg(not(target_arch = "wasm32"))]
+        impl #name {
+            /// Storage slot for this type's **record chain** segments.
+            #[must_use]
+            pub fn records_lane_storage()
+            -> &'static ::wavedb_storage::StructStorage {
+                static SLOT: ::wavedb_storage::StructStorage =
+                    ::wavedb_storage::StructStorage::new(#records);
+                &SLOT
+            }
+
+            /// Storage slot for this type's **removal log** segments.
+            #[must_use]
+            pub fn dead_lane_storage()
+            -> &'static ::wavedb_storage::StructStorage {
+                static SLOT: ::wavedb_storage::StructStorage =
+                    ::wavedb_storage::StructStorage::new(#dead);
+                &SLOT
+            }
+
+            /// Storage slot for this type's **sparse index** nodes.
+            #[must_use]
+            pub fn index_lane_storage()
+            -> &'static ::wavedb_storage::StructStorage {
+                static SLOT: ::wavedb_storage::StructStorage =
+                    ::wavedb_storage::StructStorage::new(#index);
+                &SLOT
             }
         }
     }

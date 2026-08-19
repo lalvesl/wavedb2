@@ -84,15 +84,15 @@ impl Lane {
     }
 }
 
-/// Mint a fresh segment `LocalId`.
+/// Mint a fresh `LocalId` in `lane_hash`'s lane — a segment or an index node.
 ///
 /// A [`key_nanos`] key (collision-free by its fused counter), `FLAG = 1`, and the
-/// lane hash's type salt — which keeps segment ids apart from record anchors,
+/// lane hash's type salt — which keeps lane ids apart from record anchors,
 /// archive slots and tree nodes even in a flat keyspace (IndexedDB).
 ///
 /// [`key_nanos`]: wavedb_platform::time::key_nanos
 #[must_use]
-pub fn mint_segment_id(lane_hash: u64) -> LocalId {
+pub fn mint_lane_id(lane_hash: u64) -> LocalId {
     LocalId::new(
         wavedb_platform::time::key_nanos(),
         true,
@@ -121,6 +121,33 @@ impl<P> Segment<P> {
             next,
             entries: Vec::new(),
         }
+    }
+
+    /// A segment holding `entries` — which must already ascend by key, as they
+    /// do when they came out of another segment.
+    #[must_use]
+    pub const fn with_entries(
+        prev: Option<LocalId>,
+        next: Option<LocalId>,
+        entries: Vec<(SecKey, P)>,
+    ) -> Self {
+        Self {
+            prev,
+            next,
+            entries,
+        }
+    }
+
+    /// Take every entry out, leaving the segment empty but still linked — how a
+    /// split and a merge move runs of entries without copying them.
+    pub fn take_entries(&mut self) -> Vec<(SecKey, P)> {
+        core::mem::take(&mut self.entries)
+    }
+
+    /// Append `entries`, which must all sort above everything already here (a
+    /// merge with the neighbour toward larger keys).
+    pub fn extend(&mut self, entries: Vec<(SecKey, P)>) {
+        self.entries.extend(entries);
     }
 
     /// The neighbour toward smaller keys; `None` if this is the head.
@@ -286,7 +313,7 @@ impl<P: WaveWire> Segment<P> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lane, Segment, mint_segment_id};
+    use super::{Lane, Segment, mint_lane_id};
     use crate::error::Error;
     use crate::index::node_key::SecKey;
     use crate::local_id::LocalId;
@@ -392,12 +419,12 @@ mod tests {
     #[test]
     fn segment_ids_are_minted_apart_and_never_repeat() {
         let hash = Lane::Records.hash(TYPE_HASH);
-        let a = mint_segment_id(hash);
-        let b = mint_segment_id(hash);
+        let a = mint_lane_id(hash);
+        let b = mint_lane_id(hash);
         assert_ne!(a, b, "the fused counter must order back-to-back mints");
         assert_ne!(
             a.salt(),
-            mint_segment_id(Lane::Dead.hash(TYPE_HASH)).salt(),
+            mint_lane_id(Lane::Dead.hash(TYPE_HASH)).salt(),
             "lanes must land in different salt lanes"
         );
     }

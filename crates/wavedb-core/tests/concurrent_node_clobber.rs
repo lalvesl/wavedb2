@@ -1,9 +1,20 @@
-//! Scratch experiment: does a shared `BpTree` node survive two concurrently
-//! planned batches?
+//! Does a shared `BpTree` node survive two concurrently planned batches?
 //!
-//! The question the RFC 0050 chain inherits. Two stores, identical except for
-//! one thing — whether `get` yields to the executor — driven by the same pair
-//! of interleaved inserts.
+//! The invariant the RFC 0050 chain inherits, pinned here because it is a
+//! property of the **executor model**, not of any structure: `PageStore`'s
+//! futures all resolve on first poll (its `get`/`apply` bodies are synchronous),
+//! so on a current-thread runtime a collection op never yields between its reads
+//! and its `apply` and cannot interleave with another. A `Store` that genuinely
+//! suspends — IndexedDB, or anything network-backed — breaks that, and the loss
+//! is silent: the record is live at its anchor and absent from the index.
+//!
+//! Two backends, identical but for whether `get` suspends, driven by the same
+//! pair of interleaved inserts.
+
+// The engine's futures are deliberately non-`Send` (current-thread `LocalSet`),
+// which is the whole subject here; an integration test is its own crate and so
+// does not inherit the crate-root allow.
+#![allow(clippy::future_not_send, clippy::significant_drop_tightening)]
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
