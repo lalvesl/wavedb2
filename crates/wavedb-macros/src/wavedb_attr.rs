@@ -94,6 +94,7 @@ pub fn expand(
             let pivot_id = format_ident!("{}PivotId", name);
             let types = generated::nonunique_types(
                 &name,
+                hash,
                 &secondaries,
                 key_fields.as_deref(),
             )?;
@@ -103,6 +104,7 @@ pub fn expand(
 
     let (storage_slot, storage_entries, exec_steps, shape_marker) =
         shape_scaffolding(&name, args.shape, args.compress);
+    let lane_hashes = lane_hashes_const(args.shape, hash);
 
     Ok(quote! {
         #input
@@ -123,6 +125,7 @@ pub fn expand(
         impl ::wavedb_core::WaveDbStruct for #name {
             const STRUCT_HASH: u64 = #hash;
             const SHAPE: ::wavedb_core::Shape = ::wavedb_core::Shape::#shape_variant;
+            const LANE_HASHES: &'static [u64] = #lane_hashes;
             type PivotId = #pivot_id_ty;
         }
 
@@ -276,6 +279,23 @@ fn shape_scaffolding(
         }
     };
     (storage_slot, storage_entries, exec_steps, shape_marker)
+}
+
+/// The reserved lane hashes this shape occupies, as the `&'static [u64]`
+/// initialiser for `WaveDbStruct::LANE_HASHES`.
+///
+/// Literals, because SeaHash is not a `const fn` — the same reason the
+/// `StructStorage` slots carry them. Both derivations must agree; that is
+/// what `lane_hashes_match_the_engines` pins.
+fn lane_hashes_const(shape: Shape, hash: u64) -> TokenStream {
+    if matches!(shape, Shape::Unique) {
+        // No collection, so no chains and no lanes.
+        return quote!(&[]);
+    }
+    let records = crate::struct_hash::lane_hash(b"WDB.SEG", hash);
+    let dead = crate::struct_hash::lane_hash(b"WDB.DEAD", hash);
+    let index = crate::struct_hash::lane_hash(b"WDB.IDX", hash);
+    quote!(&[#records, #dead, #index])
 }
 
 /// A whitespace-free rendering of a field type, so the same declared type always

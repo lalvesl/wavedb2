@@ -173,7 +173,7 @@ async fn online_tour(db: &Db) {
 
     // ---- the walk (streamed frames, mirrored into the cache) ----------
     let all: Vec<Task> = tasks.all(db).try_collect().await.expect("walk");
-    println!("full walk in insertion order: {} living tasks", all.len());
+    println!("full walk, newest first: {} living tasks", all.len());
 
     // ---- a Unique upsert (archives the old version) -------------------
     Workspace {
