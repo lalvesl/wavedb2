@@ -76,6 +76,7 @@ where
         // No collection, no persisted watermark: the chain guard alone
         // keeps a Unique walkable (catch-up is chain-forward navigation).
         floor: 0,
+        revives: false,
     };
     let (writes, _old, live_meta) =
         plan_chained_save::<T, S>(store, &plan, value).await?;
@@ -131,6 +132,7 @@ where
         pivot_id: None,
         imposed: Some(meta),
         floor: 0,
+        revives: false,
     };
     let (writes, _old, _live) =
         plan_chained_save::<T, S>(store, &plan, value).await?;

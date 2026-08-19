@@ -67,6 +67,19 @@ pub trait WaveDbStruct: WaveWire {
     /// This type's cardinality discipline.
     const SHAPE: Shape;
 
+    /// The reserved lane hashes this type's storage occupies **beyond** its
+    /// own records — one per chain a collection rides (RFC 0050): the record
+    /// chain, the removal log, and the sparse index above the chain. A
+    /// `Unique` type has no collection and so no lanes, which is the default.
+    ///
+    /// Derived by the macro at expansion time, because SeaHash is not a
+    /// `const fn` (the same reason the `StructStorage` slots carry literals).
+    /// They are listed here because a lane occupies a
+    /// `type_salt` (the low 15 bits) exactly as a record type does,
+    /// and the registry's collision guard has to see every occupant to
+    /// uphold "a segment id can never equal a record anchor".
+    const LANE_HASHES: &'static [u64] = &[];
+
     /// The typed handle into this type's collection.
     ///
     /// For a `NonUnique` type the macro generates a concrete `PivotId` (a wrapper
