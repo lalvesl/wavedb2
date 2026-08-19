@@ -15,6 +15,7 @@
 //! node insert/update, a walked `All` item) only ever see living records.
 
 use crate::collection::Collection;
+use crate::collection_read::Anchor;
 use crate::error::Result;
 use crate::id::Id;
 use crate::index::Pivot;
@@ -66,32 +67,27 @@ impl<T: NonUniqueStruct> Collection<T> {
         value: &T,
     ) -> Result<()> {
         let pivot = self.load_pivot(store).await?;
-        let living = self
-            .tree(pivot.current())
-            .contains(store, LocalId::from_id(id))
-            .await?;
-        if !living {
-            // A non-living anchor that still holds bytes is a locally-dead
-            // record coming back — only a keyed type's anchor can recur.
-            // Revive it as a chained version so the dead copy archives
-            // instead of being overwritten.
-            if store.get_of(T::STRUCT_HASH, id).await?.is_some() {
-                return self
-                    .chain_into_living(store, &pivot, id, None, value)
-                    .await;
+        // One read decides all three cases and hands back the bytes the
+        // living branch compares — where a `current` descent, a "is it merely
+        // dead?" fetch and a re-read of the same record used to sit.
+        match self.anchor(store, id).await? {
+            // No `PartialEq` bound on record types — unchanged is decided on
+            // the wire bytes, the identity the store actually holds.
+            Anchor::Living(_, existing)
+                if to_wire(&existing) == to_wire(value) =>
+            {
+                Ok(())
             }
-            return self.insert_at(store, &pivot, id, value).await;
+            Anchor::Living(..) => self.save(store, id, value).await,
+            // A dead anchor still holding bytes is a locally-dead record
+            // coming back — only a keyed type's anchor can recur. Revive it
+            // as a chained version so the dead copy archives instead of
+            // being overwritten.
+            Anchor::Dead => {
+                self.chain_into_living(store, &pivot, id, None, value).await
+            }
+            Anchor::Vacant => self.insert_at(store, &pivot, id, value).await,
         }
-        // No `PartialEq` bound on record types — unchanged is decided on the
-        // wire bytes, the identity the store actually holds.
-        let unchanged = matches!(
-            self.get(store, id).await?,
-            Some(existing) if to_wire(&existing) == to_wire(value)
-        );
-        if unchanged {
-            return Ok(());
-        }
-        self.save(store, id, value).await
     }
 
     /// [`adopt`](Self::adopt) with the node's [`Metadata`] written
@@ -112,29 +108,25 @@ impl<T: NonUniqueStruct> Collection<T> {
         value: &T,
     ) -> Result<()> {
         let pivot = self.load_pivot(store).await?;
-        let living = self
-            .tree(pivot.current())
-            .contains(store, LocalId::from_id(id))
-            .await?;
-        if !living {
+        match self.anchor(store, id).await? {
+            Anchor::Living(existing, body)
+                if existing == meta && to_wire(&body) == to_wire(value) =>
+            {
+                Ok(())
+            }
+            Anchor::Living(..) => {
+                self.save_with_meta(store, id, meta, value).await
+            }
             // A revived keyed anchor: chain the node's version onto the
             // locally-dead copy, archiving it at the node's derived slot.
-            if store.get_of(T::STRUCT_HASH, id).await?.is_some() {
-                return self
-                    .chain_into_living(store, &pivot, id, Some(meta), value)
-                    .await;
+            Anchor::Dead => {
+                self.chain_into_living(store, &pivot, id, Some(meta), value)
+                    .await
             }
-            return self.insert_with_meta(store, &pivot, id, meta, value).await;
+            Anchor::Vacant => {
+                self.insert_with_meta(store, &pivot, id, meta, value).await
+            }
         }
-        let unchanged = matches!(
-            self.load_record(store, id).await,
-            Ok((existing, body)) if existing == meta
-                && to_wire(&body) == to_wire(value)
-        );
-        if unchanged {
-            return Ok(());
-        }
-        self.save_with_meta(store, id, meta, value).await
     }
 }
 
@@ -147,7 +139,7 @@ mod tests {
     use crate::error::Error;
     use crate::id::Id;
     use crate::index::mem_store::MemStore;
-    use crate::index::{IndexKey, Pivot};
+    use crate::index::{ChainRoots, IndexKey, LogRoots, Pivot};
     use crate::local_id::LocalId;
     use crate::permission::PermissionRef;
     use crate::traits::{NonUniqueStruct, Shape, WaveDbStruct};
@@ -180,42 +172,36 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct ItemPivot {
-        current: LocalId,
-        dead: LocalId,
-        recency: LocalId,
+        records: ChainRoots,
+        removals: LogRoots,
         secondaries: [LocalId; 1],
         permission: Option<PermissionRef>,
     }
     impl Pivot for ItemPivot {
         const STRUCT_HASH: u64 = 0xADD_0002;
-        fn current(&self) -> LocalId {
-            self.current
-        }
-        fn dead(&self) -> LocalId {
-            self.dead
-        }
-        fn recency(&self) -> LocalId {
-            self.recency
-        }
         fn secondaries(&self) -> &[LocalId] {
             &self.secondaries
+        }
+        fn records(&self) -> ChainRoots {
+            self.records
+        }
+        fn removals(&self) -> LogRoots {
+            self.removals
         }
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
         fn replace_roots(
             &self,
-            current: LocalId,
-            dead: LocalId,
-            recency: LocalId,
             secondaries: &[LocalId],
+            records: ChainRoots,
+            removals: LogRoots,
         ) -> Self {
             let mut s = self.secondaries;
             s.copy_from_slice(secondaries);
             Self {
-                current,
-                dead,
-                recency,
+                records,
+                removals,
                 secondaries: s,
                 permission: self.permission.clone(),
             }
@@ -328,9 +314,12 @@ mod tests {
 
             let walked: Vec<(Id, Item)> =
                 col.all(&cache).try_collect().await.unwrap();
+            // Newest-first, and the instants ordering it are the **node's** —
+            // `adopt` writes the node's `Metadata` verbatim, so the mirror's
+            // walk reproduces the node's own order rather than its local one.
             assert_eq!(
                 walked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-                vec![a, b],
+                vec![b, a],
                 "the cache walk must yield the node's ids in node order"
             );
             let blues: Vec<(Id, Item)> = col
