@@ -71,8 +71,8 @@ mod tests {
     use crate::collection::Collection;
     use crate::error::Result;
     use crate::id::Id;
-    use crate::index::Pivot;
     use crate::index::mem_store::MemStore;
+    use crate::index::{ChainRoots, LogRoots, Pivot};
     use crate::local_id::LocalId;
     use crate::permission::PermissionRef;
     use crate::record::save_unique;
@@ -121,39 +121,33 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct NotePivot {
-        current: LocalId,
-        dead: LocalId,
-        recency: LocalId,
+        records: ChainRoots,
+        removals: LogRoots,
         permission: Option<PermissionRef>,
     }
     impl Pivot for NotePivot {
         const STRUCT_HASH: u64 = 0x1107_0002;
-        fn current(&self) -> LocalId {
-            self.current
-        }
-        fn dead(&self) -> LocalId {
-            self.dead
-        }
-        fn recency(&self) -> LocalId {
-            self.recency
-        }
         fn secondaries(&self) -> &[LocalId] {
             &[]
+        }
+        fn records(&self) -> ChainRoots {
+            self.records
+        }
+        fn removals(&self) -> LogRoots {
+            self.removals
         }
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
         fn replace_roots(
             &self,
-            current: LocalId,
-            dead: LocalId,
-            recency: LocalId,
             _: &[LocalId],
+            records: ChainRoots,
+            removals: LogRoots,
         ) -> Self {
             Self {
-                current,
-                dead,
-                recency,
+                records,
+                removals,
                 permission: self.permission.clone(),
             }
         }

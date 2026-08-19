@@ -102,6 +102,28 @@ pub struct Metadata {
     /// This version's place in the chain — live ([`Succession::CreatedAt`])
     /// or superseded ([`Succession::Next`]).
     pub succession: Succession,
+    /// Whether this record has left the collection's living set.
+    ///
+    /// Liveness is a property of the **anchor**, not of a membership index.
+    /// RFC 0050 deletes the `current` B+tree, so "is this record live?" is
+    /// answered by the same single read that fetches the record — strictly
+    /// cheaper than a descent, for the question asked most often.
+    ///
+    /// A **flag, not the removal instant**, and that is load-bearing rather
+    /// than frugal: the instant is minted per store, so a node and a mirror
+    /// that both removed the same record would hold anchors differing in those
+    /// eight bytes, and every later archive of that version would differ too.
+    /// The two converge on a flag. *When* it died is the `dead` log's job,
+    /// which is keyed by exactly that instant and is what a catch-up reads.
+    ///
+    /// It survives an ordinary [`save`], which is what keeps this field and the
+    /// index agreeing: writing to a removed anchor does not resurrect it. Only
+    /// the path that deliberately makes a non-living anchor live again clears
+    /// it (`SavePlan::revives`, a `#[wavedb::key]` upsert or a mirrored
+    /// revival).
+    ///
+    /// [`save`]: crate::Collection::save
+    pub removed: bool,
     /// Owning Pivot back-link (`None` = Unique record).
     pub pivot_id: Option<LocalId>,
     /// Who wrote this version.
@@ -112,10 +134,21 @@ pub struct Metadata {
     pub permission: Option<PermissionRef>,
 }
 
+impl Metadata {
+    /// Whether this record is still in the collection's living set.
+    ///
+    /// The anchor answers it, so a caller that already holds the record has the
+    /// answer without touching an index — see [`removed`](Self::removed).
+    #[must_use]
+    pub const fn is_live(&self) -> bool {
+        !self.removed
+    }
+}
+
 // `WaveWire` is derived field-by-field in declaration order: `Option<u64>` (1
-// stack byte) + `Succession` (9) + `Option<LocalId>` (1) + `U48` (6) + `u64`
-// (8) + `Option<PermissionRef>` (1) = 26-byte stack; heap grows only for the
-// `Some` fields.
+// stack byte) + `Succession` (9) + `bool` (1) + `Option<LocalId>` (1) +
+// `U48` (6) + `u64` (8) + `Option<PermissionRef>` (1) = 27-byte stack; heap
+// grows only for the `Some` fields.
 
 #[cfg(test)]
 mod tests {
@@ -150,6 +183,7 @@ mod tests {
             pivot_id: Some(LocalId::new(0xABCD, true, 3)),
             user: U48::from(42u32),
             device_created: 0xCAFE,
+            removed: false,
             permission: Some(PermissionRef::Tenants(vec![
                 U48::from(1u32),
                 U48::from(2u32),
@@ -161,17 +195,29 @@ mod tests {
             pivot_id: None,
             user: U48::MAX,
             device_created: 1,
+            removed: true,
             permission: Some(PermissionRef::Public),
         });
     }
 
     #[test]
+    fn liveness_reads_off_the_record_itself() {
+        // No index consulted: the anchor's own metadata answers it, which is
+        // what lets RFC 0050 delete the `current` tree.
+        let mut m = Metadata::default();
+        assert!(m.is_live());
+        m.removed = true;
+        assert!(!m.is_live());
+        roundtrip(&m);
+    }
+
+    #[test]
     fn unique_first_version_is_minimal() {
-        // Unique first version: all Option fields None → stack=26, heap=0.
+        // Unique first version: all Option fields None → stack=27, heap=0.
         let m = Metadata::default();
-        assert_eq!(Metadata::STACK_SIZE, 26);
+        assert_eq!(Metadata::STACK_SIZE, 27);
         assert_eq!(m.heap_size(), 0);
-        assert_eq!(to_wire(&m).len(), 26);
+        assert_eq!(to_wire(&m).len(), 27);
     }
 
     #[test]

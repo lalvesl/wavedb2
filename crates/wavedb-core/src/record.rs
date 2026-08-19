@@ -178,6 +178,15 @@ pub(crate) struct SavePlan {
     /// maxima) an authored version must land strictly above — `0` for a
     /// `Unique` (no collection; its chain guard alone keeps it walkable).
     pub floor: u64,
+    /// Whether this write deliberately makes a **non-living** anchor live
+    /// again, clearing [`Metadata::removed`].
+    ///
+    /// `false` for an ordinary save, which carries the removal forward: writing
+    /// to a removed anchor must not silently resurrect it, or the record's own
+    /// metadata would claim to be alive while every index still says otherwise.
+    /// `true` only on the path that re-indexes it too — a `#[wavedb::key]`
+    /// upsert at a dead anchor, or a mirror adopting that revival.
+    pub revives: bool,
 }
 
 /// Plan a chained save of `value` at the shape's anchor: archive the
@@ -237,6 +246,9 @@ pub(crate) async fn plan_chained_save<V: WaveWire, S: Store>(
         user: plan.user,
         device_created: 0,
         permission: old_meta.permission.clone(),
+        // A removal carries forward unless this write is the one that
+        // re-indexes the anchor into the living set.
+        removed: !plan.revives && old_meta.removed,
     });
     let Succession::CreatedAt(instant) = live_meta.succession else {
         return Err(Error::ChainCorrupt(plan.live_id));
