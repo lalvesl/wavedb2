@@ -47,12 +47,26 @@ const KIND_INTERNAL: u8 = 1;
 
 /// A leaf entry: one chain segment, filed under the least key it holds.
 ///
-/// `key.rec` **is** the segment's id — a [`SecKey`]'s trailing pointer already
-/// serves as the payload, so nothing else is needed to reach the segment.
+/// The same shape as [`Branch`] one level up — least key, pointer, count — which
+/// is what lets one descent routine serve both levels.
+///
+/// > **Corrected 2026-07-30 (phase 3).** Phase 2 stored only a `SecKey` here and
+/// > reused its trailing `rec` as the segment id, saving ten bytes an entry. That
+/// > is wrong: `SecKey` orders by `field` **then** `rec`, so when a search key and
+/// > a separator share a `field` the comparison falls through to the trailing
+/// > pointer — and a segment id has no relationship to a record anchor, making the
+/// > descent land on the wrong side of the boundary about half the time. It breaks
+/// > wherever equal fields are reachable: an exact hit on a segment's own least
+/// > instant in the built-in chain, and *routinely* in a declared ordering over a
+/// > low-cardinality column, where a whole run of segments shares one value. The
+/// > separator must be the segment's least **record** key, verbatim, with the
+/// > segment id carried beside it.
 #[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
 pub struct Slot {
-    /// The least key the segment holds; its `rec` is the segment id.
-    pub key: SecKey,
+    /// The least key the segment holds, exactly as the segment holds it.
+    pub first: SecKey,
+    /// The segment this entry names.
+    pub seg: LocalId,
     /// How many entries the segment holds.
     pub count: u64,
 }
@@ -126,6 +140,34 @@ impl SparseNode {
         self.len() == 0
     }
 
+    /// The least key this node covers — the separator its parent files it under.
+    ///
+    /// `None` for an empty node, which is also the signal that a parent should
+    /// drop the entry naming it rather than file it under no key at all.
+    #[must_use]
+    pub fn first_key(&self) -> Option<&SecKey> {
+        match self {
+            Self::Leaf(slots) => slots.first().map(|s| &s.first),
+            Self::Internal(branches) => branches.first().map(|b| &b.first),
+        }
+    }
+
+    /// Split in half, keeping the lower half here and returning the upper half
+    /// with its least key — what a parent needs to file the new sibling under.
+    ///
+    /// `None` when there is nothing to hand up (fewer than two entries), in
+    /// which case this node is left untouched.
+    pub fn split_off_half(&mut self) -> Option<(SecKey, Self)> {
+        // Ceiling, so the half that keeps this node's id is never the empty one.
+        let at = self.len().div_ceil(2);
+        let upper = match self {
+            Self::Leaf(slots) => Self::Leaf(slots.split_off(at)),
+            Self::Internal(branches) => Self::Internal(branches.split_off(at)),
+        };
+        let first = upper.first_key()?.clone();
+        Some((first, upper))
+    }
+
     /// One level of a descent **by key**: the last entry whose own least key is
     /// `<= key`, since that is the one covering it.
     ///
@@ -137,7 +179,7 @@ impl SparseNode {
             Self::Leaf(slots) => {
                 let i = Self::last_at_or_below(
                     slots.len(),
-                    |i| &slots[i].key,
+                    |i| &slots[i].first,
                     key,
                 )?;
                 Some(Step::Segment {
@@ -294,10 +336,27 @@ mod tests {
         }
     }
 
+    /// A key whose `field` is `value` but whose record anchor is `rec` — what a
+    /// low-cardinality ordering produces, where many records share one value.
+    fn shared(value: u64, rec: u64) -> crate::index::SecKey {
+        crate::index::SecKey {
+            field: value.to_be_bytes().to_vec(),
+            rec: LocalId::new(rec, false, 3),
+        }
+    }
+
+    fn slot(first: crate::index::SecKey, seg: u64, count: u64) -> Slot {
+        Slot {
+            first,
+            seg: LocalId::new(seg, true, 9),
+            count,
+        }
+    }
+
     fn leaf(spec: &[(u64, u64)]) -> SparseNode {
         SparseNode::Leaf(
             spec.iter()
-                .map(|&(k, count)| Slot { key: key(k), count })
+                .map(|&(k, count)| slot(key(k), k, count))
                 .collect(),
         )
     }
@@ -374,7 +433,7 @@ mod tests {
         else {
             panic!("expected a segment")
         };
-        assert_eq!(slot.key, key(20));
+        assert_eq!(slot.first, key(20));
         assert_eq!(offset, 0, "a key descent never skips inside the segment");
     }
 
@@ -385,7 +444,40 @@ mod tests {
         else {
             panic!("expected a segment")
         };
-        assert_eq!(slot.key, key(20));
+        assert_eq!(slot.first, key(20));
+    }
+
+    #[test]
+    fn a_run_of_segments_sharing_one_value_still_descends_exactly() {
+        // A low-cardinality ordering: three segments, all holding value 7, split
+        // by record anchor. The separator must be the segment's least *record*
+        // key — reusing its trailing pointer as the segment id (phase 2's shape)
+        // made this comparison fall through to an unrelated minted id.
+        let node = SparseNode::Leaf(vec![
+            slot(shared(7, 100), 900, 4),
+            slot(shared(7, 200), 901, 4),
+            slot(shared(7, 300), 902, 4),
+        ]);
+        for (probe, want) in [
+            (150, 900u64),
+            (200, 901),
+            (250, 901),
+            (300, 902),
+            (999, 902),
+        ] {
+            let Some(Step::Segment { slot, .. }) =
+                node.step_to_key(&shared(7, probe))
+            else {
+                panic!("expected a segment for {probe}")
+            };
+            assert_eq!(
+                slot.seg,
+                LocalId::new(want, true, 9),
+                "anchor {probe} landed in the wrong segment"
+            );
+        }
+        // Below the whole run, nothing covers it.
+        assert_eq!(node.step_to_key(&shared(7, 1)), None);
     }
 
     #[test]
@@ -404,10 +496,7 @@ mod tests {
         assert_eq!(
             node.step_to_offset(0),
             Some(Step::Segment {
-                slot: Slot {
-                    key: key(10),
-                    count: 50
-                },
+                slot: slot(key(10), 10, 50),
                 offset: 0
             })
         );
@@ -415,10 +504,7 @@ mod tests {
         assert_eq!(
             node.step_to_offset(50),
             Some(Step::Segment {
-                slot: Slot {
-                    key: key(20),
-                    count: 75
-                },
+                slot: slot(key(20), 20, 75),
                 offset: 0
             })
         );
@@ -426,10 +512,7 @@ mod tests {
         assert_eq!(
             node.step_to_offset(60),
             Some(Step::Segment {
-                slot: Slot {
-                    key: key(20),
-                    count: 75
-                },
+                slot: slot(key(20), 20, 75),
                 offset: 10
             })
         );
@@ -437,10 +520,7 @@ mod tests {
         assert_eq!(
             node.step_to_offset(134),
             Some(Step::Segment {
-                slot: Slot {
-                    key: key(30),
-                    count: 10
-                },
+                slot: slot(key(30), 30, 10),
                 offset: 9
             })
         );
@@ -463,7 +543,7 @@ mod tests {
         else {
             panic!("expected a segment")
         };
-        assert_eq!(slot.key, key(20));
+        assert_eq!(slot.first, key(20));
         assert_eq!(offset, 0);
     }
 

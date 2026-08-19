@@ -12,6 +12,15 @@
 //!   stay correct (the full head is verified), but the pair shares archive slots
 //!   and loses its separation in the browser's flat keyspace, so it is surfaced
 //!   rather than enforced.
+//!
+//! The salt check counts **every occupant**, not one per entry: since RFC 0050
+//! a NonUnique type also reserves three chain lanes (`WDB.SEG`, `WDB.DEAD`,
+//! `WDB.IDX`), each with a hash of its own and therefore a salt of its own. A
+//! registry of `n` such types puts `4n` values in a 15-bit space — comparing
+//! only the record hashes would leave three quarters of them unchecked, over
+//! exactly the property the lanes exist to provide ("a segment id can never
+//! equal a record anchor, an archive slot, or a tree node"). Hence also the
+//! per-entry self-check: a type can clash with its own lane alone.
 
 use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned};
@@ -29,10 +38,13 @@ use crate::expose_parse::{Entry, Kind};
 pub fn collision_guard(entries: &[Entry]) -> TokenStream {
     let mut guards = TokenStream::new();
     for (i, b) in entries.iter().enumerate() {
+        // `fn`s share the dispatch hash space but are never stored, so the
+        // storage-slot discriminator does not apply to them.
+        if b.kind != Kind::Fn {
+            guards.extend(self_salt_warning(b));
+        }
         for a in &entries[..i] {
             guards.extend(identity_error(a, b));
-            // `fn`s share the dispatch hash space but are never stored, so the
-            // storage-slot discriminator does not apply to them.
             if a.kind != Kind::Fn && b.kind != Kind::Fn {
                 guards.extend(salt_warning(a, b));
             }
@@ -63,12 +75,36 @@ fn render(path: &syn::Path) -> String {
     quote!(#path).to_string().split_whitespace().collect()
 }
 
-/// The warning: a pair sharing the 15-bit storage discriminator.
+/// The warning: two entries sharing the 15-bit storage discriminator.
+///
+/// An entry occupies its record type's salt **and** one per reserved chain
+/// lane its collection rides (RFC 0050), so the check runs over both entries'
+/// full occupant sets rather than the two record hashes alone.
 fn salt_warning(a: &Entry, b: &Entry) -> TokenStream {
     let (ha, hb) = (hash_expr(a), hash_expr(b));
+    let (la, lb) = (lanes_expr(a), lanes_expr(b));
     quote_spanned! { b.path.span() =>
         const _: () = ::wavedb_core::expose::SaltGuard::<
-            { (#ha & 0x7FFF) != (#hb & 0x7FFF) },
+            { ::wavedb_core::expose::salts_distinct(#ha, #la, #hb, #lb) },
         >::check();
     }
+}
+
+/// The same warning for **one** entry against itself: a type can share the
+/// discriminator with one of its own lanes with no second entry in sight, so
+/// this fires even on a one-item registry.
+fn self_salt_warning(entry: &Entry) -> TokenStream {
+    let (h, lanes) = (hash_expr(entry), lanes_expr(entry));
+    quote_spanned! { entry.path.span() =>
+        const _: () = ::wavedb_core::expose::SaltGuard::<
+            { ::wavedb_core::expose::salts_self_distinct(#h, #lanes) },
+        >::check();
+    }
+}
+
+/// The reserved lane hashes an entry's storage occupies — empty for a
+/// `Unique` type, which has no collection.
+fn lanes_expr(entry: &Entry) -> TokenStream {
+    let path = &entry.path;
+    quote!(<#path as ::wavedb_core::WaveDbStruct>::LANE_HASHES)
 }
