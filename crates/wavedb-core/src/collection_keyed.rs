@@ -22,6 +22,8 @@
 //! is an explicit `remove` + `insert` of the new key.
 
 use crate::collection::Collection;
+use crate::collection_read::Anchor;
+use crate::collection_write::MovedRoots;
 use crate::error::Result;
 use crate::id::Id;
 use crate::index::Pivot;
@@ -52,11 +54,10 @@ impl<T: NonUniqueStruct> Collection<T> {
         id: Id,
         value: &T,
     ) -> Result<()> {
-        let living = self
-            .tree(pivot.current())
-            .contains(store, LocalId::from_id(id))
-            .await?;
-        if living {
+        // Liveness reads off the anchor, not off `current` (RFC 0050): one
+        // record read where a tree descent plus a "is it merely dead?" fetch
+        // used to sit.
+        if matches!(self.anchor(store, id).await?, Anchor::Living(..)) {
             return self.save_planned(store, id, value, None).await;
         }
         self.chain_into_living(store, pivot, id, None, value).await
@@ -87,23 +88,31 @@ impl<T: NonUniqueStruct> Collection<T> {
             pivot_id: Some(self.pivot()),
             imposed,
             floor,
+            revives: true,
         };
         let (mut batch, _superseded, live_meta) =
             plan_chained_save::<T, S>(store, &plan, value).await?;
         let Succession::CreatedAt(instant) = live_meta.succession else {
             return Err(crate::Error::ChainCorrupt(id));
         };
-        // Distinct trees, so their plans don't overlap (the writes already
-        // in `batch` are record slots, never tree nodes) — no overlay.
-        let mut current = self.tree(pivot.current());
-        let mut recency = self.sec_tree(pivot.recency());
+        // Distinct structures, so their plans don't overlap (the writes
+        // already in `batch` are record slots, never nodes) — no overlay.
+        let mut records = self.records_chain(pivot);
         let mut secs = self.sec_trees(pivot);
-        batch.extend(current.plan_insert(store, id).await?);
+        let key = Self::instant_key(instant, LocalId::from_id(id));
+        // A revival re-enters the chain exactly as a first version does: the
+        // record's prior copy left it when the key was removed, so there is
+        // nothing to relocate — only to insert, at the new live instant.
         batch.extend(
-            recency
+            records
                 .plan_insert(
                     store,
-                    Self::instant_key(instant, LocalId::from_id(id)),
+                    key,
+                    crate::record::encode_record(
+                        T::STRUCT_HASH,
+                        &live_meta,
+                        value,
+                    ),
                 )
                 .await?,
         );
@@ -114,10 +123,11 @@ impl<T: NonUniqueStruct> Collection<T> {
         self.push_root_moves(
             &mut batch,
             pivot,
-            current.root(),
-            pivot.dead(),
-            recency.root(),
-            &secs,
+            &MovedRoots {
+                secondaries: &secs,
+                records: records.roots(),
+                removals: pivot.removals(),
+            },
         );
         store.apply(&batch).await?;
         store.note_mutation(|| Mutation {
@@ -144,7 +154,7 @@ mod tests {
     use crate::expose::collection_changes;
     use crate::id::Id;
     use crate::index::mem_store::MemStore;
-    use crate::index::{Bound, IndexKey, Pivot};
+    use crate::index::{Bound, ChainRoots, IndexKey, LogRoots, Pivot};
     use crate::local_id::LocalId;
     use crate::metadata::Metadata;
     use crate::permission::PermissionRef;
@@ -184,42 +194,36 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct CredPivot {
-        current: LocalId,
-        dead: LocalId,
-        recency: LocalId,
+        records: ChainRoots,
+        removals: LogRoots,
         secondaries: [LocalId; 1],
         permission: Option<PermissionRef>,
     }
     impl Pivot for CredPivot {
         const STRUCT_HASH: u64 = 0x5EA_0002;
-        fn current(&self) -> LocalId {
-            self.current
-        }
-        fn dead(&self) -> LocalId {
-            self.dead
-        }
-        fn recency(&self) -> LocalId {
-            self.recency
-        }
         fn secondaries(&self) -> &[LocalId] {
             &self.secondaries
+        }
+        fn records(&self) -> ChainRoots {
+            self.records
+        }
+        fn removals(&self) -> LogRoots {
+            self.removals
         }
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
         fn replace_roots(
             &self,
-            current: LocalId,
-            dead: LocalId,
-            recency: LocalId,
             secondaries: &[LocalId],
+            records: ChainRoots,
+            removals: LogRoots,
         ) -> Self {
             let mut s = self.secondaries;
             s.copy_from_slice(secondaries);
             Self {
-                current,
-                dead,
-                recency,
+                records,
+                removals,
                 secondaries: s,
                 permission: self.permission.clone(),
             }
@@ -383,6 +387,9 @@ mod tests {
             let walked: Vec<(Id, Cred)> =
                 col.all(&store).try_collect().await.unwrap();
             assert!(walked.is_empty(), "removed = out of the living walk");
+            // The anchor says so on its own, without consulting a tree.
+            let (dead_meta, _) = col.load_record(&store, id).await.unwrap();
+            assert!(!dead_meta.is_live(), "the anchor hid the removal");
 
             // Same key again: same anchor, revived — the whole history
             // survives the removal.
@@ -391,6 +398,10 @@ mod tests {
             let walked: Vec<(Id, Cred)> =
                 col.all(&store).try_collect().await.unwrap();
             assert_eq!(walked, vec![(id, cred("ada", "v2"))]);
+            // Revival is the one write that clears the flag, and it clears it
+            // in the same batch that re-indexes the anchor — the two agree.
+            let (live_meta, _) = col.load_record(&store, id).await.unwrap();
+            assert!(live_meta.is_live(), "the revived anchor still reads dead");
             let tags: Vec<String> = col
                 .history(&store, id)
                 .try_collect::<Vec<(Metadata, Cred)>>()
