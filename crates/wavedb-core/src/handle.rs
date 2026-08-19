@@ -310,7 +310,7 @@ mod tests {
 
     use super::{DbHandle, LocalHandle};
     use crate::index::mem_store::MemStore;
-    use crate::index::{IndexKey, Pivot};
+    use crate::index::{ChainRoots, IndexKey, LogRoots, Pivot};
     use crate::local_id::LocalId;
     use crate::permission::PermissionRef;
     use crate::traits::{NonUniqueStruct, Shape, UniqueStruct, WaveDbStruct};
@@ -353,42 +353,36 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct NotePivot {
-        current: LocalId,
-        dead: LocalId,
-        recency: LocalId,
+        records: ChainRoots,
+        removals: LogRoots,
         secondaries: [LocalId; 1],
         permission: Option<PermissionRef>,
     }
     impl Pivot for NotePivot {
         const STRUCT_HASH: u64 = 0x2077_1002;
-        fn current(&self) -> LocalId {
-            self.current
-        }
-        fn dead(&self) -> LocalId {
-            self.dead
-        }
-        fn recency(&self) -> LocalId {
-            self.recency
-        }
         fn secondaries(&self) -> &[LocalId] {
             &self.secondaries
+        }
+        fn records(&self) -> ChainRoots {
+            self.records
+        }
+        fn removals(&self) -> LogRoots {
+            self.removals
         }
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
         fn replace_roots(
             &self,
-            current: LocalId,
-            dead: LocalId,
-            recency: LocalId,
             secondaries: &[LocalId],
+            records: ChainRoots,
+            removals: LogRoots,
         ) -> Self {
             let mut s = self.secondaries;
             s.copy_from_slice(secondaries);
             Self {
-                current,
-                dead,
-                recency,
+                records,
+                removals,
                 secondaries: s,
                 permission: self.permission.clone(),
             }
@@ -446,8 +440,8 @@ mod tests {
                 db.all::<Note>(pivot).try_collect().await.unwrap();
             assert_eq!(
                 walked.iter().map(|v| v.n).collect::<Vec<_>>(),
-                vec![1, 2],
-                "walk is insertion-ordered and yields values"
+                vec![2, 1],
+                "walk is newest-first and yields values"
             );
 
             db.update(pivot, b, &note("blue", 22)).await.unwrap();

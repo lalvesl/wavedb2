@@ -26,11 +26,14 @@ pub mod collection;
 mod collection_adopt;
 pub mod collection_handle;
 mod collection_keyed;
+mod collection_read;
 mod collection_recency;
+mod collection_remove;
 mod collection_write;
 pub mod error;
 pub mod expose;
 mod expose_changes;
+mod expose_salt;
 pub mod fn_identity;
 pub mod handle;
 pub mod hooks;
@@ -63,8 +66,8 @@ pub use futures::{Stream, TryStreamExt};
 pub use hooks::LookupHooks;
 pub use id::Id;
 pub use index::{
-    Bound, BpTree, Except, IdStreamExt, IndexKey, Intersect, NodeKey, Pivot,
-    SecKey, Union,
+    Bound, BpTree, ChainRoots, Except, IdStreamExt, IndexKey, Intersect,
+    LogRoots, NodeKey, Pivot, SecKey, Union,
 };
 pub use local_id::LocalId;
 pub use metadata::{Metadata, Succession};

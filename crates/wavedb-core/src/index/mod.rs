@@ -9,6 +9,8 @@
 //! (IndexedDB). Pages, blocks, and the journal are backend internals and are
 //! never named here.
 
+mod chain;
+mod chain_remove;
 mod key;
 #[cfg(test)]
 pub(crate) mod mem_store;
@@ -16,16 +18,19 @@ mod node;
 mod node_key;
 mod segment;
 mod sparse;
+mod sparse_write;
 mod stream;
 mod tree;
 mod tree_delete;
 mod tree_insert;
 
+pub use chain::{Chain, DEFAULT_DEAD_MIN, DEFAULT_SEGMENT_MIN};
 pub use key::IndexKey;
 pub use node::BPTREE_NODE_STRUCT_HASH;
 pub use node_key::{NodeKey, SecKey};
-pub use segment::{Lane, Segment, mint_segment_id};
+pub use segment::{Lane, Segment, mint_lane_id};
 pub use sparse::{Branch, Slot, SparseNode, Step};
+pub use sparse_write::{DEFAULT_SPARSE_CAP, SparseTree};
 pub use stream::{Except, IdStreamExt, Intersect, Union};
 pub use tree::{BpTree, DEFAULT_INTERNAL_CAP, DEFAULT_LEAF_CAP};
 
@@ -101,6 +106,38 @@ impl Bound {
     }
 }
 
+// ---- Chain roots ------------------------------------------------------------
+
+/// The ids naming one **indexed** chain: both endpoints, and its sparse index's
+/// root.
+///
+/// All three are **permanent** (RFC 0050): a split hands its new id to the
+/// interior side so an endpoint keeps its own, and an index root that overflows
+/// keeps its id by moving its contents into a fresh child. So a `Pivot` holding
+/// these is written once at creation and then essentially never — the opposite
+/// of a `BpTree` root, which moves on every root split and rewrites the `Pivot`
+/// with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, WaveWire)]
+pub struct ChainRoots {
+    /// The segment holding the least keys.
+    pub head: LocalId,
+    /// The segment holding the greatest keys — the growth end.
+    pub tail: LocalId,
+    /// Root of the sparse index above the chain.
+    pub index: LocalId,
+}
+
+/// The ids naming one **index-less** chain — the removal log, which nothing
+/// searches, so there is no index root to name (RFC 0050).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, WaveWire)]
+pub struct LogRoots {
+    /// The segment holding the earliest removals.
+    pub head: LocalId,
+    /// The segment holding the most recent — where an append lands and a
+    /// catch-up starts.
+    pub tail: LocalId,
+}
+
 // ---- Pivot: the collection's roots holder -----------------------------------
 
 /// The collection's roots holder.
@@ -115,36 +152,38 @@ pub trait Pivot: WaveWire + Sized {
     /// directory. The macro derives it from the generated pivot's own shape.
     const STRUCT_HASH: u64;
 
-    /// Root of the living-records B+tree.
-    fn current(&self) -> LocalId;
-    /// Root of the removed-records B+tree, keyed `[removed_at BE][anchor]`
-    /// — the collection's removal log, in removal order (membership by id
-    /// is not its job; record bytes stay resolvable by address anyway).
-    fn dead(&self) -> LocalId;
-    /// Root of the recency B+tree: exactly one `[modified_at BE][anchor]`
-    /// entry per **living** record, keyed by its live version's authoring
-    /// instant — the collection's modification log, what a reconnect
-    /// catch-up scans as "changed since cursor".
-    fn recency(&self) -> LocalId;
-    /// One root per `#[wavedb::pivot(...)]` secondary index.
+    /// One root per `#[wavedb::pivot(...)]` secondary index — the only
+    /// B+trees a collection still holds (RFC 0050 phase 5c retired the rest).
     fn secondaries(&self) -> &[LocalId];
+    /// The **record chain**'s roots: the collection's living records stored
+    /// inline in modification order, with a sparse index above them (RFC 0050).
+    ///
+    /// This *is* the membership set and the modification log — it replaced the
+    /// `current` and `recency` B+trees the collection used to carry. Liveness
+    /// is read off each record's own `Metadata`, not off a tree.
+    fn records(&self) -> ChainRoots;
+    /// The **removal log**'s endpoints — the same segment chain shape with no
+    /// index, since nothing ever searches it. It replaced the `dead` B+tree.
+    fn removals(&self) -> LogRoots;
     /// Collection-default access rule: seeds new inserts and gates
     /// collection-scope ops (`Insert`, `All`). Each record's
     /// `Metadata.permission` overrides it (authoritative per record).
     /// `None` = tenant-only.
     fn permission(&self) -> Option<&PermissionRef>;
-    /// A copy of this pivot with every root replaced (`current`, `dead`,
-    /// `recency`, and one entry per secondary index) and everything else
-    /// (permission) preserved — what the engine writes back when a B+tree
-    /// root moves. `secondaries` must hold exactly as many roots as
+    /// A copy of this pivot with every root replaced and everything else
+    /// (permission) preserved — what the engine writes back when a root moved.
+    ///
+    /// In practice that is now rare: a chain's endpoints move at most once in
+    /// its life (its first split) and its index root never moves, so only a
+    /// secondary tree's root split still triggers a `Pivot` rewrite.
+    /// `secondaries` must hold exactly as many roots as
     /// [`secondaries`](Self::secondaries) returns.
     #[must_use]
     fn replace_roots(
         &self,
-        current: LocalId,
-        dead: LocalId,
-        recency: LocalId,
         secondaries: &[LocalId],
+        records: ChainRoots,
+        removals: LogRoots,
     ) -> Self;
 }
 

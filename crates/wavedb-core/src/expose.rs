@@ -17,13 +17,17 @@
 use crate::collection::Collection;
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::Pivot as _;
 use crate::local_id::LocalId;
 use crate::record;
 use crate::store::Store;
 use crate::traits::{NonUniqueStruct, WaveDbStruct};
 use crate::u48::U48;
 use crate::wire::{WaveWire, from_wire, to_wire};
+
+// The 15-bit salt guard is part of this module's surface — the `expose_*`
+// macros emit `::wavedb_core::expose::SaltGuard` — but lives in its own file
+// for the budget, mirroring the macro side's `expose_collision`.
+pub use crate::expose_salt::{SaltGuard, salts_distinct, salts_self_distinct};
 
 // The catch-up navigation (the `Changes` command's engine) lives in its own
 // module; re-exported so the wire vocabulary reads from one place.
@@ -44,7 +48,7 @@ pub enum Command {
     Update,
     /// NonUnique move to the dead tree (payload = the `Id`).
     Remove,
-    /// NonUnique collection walk in `CREATED_AT` order (payload = the
+    /// NonUnique collection walk, most recently written first (payload = the
     /// collection's `Pivot` `LocalId`). Buffered for now — streaming frames
     /// are a later transport refinement.
     All,
@@ -70,8 +74,8 @@ pub enum Reply {
     Removed(bool),
     /// A `Save`/`Update` completed.
     Done,
-    /// An `All` walk's results: each record's body wire bytes, in
-    /// `CREATED_AT` order.
+    /// An `All` walk's results: each record's body wire bytes, most
+    /// recently written first.
     Values(Vec<Vec<u8>>),
     /// A `#[server]` function's wire-encoded return value.
     Returned(Vec<u8>),
@@ -114,41 +118,6 @@ impl Caller {
     pub const fn is_anonymous(&self) -> bool {
         self.user.get() == U48::MAX.get()
     }
-}
-
-/// The 15-bit identity guard the `expose_*` macros instantiate — one call per
-/// declared pair, at compile time.
-///
-/// `DISTINCT` is the const-evaluated verdict for a pair of exposed types: `true`
-/// when their [`type_salt`]s differ, `false` when they share one. Only the
-/// `false` arm is deprecated, so a clash costs the build a **warning naming the
-/// entry**, while a clean registry is silent.
-///
-/// Sharing the salt is legal — the full 64-bit head still tells the two types
-/// apart on read (a full-`STRUCT_HASH` clash is the hard error, asserted
-/// alongside this call). It is only a smell worth surfacing: the salt is the
-/// archive-slot and flat-keyspace (IndexedDB) discriminator, so a shared value
-/// costs those paths their type separation. Rename a field or the type to
-/// reshuffle the hash, or keep it knowingly.
-///
-/// [`type_salt`]: crate::mint::type_salt
-pub struct SaltGuard<const DISTINCT: bool>;
-
-impl SaltGuard<true> {
-    /// The clean arm — the pair's salts differ, nothing to report.
-    pub const fn check() {}
-}
-
-impl SaltGuard<false> {
-    /// The clashing arm; its deprecation **is** the warning.
-    #[deprecated(
-        note = "this exposed type shares the low 15 bits of its STRUCT_HASH \
-                (`type_salt`) with another entry in the same exposure list: \
-                they share archive slots and lose their separation in the \
-                browser's flat keyspace. Rename the type or a field to \
-                reshuffle the hash, or keep it knowingly."
-    )]
-    pub const fn check() {}
 }
 
 /// The declared registry surface.
@@ -217,7 +186,7 @@ where
     }
 }
 
-/// Walk a NonUnique collection in `CREATED_AT` order and buffer each record
+/// Walk a NonUnique collection newest-first and buffer each record
 /// as the wire pair `(Id, T)` — the shared tail of the generated `All` step.
 ///
 /// The node-minted `Id` rides with every item so a client can mirror the walk
@@ -239,28 +208,33 @@ where
     T: NonUniqueStruct,
     S: Store,
 {
-    use futures::TryStreamExt;
     let col = Collection::<T>::at(pivot, tenant);
     // Each entry is the wire triple `(Id, Metadata, T)`: the node-minted
-    // identity and the authoritative chain data ride along so a client
-    // mirror adopts them verbatim; the typed surface still yields values —
-    // hence the direct tree walk here, decoding once and keeping the
-    // metadata `all` would drop.
+    // identity and the authoritative chain data ride along so a client mirror
+    // adopts them verbatim, where the typed surface yields values alone.
+    //
+    // Walked off the **record chain** (RFC 0050), back from its tail, for two
+    // reasons. It is the same order `Collection::all` yields — most recently
+    // written first — and the two surfaces must not disagree about what "all"
+    // means. And the chain's payload *is* the stored envelope, so the metadata
+    // this needs comes out of the same decode: no per-record fetch at all,
+    // where the tree walk paid one page read and one decompression each.
     let pivot_record = col.load_pivot(store).await?;
-    let items: Vec<(Id, crate::metadata::Metadata, T)> = col
-        .tree(pivot_record.current())
-        .search(store, crate::index::Bound::All)
-        .and_then(|id| async move {
-            let bytes = store
-                .get_of(T::STRUCT_HASH, id)
-                .await?
-                .ok_or(Error::RecordMissing(id))?;
+    let chain = col.records_chain(&pivot_record);
+    let mut items: Vec<(Id, crate::metadata::Metadata, T)> = Vec::new();
+    let mut cursor = Some(chain.tail());
+    while let Some(seg_id) = cursor {
+        let seg = chain.segment(store, seg_id).await?;
+        let from = items.len();
+        for (key, bytes) in seg.entries() {
             let (meta, value) =
-                crate::record::decode_record::<T>(T::STRUCT_HASH, &bytes)?;
-            Ok((id, meta, value))
-        })
-        .try_collect()
-        .await?;
+                crate::record::decode_record::<T>(T::STRUCT_HASH, bytes)?;
+            items.push((key.rec.to_id(col.tenant()), meta, value));
+        }
+        // A segment holds its keys ascending; the walk runs descending.
+        items[from..].reverse();
+        cursor = seg.prev();
+    }
     let entries = items.iter().map(to_wire).collect();
     Ok(Reply::Values(entries))
 }
