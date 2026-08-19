@@ -11,36 +11,53 @@
 use crate::collection::Collection;
 use crate::error::Result;
 use crate::id::Id;
-use crate::index::{BpTree, Pivot, SecKey};
+use crate::index::{BpTree, ChainRoots, LogRoots, Pivot, SecKey};
 use crate::local_id::LocalId;
 use crate::metadata::{Metadata, Succession};
 use crate::notify::{Mutation, MutationKind};
 use crate::record::{
-    Overlay, encode_record, mint_floored_id, mint_instant, plan_chained_save,
+    Overlay, encode_record, mint_floored_id, plan_chained_save,
 };
 use crate::store::{Store, Write};
 use crate::traits::NonUniqueStruct;
 use crate::wire::to_wire;
 
+/// Everything one mutation may have moved, gathered so the `Pivot` is compared
+/// and rewritten **exactly once** — a second write built from the pre-batch
+/// pivot would drop whatever the first one carried.
+pub struct MovedRoots<'a> {
+    /// The secondary trees, in declaration order.
+    pub secondaries: &'a [BpTree<SecKey>],
+    /// The record chain's endpoints and index root (RFC 0050).
+    pub records: ChainRoots,
+    /// The removal log's endpoints.
+    pub removals: LogRoots,
+}
+
 impl<T: NonUniqueStruct> Collection<T> {
-    /// When any tree root moved, append the `Pivot` rewrite carrying them all.
+    /// When any root moved — a secondary B+tree's, or a chain's endpoint —
+    /// append the `Pivot` rewrite carrying them all.
+    ///
+    /// A chain moves an endpoint at most once in its life (its first split) and
+    /// its index root never moves, so a collection with no declared secondary
+    /// index compares and writes nothing here after that one split. What used
+    /// to make this fire constantly — `current`, `recency`, `dead` — is gone
+    /// (RFC 0050 phase 5c).
     pub(crate) fn push_root_moves(
         &self,
         batch: &mut Vec<Write>,
         pivot: &T::Pivot,
-        current: LocalId,
-        dead: LocalId,
-        recency: LocalId,
-        secs: &[BpTree<SecKey>],
+        moved: &MovedRoots<'_>,
     ) {
-        let sec_roots: Vec<LocalId> = secs.iter().map(BpTree::root).collect();
-        if current != pivot.current()
-            || dead != pivot.dead()
-            || recency != pivot.recency()
-            || sec_roots.as_slice() != pivot.secondaries()
+        let sec_roots: Vec<LocalId> =
+            moved.secondaries.iter().map(BpTree::root).collect();
+        if sec_roots.as_slice() != pivot.secondaries()
+            || moved.records != pivot.records()
+            || moved.removals != pivot.removals()
         {
-            let moved = pivot.replace_roots(current, dead, recency, &sec_roots);
-            batch.push(self.pivot_rewrite(&moved));
+            let rewritten =
+                pivot.replace_roots(&sec_roots, moved.records, moved.removals);
+            batch.push(self.pivot_rewrite(&rewritten));
         }
     }
 
@@ -108,20 +125,15 @@ impl<T: NonUniqueStruct> Collection<T> {
         let Succession::CreatedAt(instant) = meta.succession else {
             return Err(crate::Error::ChainCorrupt(id));
         };
-        let mut current = self.tree(pivot.current());
-        let mut recency = self.sec_tree(pivot.recency());
+        let mut records = self.records_chain(pivot);
         let mut secs = self.sec_trees(pivot);
-        let mut batch =
-            vec![Write::Put(id, encode_record(T::STRUCT_HASH, &meta, value))];
-        batch.extend(current.plan_insert(store, id).await?);
-        batch.extend(
-            recency
-                .plan_insert(
-                    store,
-                    Self::instant_key(instant, LocalId::from_id(id)),
-                )
-                .await?,
-        );
+        let envelope = encode_record(T::STRUCT_HASH, &meta, value);
+        let key = Self::instant_key(instant, LocalId::from_id(id));
+        // The chain carries the record **inline**, keyed by the instant its
+        // live version was authored. That one entry is the membership set and
+        // the modification log at once (RFC 0050).
+        let mut batch = vec![Write::Put(id, envelope.clone())];
+        batch.extend(records.plan_insert(store, key, envelope).await?);
         for (i, tree) in secs.iter_mut().enumerate() {
             let key = Self::sec_key(value, i, id);
             batch.extend(tree.plan_insert(store, key).await?);
@@ -129,10 +141,11 @@ impl<T: NonUniqueStruct> Collection<T> {
         self.push_root_moves(
             &mut batch,
             pivot,
-            current.root(),
-            pivot.dead(),
-            recency.root(),
-            &secs,
+            &MovedRoots {
+                secondaries: &secs,
+                records: records.roots(),
+                removals: pivot.removals(),
+            },
         );
         store.apply(&batch).await?;
         store.note_mutation(|| Mutation {
@@ -145,72 +158,6 @@ impl<T: NonUniqueStruct> Collection<T> {
             body: to_wire(value),
         });
         Ok(())
-    }
-
-    /// Remove the record at `id` from the living set: de-indexes it from
-    /// `current`, the recency log, **and every secondary tree**, and logs it
-    /// in `dead` keyed by a freshly minted removal instant — one atomic
-    /// batch. The record **bytes stay** (history stays navigable); only
-    /// `remove` ever writes the `dead` tree. Returns whether the record was
-    /// in `current`.
-    ///
-    /// # Errors
-    /// Propagates a [`Store`] failure, [`Error::PivotMissing`](crate::Error::PivotMissing)
-    /// on a stale handle, [`Error::RecordMissing`](crate::Error::RecordMissing) if a
-    /// living record's bytes are gone (index out of sync), or a decode fault on
-    /// a corrupt pivot.
-    pub async fn remove<S: Store>(&self, store: &S, id: Id) -> Result<bool> {
-        let pivot = self.load_pivot(store).await?;
-        let mut current = self.tree(pivot.current());
-        let mut dead = self.sec_tree(pivot.dead());
-        let mut recency = self.sec_tree(pivot.recency());
-        let mut secs = self.sec_trees(&pivot);
-
-        let Some(mut batch) = current.plan_remove(store, id).await? else {
-            return Ok(false);
-        };
-        // The record's bytes carry the live instant its recency entry is
-        // keyed by, and the field values its secondary keys were built from.
-        let (meta, value) = self.load_record(store, id).await?;
-        let floor = self.instant_floor(store, &pivot).await?;
-        let removed_at = mint_instant(floor);
-        let anchor = LocalId::from_id(id);
-        batch.extend(
-            dead.plan_insert(store, Self::instant_key(removed_at, anchor))
-                .await?,
-        );
-        if let Succession::CreatedAt(instant) = meta.succession
-            && let Some(writes) = recency
-                .plan_remove(store, Self::instant_key(instant, anchor))
-                .await?
-        {
-            batch.extend(writes);
-        }
-        for (i, tree) in secs.iter_mut().enumerate() {
-            let key = Self::sec_key(&value, i, id);
-            if let Some(writes) = tree.plan_remove(store, key).await? {
-                batch.extend(writes);
-            }
-        }
-        self.push_root_moves(
-            &mut batch,
-            &pivot,
-            current.root(),
-            dead.root(),
-            recency.root(),
-            &secs,
-        );
-        store.apply(&batch).await?;
-        store.note_mutation(|| Mutation {
-            struct_hash: T::STRUCT_HASH,
-            tenant: self.tenant(),
-            pivot: Some(self.pivot()),
-            id,
-            kind: MutationKind::Removed(removed_at),
-            meta: None,
-            body: Vec::new(),
-        });
-        Ok(true)
     }
 
     /// Overwrite the record at `id` with `value` — the NonUnique *update*.
@@ -281,22 +228,28 @@ impl<T: NonUniqueStruct> Collection<T> {
             pivot_id: Some(self.pivot()),
             imposed,
             floor,
+            revives: false,
         };
         let (mut batch, old, live_meta) =
             plan_chained_save::<T, S>(store, &plan, value).await?;
-        let mut recency = self.sec_tree(pivot.recency());
+        let mut records = self.records_chain(&pivot);
         let mut secs = self.sec_trees(&pivot);
-        // Removals and inserts mutate the same trees in one batch: each
+        // Removals and inserts mutate the same structures in one batch: each
         // plan reads through the overlay of the pending node writes.
         let mut view = Overlay::new(store);
         if let Some((old_instant, old_value)) = &old {
-            self.plan_recency_rekey(
+            let anchor = LocalId::from_id(id);
+            // A save **relocates** the record in the chain: its key is the live
+            // version's authoring instant, and that instant just changed. Out of
+            // the old position, in at the new one — which is the movement that
+            // *is* the modification log (RFC 0050).
+            self.plan_chain_move(
                 &mut view,
                 &mut batch,
-                &mut recency,
-                Self::instant_key(*old_instant, LocalId::from_id(id)),
+                &mut records,
+                Self::instant_key(*old_instant, anchor),
                 &live_meta,
-                id,
+                value,
             )
             .await?;
             for (i, tree) in secs.iter_mut().enumerate() {
@@ -319,10 +272,11 @@ impl<T: NonUniqueStruct> Collection<T> {
         self.push_root_moves(
             &mut batch,
             &pivot,
-            pivot.current(),
-            pivot.dead(),
-            recency.root(),
-            &secs,
+            &MovedRoots {
+                secondaries: &secs,
+                records: records.roots(),
+                removals: pivot.removals(),
+            },
         );
         store.apply(&batch).await?;
         store.note_mutation(|| Mutation {

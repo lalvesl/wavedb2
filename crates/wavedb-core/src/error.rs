@@ -35,6 +35,12 @@ pub enum Error {
     /// kind of value.
     #[error("foreign lane tag {0:#018x}")]
     LaneBadTag(u64),
+    /// A chain segment or sparse-index pointer resolved to nothing in the
+    /// backing [`Store`](crate::Store) — a dangling neighbour, child or root
+    /// pointer. The chain's own writes are one atomic batch, so this means the
+    /// structure disagrees with the store, never a half-applied mutation.
+    #[error("chain node {0:?} missing")]
+    ChainNodeMissing(LocalId),
     /// A collection handle's `Pivot` record was not in the [`Store`] — a stale
     /// or foreign `PivotId`.
     ///
