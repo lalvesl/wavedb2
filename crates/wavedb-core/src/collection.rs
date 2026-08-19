@@ -10,39 +10,33 @@
 //! let todos = Todo::create_pivot(&store, tenant).await?;   // once, explicit
 //! let col   = Todo::collection(todos, tenant);              // cheap handle
 //! let id    = col.insert(&store, &Todo { .. }).await?;      // one atomic batch
-//! col.remove(&store, id).await?;                            // current → dead
+//! col.remove(&store, id).await?;                            // leaves the chain
 //! col.all(&store)                                           // Stream<Result<Todo>>
 //! ```
 //!
 //! ## Record envelope & history
 //!
 //! Every stored value starts `[STRUCT_HASH (8 B LE)]` (backends route by it,
-//! decode verifies it); user records additionally carry their [`Metadata`]
-//! (see [`crate::record`]). Saving never destroys old bytes — `save` archives
+//! decode verifies it); user records additionally carry their
+//! [`Metadata`](crate::Metadata) (see [`crate::record`]). Saving never destroys old bytes — `save` archives
 //! the superseded version and links the modification chain;
 //! [`history`](Collection::history) walks it newest-first.
 //!
 //! ## Atomicity
 //!
 //! Each mutating op commits **one** [`Store::apply`] batch: the record write
-//! (plus its archived predecessor and chain relinks on a save), every touched
-//! B+tree node (via the tree's `plan_*` planners), and — when a root moved —
-//! the rewritten `Pivot` record. A crash replays the whole batch or none of
-//! it.
+//! (plus its archived predecessor and chain relinks on a save), the record
+//! chain segments and sparse-index nodes it touched, every touched secondary
+//! B+tree node, and — when a root moved — the rewritten `Pivot` record. A
+//! crash replays the whole batch or none of it.
 
 use std::marker::PhantomData;
 
-use futures::{Stream, TryStreamExt};
-
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::{Bound, BpTree, Pivot, SecKey};
+use crate::index::{BpTree, Chain, Lane, Pivot, SecKey};
 use crate::local_id::LocalId;
-use crate::metadata::Metadata;
-use crate::record::{
-    decode_envelope, decode_record, encode_envelope, history_stream,
-    mint_floored_id,
-};
+use crate::record::{decode_envelope, encode_envelope, mint_floored_id};
 use crate::store::{Store, Write};
 use crate::traits::NonUniqueStruct;
 use crate::u48::U48;
@@ -123,12 +117,6 @@ impl<T: NonUniqueStruct> Collection<T> {
         self.user
     }
 
-    /// A tree handle at `root` with this collection's capacities.
-    pub(crate) fn tree(&self, root: LocalId) -> BpTree {
-        BpTree::at(root, self.tenant)
-            .with_caps(self.leaf_cap, self.internal_cap)
-    }
-
     /// A secondary-index tree handle at `root` with the same capacities.
     pub(crate) fn sec_tree(&self, root: LocalId) -> BpTree<SecKey> {
         BpTree::at(root, self.tenant)
@@ -144,6 +132,37 @@ impl<T: NonUniqueStruct> Collection<T> {
             .collect()
     }
 
+    /// The **record chain** this pivot names: living records stored inline in
+    /// modification order, with a sparse index above them (RFC 0050).
+    ///
+    /// The payload is the record's stored envelope **verbatim**, so the chain
+    /// copy is byte-comparable with the anchor it derives from — which is what
+    /// makes the consistency invariant testable rather than arguable.
+    pub(crate) fn records_chain(&self, pivot: &T::Pivot) -> Chain<Vec<u8>> {
+        let roots = pivot.records();
+        Chain::at(
+            roots.head,
+            roots.tail,
+            roots.index,
+            self.tenant,
+            T::STRUCT_HASH,
+            Lane::Records,
+        )
+    }
+
+    /// The **removal log** this pivot names — the same chain shape with no
+    /// index, keyed by removal instant, payload-free.
+    pub(crate) fn dead_log(&self, pivot: &T::Pivot) -> Chain<()> {
+        let roots = pivot.removals();
+        Chain::log_at(
+            roots.head,
+            roots.tail,
+            self.tenant,
+            T::STRUCT_HASH,
+            Lane::Dead,
+        )
+    }
+
     /// Secondary index `i`'s key for `value` stored at `id`.
     pub(crate) fn sec_key(value: &T, i: usize, id: Id) -> SecKey {
         SecKey {
@@ -152,10 +171,10 @@ impl<T: NonUniqueStruct> Collection<T> {
         }
     }
 
-    /// Create a new, empty collection under `tenant`: the `current`, `dead`,
-    /// and recency B+trees, one secondary tree per `#[wavedb::pivot(...)]`,
-    /// and the `Pivot` record pointing at them all, committed in one atomic
-    /// batch. Returns the pivot's `LocalId` — the caller stores it (via the
+    /// Create a new, empty collection under `tenant`: the record chain and
+    /// its sparse index, the removal log, one B+tree per
+    /// `#[wavedb::pivot(...)]`, and the `Pivot` record pointing at them all,
+    /// committed in one atomic batch. Returns the pivot's `LocalId` — the caller stores it (via the
     /// generated `{Name}PivotId`) in an owning record.
     ///
     /// # Errors
@@ -178,22 +197,29 @@ impl<T: NonUniqueStruct> Collection<T> {
         tenant: U48,
         pivot_id: Id,
     ) -> Result<()> {
-        let (current, current_write) = BpTree::<LocalId>::plan_create(tenant);
-        // The dead and recency logs are instant-keyed — `SecKey` trees.
-        let (dead, dead_write) = BpTree::<SecKey>::plan_create(tenant);
-        let (recency, recency_write) = BpTree::<SecKey>::plan_create(tenant);
-        let mut batch = vec![current_write, dead_write, recency_write];
+        // One B+tree per declared `#[wavedb::pivot(...)]` index, and nothing
+        // else: the record chain IS the membership set and the modification
+        // log, the removal log replaced the `dead` tree (RFC 0050 phase 5c).
+        let mut batch = Vec::new();
         let mut sec_roots = Vec::with_capacity(T::NUM_SECONDARIES);
         for _ in 0..T::NUM_SECONDARIES {
             let (tree, write) = BpTree::<SecKey>::plan_create(tenant);
             sec_roots.push(tree.root());
             batch.push(write);
         }
+        let (records, record_writes) = Chain::<Vec<u8>>::plan_create(
+            tenant,
+            T::STRUCT_HASH,
+            Lane::Records,
+        );
+        let (removals, removal_writes) =
+            Chain::<()>::plan_create_log(tenant, T::STRUCT_HASH, Lane::Dead);
+        batch.extend(record_writes);
+        batch.extend(removal_writes);
         let pivot_record = T::Pivot::default().replace_roots(
-            current.root(),
-            dead.root(),
-            recency.root(),
             &sec_roots,
+            records.roots(),
+            removals.log_roots(),
         );
         batch.push(Write::Put(
             pivot_id,
@@ -230,120 +256,17 @@ impl<T: NonUniqueStruct> Collection<T> {
 
     /// Load and decode the record at `id` (metadata + body), failing if it is
     /// gone.
+    #[cfg(test)]
     pub(crate) async fn load_record<S: Store>(
         &self,
         store: &S,
         id: Id,
-    ) -> Result<(Metadata, T)> {
+    ) -> Result<(crate::metadata::Metadata, T)> {
         let bytes = store
             .get_of(T::STRUCT_HASH, id)
             .await?
             .ok_or(Error::RecordMissing(id))?;
-        decode_record(T::STRUCT_HASH, &bytes)
-    }
-
-    /// Fetch and decode the record at `id`. `None` = no such record. Resolves
-    /// by direct address — a removed (dead-indexed) record still resolves,
-    /// which is what keeps history navigable.
-    ///
-    /// # Errors
-    /// Propagates a [`Store`] failure or a decode fault (including an `id`
-    /// that resolves to a different type's record).
-    pub async fn get<S: Store>(&self, store: &S, id: Id) -> Result<Option<T>> {
-        match store.get_of(T::STRUCT_HASH, id).await? {
-            Some(bytes) => Ok(Some(decode_record(T::STRUCT_HASH, &bytes)?.1)),
-            None => Ok(None),
-        }
-    }
-
-    /// Stream the record at `id`'s versions **newest-first**: the live
-    /// version, then each archived one along the modification chain that
-    /// [`save`](Self::save) maintains. Saving never destroys old bytes — this
-    /// is the walk over them.
-    // The read methods take `self` by value (the handle is `Copy`): they
-    // return streams, and a borrowed receiver would tie the opaque type to a
-    // temporary when called as `T::collection(..).all(store)`.
-    pub fn history<'a, S: Store>(
-        self,
-        store: &'a S,
-        id: Id,
-    ) -> impl Stream<Item = Result<(Metadata, T)>> + 'a
-    where
-        T: 'a,
-    {
-        history_stream::<T, S>(store, T::STRUCT_HASH, T::SHAPE, id, self.tenant)
-    }
-
-    /// Stream the living records secondary index `index` selects under
-    /// `bound` (a bound over the index's [`IndexKey`](crate::index::IndexKey)
-    /// encoding — `Exact` for one value, `Prefix`/`Range` for scans), resolved
-    /// two-phase like [`search`](Self::search). Ordered by the indexed field.
-    /// The generated `by_<field>` wrappers call this with the field's exact
-    /// encoding.
-    pub fn search_by<'a, S: Store>(
-        self,
-        store: &'a S,
-        index: usize,
-        bound: Bound,
-    ) -> impl Stream<Item = Result<(Id, T)>> + 'a
-    where
-        T: 'a,
-    {
-        let handle = self;
-        futures::stream::once(async move {
-            let pivot = handle.load_pivot(store).await?;
-            let root = *pivot
-                .secondaries()
-                .get(index)
-                .ok_or(Error::SecondaryIndexOutOfRange(index))?;
-            Ok::<_, Error>(handle.sec_tree(root).search(store, bound))
-        })
-        .try_flatten()
-        .and_then(move |id| async move {
-            let bytes = store
-                .get_of(T::STRUCT_HASH, id)
-                .await?
-                .ok_or(Error::RecordMissing(id))?;
-            Ok((id, decode_record::<T>(T::STRUCT_HASH, &bytes)?.1))
-        })
-    }
-
-    /// Stream the living records whose `CREATED_AT` falls in `bound`, in
-    /// chronological order — the two-phase walk (index → `Id`s → fetch +
-    /// decode) fused into one stream.
-    pub fn search<'a, S: Store>(
-        self,
-        store: &'a S,
-        bound: Bound,
-    ) -> impl Stream<Item = Result<(Id, T)>> + 'a
-    where
-        T: 'a,
-    {
-        let handle = self;
-        futures::stream::once(async move {
-            let pivot = handle.load_pivot(store).await?;
-            let tree = handle.tree(pivot.current());
-            Ok::<_, Error>(tree.search(store, bound))
-        })
-        .try_flatten()
-        .and_then(move |id| async move {
-            let bytes = store
-                .get_of(T::STRUCT_HASH, id)
-                .await?
-                .ok_or(Error::RecordMissing(id))?;
-            Ok((id, decode_record::<T>(T::STRUCT_HASH, &bytes)?.1))
-        })
-    }
-
-    /// Stream every living record in insertion (`CREATED_AT`) order.
-    pub fn all<'a, S: Store>(
-        self,
-        store: &'a S,
-    ) -> impl Stream<Item = Result<(Id, T)>> + 'a
-    where
-        T: 'a,
-    {
-        self.search(store, Bound::All)
+        crate::record::decode_record(T::STRUCT_HASH, &bytes)
     }
 }
 
@@ -354,8 +277,8 @@ mod tests {
 
     use super::{Collection, get_unique, save_unique};
     use crate::error::Error;
-    use crate::index::Pivot;
     use crate::index::mem_store::MemStore;
+    use crate::index::{ChainRoots, LogRoots, Pivot};
     use crate::local_id::LocalId;
     use crate::metadata::Succession;
     use crate::permission::PermissionRef;
@@ -380,40 +303,34 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct DocPivot {
-        current: LocalId,
-        dead: LocalId,
-        recency: LocalId,
+        records: ChainRoots,
+        removals: LogRoots,
         permission: Option<PermissionRef>,
     }
 
     impl Pivot for DocPivot {
         const STRUCT_HASH: u64 = 0xD0C_0002;
-        fn current(&self) -> LocalId {
-            self.current
-        }
-        fn dead(&self) -> LocalId {
-            self.dead
-        }
-        fn recency(&self) -> LocalId {
-            self.recency
-        }
         fn secondaries(&self) -> &[LocalId] {
             &[]
+        }
+        fn records(&self) -> ChainRoots {
+            self.records
+        }
+        fn removals(&self) -> LogRoots {
+            self.removals
         }
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
         fn replace_roots(
             &self,
-            current: LocalId,
-            dead: LocalId,
-            recency: LocalId,
             _secondaries: &[LocalId],
+            records: ChainRoots,
+            removals: LogRoots,
         ) -> Self {
             Self {
-                current,
-                dead,
-                recency,
+                records,
+                removals,
                 permission: self.permission.clone(),
             }
         }
@@ -439,43 +356,37 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct TaggedPivot {
-        current: LocalId,
-        dead: LocalId,
-        recency: LocalId,
+        records: ChainRoots,
+        removals: LogRoots,
         secondaries: [LocalId; 1],
         permission: Option<PermissionRef>,
     }
 
     impl Pivot for TaggedPivot {
         const STRUCT_HASH: u64 = 0x7A6_0002;
-        fn current(&self) -> LocalId {
-            self.current
-        }
-        fn dead(&self) -> LocalId {
-            self.dead
-        }
-        fn recency(&self) -> LocalId {
-            self.recency
-        }
         fn secondaries(&self) -> &[LocalId] {
             &self.secondaries
+        }
+        fn records(&self) -> ChainRoots {
+            self.records
+        }
+        fn removals(&self) -> LogRoots {
+            self.removals
         }
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
         fn replace_roots(
             &self,
-            current: LocalId,
-            dead: LocalId,
-            recency: LocalId,
             secondaries: &[LocalId],
+            records: ChainRoots,
+            removals: LogRoots,
         ) -> Self {
             let mut s = self.secondaries;
             s.copy_from_slice(secondaries);
             Self {
-                current,
-                dead,
-                recency,
+                records,
+                removals,
                 secondaries: s,
                 permission: self.permission.clone(),
             }
@@ -550,12 +461,16 @@ mod tests {
 
             let walked: Vec<(crate::id::Id, Doc)> =
                 col.all(&store).try_collect().await.unwrap();
+            // The walk comes off the record chain, which is ordered by each
+            // record's live version's authoring instant — so it is **most
+            // recently written first**, the reverse of insertion order here
+            // because nothing has been saved yet (RFC 0050).
             assert_eq!(
                 walked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-                vec![a, b, c],
-                "walk must be insertion-ordered"
+                vec![c, b, a],
+                "walk must be newest-first"
             );
-            assert_eq!(walked[0].1, Doc { n: 1 });
+            assert_eq!(walked[0].1, Doc { n: 3 });
 
             // Update in place: same Id, new bytes, still one walk entry.
             col.save(&store, b, &Doc { n: 22 }).await.unwrap();
@@ -568,7 +483,7 @@ mod tests {
                 col.all(&store).try_collect().await.unwrap();
             assert_eq!(
                 after.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-                vec![a, c]
+                vec![c, a]
             );
             assert_eq!(
                 col.get(&store, b).await.unwrap(),
@@ -599,10 +514,14 @@ mod tests {
             let walked: Vec<(crate::id::Id, Doc)> =
                 reopened.all(&store).try_collect().await.unwrap();
             assert_eq!(walked.len(), 64);
+            // Newest-first: the chain's order survives its own splits, and the
+            // reopened handle reaches it through the rewritten `Pivot`.
+            let mut newest_first = ids.clone();
+            newest_first.reverse();
             assert_eq!(
                 walked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-                ids,
-                "insertion order lost across root splits"
+                newest_first,
+                "chain order lost across splits"
             );
 
             // Remove everything; merges collapse roots — pivot keeps up.
@@ -841,6 +760,7 @@ mod tests {
                 pivot_id: Some(pivot),
                 imposed: None,
                 floor: 0,
+                revives: false,
             };
             let (stale, _, _) = crate::record::plan_chained_save::<Doc, _>(
                 &store,
@@ -872,19 +792,159 @@ mod tests {
     // removal time. Between them, a tail scan from any cursor is precisely
     // "everything that changed since".
     #[test]
-    fn recency_and_dead_logs_track_the_living_set() {
-        use futures::StreamExt;
+    fn the_record_chain_agrees_with_the_anchors_it_derives_from() {
+        block_on(async {
+            // The chain holds a *copy* of every living record. At every step
+            // of a mixed workload that copy must be byte-identical to the
+            // anchor it came from, and the two answers to "does this record
+            // live?" — chain membership and `Metadata.removed` — must match.
+            //
+            // Until phase 5c this also compared the chain against the
+            // `recency`/`dead` B+trees written beside it. Those are gone; the
+            // anchors are what remains to check against, and they are the
+            // authority anyway.
+            let store = MemStore::default();
+            let pivot_id =
+                Collection::<Doc>::create(&store, tenant()).await.unwrap();
+            let col = Collection::<Doc>::at(pivot_id, tenant());
 
-        async fn recency_ids(
+            let mut ids = Vec::new();
+            for n in 1..=12u64 {
+                ids.push(col.insert(&store, &Doc { n }).await.unwrap());
+                agree(&store, &col).await;
+            }
+            // Saves relocate their records; removals evict them.
+            for (i, id) in ids.iter().enumerate() {
+                if i % 3 == 0 {
+                    col.save(&store, *id, &Doc { n: 900 + i as u64 })
+                        .await
+                        .unwrap();
+                } else if i % 3 == 1 {
+                    assert!(col.remove(&store, *id).await.unwrap());
+                }
+                agree(&store, &col).await;
+            }
+            // Something must actually have happened, or the assertions above
+            // were comparing two empty structures.
+            let pivot = col.load_pivot(&store).await.unwrap();
+            assert!(
+                !col.records_chain(&pivot)
+                    .collect(&store)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                !col.dead_log(&pivot)
+                    .collect(&store)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    /// Assert every inline chain record equals the bytes at its own anchor,
+    /// and that chain membership and `Metadata.removed` tell the same story.
+    async fn agree(store: &MemStore, col: &Collection<Doc>) {
+        use crate::collection_read::Anchor;
+        use crate::local_id::LocalId;
+        use crate::store::Store;
+
+        let pivot = col.load_pivot(store).await.unwrap();
+        let chain = col.records_chain(&pivot).collect(store).await.unwrap();
+        let mut in_chain: Vec<LocalId> = Vec::with_capacity(chain.len());
+        for (key, payload) in &chain {
+            let id = key.rec.to_id(col.tenant());
+            let stored = Store::get(store, id)
+                .await
+                .unwrap()
+                .expect("the chain names a record that is not at its anchor");
+            assert_eq!(
+                payload, &stored,
+                "the chain's copy diverged from its anchor"
+            );
+            // The two answers to "does this live?" — the structure's and the
+            // record's own — are what every read path now depends on agreeing.
+            assert!(
+                matches!(
+                    col.anchor(store, id).await.unwrap(),
+                    Anchor::Living(..)
+                ),
+                "a record the chain holds reads dead at its anchor"
+            );
+            in_chain.push(key.rec);
+        }
+
+        let log = col.dead_log(&pivot).collect(store).await.unwrap();
+        for (key, ()) in &log {
+            // A revived keyed anchor keeps its removal as a historical event,
+            // so the dead side is checked only where the chain has not taken
+            // the record back.
+            if !in_chain.contains(&key.rec) {
+                assert!(
+                    matches!(
+                        col.anchor(store, key.rec.to_id(col.tenant()))
+                            .await
+                            .unwrap(),
+                        Anchor::Dead
+                    ),
+                    "a removed record reads living at its anchor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_removal_is_stamped_on_the_anchor_and_a_save_does_not_undo_it() {
+        block_on(async {
+            // Liveness reads off the record itself (RFC 0050), so the anchor
+            // must agree with the index at every step — including the step
+            // where they could most easily drift: a save aimed at an anchor
+            // that is already dead.
+            let store = MemStore::default();
+            let pivot =
+                Collection::<Doc>::create(&store, tenant()).await.unwrap();
+            let col = Collection::<Doc>::at(pivot, tenant());
+            let id = col.insert(&store, &Doc { n: 1 }).await.unwrap();
+
+            let (meta, _) = col.load_record(&store, id).await.unwrap();
+            assert!(meta.is_live(), "a fresh insert reads dead");
+
+            assert!(col.remove(&store, id).await.unwrap());
+            let (meta, _) = col.load_record(&store, id).await.unwrap();
+            assert!(!meta.is_live(), "the anchor did not record the removal");
+
+            // The record is out of the living walk, and writing to it must not
+            // put it back: an unkeyed save re-indexes nothing, so a cleared
+            // flag here would claim life the walk does not grant.
+            col.save(&store, id, &Doc { n: 2 }).await.unwrap();
+            let (meta, body) = col.load_record(&store, id).await.unwrap();
+            assert_eq!(body, Doc { n: 2 }, "the save did not land");
+            assert!(!meta.is_live(), "a plain save silently revived a record");
+            let walked: Vec<(crate::id::Id, Doc)> =
+                col.all(&store).try_collect().await.unwrap();
+            assert!(walked.is_empty(), "the walk disagrees with the anchor");
+        });
+    }
+
+    // The chain IS the modification log: exactly one entry per living
+    // record, at its live version's instant, and a save moves that entry
+    // rather than adding one. The removal log is the other half.
+    #[test]
+    fn the_chain_and_the_removal_log_track_the_living_set() {
+        async fn chain_ids(
             col: Collection<Doc>,
             store: &MemStore,
         ) -> Vec<crate::id::Id> {
             let pivot = col.load_pivot(store).await.unwrap();
-            col.sec_tree(pivot.recency())
-                .search(store, crate::index::Bound::All)
-                .map(|r| r.unwrap())
-                .collect()
+            col.records_chain(&pivot)
+                .collect(store)
                 .await
+                .unwrap()
+                .into_iter()
+                .map(|(key, _)| key.rec.to_id(col.tenant()))
+                .collect()
         }
 
         block_on(async {
@@ -894,52 +954,89 @@ mod tests {
             let col = Collection::<Doc>::at(pivot, tenant());
             let a = col.insert(&store, &Doc { n: 1 }).await.unwrap();
             let b = col.insert(&store, &Doc { n: 2 }).await.unwrap();
-            assert_eq!(recency_ids(col, &store).await, vec![a, b]);
+            assert_eq!(chain_ids(col, &store).await, vec![a, b]);
 
-            // A save re-keys the one entry to the new version's instant —
-            // `a` moves to the log's tail, still a single entry.
+            // A save relocates the one entry to the new version's instant —
+            // `a` moves to the chain's tail, still a single entry.
             col.save(&store, a, &Doc { n: 10 }).await.unwrap();
-            assert_eq!(recency_ids(col, &store).await, vec![b, a]);
+            assert_eq!(chain_ids(col, &store).await, vec![b, a]);
             let (meta, _) = col.load_record(&store, a).await.unwrap();
             let live_instant = meta.succession.instant();
-            assert!(live_instant > b.key(), "the log tail is the newest");
-            let keyed_at_live: Vec<crate::id::Id> = col
-                .sec_tree(col.load_pivot(&store).await.unwrap().recency())
-                .search(
-                    &store,
-                    crate::index::Bound::Exact(
-                        live_instant.to_be_bytes().to_vec(),
-                    ),
-                )
-                .map(|r| r.unwrap())
-                .collect()
-                .await;
+            assert!(live_instant > b.key(), "the chain tail is the newest");
+            let pivot_rec = col.load_pivot(&store).await.unwrap();
+            let entries =
+                col.records_chain(&pivot_rec).collect(&store).await.unwrap();
+            let (key, _) = entries.last().unwrap();
             assert_eq!(
-                keyed_at_live,
-                vec![a],
+                (
+                    u64::from_be_bytes(key.field.clone().try_into().unwrap()),
+                    key.rec.to_id(col.tenant()),
+                ),
+                (live_instant, a),
                 "the entry sits exactly at the live version's instant"
             );
 
-            // A removal deletes the recency entry and logs the removal —
-            // keyed above every instant the collection minted before it.
+            // A removal takes the record out of the chain and appends to the
+            // removal log — keyed above every instant minted before it.
             assert!(col.remove(&store, b).await.unwrap());
-            assert_eq!(recency_ids(col, &store).await, vec![a]);
+            assert_eq!(chain_ids(col, &store).await, vec![a]);
             let pivot_rec = col.load_pivot(&store).await.unwrap();
-            let dead: Vec<crate::id::Id> = col
-                .sec_tree(pivot_rec.dead())
-                .search(&store, crate::index::Bound::All)
-                .map(|r| r.unwrap())
-                .collect()
-                .await;
-            assert_eq!(dead, vec![b]);
-            let removed_at = col
-                .sec_tree(pivot_rec.dead())
-                .max_key(&store)
-                .await
-                .unwrap()
-                .map(|k| u64::from_be_bytes(k.field.try_into().unwrap()))
-                .unwrap();
+            let log = col.dead_log(&pivot_rec).collect(&store).await.unwrap();
+            let (removed_key, ()) = log.last().unwrap();
+            assert_eq!(log.len(), 1);
+            assert_eq!(removed_key.rec.to_id(col.tenant()), b);
+            let removed_at = u64::from_be_bytes(
+                removed_key.field.clone().try_into().unwrap(),
+            );
             assert!(removed_at > live_instant);
+        });
+    }
+
+    // The floor is read off both chains' tail segments (RFC 0050, A2), and
+    // it needs both: a removed record *leaves* the record chain, so once a
+    // collection has been emptied its whole history lives in the removal
+    // log alone.
+    #[test]
+    fn the_floor_is_the_greater_of_the_two_chain_tails() {
+        block_on(async {
+            let store = MemStore::default();
+            let pivot =
+                Collection::<Doc>::create(&store, tenant()).await.unwrap();
+            let col = Collection::<Doc>::at(pivot, tenant());
+
+            let pivot_rec = col.load_pivot(&store).await.unwrap();
+            assert_eq!(
+                col.instant_floor(&store, &pivot_rec).await.unwrap(),
+                0,
+                "an empty collection floors at zero"
+            );
+
+            let a = col.insert(&store, &Doc { n: 1 }).await.unwrap();
+            let b = col.insert(&store, &Doc { n: 2 }).await.unwrap();
+            let pivot_rec = col.load_pivot(&store).await.unwrap();
+            assert_eq!(
+                col.instant_floor(&store, &pivot_rec).await.unwrap(),
+                b.key(),
+                "the floor is the record chain's tail while records live"
+            );
+
+            // Empty the collection: the chain now holds nothing, so only the
+            // removal log can still answer.
+            assert!(col.remove(&store, a).await.unwrap());
+            assert!(col.remove(&store, b).await.unwrap());
+            let pivot_rec = col.load_pivot(&store).await.unwrap();
+            assert!(
+                col.records_chain(&pivot_rec)
+                    .collect(&store)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "the removals did not empty the chain"
+            );
+            assert!(
+                col.instant_floor(&store, &pivot_rec).await.unwrap() > b.key(),
+                "the removal log must hold the floor once the chain is empty"
+            );
         });
     }
 
