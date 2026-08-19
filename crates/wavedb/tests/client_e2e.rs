@@ -193,7 +193,7 @@ async fn nonunique_phase(db: &Db, pivot: NotePivotId) {
         .expect("update");
     assert!(notes.get(db, id).await.expect("get").unwrap().pinned);
 
-    // A second insert, then walk the whole collection in insertion order.
+    // A second insert, then walk the whole collection — newest write first.
     notes
         .insert(
             db,
@@ -207,8 +207,8 @@ async fn nonunique_phase(db: &Db, pivot: NotePivotId) {
     let all: Vec<Note> = notes.all(db).try_collect().await.expect("all");
     assert_eq!(
         all.iter().map(|n| n.body.as_str()).collect::<Vec<_>>(),
-        vec!["buy milk", "write docs"],
-        "collection walk in CREATED_AT order"
+        vec!["write docs", "buy milk"],
+        "collection walk, most recently written first"
     );
 
     assert!(notes.remove(db, id).await.expect("remove"));

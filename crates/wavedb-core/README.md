@@ -445,7 +445,7 @@ let id = col.insert(&store, &Todo { title, completed: false }).await?; // → st
 col.save(&store, id, &updated).await?;    // update at the same Id (no reindex)
 col.remove(&store, id).await?;            // current → dead; bytes kept (history)
 col.get(&store, id).await?;               // direct address → Option<Todo>
-col.all(&store);                          // Stream<Item = Result<(Id, Todo)>>, CREATED_AT order
+col.all(&store);                          // Stream<Item = Result<(Id, Todo)>>, newest write first
 ```
 
 Every mutating op is **one `Store::apply` batch** (record + touched nodes +
