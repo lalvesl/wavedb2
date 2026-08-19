@@ -4,9 +4,14 @@
 //! seen for a topic. Answering "what changed since?" never replays a log
 //! of requests — the disk structures phase 3 laid down *are* the answer:
 //!
-//! - a **collection** scans its recency and dead logs' tails past the
-//!   cursor — every record inserted or updated since (once, at its live
-//!   instant) and every removal (at its removal instant);
+//! - a **collection** scans the tails of its record chain and its removal
+//!   log past the cursor (RFC 0050) — every record inserted or updated
+//!   since (once, at its live instant) and every removal (at its removal
+//!   instant). Both are ordered by instant, so each scan starts at its
+//!   chain's tail and stops at the first segment reaching the cursor; and
+//!   the record chain carries each version's bytes **inline**, so a change
+//!   costs no read of its own. A caught-up client pays two segment reads
+//!   for "nothing new";
 //! - a **Unique** walks its chain forward from the client's own version:
 //!   the derived slot of the cursor instant holds its archive, whose
 //!   `Next` names the successor — a MISS means the successor is the live
@@ -22,7 +27,7 @@ use crate::collection::Collection;
 use crate::error::{Error, Result};
 use crate::expose::Reply;
 use crate::id::Id;
-use crate::index::{Bound, Pivot as _, SecKey};
+use crate::index::{Chain, SecKey};
 use crate::local_id::LocalId;
 use crate::metadata::{Metadata, Succession};
 use crate::record;
@@ -46,18 +51,44 @@ pub enum Change {
     Removed(Id, u64),
 }
 
-/// The half-open instant range strictly after `cursor`, as a bound over
-/// the logs' 8-byte big-endian keys. Nine `0xFF` bytes sort above every
-/// 8-byte key, closing the range at the top without excluding `u64::MAX`.
-fn after(cursor: u64) -> Bound {
-    Bound::Range {
-        lo: cursor.saturating_add(1).to_be_bytes().to_vec(),
-        hi: vec![0xFF; 9],
+/// One chain's tail past `cursor`: every entry whose key instant is
+/// strictly greater, as `(instant, anchor, payload)`.
+///
+/// The chain is instant-ordered, so the scan starts at the tail and stops
+/// at the first segment reaching at or below the cursor — a client `k`
+/// changes behind reads `k / entries-per-segment` segments, not `k`
+/// records. Order is per-segment ascending, newest segment first; the two
+/// chains are merged by instant afterwards, so it does not matter here.
+async fn tail_since<P, S>(
+    chain: &Chain<P>,
+    store: &S,
+    cursor: u64,
+) -> Result<Vec<(u64, LocalId, P)>>
+where
+    P: WaveWire,
+    S: Store,
+{
+    let mut out = Vec::new();
+    let mut at = Some(chain.tail());
+    while let Some(id) = at {
+        let mut seg = chain.segment(store, id).await?;
+        let prev = seg.prev();
+        // Ascending keys: a segment whose least key already sits at or
+        // below the cursor is the last one worth reading.
+        let reached = seg
+            .first_key()
+            .is_some_and(|key| key_instant(key) <= cursor);
+        out.extend(seg.take_entries().into_iter().filter_map(|(key, load)| {
+            let instant = key_instant(&key);
+            (instant > cursor).then_some((instant, key.rec, load))
+        }));
+        at = if reached { None } else { prev };
     }
+    Ok(out)
 }
 
-/// The instant a recency/dead key encodes (their field IS the 8-byte
-/// big-endian instant).
+/// The instant a chain key encodes (their field IS the 8-byte big-endian
+/// instant).
 fn key_instant(key: &SecKey) -> u64 {
     key.field
         .as_slice()
@@ -67,9 +98,14 @@ fn key_instant(key: &SecKey) -> u64 {
 
 /// A collection's changes since `cursor`, `Cursor` first.
 ///
-/// The recency tail (live versions of every record inserted or updated
-/// since) merged with the dead tail (removals), in instant order. `None`
-/// = register at the collection's current tail with no events.
+/// The record chain's tail (the live version of every record inserted or
+/// updated since) merged with the removal log's (removals), in instant
+/// order. `None` = register at the collection's current tail with no
+/// events.
+///
+/// The chain stores each record's envelope inline, so a `Saved` is
+/// assembled from bytes the tail scan already read — catching up costs
+/// segment reads, never one read per change.
 ///
 /// # Errors
 /// Propagates a [`Store`] failure, [`Error::PivotMissing`] on a stale
@@ -86,8 +122,6 @@ where
     T: NonUniqueStruct,
     S: Store,
 {
-    use futures::TryStreamExt;
-
     let col = Collection::<T>::at(pivot, tenant);
     let pivot_record = col.load_pivot(store).await?;
     let Some(cursor) = since else {
@@ -95,41 +129,30 @@ where
         return Ok(values(tail, &[]));
     };
 
-    let saved: Vec<SecKey> = col
-        .sec_tree(pivot_record.recency())
-        .search_keys(store, after(cursor))
-        .try_collect()
-        .await?;
-    let removed: Vec<SecKey> = col
-        .sec_tree(pivot_record.dead())
-        .search_keys(store, after(cursor))
-        .try_collect()
-        .await?;
+    let saved =
+        tail_since(&col.records_chain(&pivot_record), store, cursor).await?;
+    let removed =
+        tail_since(&col.dead_log(&pivot_record), store, cursor).await?;
 
     // Merge the two tails into one instant-ordered timeline.
-    let mut timeline: Vec<(u64, bool, LocalId)> = saved
-        .iter()
-        .map(|k| (key_instant(k), true, k.rec))
-        .chain(removed.iter().map(|k| (key_instant(k), false, k.rec)))
-        .collect();
-    timeline.sort_unstable_by_key(|(instant, ..)| *instant);
-
-    let mut new_cursor = cursor;
-    let mut changes = Vec::with_capacity(timeline.len());
-    for (instant, living, rec) in timeline {
-        new_cursor = new_cursor.max(instant);
+    let mut timeline = Vec::with_capacity(saved.len() + removed.len());
+    for (instant, rec, bytes) in saved {
+        let (meta, body) = record::split_record(T::STRUCT_HASH, &bytes)?;
         let id = rec.to_id(tenant);
-        if living {
-            let bytes = store
-                .get_of(T::STRUCT_HASH, id)
-                .await?
-                .ok_or(Error::RecordMissing(id))?;
-            let (meta, body) = record::split_record(T::STRUCT_HASH, &bytes)?;
-            changes.push(Change::Saved(id, meta, body.to_vec()));
-        } else {
-            changes.push(Change::Removed(id, instant));
-        }
+        timeline.push((instant, Change::Saved(id, meta, body.to_vec())));
     }
+    timeline.extend(removed.into_iter().map(|(instant, rec, ())| {
+        (instant, Change::Removed(rec.to_id(tenant), instant))
+    }));
+    timeline.sort_unstable_by_key(|(instant, _)| *instant);
+
+    // Sorted, so the last entry carries the tail the caller comes back with.
+    let new_cursor = timeline
+        .last()
+        .map_or(cursor, |(instant, _)| *instant)
+        .max(cursor);
+    let changes: Vec<Change> =
+        timeline.into_iter().map(|(_, change)| change).collect();
     Ok(values(new_cursor, &changes))
 }
 
@@ -211,13 +234,17 @@ fn values(cursor: u64, changes: &[Change]) -> Reply {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use futures::executor::block_on;
 
     use super::{Change, collection_changes, unique_changes};
     use crate::collection::Collection;
+    use crate::error::Result;
     use crate::expose::Reply;
-    use crate::index::Pivot;
+    use crate::id::Id;
     use crate::index::mem_store::MemStore;
+    use crate::index::{ChainRoots, LogRoots, Pivot};
     use crate::local_id::LocalId;
     use crate::metadata::Succession;
     use crate::permission::PermissionRef;
@@ -244,39 +271,33 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct DocPivot {
-        current: LocalId,
-        dead: LocalId,
-        recency: LocalId,
+        records: ChainRoots,
+        removals: LogRoots,
         permission: Option<PermissionRef>,
     }
     impl Pivot for DocPivot {
         const STRUCT_HASH: u64 = 0xC4A6_0002;
-        fn current(&self) -> LocalId {
-            self.current
-        }
-        fn dead(&self) -> LocalId {
-            self.dead
-        }
-        fn recency(&self) -> LocalId {
-            self.recency
-        }
         fn secondaries(&self) -> &[LocalId] {
             &[]
+        }
+        fn records(&self) -> ChainRoots {
+            self.records
+        }
+        fn removals(&self) -> LogRoots {
+            self.removals
         }
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
         fn replace_roots(
             &self,
-            current: LocalId,
-            dead: LocalId,
-            recency: LocalId,
             _: &[LocalId],
+            records: ChainRoots,
+            removals: LogRoots,
         ) -> Self {
             Self {
-                current,
-                dead,
-                recency,
+                records,
+                removals,
                 permission: self.permission.clone(),
             }
         }
@@ -294,6 +315,38 @@ mod tests {
 
     fn tenant() -> U48 {
         U48::from(TENANT)
+    }
+
+    /// A [`Store`] that records every address it is asked to read. Phase
+    /// 5b's claim is about *which* addresses a catch-up touches, so the
+    /// test has to see them.
+    struct Watched<'a> {
+        inner: &'a MemStore,
+        reads: Mutex<Vec<Id>>,
+    }
+
+    impl<'a> Watched<'a> {
+        fn new(inner: &'a MemStore) -> Self {
+            Self {
+                inner,
+                reads: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn reads(&self) -> Vec<Id> {
+            self.reads.lock().unwrap().clone()
+        }
+    }
+
+    impl Store for Watched<'_> {
+        async fn get(&self, id: Id) -> Result<Option<Vec<u8>>> {
+            self.reads.lock().unwrap().push(id);
+            self.inner.get(id).await
+        }
+
+        async fn apply(&self, batch: &[crate::store::Write]) -> Result<()> {
+            self.inner.apply(batch).await
+        }
     }
 
     fn decode(reply: Reply) -> (u64, Vec<Change>) {
@@ -372,6 +425,75 @@ mod tests {
                 .unwrap(),
             );
             assert_eq!((again, rest.len()), (cursor, 0));
+        });
+    }
+
+    #[test]
+    fn a_collection_catch_up_reads_segments_not_records() {
+        block_on(async {
+            let store = MemStore::default();
+            let pivot =
+                Collection::<Doc>::create(&store, tenant()).await.unwrap();
+            let col = Collection::<Doc>::at(pivot, tenant());
+
+            let n = 40u64;
+            let mut anchors = Vec::new();
+            for i in 0..n {
+                anchors.push(col.insert(&store, &Doc { n: i }).await.unwrap());
+            }
+
+            // Everything since the beginning of time.
+            let watched = Watched::new(&store);
+            let (cursor, changes) = decode(
+                collection_changes::<Doc, _>(
+                    &watched,
+                    pivot,
+                    tenant(),
+                    Some(0),
+                )
+                .await
+                .unwrap(),
+            );
+            let bodies: Vec<u64> = changes
+                .iter()
+                .map(|c| {
+                    let Change::Saved(_, _, body) = c else {
+                        panic!("inserts only")
+                    };
+                    from_wire::<Doc>(body).unwrap().n
+                })
+                .collect();
+            assert_eq!(bodies, (0..n).collect::<Vec<_>>());
+
+            // The claim: the bodies above came out of the segments, so not
+            // one record was fetched by address.
+            let reads = watched.reads();
+            assert!(
+                anchors.iter().all(|id| !reads.contains(id)),
+                "a catch-up must never resolve a record by address"
+            );
+            assert!(
+                reads.len() < anchors.len(),
+                "{n} changes in {} reads — the chain exists to make this \
+                 segment-shaped, not record-shaped",
+                reads.len()
+            );
+
+            // And a caught-up client pays a constant: the pivot, the record
+            // chain's tail segment, the removal log's tail segment.
+            let watched = Watched::new(&store);
+            let (again, rest) = decode(
+                collection_changes::<Doc, _>(
+                    &watched,
+                    pivot,
+                    tenant(),
+                    Some(cursor),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!((again, rest.len()), (cursor, 0));
+            assert_eq!(watched.reads().len(), 3, "reads for 'nothing new'");
         });
     }
 
