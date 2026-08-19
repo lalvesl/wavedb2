@@ -117,7 +117,7 @@ impl<T: NonUniqueStruct> CollectionHandle<T> {
     // `pivot` value feeds the stream, so `T::collection(p).all(db)` on a
     // temporary handle must work.
 
-    /// Stream every living record in insertion (`CREATED_AT`) order.
+    /// Stream every living record, most recently written first.
     pub fn all<'d, D: DbHandle>(
         &self,
         db: &'d D,

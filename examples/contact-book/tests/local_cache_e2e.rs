@@ -173,7 +173,7 @@ async fn client_survives_node_restart_with_warm_local_reads() {
             .map(|c| c.name.as_str())
             .collect::<Vec<_>>(),
         vec!["Grace", "Alan"],
-        "the warm walk keeps the node's insertion order"
+        "the warm walk reproduces the node's own order"
     );
 
     // Writes refuse honestly (write-through, no offline queue)…
