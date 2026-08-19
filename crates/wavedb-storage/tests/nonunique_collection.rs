@@ -78,8 +78,11 @@ fn collection_walk_and_durable_reopen() {
         let walked = walk(&db, col).await;
         assert_eq!(
             walked.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
-            (0..n).map(|i| format!("task-{i}")).collect::<Vec<_>>(),
-            "collection must walk in insertion (CREATED_AT) order"
+            (0..n)
+                .rev()
+                .map(|i| format!("task-{i}"))
+                .collect::<Vec<_>>(),
+            "collection walks the record chain, most recently written first"
         );
         pivot
     });
@@ -92,7 +95,9 @@ fn collection_walk_and_durable_reopen() {
         let col = Todo::collection(pivot);
         let walked = walk(&db, col).await;
         assert_eq!(walked.len(), n, "lost records across reopen");
-        assert_eq!(*walked.last().unwrap(), todo(&format!("task-{}", n - 1)));
+        // Newest-first: the last insert leads the walk, the first trails it.
+        assert_eq!(*walked.first().unwrap(), todo(&format!("task-{}", n - 1)));
+        assert_eq!(*walked.last().unwrap(), todo("task-0"));
     });
 }
 
