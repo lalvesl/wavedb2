@@ -30,6 +30,10 @@ pub enum Error {
     /// tag — the pointer resolved to some other kind of value.
     #[error("bptree node bad page-kind tag {0:#018x}")]
     BpTreeNodeBadTag(u64),
+    /// A value read as a chain segment did not start with its lane's reserved
+    /// hash — the pointer resolved to some other kind of value.
+    #[error("chain segment bad lane tag {0:#018x}")]
+    SegmentBadTag(u64),
     /// A collection handle's `Pivot` record was not in the [`Store`] — a stale
     /// or foreign `PivotId`.
     ///
