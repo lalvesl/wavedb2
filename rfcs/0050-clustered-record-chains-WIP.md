@@ -66,12 +66,33 @@ which is the one that changes the on-disk layout.
 | --- | --- | --- |
 | 1 | `index/segment.rs` — the segment value: lane identity, byte form, in-place edits | **landed 2026-07-30** |
 | 2 | `index/sparse.rs` — the sparse-index node: counts, key descent, offset descent | **landed 2026-07-30** |
-| 3 | `index/chain.rs` — locate / insert / remove / scan over a `Store`, split policy, separator upkeep, and the index's write half | |
-| 4 | `Pivot` roots become `(head, tail)` pairs; `Metadata` gains liveness | |
-| 5 | Collection write paths: anchor + segment + index + logs in one batch | |
-| 6 | Collection read paths: `all` / `search` / `search_by` descend and walk | |
+| 3a | `index/sparse_write.rs` — the index's write half: upsert, remove, node splits, count propagation | **landed 2026-07-30** |
+| 3b | `index/chain.rs` + `index/chain_remove.rs` — locate / insert / remove over a `Store`, split and merge policy, separator upkeep | **landed 2026-07-30** |
+| 4 | `Metadata` gains liveness (`removed`), stamped by `remove` and cleared only by a revival | **landed 2026-07-30** |
+| 5 | `Pivot` roots become `(head, tail, index)`, **and** the collection write paths maintain the chain — as a *dual write* beside the trees, see below | **landed 2026-07-30** |
+| 5b | **Catch-up rewritten against the chain** — `expose_changes.rs` read the `recency` tree, which phase 5c deletes | **landed 2026-07-30** |
+| 5c | Retire `current`, `recency` and the `dead` tree: delete them, their roots, the dual write, and `Collection::search` | **landed 2026-07-31** |
+| 6 | Collection read paths: `all` (and the wire `All`) walk the chain | **landed 2026-07-30** — `search`/`search_by` still read trees, see below |
 | 7 | Macros: `#[wavedb::order]`, `page = N`, generated roots | |
 | 8 | Compaction pass for sparse chains (RFC 0042's shape) | |
+
+Phase 3 was one row until the design was worked through: the index's write half is
+a B+tree write path in its own right (splits, count propagation up the path, root
+growth) and the chain sits *on top* of it, so they are a dependency pair rather
+than one unit of work.
+
+Phase **5b** was missing from this table entirely, which was the plan's worst
+omission: the W6/W7 catch-up is Implemented, has e2e coverage, and was written
+directly against the structure 5c deletes.
+
+Phase 4 lost the `Pivot` half to phase 5, for a reason worth writing down: the
+`Pivot` shape is **not separable** from the write paths. Changing it additively —
+new roots beside the old — means teaching the trait three methods that seven
+hand-written test fixtures must then implement with values nothing reads, only to
+delete them again a phase later. Changing it destructively breaks
+`collection_write`, `collection_keyed` and `collection_adopt` the same instant. So
+the shape and the paths that use it land together, and what phase 4 keeps is the
+part that is genuinely independent: liveness on the record.
 
 **Phase 1** landed `Lane` (the derived per-type lane hash), `mint_segment_id`, and
 `Segment<P>` with a hand-written `WaveWire` impl — hand-written because a derive would
@@ -124,6 +145,212 @@ empty entries instead of skipping them fails
 `an_offset_descent_skips_empty_entries` (a pager landing on an empty segment would
 render a blank page); making `total` count entries instead of elements fails
 `the_total_is_the_sum_of_the_counts`.
+
+**Phase 3a** landed `SparseTree`, and building it turned up a **defect in phase 2's
+`Slot`**, which stored only a `SecKey` and reused its trailing `rec` as the segment
+id. `SecKey` orders by `field` then `rec`, so whenever a search key and a separator
+share a `field` the comparison falls through to that trailing pointer — and a minted
+segment id bears no relation to a record anchor, so the descent lands on the wrong
+side of the boundary about half the time. It is reachable on an exact hit in the
+built-in chain and **routine** in a declared ordering over a low-cardinality column,
+where a whole run of segments shares one value. `Slot` now mirrors `Branch` exactly
+— least key, pointer, count. None of phase 2's tests could see it; the regression
+that guards it is `a_run_of_segments_sharing_one_value_still_descends_exactly`.
+
+One design decision the phase added: **the index root id is permanent too.** A root
+that overflows keeps its id — its contents move into a freshly minted child and the
+root becomes the internal node above the two halves. One extra node write on a level
+growth buys the same `Pivot` permanence the chain's endpoints give, and it is why
+every `SparseTree` method takes `&self`.
+
+**Phase 3b** landed `Chain` (locate, insert, split) and `chain_remove` (remove,
+merge, redistribute), keeping the segment writes and the index writes in one batch
+through an `Overlay` so later steps of a plan read what earlier ones wrote.
+
+Two things the tests forced out that the design text had wrong or missing:
+
+1. **A drained index could not be written to again.** When the last child of an
+   internal root is dropped, the root becomes an `Internal` naming nobody, and a
+   write descent steps through no child and faults. *Reads* stay fine — which is
+   exactly why a suite that only read after draining missed it. An emptied root
+   now returns to the empty leaf it started as.
+2. **The endpoint-survives-a-merge rule had no test.** Forcing the merge to always
+   keep the left side left every test green, because the code still moved the
+   endpoint pointer and stayed *correct* — just at the cost of a `Pivot` rewrite
+   per merge, which is the whole thing the discipline buys.
+   `a_merge_never_deletes_an_endpoint` pins it.
+
+Proven by mutation: giving the split's new id to the endpoint instead of the
+interior fails `a_tail_split_keeps_the_tail_and_moves_the_head_exactly_once`;
+skipping the outer neighbour's relink fails five; never dropping a stale separator
+fails five; leaking the absorbed segment fails four; and in the index, counting
+entries instead of elements, unlinking a node without deleting it, and never
+splitting each fail their own guard.
+
+**Phase 4** put liveness on the record: `Metadata.removed`, stamped by `remove` on
+the anchor it already holds, carried forward by an ordinary save, and cleared only
+by the path that re-indexes the anchor into the living set (`SavePlan::revives` —
+a `#[wavedb::key]` upsert at a dead anchor, or a mirror adopting that revival). The
+`current` tree still answers liveness until phase 5; this makes the record itself
+agree ahead of that tree going away.
+
+It is a **flag, not the removal instant**, and a test is what settled that. The
+first cut stored `removed_at: Option<u64>` on the grounds that the instant costs
+nothing extra while a record lives. It broke `adopting_a_revival_chains_the_mirrors_dead_copy`:
+removal instants are minted per store, so a node and a mirror that both removed the
+same record hold anchors differing in those eight bytes — and every later archive of
+that version differs too, which is exactly the byte-identity the mirror path
+promises. A flag converges. *When* it died is the `dead` log's business, keyed by
+that instant, which is what a catch-up reads anyway.
+
+Proven by mutation: not stamping the flag on removal fails the removal test and the
+keyed-revival test; clearing it on every save fails
+`a_removal_is_stamped_on_the_anchor_and_a_save_does_not_undo_it` — the case where
+the record's own metadata would claim life the walk does not grant.
+
+**Phase 5** landed as a **dual write** rather than a switchover, which turned out
+to be the cheaper path *and* the better-tested one. The `Pivot` gained
+`records: ChainRoots` and `removals: LogRoots` beside `current`/`dead`/`recency`;
+`create` builds the chain and the log; and `insert`, `save`, `remove` and the
+keyed revival maintain them in the same atomic batch as the trees.
+
+The earlier plan avoided this on the grounds that teaching seven hand-written test
+fixtures three new methods was throwaway work. That was wrong in the direction
+that mattered: the chain roots are the **end state**, so the fixtures keep them —
+what gets deleted later is the tree roots they already had. And running both at
+once buys the strongest check available, which a switchover could not have:
+`the_record_chain_tracks_the_trees_it_is_replacing` asserts, after every step of a
+mixed workload, that the chain holds exactly the recency tree's entries, the log
+holds exactly the dead tree's, and every inline copy is **byte-identical** to the
+anchor it derives from. Removing the chain insert, or the save's relocation, fails
+it.
+
+Two things the phase forced that the design text had not:
+
+1. **Every lane needs a registered `StructStorage` slot.** The native engine routes
+   by `STRUCT_HASH` and refuses an unregistered one, so the first end-to-end run
+   died with `no StructStorage registered`. `storage_entries()` now carries five
+   slots for a NonUnique type — record, pivot, and the three lanes. The RFC named
+   this cost in passing; it is a hard requirement, not a footnote.
+2. **The lane hash is derived twice.** A `static` needs a `const` initialiser and
+   SeaHash is not a `const fn`, so `wavedb-macros` computes each lane's hash at
+   expansion time while `Lane::hash` computes it at runtime. Two implementations
+   of one identity, and a drift between them would write a chain into a directory
+   nothing reads — silently. `lane_hashes_match_the_engines` pins them together
+   against a real generated type.
+
+Two file splits came with it, both along the existing layer seam:
+`collection_read.rs` (the reading half — where phase 6 lands) and, in phase 4,
+`collection_remove.rs`.
+
+**Phase 5b** moved reconnect catch-up onto the chain — the migration this plan had
+originally left out of the table, and the riskiest one left, so it was taken while
+the dual write still made every answer checkable against the trees it replaces.
+
+The surface turned out to be two lines. `collection_changes` scanned the `recency`
+and `dead` trees for keys past the cursor, then **fetched each changed record by
+address**; it now walks the record chain and the removal log back from their tails.
+The records come inline, so the per-change fetch is gone entirely: catching up
+costs segment reads, not record reads. `net/sync.rs` and the HTTP piggyback path
+needed no change at all — both ride on top of `Command::Changes` and never touched
+a tree.
+
+The scan stops at the first segment whose least key has reached the cursor, which
+is what makes the common case cheap rather than merely cheaper: a **caught-up**
+client pays exactly three reads for "nothing new" — the pivot, the record chain's
+tail segment, the removal log's tail segment — regardless of how large the
+collection is. `a_collection_catch_up_reads_segments_not_records` pins both halves
+of the claim through a `Store` that records every address it is asked for: no
+record anchor is ever among them, and 40 changes arrive in fewer reads than there
+are records. Proven by mutation: never stepping past the tail segment loses the
+older half of the answer; making the cursor inclusive (`>=` for `>`) replays a
+change the client already has.
+
+**Three follow-ups landed with it**, all of them "the chain already answers this,
+stop asking the tree":
+
+**Liveness reads off the anchor.** Three probes — the keyed upsert and both
+`adopt` paths — descended `current` to ask "does this record live?", and each
+then fetched the record anyway to tell a *vacant* anchor from a *dead* one. One
+`Collection::anchor` read now answers all three cases and hands back the bytes,
+so `adopt` on an unchanged record went from a tree descent plus two fetches to a
+single read. The swap is only safe if `Metadata.removed` and `current`
+membership never disagree, so the dual-write agreement check now asserts exactly
+that, in both directions, after every step of its mixed workload.
+
+**The instant floor is two endpoint reads.** `instant_floor` asked the `recency`
+and `dead` trees for their maxima — two descents to a rightmost leaf, taken on
+*every* mint. It now reads each chain's tail segment and takes its last key.
+Both halves are load-bearing and the test says so: a removed record leaves the
+record chain, so once a collection has been emptied its history survives only in
+the removal log — dropping either half fails
+`the_floor_is_the_greater_of_the_two_chain_tails`, and dropping the record half
+also fails `imposed_future_instants_floor_local_minting`. That gap was real
+before the test: the removal-log half had no coverage at all.
+
+**The salt guard sees the lanes.** The registry's 15-bit collision guard
+compared declared record hashes pairwise — but a NonUnique type reserves three
+lane hashes as well, each with a `type_salt` of its own, so a registry of `n`
+such types puts `4n` occupants in a 32768-slot space and the guard was checking
+one in four. That is not a rounding error: it is the guard for exactly the
+property the lanes exist to give ("a segment id can never equal a record anchor,
+an archive slot, or a tree node"), and at 80 occupants a birthday collision is
+already a ~9% event. `WaveDbStruct::LANE_HASHES` now carries the lane list (the
+macro emits literals — SeaHash is not a `const fn`, the same reason the
+`StructStorage` slots do), and `expose_salt.rs` compares whole occupant sets,
+plus a per-entry self-check since a type can clash with its own lane alone. The
+list is a *third* derivation of one identity, so it is pinned against
+`Lane::hash` beside the storage slots.
+
+**Phase 6** moved the enumeration onto the chain. `Collection::all` and the wire
+`All` command both walk it back from the tail, and the records come **inline**:
+no `get_of` per record, so a listing costs one read per segment where it used to
+cost one page read *and* one dictionary decompression per record. The wire path
+gains more than the typed one — it needs each record's `Metadata`, which now
+falls out of the same decode instead of a second fetch.
+
+Two things worth recording.
+
+**The order changed, and it changed in two places at once.** `all()` used to
+stream in insertion order; it now streams most-recently-written first, which the
+"What this gives up" section below has always named as the price. What the plan
+did *not* anticipate is that the wire `All` never went through `Collection::all`
+— it walked the `current` tree itself, for the metadata. Changing only the typed
+surface left the two disagreeing about what "all" means, and the client e2e caught
+it. Both walk the chain now. Nine assertions and four doc comments across the
+workspace moved with them.
+
+**A save must not resurrect a dead record.** `plan_recency_rekey` had always
+guarded this — it returns early when the old entry is absent, so "a record outside
+the living set must not enter the modification log through a save". The chain's
+equivalent did not, and inserted unconditionally: a save aimed at a removed anchor
+put the record back in `all()` while its own `Metadata` still read removed. Phase
+4's liveness test is what caught it, which is the argument for having landed that
+flag before the read paths rather than after.
+
+**Phase 5c** deleted the three B+trees the chains had been shadowing —
+`current`, `recency`, and `dead` — along with the dual write and
+`Collection::search` (the `CREATED_AT` range; see the answered open question).
+The `Pivot` lost three roots and two rewrite constructors, keeping
+`secondaries` / `records` / `removals` / `permission` and one
+`replace_roots`; the write paths lost every tree plan except the declared
+secondary indexes; `remove`'s "was it in the living set?" gate — the last
+liveness probe — became the same `Collection::anchor` read the other three
+took in 5b's follow-up, which also folded in the record fetch it did next.
+
+Two consequences worth naming. **A `Pivot` rewrite is now rare rather than
+routine**: chain endpoints move at most once in a chain's life and index roots
+never move, so a collection with no declared secondary index stops rewriting
+its `Pivot` entirely after the first split — where `current`/`recency` moved
+their roots constantly. And **`search_by` is the only B+tree read left** in a
+collection; it stays one deliberately, because a secondary index is *declared*,
+so RFC 0051's orderings are what replace it, not the built-in chain.
+
+The agreement test that justified the dual write lost its comparand, so it was
+rewritten rather than deleted: `the_record_chain_agrees_with_the_anchors_it_
+derives_from` keeps the same mixed workload and asserts what still stands —
+every inline copy byte-identical to its anchor, and chain membership agreeing
+with `Metadata.removed` in both directions.
 
 The dense `BpTree` is **not** being retired — it is the right structure for cold or
 small collections, and [RFC 0054](0054-anchored-layout-PLANNED.md)
@@ -226,7 +453,25 @@ LocalId::new(key_nanos(), true, type_salt(SEGMENT_STRUCT_HASH))
 
 The salt puts segments in their own lane of the flat keyspace, so a segment id can
 never equal a record anchor, an archive slot, or a tree node, whatever the
-timestamps do. It also routes them into their own storage directory, which
+timestamps do.
+
+Worth stating plainly, because phase 5b's follow-up made it a live question: the
+salt is **not** what keeps minted keys from repeating — `key_nanos()` fuses a
+process-global atomic counter into the sub-ms digits and `mint_instant` layers a
+`LAST` watermark on top, so no key repeats within a process, and nothing in the
+engine ever *dispatches* on the salt (decode verifies the full 64-bit head). On
+native it is inert: the `PageStore` routes by whole `STRUCT_HASH` into per-type
+directories, so identical `Id`s of two types never meet. Its one live role is the
+seam the counter cannot cover — IndexedDB's flat keyspace holding ids minted by
+*two* processes, since the client cache adopts node-minted metadata verbatim and
+files archives at the node's derived slots.
+
+That makes the salt narrow, not cosmetic, and the `SALT` field has reserved
+future use (user-directed). So the registry's salt guard stays and covers every
+occupant including the lanes (`expose_salt.rs`) — deleting it would be trading a
+compile-time-only check for nothing.
+
+The lane hash also routes segments into their own storage directory, which
 **preserves the existing invariant that a page holds records of exactly one
 `STRUCT_HASH`** (`page.rs:3`) — anchors, log entries and segments never share a
 page. That is worth keeping deliberately: homogeneity is what makes a per-type
@@ -313,16 +558,28 @@ anchor key could not manage: a keyed type's anchor is a content hash, so an
 anchor-ordered chain put it in a meaningless order, while modification order is
 meaningful for every shape.
 
-Every mutation lands at the tail, because every mutation stamps a fresh instant:
+Locally minted mutations land at the tail, because every one of them stamps a fresh
+instant:
 
 - an **insert** appends at the tail;
 - a **save** removes the record from wherever it sat and appends it at the tail —
   one descent to find the old position, two segment writes;
 - a **remove** deletes it from its segment and appends to the `dead` chain.
 
-A segment holds between N and 2N records and **splits when it reaches 2N** (RFC
-0052). Since arrivals concentrate at the tail, the tail is the usual splitter, and
-its split seals the older half.
+**That is a fast path, not an invariant**, and the exception is not exotic: the
+client cache's `adopt` writes the node's `Metadata` *verbatim* (`collection_adopt.rs`),
+so its instant never passes through `mint_instant` and the local watermark does not
+know it. A client that made a local optimistic write and then receives a catch-up
+from the node inserts **into the middle of its own chain**. The chain handles it —
+the sparse index is exactly what makes an interior insert affordable — but any code
+written on the assumption "appends only" would corrupt a browser cache silently, so
+the general path stays the one that is implemented and the tail is only a
+comparison away from it.
+
+A segment holds between N and 2N records, **splits at 2N and merges at N/2**
+(RFC 0052 has the rules and the reason 50/50 is right). Since arrivals concentrate
+at the tail, the tail is the usual splitter, and its split seals the older half
+behind it while keeping its own id.
 
 ### No back-pointers, anywhere
 
@@ -387,8 +644,8 @@ readers, and the modification-ordered chain serves both better:
 
 | reader | with `recency` | with the chain |
 | --- | --- | --- |
-| **`Changes` catch-up** (`expose_changes.rs:99`) | descend the recency tree to the cursor instant, walk its tail, then fetch each record by anchor — one random read per change | read `tail` from the `Pivot`, walk `prev` until instants fall below the cursor — the records are *inline*, so no fetch at all |
-| **The instant floor** (`collection_recency.rs:60`) | `max_key` descent of the recency tree | the tail segment's last key, an O(1) endpoint read |
+| **`Changes` catch-up** (`expose_changes.rs`) | descend the recency tree to the cursor instant, walk its tail, then fetch each record by anchor — one random read per change | read `tail` from the `Pivot`, walk `prev` until instants fall below the cursor — the records are *inline*, so no fetch at all — **done, phase 5b** |
+| **The instant floor** (`collection_recency.rs`) | `max_key` descent of the recency tree | the tail segment's last key, an O(1) endpoint read — **done, phase 5b** |
 
 So the structure is not dropped for being useless — it is dropped because the chain
 *is* it, with the records inline instead of references. The write path loses a whole
@@ -455,8 +712,10 @@ record. The chains are derived read paths over it.
   before. The single-batch rule makes it structural — anchor, segment, index and
   logs land in one atomic `Store::apply` or none of them do — and the verbatim
   envelope makes it byte-testable.
-- **A split is a second segment write.** Amortised one per N inserts, and RFC 0052
-  argues the N…2N band is what keeps it from being every insert.
+- **A split is two more segment writes.** The two halves plus the neighbour on the
+  far side of the newly minted segment, whose `next` (or `prev`) must name it —
+  three writes, or two only at a chain end. A merge costs the same. Amortised one
+  extra per N inserts, in the window a batch already writes.
 - **A save relocates the record**, since its instant changes: one descent to find the
   old position, two segment writes. Against today's save — rewrite the record, remove
   one `recency` entry, insert another — it is a write *fewer* and a structure fewer,
@@ -506,6 +765,26 @@ draft's main regression is gone.
   remaining home for its bytes — eliding it would force the `dead` log to carry
   records, and `dead` is the one structure that grows forever. Add `Collection::get`
   being public API for every shape, and the anchor is load-bearing in all cases.
+- ~~**What does a `CREATED_AT` range mean once `current` is gone?**~~
+  **Answered 2026-07-31: `Collection::search` was deleted with the tree.**
+
+  `search(bound)` bounded on the *insertion* instant while the chain is keyed by
+  the *modification* one — two different questions, so there was nothing to
+  migrate. Three answers were open: rebind the bound to the chain's key (a
+  silent meaning change to a public API), keep one instant-keyed tree purely for
+  it (most of what `current` cost), or declare it an ordering under RFC 0051.
+
+  What settled it was checking the caller side rather than arguing semantics.
+  Three facts pointed the same way: `search` had **zero** production callers (no
+  generated wrapper, no wire `Command`, nothing on `DbHandle` — only tests); its
+  contract was **already false** for `#[wavedb::key]` types, whose anchor `KEY`
+  is a content hash, so the "chronological order" it documented was really hash
+  order; and the pre-release policy lets the API break without ceremony.
+  Building the ordering now would have been building for a hypothetical user.
+  When a real one appears, RFC 0051 is the mechanism —
+  `#[wavedb::order(created_at)]` materialises the insertion-ordered chain with a
+  sparse index, and `search` returns as a read of *that*, with declared
+  semantics instead of implicit ones.
 - **Compaction trigger.** By occupancy ratio, by absolute hole count, or on the same
   maintenance tick as defragmentation (RFC 0042) — and whether it may run while a
   watch holds a cursor into the segments it is rewriting.

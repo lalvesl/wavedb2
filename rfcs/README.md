@@ -99,19 +99,39 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   moves into the anchor's `Metadata`), `dead` stays as a reference-only log chain in a
   lane of its own with **no index at all**, since nothing ever *searches* it, and a
   dense B+tree exists only where the developer declares one. The cost is storage,
-  duplicated write bytes, and `all()` changing from insertion to modification order;
+  duplicated write bytes, and `all()` changing from insertion to modification order.
+  **Phases 1–6 are implemented, bar 5c.** The structure
+  (`index/{segment,sparse,sparse_write,chain,chain_remove}.rs`): locate, insert
+  with a 50/50 split at 2N, remove with a merge at N/2 or a redistribute when
+  folding would breach the band, all as one batch. Liveness on the record
+  (`Metadata.removed`). The `Pivot` carrying the chain roots, and every write path
+  maintaining the chain **alongside** `current`/`recency` — a dual write, which is
+  what lets a test assert the two agree entry for entry and byte for byte. And both
+  reads off the chain: `all()` and the wire `All` walk it back from the tail,
+  records inline, no per-record fetch; and reconnect catch-up (`Changes`) scans the
+  chain's and the removal log's tails past the client's cursor, stopping at the
+  first segment that reaches it — so a caught-up client pays three reads for
+  "nothing new" whatever the collection's size, and a client behind pays segment
+  reads rather than one random read per change. What remains is retiring the old
+  trees (blocked on what a `CREATED_AT` range should mean), the macros and
+  compaction;
   [0051](0051-ordered-record-lists-PLANNED.md) — built on it, and the repair for
   the one thing it gives up: a declared property materialises a *second* chain of
   the same records, kept sorted at write time (affordable because K extra segment
-  rewrites still cost one barrier), with a **sparse** index above it — one B+tree
-  entry per segment instead of per record, ~200× smaller, so a million-record
-  index is three leaves and permanently resident. Ordered and range reads cost one
+  rewrites still cost one barrier), with a **sparse** index above it — one entry
+  per segment instead of per record, so the descent is two or three nodes **cold**
+  (nothing is resident: 0053 forbids pinning in a multi-tenant engine, so the
+  guarantee is bounded size, never residency). Ordered and range reads cost one
   dense read per segment of hits instead of one random read per hit; the price is
-  `(K+1)` copies of every record on disk, accepted deliberately;
+  `(K+2)` copies of every record on disk — anchor, built-in chain, K declared
+  orderings — accepted deliberately;
   [0052](0052-segment-size-as-the-pagination-unit-PLANNED.md) — the developer
   declares a chain's capacity as a **minimum** N, normally the page size the UI
-  renders; a segment holds N…2N records and splits at 2N, which keeps an insert to
-  one segment rewrite where an exact size would cascade. A rendered page is one
+  renders (undeclared: **16** for record chains, **256** for the removal log); a
+  segment holds N…2N records, splits 50/50 at 2N with the endpoint keeping its own
+  id, and **merges at N/2** — which keeps an insert to one segment rewrite where an
+  exact size would cascade, and stops a chain decaying into near-empty segments as
+  saves relocate their records to the growth end. A rendered page is one
   segment read, two when the window straddles a boundary — and the first is almost
   certainly still cached from the previous page. Exactness is not the goal anyway:
   `search` is an async iterable, so a tick yields whatever the segment held and the
