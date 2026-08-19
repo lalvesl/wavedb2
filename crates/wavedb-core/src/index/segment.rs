@@ -55,6 +55,13 @@ pub enum Lane {
     Records,
     /// The removal log. Payload = `()`.
     Dead,
+    /// Sparse-index nodes — the descent above a chain.
+    ///
+    /// Its own lane because index nodes are *navigational* (small, reread
+    /// constantly) while segments are *streaming* (large, touched once): the
+    /// distinction RFC 0053 draws, which only separate lanes let the cache and
+    /// the bucket target act on.
+    Index,
 }
 
 impl Lane {
@@ -69,6 +76,7 @@ impl Lane {
         let tag: &[u8] = match self {
             Self::Records => b"WDB.SEG",
             Self::Dead => b"WDB.DEAD",
+            Self::Index => b"WDB.IDX",
         };
         let mut bytes = tag.to_vec();
         bytes.extend_from_slice(&struct_hash.to_le_bytes());
@@ -260,17 +268,17 @@ impl<P: WaveWire> Segment<P> {
     /// Parse a segment value, checking the lane tag first.
     ///
     /// # Errors
-    /// [`Error::SegmentBadTag`] if the first 8 bytes are not `lane_hash` (or the
+    /// [`Error::LaneBadTag`] if the first 8 bytes are not `lane_hash` (or the
     /// value is shorter than the tag) — the pointer resolved to some other kind
     /// of value; [`Error::Wire`] if the payload fails to decode.
     pub fn from_bytes(lane_hash: u64, buf: &[u8]) -> Result<Self> {
         let tag_bytes: [u8; LANE_PREFIX] = buf
             .get(..LANE_PREFIX)
             .and_then(|s| s.try_into().ok())
-            .ok_or(Error::SegmentBadTag(0))?;
+            .ok_or(Error::LaneBadTag(0))?;
         let tag = u64::from_le_bytes(tag_bytes);
         if tag != lane_hash {
-            return Err(Error::SegmentBadTag(tag));
+            return Err(Error::LaneBadTag(tag));
         }
         Ok(from_wire::<Self>(&buf[LANE_PREFIX..])?)
     }
@@ -330,7 +338,7 @@ mod tests {
         // Right shape, wrong lane: the value decodes fine but is not ours.
         assert!(matches!(
             Segment::<Vec<u8>>::from_bytes(dead, &bytes),
-            Err(Error::SegmentBadTag(t)) if t == Lane::Records.hash(TYPE_HASH)
+            Err(Error::LaneBadTag(t)) if t == Lane::Records.hash(TYPE_HASH)
         ));
     }
 
@@ -338,7 +346,7 @@ mod tests {
     fn a_value_shorter_than_the_tag_is_refused() {
         assert!(matches!(
             Segment::<Vec<u8>>::from_bytes(7, &[0, 1, 2]),
-            Err(Error::SegmentBadTag(0))
+            Err(Error::LaneBadTag(0))
         ));
     }
 

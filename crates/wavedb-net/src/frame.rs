@@ -75,8 +75,9 @@ pub enum NodeErrorKind {
     BpTreeNodeMissing,
     /// A value read as a `BpTree` node had a foreign tag.
     BpTreeNodeBadTag,
-    /// A value read as a chain segment had a foreign lane tag.
-    SegmentBadTag,
+    /// A value read as a chain segment or sparse-index node had a foreign
+    /// lane tag.
+    LaneBadTag,
     /// A secondary-index lookup out of the declared range.
     SecondaryIndexOutOfRange,
     /// A value did not fit in 48 bits.
@@ -121,7 +122,7 @@ impl NodeError {
             CoreError::UnknownStructHash(_) => NodeErrorKind::UnknownStructHash,
             CoreError::BpTreeNodeMissing(_) => NodeErrorKind::BpTreeNodeMissing,
             CoreError::BpTreeNodeBadTag(_) => NodeErrorKind::BpTreeNodeBadTag,
-            CoreError::SegmentBadTag(_) => NodeErrorKind::SegmentBadTag,
+            CoreError::LaneBadTag(_) => NodeErrorKind::LaneBadTag,
             CoreError::PivotMissing(_) => NodeErrorKind::PivotMissing,
             CoreError::RecordMissing(_) => NodeErrorKind::RecordMissing,
             CoreError::SecondaryIndexOutOfRange(_) => {
