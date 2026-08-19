@@ -65,8 +65,8 @@ which is the one that changes the on-disk layout.
 | # | Phase | State |
 | --- | --- | --- |
 | 1 | `index/segment.rs` — the segment value: lane identity, byte form, in-place edits | **landed 2026-07-30** |
-| 2 | Element counts on `BpTree` nodes (order-statistic descent, RFC 0052) | next |
-| 3 | `index/chain.rs` — locate / insert / remove / scan over a `Store`, split policy, separator upkeep | |
+| 2 | `index/sparse.rs` — the sparse-index node: counts, key descent, offset descent | **landed 2026-07-30** |
+| 3 | `index/chain.rs` — locate / insert / remove / scan over a `Store`, split policy, separator upkeep, and the index's write half | |
 | 4 | `Pivot` roots become `(head, tail)` pairs; `Metadata` gains liveness | |
 | 5 | Collection write paths: anchor + segment + index + logs in one batch | |
 | 6 | Collection read paths: `all` / `search` / `search_by` descend and walk | |
@@ -87,6 +87,47 @@ Proven by mutation: dropping the lane tag from the hash derivation fails three t
 `segment_ids_are_minted_apart_and_never_repeat`); appending instead of placing in key
 order fails `inserts_land_in_key_order_whatever_the_arrival_order`; skipping the tag
 check on decode fails `a_foreign_lane_tag_is_refused`.
+
+**Phase 2** landed the sparse-index node as its **own structure**, `index/sparse.rs`,
+not a count retrofitted onto `BpTree`. Three findings forced that, and they are worth
+keeping because they are the reasons a future reader should not "simplify" the two
+back together:
+
+1. **A dense tree would pay for it.** Eight bytes per entry buys a dense secondary
+   nothing and shrinks its leaf capacity — `DEFAULT_LEAF_CAP` is sized so a node fits
+   a 32 KiB page, so counts would mean more nodes and more reads for trees that never
+   consult them.
+2. **`BpTree` has no update path for a mutable payload.** `plan_insert` returns
+   `Ok(Vec::new())` when the key is already present (`tree_insert.rs:63`), so revising
+   a count through it would be a *silent no-op* — the worst available failure mode.
+3. **`NodeBody::Internal` has nowhere to put the leftmost child's count.** It holds
+   `leftmost` plus the separators *between* children, so the first subtree owns no
+   entry. `sparse::Branch` gives every child its own least key, which is exactly what
+   lets every child own a count.
+
+The node carries `Slot { key, count }` in leaves and `Branch { first, node, count }`
+in internals, with `step_to_key` / `step_to_offset` returning one level of descent.
+A `Slot` needs no segment field: `SecKey.rec` already *is* the segment id. Index nodes
+take `Lane::Index`, their own lane, because they are navigational where segments are
+streaming ([RFC 0053](0053-tenant-fair-cache-retention-PLANNED.md)) — which lets the
+cache and the bucket target treat them differently. `Error::SegmentBadTag` from phase
+1 generalised to `Error::LaneBadTag`, since both kinds are now lane-tagged values.
+
+The tree's **write** half (insert, split, count maintenance up the path) deliberately
+waits for phase 3: the chain is what triggers it, and the two must land in one atomic
+batch, so writing them apart would mean writing the seam twice.
+
+Proven by mutation: an off-by-one in the offset descent (`<=` for `<`) fails four
+tests; making the key descent take the first entry at-or-above instead of the last
+at-or-below fails `a_key_descent_takes_an_exact_match_over_its_predecessor`; matching
+empty entries instead of skipping them fails
+`an_offset_descent_skips_empty_entries` (a pager landing on an empty segment would
+render a blank page); making `total` count entries instead of elements fails
+`the_total_is_the_sum_of_the_counts`.
+
+The dense `BpTree` is **not** being retired — it is the right structure for cold or
+small collections, and [RFC 0054](0054-anchored-layout-PLANNED.md)
+records that as a declared choice so the option survives this work.
 
 ## Motivation
 

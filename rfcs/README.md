@@ -120,6 +120,12 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   page k" is one descent regardless of k, and an unfiltered pager's "of M" is the
   root's sum. Costs are quoted **cold**: WaveDB is multi-tenant, so nothing may be
   pinned in RAM;
+  [0054](0054-anchored-layout-PLANNED.md) — the counterweight: 0050–0052 trade space
+  for bulk reads, the wrong bargain for a collection read one record at a time or
+  rarely at all, so the **anchored** layout — records only at their anchors, one dense
+  index over them — stays a declared choice rather than being retired. The two are
+  packages, not independent knobs: a sparse index is only possible over data ordered
+  by its key, so hash-scattered anchors can only ever carry a dense one;
   [0053](0053-tenant-fair-cache-retention-PLANNED.md) — the policy that follows
   from that: which entries deserve to stay hot without one tenant monopolising the
   budget (navigational vs streaming, per-tenant accounting, no pinning ever). Held
@@ -223,6 +229,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0051](0051-ordered-record-lists-PLANNED.md) | Declared orderings: sorted chains + sparse index | Planned |
 | [0052](0052-segment-size-as-the-pagination-unit-PLANNED.md) | Segment size as the pagination unit | Planned |
 | [0053](0053-tenant-fair-cache-retention-PLANNED.md) | Tenant-fair cache retention | Planned |
+| [0054](0054-anchored-layout-PLANNED.md) | The anchored layout (no clustering) | Planned |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |
