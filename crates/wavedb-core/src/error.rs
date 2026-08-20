@@ -76,6 +76,10 @@ pub enum Error {
     /// not declare (out of `0..NUM_SECONDARIES`).
     #[error("secondary index {0} out of range")]
     SecondaryIndexOutOfRange(usize),
+    /// A list read named an ordering this collection's `Pivot` does not declare
+    /// (out of `0..NUM_LISTS`).
+    #[error("declared list {0} out of range")]
+    ListOutOfRange(usize),
     /// The caller's identity tier may not perform this operation (M8 gate:
     /// an unauthenticated caller on a login-required item). The message is
     /// evidence for the log; the wire flattens it to one uniform kind.

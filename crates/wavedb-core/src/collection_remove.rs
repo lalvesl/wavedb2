@@ -74,6 +74,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         // for its bytes — and an instant-keyed reference joins the removal log.
         let mut records = self.records_chain(&pivot);
         let mut removals = self.dead_log(&pivot);
+        let mut lists = self.list_chains(&pivot);
         if let Succession::CreatedAt(instant) = meta.succession
             && let Some(writes) = records
                 .plan_remove(store, &Self::instant_key(instant, anchor))
@@ -81,6 +82,10 @@ impl<T: NonUniqueStruct> Collection<T> {
         {
             batch.extend(writes);
         }
+        // Every declared list holds only living records, so a removal takes the
+        // record out of all of them (RFC 0051).
+        self.plan_list_removes(store, &mut batch, &mut lists, id, &value)
+            .await?;
         batch.extend(
             removals
                 .plan_insert(store, Self::instant_key(removed_at, anchor), ())
@@ -99,6 +104,7 @@ impl<T: NonUniqueStruct> Collection<T> {
                 secondaries: &secs,
                 records: records.roots(),
                 removals: removals.log_roots(),
+                lists: &lists,
             },
         );
         store.apply(&batch).await?;

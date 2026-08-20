@@ -13,11 +13,13 @@
 use proc_macro::TokenStream;
 
 mod args;
+mod declarations;
 mod exec_ops;
 mod expose;
 mod expose_collision;
 mod expose_parse;
 mod generated;
+mod lists;
 mod natural_key;
 mod secondaries;
 mod server;

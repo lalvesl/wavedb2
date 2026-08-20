@@ -13,8 +13,9 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Ident, parse_quote};
 
-use crate::secondaries::{self, ResolvedPivot};
-use crate::{exec_ops, storage_statics, struct_hash, wire_derive};
+use crate::declarations::Declared;
+use crate::secondaries;
+use crate::{exec_ops, lists, storage_statics, struct_hash, wire_derive};
 
 /// The `{Name}PivotId` newtype: `struct {Name}PivotId(pub LocalId);` with its
 /// `WaveWire` impl (delegating to `LocalId`) and wrap/unwrap accessors.
@@ -80,7 +81,11 @@ fn natural_key_items(key_fields: Option<&[(Ident, syn::Type)]>) -> TokenStream {
 /// The pivot record's own identity: hashed like any struct, under the
 /// reserved `Pivot` shape discriminator so it can never collide with a
 /// user-declared `Unique`/`NonUnique` type of the same name and fields.
-fn pivot_identity(pivot: &Ident, num_secondaries: usize) -> u64 {
+fn pivot_identity(
+    pivot: &Ident,
+    num_secondaries: usize,
+    num_lists: usize,
+) -> u64 {
     struct_hash::compute(
         &pivot.to_string(),
         "Pivot",
@@ -88,6 +93,7 @@ fn pivot_identity(pivot: &Ident, num_secondaries: usize) -> u64 {
             ("records".into(), "ChainRoots".into()),
             ("removals".into(), "LogRoots".into()),
             ("secondaries".into(), format!("[LocalId;{num_secondaries}]")),
+            ("lists".into(), format!("[ChainRoots;{num_lists}]")),
             ("permission".into(), "Option<PermissionRef>".into()),
         ],
     )
@@ -104,24 +110,26 @@ fn pivot_impl(pivot: &Ident, pivot_hash: u64) -> TokenStream {
             fn secondaries(&self) -> &[::wavedb_core::LocalId] { &self.secondaries }
             fn records(&self) -> ::wavedb_core::ChainRoots { self.records }
             fn removals(&self) -> ::wavedb_core::LogRoots { self.removals }
+            fn lists(&self) -> &[::wavedb_core::ChainRoots] { &self.lists }
             fn permission(&self) -> ::core::option::Option<&::wavedb_core::PermissionRef> {
                 self.permission.as_ref()
             }
             fn replace_roots(
                 &self,
-                secondaries: &[::wavedb_core::LocalId],
-                records: ::wavedb_core::ChainRoots,
-                removals: ::wavedb_core::LogRoots,
+                roots: ::wavedb_core::index::Roots<'_>,
             ) -> Self {
                 let mut secs = self.secondaries;
-                // The engine always passes exactly this pivot's root count
-                // (it derives the slice from `secondaries()`); a mismatch is
+                let mut lists = self.lists;
+                // The engine always passes exactly this pivot's root counts
+                // (it derives both slices from the accessors); a mismatch is
                 // a caller bug worth failing loudly on.
-                secs.copy_from_slice(secondaries);
+                secs.copy_from_slice(roots.secondaries);
+                lists.copy_from_slice(roots.lists);
                 Self {
-                    records,
-                    removals,
+                    records: roots.records,
+                    removals: roots.removals,
                     secondaries: secs,
+                    lists,
                     permission: ::core::clone::Clone::clone(&self.permission),
                 }
             }
@@ -134,17 +142,18 @@ fn pivot_impl(pivot: &Ident, pivot_hash: u64) -> TokenStream {
 pub fn nonunique_types(
     name: &Ident,
     hash: u64,
-    secondaries_specs: &[ResolvedPivot],
-    key_fields: Option<&[(Ident, syn::Type)]>,
+    declared: &Declared,
     page: Option<usize>,
 ) -> syn::Result<TokenStream> {
     // `page = N` rides the trait as a const the chain builders read; unset
     // leaves the trait default (RFC 0052).
     let page_const = page.map(|n| quote!(const PAGE: usize = #n;));
+    let secondaries_specs = &declared.secondaries;
     let num_secondaries = secondaries_specs.len();
+    let num_lists = declared.lists.len();
     let pivot_id = format_ident!("{}PivotId", name);
     let pivot = format_ident!("{}Pivot", name);
-    let pivot_hash = pivot_identity(&pivot, num_secondaries);
+    let pivot_hash = pivot_identity(&pivot, num_secondaries, num_lists);
 
     let pivot_id_tokens = pivot_id_tokens(&pivot_id)?;
 
@@ -160,10 +169,13 @@ pub fn nonunique_types(
         storage_statics::statics_for(&pivot, &pivot_hash_expr, true);
     let storage_entries = storage_statics::entries_for(name, Some(&pivot));
 
-    // Secondary-index hooks + the typed `by_<field>` lookup surface.
+    // Secondary-index hooks + the typed `by_<field>` lookup surface, and the
+    // declared lists' hooks + their `listed_by_<fields>` enumerations.
     let secondary_items = secondaries::trait_items(secondaries_specs);
     let by_lookups = secondaries::by_lookups(name, secondaries_specs);
-    let key_items = natural_key_items(key_fields);
+    let list_items = lists::trait_items(&declared.lists);
+    let listed_readers = lists::listed_readers(name, &declared.lists);
+    let key_items = natural_key_items(declared.key_fields.as_deref());
 
     // The per-command execution steps (`__wavedb_<op>`) — defined here,
     // wire-reachable only once listed in an exposure declaration.
@@ -179,6 +191,7 @@ pub fn nonunique_types(
             pub records: ::wavedb_core::ChainRoots,
             pub removals: ::wavedb_core::LogRoots,
             pub secondaries: [::wavedb_core::LocalId; #num_secondaries],
+            pub lists: [::wavedb_core::ChainRoots; #num_lists],
             pub permission: ::core::option::Option<::wavedb_core::PermissionRef>,
         }
     };
@@ -194,10 +207,12 @@ pub fn nonunique_types(
             type Pivot = #pivot;
             #page_const
             #secondary_items
+            #list_items
             #key_items
         }
 
         #by_lookups
+        #listed_readers
 
         impl #name {
             /// The typed handle into an existing collection of this type,
