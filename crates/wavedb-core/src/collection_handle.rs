@@ -143,6 +143,50 @@ impl<T: NonUniqueStruct> CollectionHandle<T> {
         db.search_by(self.pivot, index, bound)
     }
 
+    /// Stream every living record in declared list `index`'s order — one read
+    /// per segment, records inline. The generated `listed_by_<fields>` wrappers
+    /// call this with the declaration's index.
+    pub fn listed<'d, D: DbHandle>(
+        &self,
+        db: &'d D,
+        index: usize,
+    ) -> impl Stream<Item = Result<T, D::Error>> + use<'d, D, T>
+    where
+        T: 'static,
+    {
+        db.listed(self.pivot, index, 0)
+    }
+
+    /// [`listed`](Self::listed) entered at global `offset` — one sparse-index
+    /// descent rather than a walk. The stream runs on to the end of the list.
+    pub fn listed_at<'d, D: DbHandle>(
+        &self,
+        db: &'d D,
+        index: usize,
+        offset: u64,
+    ) -> impl Stream<Item = Result<T, D::Error>> + use<'d, D, T>
+    where
+        T: 'static,
+    {
+        db.listed(self.pivot, index, offset)
+    }
+
+    /// How many living records declared list `index` holds — the pager's
+    /// "of M".
+    ///
+    /// # Errors
+    /// A backend/transport failure, or an undeclared list index.
+    pub async fn list_len<D: DbHandle>(
+        &self,
+        db: &D,
+        index: usize,
+    ) -> Result<u64, D::Error>
+    where
+        T: 'static,
+    {
+        db.list_len::<T>(self.pivot, index).await
+    }
+
     /// Stream the record at `id`'s versions **newest-first** along the
     /// modification chain. Saving never destroys old bytes — this walks them.
     pub fn history<'d, D: DbHandle>(

@@ -86,6 +86,13 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// by the live version's authoring instant, so a save necessarily takes the
     /// record out of wherever it sat and puts it back at the growth end.
     ///
+    /// Returns the freshly encoded envelope the chain now holds, or `None` when
+    /// the record was not in the chain to begin with. Both halves of that are
+    /// used: the caller's declared lists hold the same bytes, so returning them
+    /// saves a second encode, and `None` is the **liveness gate** every derived
+    /// chain rides on — a record the built-in chain does not hold must not enter
+    /// any other one.
+    ///
     /// # Errors
     /// Propagates a [`Store`] failure, or
     /// [`Error::ChainCorrupt`](crate::Error::ChainCorrupt) if the freshly
@@ -98,7 +105,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         old_key: SecKey,
         live_meta: &Metadata,
         value: &T,
-    ) -> Result<()> {
+    ) -> Result<Option<Vec<u8>>> {
         // The anchor rides in the key's trailing pointer, so the record's `Id`
         // needs no parameter of its own.
         let id = old_key.rec.to_id(self.tenant());
@@ -111,19 +118,21 @@ impl<T: NonUniqueStruct> Collection<T> {
         // save. Without this the record would reappear in `all()` while its own
         // anchor still reads removed.
         let Some(writes) = records.plan_remove(&*view, &old_key).await? else {
-            return Ok(());
+            return Ok(None);
         };
         view.stage(&writes);
         batch.extend(writes);
+        let envelope =
+            crate::record::encode_record(T::STRUCT_HASH, live_meta, value);
         let writes = records
             .plan_insert(
                 &*view,
                 Self::instant_key(instant, LocalId::from_id(id)),
-                crate::record::encode_record(T::STRUCT_HASH, live_meta, value),
+                envelope.clone(),
             )
             .await?;
         view.stage(&writes);
         batch.extend(writes);
-        Ok(())
+        Ok(Some(envelope))
     }
 }
