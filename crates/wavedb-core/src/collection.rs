@@ -34,7 +34,7 @@ use std::marker::PhantomData;
 
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::{BpTree, Chain, Lane, Pivot, SecKey};
+use crate::index::{BpTree, Chain, ChainRoots, Lane, Pivot, Roots, SecKey};
 use crate::local_id::LocalId;
 use crate::record::{decode_envelope, encode_envelope, mint_floored_id};
 use crate::store::{Store, Write};
@@ -139,7 +139,57 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// copy is byte-comparable with the anchor it derives from — which is what
     /// makes the consistency invariant testable rather than arguable.
     pub(crate) fn records_chain(&self, pivot: &T::Pivot) -> Chain<Vec<u8>> {
-        let roots = pivot.records();
+        self.record_chain(pivot.records())
+    }
+
+    /// The **removal log** this pivot names — the same chain shape with no
+    /// index, keyed by removal instant, payload-free.
+    pub(crate) fn dead_log(&self, pivot: &T::Pivot) -> Chain<()> {
+        let roots = pivot.removals();
+        Chain::log_at(
+            roots.head,
+            roots.tail,
+            self.tenant,
+            T::STRUCT_HASH,
+            Lane::Dead,
+        )
+    }
+
+    /// The **declared lists** this pivot names, in declaration order — the same
+    /// chain shape as the built-in one, sorted by a declared property instead of
+    /// by modification instant (RFC 0051).
+    ///
+    /// They share `Lane::Records` with the built-in chain: their payload is the
+    /// same record envelope, so one directory and one zstd dictionary model all
+    /// of them, which is exactly what a lane is for.
+    pub(crate) fn list_chains(&self, pivot: &T::Pivot) -> Vec<Chain<Vec<u8>>> {
+        pivot
+            .lists()
+            .iter()
+            .map(|r| self.record_chain(*r))
+            .collect()
+    }
+
+    /// One declared list's chain, by declaration index.
+    ///
+    /// # Errors
+    /// [`Error::ListOutOfRange`] when the pivot declares no such list.
+    pub(crate) fn list_chain(
+        &self,
+        pivot: &T::Pivot,
+        index: usize,
+    ) -> Result<Chain<Vec<u8>>> {
+        pivot
+            .lists()
+            .get(index)
+            .map(|r| self.record_chain(*r))
+            .ok_or(Error::ListOutOfRange(index))
+    }
+
+    /// A record-lane chain handle at `roots` — the built-in chain and every
+    /// declared list are the same structure at the same capacity, differing
+    /// only in the key they are laid out by.
+    fn record_chain(&self, roots: ChainRoots) -> Chain<Vec<u8>> {
         Chain::at(
             roots.head,
             roots.tail,
@@ -154,17 +204,16 @@ impl<T: NonUniqueStruct> Collection<T> {
         .with_min(T::PAGE)
     }
 
-    /// The **removal log** this pivot names — the same chain shape with no
-    /// index, keyed by removal instant, payload-free.
-    pub(crate) fn dead_log(&self, pivot: &T::Pivot) -> Chain<()> {
-        let roots = pivot.removals();
-        Chain::log_at(
-            roots.head,
-            roots.tail,
-            self.tenant,
-            T::STRUCT_HASH,
-            Lane::Dead,
-        )
+    /// Declared list `i`'s sort key for `value` stored at `id`.
+    ///
+    /// Tie-broken by the **anchor**, not by the live version's instant: the
+    /// anchor never changes, so a save relocates the record only when the
+    /// declared property did (RFC 0051).
+    pub(crate) fn list_key(value: &T, i: usize, id: Id) -> SecKey {
+        SecKey {
+            field: value.list_key(i),
+            rec: LocalId::from_id(id),
+        }
     }
 
     /// Secondary index `i`'s key for `value` stored at `id`.
@@ -224,11 +273,25 @@ impl<T: NonUniqueStruct> Collection<T> {
             Chain::<()>::plan_create_log(tenant, T::STRUCT_HASH, Lane::Dead);
         batch.extend(record_writes);
         batch.extend(removal_writes);
-        let pivot_record = T::Pivot::default().replace_roots(
-            &sec_roots,
-            records.roots(),
-            removals.log_roots(),
-        );
+        // One more chain per `#[wavedb::list(...)]` — same shape, same lane,
+        // sorted by the declared property instead of by modification instant
+        // (RFC 0051).
+        let mut list_roots = Vec::with_capacity(T::NUM_LISTS);
+        for _ in 0..T::NUM_LISTS {
+            let (chain, writes) = Chain::<Vec<u8>>::plan_create(
+                tenant,
+                T::STRUCT_HASH,
+                Lane::Records,
+            );
+            list_roots.push(chain.roots());
+            batch.extend(writes);
+        }
+        let pivot_record = T::Pivot::default().replace_roots(Roots {
+            secondaries: &sec_roots,
+            records: records.roots(),
+            removals: removals.log_roots(),
+            lists: &list_roots,
+        });
         batch.push(Write::Put(
             pivot_id,
             encode_envelope(T::Pivot::STRUCT_HASH, &pivot_record),
@@ -286,7 +349,7 @@ mod tests {
     use super::{Collection, get_unique, save_unique};
     use crate::error::Error;
     use crate::index::mem_store::MemStore;
-    use crate::index::{ChainRoots, LogRoots, Pivot};
+    use crate::index::{ChainRoots, LogRoots, Pivot, Roots};
     use crate::local_id::LocalId;
     use crate::metadata::Succession;
     use crate::permission::PermissionRef;
@@ -330,15 +393,10 @@ mod tests {
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
-        fn replace_roots(
-            &self,
-            _secondaries: &[LocalId],
-            records: ChainRoots,
-            removals: LogRoots,
-        ) -> Self {
+        fn replace_roots(&self, roots: Roots<'_>) -> Self {
             Self {
-                records,
-                removals,
+                records: roots.records,
+                removals: roots.removals,
                 permission: self.permission.clone(),
             }
         }
@@ -384,17 +442,12 @@ mod tests {
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
-        fn replace_roots(
-            &self,
-            secondaries: &[LocalId],
-            records: ChainRoots,
-            removals: LogRoots,
-        ) -> Self {
+        fn replace_roots(&self, roots: Roots<'_>) -> Self {
             let mut s = self.secondaries;
-            s.copy_from_slice(secondaries);
+            s.copy_from_slice(roots.secondaries);
             Self {
-                records,
-                removals,
+                records: roots.records,
+                removals: roots.removals,
                 secondaries: s,
                 permission: self.permission.clone(),
             }

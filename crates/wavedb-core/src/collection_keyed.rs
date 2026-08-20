@@ -99,23 +99,19 @@ impl<T: NonUniqueStruct> Collection<T> {
         // already in `batch` are record slots, never nodes) — no overlay.
         let mut records = self.records_chain(pivot);
         let mut secs = self.sec_trees(pivot);
+        let mut lists = self.list_chains(pivot);
         let key = Self::instant_key(instant, LocalId::from_id(id));
+        let envelope =
+            crate::record::encode_record(T::STRUCT_HASH, &live_meta, value);
         // A revival re-enters the chain exactly as a first version does: the
         // record's prior copy left it when the key was removed, so there is
-        // nothing to relocate — only to insert, at the new live instant.
-        batch.extend(
-            records
-                .plan_insert(
-                    store,
-                    key,
-                    crate::record::encode_record(
-                        T::STRUCT_HASH,
-                        &live_meta,
-                        value,
-                    ),
-                )
-                .await?,
-        );
+        // nothing to relocate — only to insert, at the new live instant. Every
+        // declared list re-enters the same way.
+        batch.extend(records.plan_insert(store, key, envelope.clone()).await?);
+        self.plan_list_inserts(
+            store, &mut batch, &mut lists, id, &envelope, value,
+        )
+        .await?;
         for (i, tree) in secs.iter_mut().enumerate() {
             let key = Self::sec_key(value, i, id);
             batch.extend(tree.plan_insert(store, key).await?);
@@ -127,6 +123,7 @@ impl<T: NonUniqueStruct> Collection<T> {
                 secondaries: &secs,
                 records: records.roots(),
                 removals: pivot.removals(),
+                lists: &lists,
             },
         );
         store.apply(&batch).await?;
@@ -154,7 +151,7 @@ mod tests {
     use crate::expose::collection_changes;
     use crate::id::Id;
     use crate::index::mem_store::MemStore;
-    use crate::index::{Bound, ChainRoots, IndexKey, LogRoots, Pivot};
+    use crate::index::{Bound, ChainRoots, IndexKey, LogRoots, Pivot, Roots};
     use crate::local_id::LocalId;
     use crate::metadata::Metadata;
     use crate::permission::PermissionRef;
@@ -213,17 +210,12 @@ mod tests {
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
-        fn replace_roots(
-            &self,
-            secondaries: &[LocalId],
-            records: ChainRoots,
-            removals: LogRoots,
-        ) -> Self {
+        fn replace_roots(&self, roots: Roots<'_>) -> Self {
             let mut s = self.secondaries;
-            s.copy_from_slice(secondaries);
+            s.copy_from_slice(roots.secondaries);
             Self {
-                records,
-                removals,
+                records: roots.records,
+                removals: roots.removals,
                 secondaries: s,
                 permission: self.permission.clone(),
             }

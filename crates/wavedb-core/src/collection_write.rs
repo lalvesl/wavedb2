@@ -11,7 +11,7 @@
 use crate::collection::Collection;
 use crate::error::Result;
 use crate::id::Id;
-use crate::index::{BpTree, ChainRoots, LogRoots, Pivot, SecKey};
+use crate::index::{BpTree, Chain, ChainRoots, LogRoots, Pivot, Roots, SecKey};
 use crate::local_id::LocalId;
 use crate::metadata::{Metadata, Succession};
 use crate::notify::{Mutation, MutationKind};
@@ -32,6 +32,8 @@ pub struct MovedRoots<'a> {
     pub records: ChainRoots,
     /// The removal log's endpoints.
     pub removals: LogRoots,
+    /// The declared lists' chains, in declaration order (RFC 0051).
+    pub lists: &'a [Chain<Vec<u8>>],
 }
 
 impl<T: NonUniqueStruct> Collection<T> {
@@ -51,12 +53,19 @@ impl<T: NonUniqueStruct> Collection<T> {
     ) {
         let sec_roots: Vec<LocalId> =
             moved.secondaries.iter().map(BpTree::root).collect();
+        let list_roots: Vec<ChainRoots> =
+            moved.lists.iter().map(Chain::roots).collect();
         if sec_roots.as_slice() != pivot.secondaries()
             || moved.records != pivot.records()
             || moved.removals != pivot.removals()
+            || list_roots.as_slice() != pivot.lists()
         {
-            let rewritten =
-                pivot.replace_roots(&sec_roots, moved.records, moved.removals);
+            let rewritten = pivot.replace_roots(Roots {
+                secondaries: &sec_roots,
+                records: moved.records,
+                removals: moved.removals,
+                lists: &list_roots,
+            });
             batch.push(self.pivot_rewrite(&rewritten));
         }
     }
@@ -127,13 +136,20 @@ impl<T: NonUniqueStruct> Collection<T> {
         };
         let mut records = self.records_chain(pivot);
         let mut secs = self.sec_trees(pivot);
+        let mut lists = self.list_chains(pivot);
         let envelope = encode_record(T::STRUCT_HASH, &meta, value);
         let key = Self::instant_key(instant, LocalId::from_id(id));
         // The chain carries the record **inline**, keyed by the instant its
         // live version was authored. That one entry is the membership set and
         // the modification log at once (RFC 0050).
         let mut batch = vec![Write::Put(id, envelope.clone())];
-        batch.extend(records.plan_insert(store, key, envelope).await?);
+        batch.extend(records.plan_insert(store, key, envelope.clone()).await?);
+        // …and one more copy per declared list, sorted by its own property
+        // (RFC 0051).
+        self.plan_list_inserts(
+            store, &mut batch, &mut lists, id, &envelope, value,
+        )
+        .await?;
         for (i, tree) in secs.iter_mut().enumerate() {
             let key = Self::sec_key(value, i, id);
             batch.extend(tree.plan_insert(store, key).await?);
@@ -145,6 +161,7 @@ impl<T: NonUniqueStruct> Collection<T> {
                 secondaries: &secs,
                 records: records.roots(),
                 removals: pivot.removals(),
+                lists: &lists,
             },
         );
         store.apply(&batch).await?;
@@ -234,6 +251,7 @@ impl<T: NonUniqueStruct> Collection<T> {
             plan_chained_save::<T, S>(store, &plan, value).await?;
         let mut records = self.records_chain(&pivot);
         let mut secs = self.sec_trees(&pivot);
+        let mut lists = self.list_chains(&pivot);
         // Removals and inserts mutate the same structures in one batch: each
         // plan reads through the overlay of the pending node writes.
         let mut view = Overlay::new(store);
@@ -243,15 +261,29 @@ impl<T: NonUniqueStruct> Collection<T> {
             // version's authoring instant, and that instant just changed. Out of
             // the old position, in at the new one — which is the movement that
             // *is* the modification log (RFC 0050).
-            self.plan_chain_move(
-                &mut view,
-                &mut batch,
-                &mut records,
-                Self::instant_key(*old_instant, anchor),
-                &live_meta,
-                value,
-            )
-            .await?;
+            let moved = self
+                .plan_chain_move(
+                    &mut view,
+                    &mut batch,
+                    &mut records,
+                    Self::instant_key(*old_instant, anchor),
+                    &live_meta,
+                    value,
+                )
+                .await?;
+            // Only a record the built-in chain holds belongs in a declared list
+            // — the same liveness gate, applied once (RFC 0051).
+            if let Some(envelope) = moved {
+                self.plan_list_moves(
+                    &mut view,
+                    &mut batch,
+                    &mut lists,
+                    id,
+                    &envelope,
+                    (old_value, value),
+                )
+                .await?;
+            }
             for (i, tree) in secs.iter_mut().enumerate() {
                 let old_key = Self::sec_key(old_value, i, id);
                 let new_key = Self::sec_key(value, i, id);
@@ -276,6 +308,7 @@ impl<T: NonUniqueStruct> Collection<T> {
                 secondaries: &secs,
                 records: records.roots(),
                 removals: pivot.removals(),
+                lists: &lists,
             },
         );
         store.apply(&batch).await?;

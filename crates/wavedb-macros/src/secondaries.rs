@@ -33,7 +33,7 @@ fn param_ty(ty: &Type) -> TokenStream {
 impl ResolvedPivot {
     /// The `IndexKey` expression encoding `self`'s field values — a direct
     /// field borrow for a single index, a ref-tuple for a composite.
-    fn self_key_expr(&self) -> TokenStream {
+    pub fn self_key_expr(&self) -> TokenStream {
         let refs = self.fields.iter().map(|(f, _)| quote!(&self.#f));
         if self.fields.len() == 1 {
             let f = &self.fields[0].0;
@@ -45,13 +45,21 @@ impl ResolvedPivot {
 
     /// The generated lookup's name: `by_f1` / `by_f1_f2`.
     fn by_ident(&self) -> Ident {
-        let joined = self
-            .fields
+        format_ident!("by_{}", self.joined())
+    }
+
+    /// The generated enumeration's name: `listed_by_f1` / `listed_by_f1_f2`.
+    pub fn listed_ident(&self) -> Ident {
+        format_ident!("listed_by_{}", self.joined())
+    }
+
+    /// The declared fields' names joined with `_`.
+    fn joined(&self) -> String {
+        self.fields
             .iter()
             .map(|(f, _)| f.to_string())
             .collect::<Vec<_>>()
-            .join("_");
-        format_ident!("by_{}", joined)
+            .join("_")
     }
 }
 
