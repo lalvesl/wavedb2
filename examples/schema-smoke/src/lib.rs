@@ -151,6 +151,35 @@ pub mod default_paged {
     }
 }
 
+/// NonUnique with two **declared lists** (RFC 0051): a second and third chain
+/// of the same records, kept sorted by `name` and by `(city, name)` instead of
+/// by modification instant.
+///
+/// The field spelling marks the field that *is* the ordering; the struct
+/// spelling names a composite. Both fold into the STRUCT_HASH — a list is a
+/// materialised copy of every record, so declaring one is a schema change.
+#[wavedb(NonUnique, page = 4)]
+#[wavedb::list((city, name))]
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct Person {
+    #[wavedb::list]
+    pub name: String,
+    pub city: String,
+}
+
+/// [`Person`]'s twin declaring **no** list — same name, same fields, same
+/// shape, same `page`. Its only purpose is to prove a list reaches the identity.
+pub mod unlisted {
+    use wavedb_macros::wavedb;
+
+    #[wavedb(NonUnique, page = 4)]
+    #[derive(Debug, PartialEq, Eq, Clone, Default)]
+    pub struct Person {
+        pub name: String,
+        pub city: String,
+    }
+}
+
 /// A struct in a submodule — items are named by path, not found by a scanner.
 pub mod billing {
     use wavedb_macros::wavedb;
@@ -290,6 +319,197 @@ mod tests {
                 1,
                 "the default capacity fits 20 records in one segment"
             );
+        });
+    }
+
+    // A declared list is a materialised copy of every record, so — like every
+    // other fact that reaches stored bytes — it folds into the identity.
+    #[test]
+    fn a_declared_list_folds_into_the_identity() {
+        use super::Person as Listed;
+        use super::unlisted::Person as Plain;
+        use wavedb_core::NonUniqueStruct;
+
+        assert_eq!(Listed::NUM_LISTS, 2, "one field-level, one struct-level");
+        assert_eq!(Plain::NUM_LISTS, 0);
+        assert_ne!(
+            Listed::STRUCT_HASH,
+            Plain::STRUCT_HASH,
+            "declaring a list must be a new type — the engine does no \
+             migration, so there is nowhere for the extra chain to come from"
+        );
+    }
+
+    // The generated `listed_by_*` readers walk their own chain, in their own
+    // order — not the built-in chain's recency order.
+    #[test]
+    fn a_declared_list_reads_in_its_own_order() {
+        use super::{Person, PersonLists};
+        use futures::TryStreamExt;
+        use futures::executor::block_on;
+        use wavedb_core::U48;
+
+        block_on(async {
+            let store = mem::MemStore::default();
+            let db = wavedb_core::LocalHandle::new(&store, U48::from(7u32));
+            let people =
+                Person::collection(Person::create_pivot(&db).await.unwrap());
+            // Inserted in an order that agrees with neither declared list.
+            for (name, city) in
+                [("carol", "lisboa"), ("alice", "porto"), ("bob", "lisboa")]
+            {
+                people
+                    .insert(
+                        &db,
+                        &Person {
+                            name: name.into(),
+                            city: city.into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let by_name: Vec<String> = people
+                .listed_by_name(&db)
+                .map_ok(|p| p.name)
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(by_name, ["alice", "bob", "carol"]);
+
+            // The composite orders by city first, so both lisboa rows precede
+            // the porto one however their names sort.
+            let by_city: Vec<String> = people
+                .listed_by_city_name(&db)
+                .map_ok(|p| format!("{}/{}", p.city, p.name))
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(by_city, ["lisboa/bob", "lisboa/carol", "porto/alice"]);
+
+            // The built-in chain is untouched by any of this: it still reads
+            // most-recently-written first.
+            let recent: Vec<String> = people
+                .all(&db)
+                .map_ok(|p| p.name)
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(recent, ["bob", "alice", "carol"]);
+
+            assert_eq!(people.list_len(&db, 0).await.unwrap(), 3);
+        });
+    }
+
+    // A list holds only living records, and it re-sorts on a save: both are
+    // maintained inside the one atomic batch the mutation already writes.
+    #[test]
+    fn a_list_tracks_saves_and_removals() {
+        use super::{Person, PersonLists};
+        use futures::TryStreamExt;
+        use futures::executor::block_on;
+        use wavedb_core::U48;
+
+        block_on(async {
+            let store = mem::MemStore::default();
+            let db = wavedb_core::LocalHandle::new(&store, U48::from(7u32));
+            let people =
+                Person::collection(Person::create_pivot(&db).await.unwrap());
+            let mut ids = Vec::new();
+            for name in ["alice", "bob", "carol"] {
+                ids.push(
+                    people
+                        .insert(
+                            &db,
+                            &Person {
+                                name: name.into(),
+                                city: "porto".into(),
+                            },
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+
+            // Renaming alice → zoe must move her to the far end of the list.
+            people
+                .save(
+                    &db,
+                    ids[0],
+                    &Person {
+                        name: "zoe".into(),
+                        city: "porto".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let names: Vec<String> = people
+                .listed_by_name(&db)
+                .map_ok(|p| p.name)
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(names, ["bob", "carol", "zoe"]);
+
+            assert!(people.remove(&db, ids[1]).await.unwrap());
+            let names: Vec<String> = people
+                .listed_by_name(&db)
+                .map_ok(|p| p.name)
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(names, ["carol", "zoe"], "a removal leaves every list");
+            assert_eq!(people.list_len(&db, 0).await.unwrap(), 2);
+        });
+    }
+
+    // The pager: `_at_page` descends the sparse index to a page boundary
+    // rather than walking to it, and `page = 4` makes a page one segment.
+    #[test]
+    fn a_list_pages_by_descent() {
+        use super::{Person, PersonLists};
+        use futures::executor::block_on;
+        use futures::{StreamExt, TryStreamExt};
+        use wavedb_core::U48;
+
+        block_on(async {
+            let store = mem::MemStore::default();
+            let db = wavedb_core::LocalHandle::new(&store, U48::from(7u32));
+            let people =
+                Person::collection(Person::create_pivot(&db).await.unwrap());
+            for n in 0..12u32 {
+                people
+                    .insert(
+                        &db,
+                        &Person {
+                            // Zero-padded so the byte order is the number order.
+                            name: format!("p{n:02}"),
+                            city: "porto".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(people.list_len(&db, 0).await.unwrap(), 12);
+
+            let page: Vec<String> = people
+                .listed_by_name_at_page(&db, 2, 4)
+                .map_ok(|p| p.name)
+                .take(4)
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(page, ["p08", "p09", "p10", "p11"]);
+
+            // Past the end yields nothing rather than failing.
+            let none: Vec<String> = people
+                .listed_by_name_at_page(&db, 99, 4)
+                .map_ok(|p| p.name)
+                .try_collect()
+                .await
+                .unwrap();
+            assert!(none.is_empty());
         });
     }
 

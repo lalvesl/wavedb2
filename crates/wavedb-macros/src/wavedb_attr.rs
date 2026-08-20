@@ -16,11 +16,10 @@
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::parse::Parser;
-use syn::{Attribute, Data, DeriveInput, Fields, Ident};
+use syn::{Data, DeriveInput, Fields, Ident};
 
-use crate::args::{PivotSpec, Shape, WavedbArgs};
-use crate::natural_key::take_and_fold_key;
-use crate::secondaries::ResolvedPivot;
+use crate::args::{Shape, WavedbArgs};
+use crate::declarations::take_declarations;
 use crate::{exec_ops, generated, storage_statics, struct_hash, wire_derive};
 
 /// Expand `#[wavedb(<attr>)] <item>`.
@@ -44,6 +43,11 @@ pub fn expand(
         ));
     };
 
+    // The declarations are taken off a *clone* of the fields, because taking
+    // the field-level `#[wavedb::list]` markers mutates `input` while the
+    // resolution needs to read the field list.
+    let named = named.clone();
+
     // Field (name, normalised-type) pairs feed the STRUCT_HASH.
     let mut hash_fields: Vec<(String, String)> = named
         .named
@@ -54,13 +58,8 @@ pub fn expand(
         })
         .collect();
 
-    let key_fields = take_and_fold_key(
-        &mut input.attrs,
-        named,
-        args.shape,
-        &mut hash_fields,
-    )?;
-    fold_layout_args(&args, &mut hash_fields)?;
+    let declared =
+        take_declarations(&mut input, &named, &args, &mut hash_fields)?;
 
     let name = input.ident.clone();
     let hash = struct_hash::compute(
@@ -68,17 +67,6 @@ pub fn expand(
         args.shape.as_str(),
         &hash_fields,
     );
-
-    // Take `#[wavedb::pivot(...)]` helper attributes; each is one secondary
-    // index, its fields resolved (and validated) against the struct's own.
-    let pivot_specs = take_pivot_specs(&mut input.attrs)?;
-    let secondaries = resolve_pivot_fields(&pivot_specs, named)?;
-    if !secondaries.is_empty() && args.shape != Shape::NonUnique {
-        return Err(syn::Error::new(
-            Span::call_site(),
-            "#[wavedb::pivot(...)] is only valid on a #[wavedb(NonUnique)] struct",
-        ));
-    }
 
     let wire_impl = wire_derive::derive(&input)?;
     let shape_variant =
@@ -93,13 +81,8 @@ pub fn expand(
         Shape::Unique => (quote!(()), unique_ops(&name)),
         Shape::NonUnique => {
             let pivot_id = format_ident!("{}PivotId", name);
-            let types = generated::nonunique_types(
-                &name,
-                hash,
-                &secondaries,
-                key_fields.as_deref(),
-                args.page,
-            )?;
+            let types =
+                generated::nonunique_types(&name, hash, &declared, args.page)?;
             (quote!(#pivot_id), types)
         }
     };
@@ -198,61 +181,6 @@ fn unique_ops(name: &Ident) -> TokenStream {
     }
 }
 
-/// Remove every `#[wavedb::pivot(...)]` attribute from `attrs`, parsing each
-/// into the fields it declares (declaration order preserved).
-fn take_pivot_specs(attrs: &mut Vec<Attribute>) -> syn::Result<Vec<PivotSpec>> {
-    let mut specs = Vec::new();
-    let mut kept = Vec::with_capacity(attrs.len());
-    for attr in attrs.drain(..) {
-        if is_pivot_attr(&attr) {
-            specs.push(attr.parse_args::<PivotSpec>()?);
-        } else {
-            kept.push(attr);
-        }
-    }
-    *attrs = kept;
-    Ok(specs)
-}
-
-/// Resolve each declared pivot field against the struct's named fields,
-/// pairing it with its type — an unknown field is a compile error at the
-/// declaration site.
-fn resolve_pivot_fields(
-    specs: &[PivotSpec],
-    named: &syn::FieldsNamed,
-) -> syn::Result<Vec<ResolvedPivot>> {
-    specs
-        .iter()
-        .map(|spec| {
-            let fields = spec
-                .fields
-                .iter()
-                .map(|ident| {
-                    named
-                        .named
-                        .iter()
-                        .find(|f| f.ident.as_ref() == Some(ident))
-                        .map(|f| (ident.clone(), f.ty.clone()))
-                        .ok_or_else(|| {
-                            syn::Error::new_spanned(
-                                ident,
-                                "#[wavedb::pivot(...)] names a field this \
-                                 struct does not declare",
-                            )
-                        })
-                })
-                .collect::<syn::Result<Vec<_>>>()?;
-            Ok(ResolvedPivot { fields })
-        })
-        .collect()
-}
-
-/// `true` for a `#[wavedb::pivot(...)]` helper attribute.
-fn is_pivot_attr(attr: &Attribute) -> bool {
-    let segs = &attr.path().segments;
-    segs.len() == 2 && segs[0].ident == "wavedb" && segs[1].ident == "pivot"
-}
-
 /// The per-shape scaffolding around the generated types: the native-only
 /// `StructStorage` static (the NonUnique variant's Pivot slot and
 /// `storage_entries()` are emitted with the pivot types in
@@ -281,39 +209,6 @@ fn shape_scaffolding(
         }
     };
     (storage_slot, storage_entries, exec_steps, shape_marker)
-}
-
-/// Fold the `#[wavedb(...)]` arguments that **reach stored bytes** into the
-/// hash inputs, as synthetic `#name` entries (`#` cannot open a real field
-/// name, so they can never collide with one).
-///
-/// This is the project rule, not a local choice: a declaration that decides how
-/// bytes are laid out yields a **new type** when it changes, because the engine
-/// performs no migration and the alternative is data that silently no longer
-/// matches what its declaration claims (RFC 0052). Each entry is emitted only
-/// when the declaration departs from the default, exactly as `#[wavedb::key]`
-/// does it, so the plain spelling keeps its identity.
-///
-/// Arguments that never reach disk — the `validate` / `preprocess` hooks — do
-/// not fold: they are behaviour, and correcting one must not orphan the data.
-fn fold_layout_args(
-    args: &WavedbArgs,
-    hash_fields: &mut Vec<(String, String)>,
-) -> syn::Result<()> {
-    if !args.compress {
-        hash_fields.push(("#compress".into(), "false".into()));
-    }
-    if let Some(page) = args.page {
-        if args.shape != Shape::NonUnique {
-            return Err(syn::Error::new(
-                Span::call_site(),
-                "`page = N` is only valid on a #[wavedb(NonUnique)] struct — \
-                 a Unique type has no collection and so no record chain",
-            ));
-        }
-        hash_fields.push(("#page".into(), page.to_string()));
-    }
-    Ok(())
 }
 
 /// The reserved lane hashes this shape occupies, as the `&'static [u64]`

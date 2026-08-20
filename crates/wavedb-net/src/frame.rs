@@ -98,6 +98,8 @@ pub enum NodeErrorKind {
     /// A save addressed an id that is not the value's own content-derived
     /// (`#[wavedb::key(...)]`) anchor — renaming is remove + insert.
     KeyMismatch,
+    /// A list read named an ordering the type does not declare.
+    ListOutOfRange,
 }
 
 /// A structured node-side rejection, riding **inside** the 200 response —
@@ -136,6 +138,7 @@ impl NodeError {
             CoreError::Conflict(_) => NodeErrorKind::Conflict,
             CoreError::ChainCorrupt(_) => NodeErrorKind::ChainCorrupt,
             CoreError::KeyMismatch(_) => NodeErrorKind::KeyMismatch,
+            CoreError::ListOutOfRange(_) => NodeErrorKind::ListOutOfRange,
         };
         Self {
             kind,
