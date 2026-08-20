@@ -1,6 +1,12 @@
 # RFC 0052 — Segment size as the pagination unit
 
-- **Status:** Planned — opened 2026-07-29, revised 2026-07-30
+- **Status:** Implemented 2026-07-31 — opened 2026-07-29, revised 2026-07-30.
+  Most of it landed as [RFC 0050](0050-clustered-record-chains.md) phases 3b
+  (the N…2N band, the 50/50 split, the merge at N/2 and its two rules), 2/3a
+  (element counts, the offset descent, the root's total) and 7a (the struct's
+  `page = N`, folded); the per-list `page` landed here on 2026-07-31.
+  **Remaining:** a crash-and-replay test for the counts (see the open
+  questions), and two policy questions that want a real application.
 - **Crates:** `wavedb-core`, `wavedb-macros`
 - **Builds on:** [RFC 0050](0050-clustered-record-chains.md) (the segment),
   [RFC 0051](0051-ordered-record-lists.md) (the sparse index),
@@ -317,6 +323,41 @@ For a chain with minimum N and a UI page P ≤ N:
   segments they name, so replay rebuilds them; but if an index entry and its segment
   could ever disagree, a pager would be silently wrong. The single-batch rule should
   make it impossible — worth an explicit test rather than an argument.
+
+  **Partly answered 2026-07-31.** The *agreement* half is now pinned at both
+  levels: the bare chain's `check()` walks every segment asserting the index
+  names it with the right id and the right count, and
+  `collection_lists::tests::counts_agree` does the same where the batch is
+  **composed** — the collection interleaves the record write, the built-in
+  chain, every declared list and the `Pivot` into one `apply`, which is traffic
+  the bare-chain tests never see. Both were mutation-checked: filing `len − 1`,
+  and skipping the upsert when the separator is unchanged, each fail the suite.
+
+  What is **still** an argument rather than a test is the half the question
+  actually names — **crash and replay**. Every test above applies whole batches
+  to a store that cannot tear. Proving it needs `PageStore`: build a chain, kill
+  during the write, reopen, and assert the counts still agree. That is a
+  `wavedb-storage` durability test (the "reopen-and-replay or kill-during-write"
+  bar), and it is the one piece of this bullet left open.
+
+  A more valuable hole turned up while mutating for the above, and is worth
+  recording because it is the class of bug this whole family of RFCs creates: a
+  save that leaves the ordering property alone must **still** rewrite the record
+  in every declared list, because the bytes are duplicated there and only the
+  *position* is unchanged. Skipping the list when `old_key == new_key` reads
+  like an obvious optimisation, produces perfectly consistent counts, and serves
+  stale bodies. Nothing in the suite caught it;
+  `a_save_refreshes_a_list_whose_order_it_did_not_change` now does. A count
+  check cannot see this failure — a stale body has exactly the right length —
+  which is the argument for checking derived **bytes** against their anchor
+  wherever a structure duplicates records.
+
+  And the shortcut is not merely unsafe, it is **unavailable**: deciding it
+  needs "did anything *else* about this record change?", whose only authority is
+  the anchor's previous version. Reading that costs an IOp to avoid a write
+  already inside the window the batch pays for — the scarce resource spent to
+  save the abundant one. So an unconditional rewrite of every list on every save
+  is the rule, not a simplification awaiting an optimisation.
 - **Compaction and stable pagination.** Re-levelling moves boundaries, so a cursor
   held across a compaction may skip or repeat rows. Keyset cursors are immune (they
   name a sort key); offset cursors are not. Does compaction defer while a watch holds

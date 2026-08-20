@@ -134,7 +134,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   `(K+2)` copies of every record on disk — anchor, built-in chain, K declared
   lists — accepted deliberately. What it does not yet ship is a wire command, so
   a client calling `listed_by_name` directly refuses exactly as `search_by` does;
-  [0052](0052-segment-size-as-the-pagination-unit-PLANNED.md) — the developer
+  [0052](0052-segment-size-as-the-pagination-unit.md) — the developer
   declares a chain's capacity as a **minimum** N, normally the page size the UI
   renders (undeclared: **16** for record chains, **256** for the removal log); a
   segment holds N…2N records, splits 50/50 at 2N with the endpoint keeping its own
@@ -148,7 +148,13 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   element counts (leaf and subtree), making it an order-statistic tree — "jump to
   page k" is one descent regardless of k, and an unfiltered pager's "of M" is the
   root's sum. Costs are quoted **cold**: WaveDB is multi-tenant, so nothing may be
-  pinned in RAM;
+  pinned in RAM. **Landed 2026-07-31** — most of it as 0050's phases 3b/2/3a/7a,
+  then the per-list `page` (`#[wavedb::list(page = 25)]`), which exists because
+  the two chain kinds have opposite write profiles: the built-in chain is
+  rewritten whole at its growth end on every save and wants a small N, a list is
+  rewritten in place and can hold the page a view renders. What is left is one
+  hardening test — the counts across a **crash and replay**, which needs
+  `PageStore` — and two policy questions;
   [0054](0054-anchored-layout-PLANNED.md) — the counterweight: 0050–0052 trade space
   for bulk reads, the wrong bargain for a collection read one record at a time or
   rarely at all, so the **anchored** layout — records only at their anchors, one dense
@@ -256,7 +262,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0049](0049-elastic-pages-and-load-driven-splits.md) | Elastic pages and load-driven splits | Implemented |
 | [0050](0050-clustered-record-chains.md) | Clustered record chains (B+trees become opt-in) | Implemented |
 | [0051](0051-ordered-record-lists.md) | Declared lists: sorted chains + sparse index | Implemented |
-| [0052](0052-segment-size-as-the-pagination-unit-PLANNED.md) | Segment size as the pagination unit | Planned |
+| [0052](0052-segment-size-as-the-pagination-unit.md) | Segment size as the pagination unit | Implemented |
 | [0053](0053-tenant-fair-cache-retention-PLANNED.md) | Tenant-fair cache retention | Planned |
 | [0054](0054-anchored-layout-PLANNED.md) | The anchored layout (no clustering) | Planned |
 
