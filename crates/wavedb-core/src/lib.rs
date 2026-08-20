@@ -26,6 +26,7 @@ pub mod collection;
 mod collection_adopt;
 pub mod collection_handle;
 mod collection_keyed;
+mod collection_lists;
 mod collection_read;
 mod collection_recency;
 mod collection_remove;

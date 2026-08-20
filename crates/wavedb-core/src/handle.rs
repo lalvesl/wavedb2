@@ -18,6 +18,8 @@
 //!   an iterator stream) — when streaming frames land, only implementations
 //!   change, never the generated call sites.
 
+use std::future::Future;
+
 use futures::{Stream, TryStreamExt};
 
 use crate::collection::Collection;
@@ -159,6 +161,28 @@ pub trait DbHandle: Sized {
         bound: Bound,
     ) -> impl Stream<Item = Result<T, Self::Error>>;
 
+    /// Stream every living record in declared list `index`'s order, entered at
+    /// global `offset` ([RFC 0051]). `offset = 0` is the whole list.
+    ///
+    /// The generated `listed_by_<fields>` wrappers call this with the
+    /// declaration's compile-time index.
+    ///
+    /// [RFC 0051]: https://github.com/wavedb/wavedb/blob/main/rfcs/0051-ordered-record-lists.md
+    fn listed<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+        index: usize,
+        offset: u64,
+    ) -> impl Stream<Item = Result<T, Self::Error>>;
+
+    /// How many living records declared list `index` holds — the pager's
+    /// "of M", one read cold.
+    fn list_len<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+        index: usize,
+    ) -> impl Future<Output = Result<u64, Self::Error>>;
+
     /// Stream the record at `id`'s versions **newest-first** along the
     /// modification chain (the live version, then each archive).
     fn record_history<T: NonUniqueStruct + 'static>(
@@ -294,6 +318,25 @@ impl<S: Store> DbHandle for LocalHandle<'_, S> {
             .map_ok(|(_, value)| value)
     }
 
+    fn listed<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+        index: usize,
+        offset: u64,
+    ) -> impl Stream<Item = Result<T, Error>> {
+        self.col::<T>(pivot)
+            .listed_at(self.store, index, offset)
+            .map_ok(|(_, value)| value)
+    }
+
+    async fn list_len<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+        index: usize,
+    ) -> Result<u64, Error> {
+        self.col::<T>(pivot).list_len(self.store, index).await
+    }
+
     fn record_history<T: NonUniqueStruct + 'static>(
         &self,
         pivot: LocalId,
@@ -310,7 +353,7 @@ mod tests {
 
     use super::{DbHandle, LocalHandle};
     use crate::index::mem_store::MemStore;
-    use crate::index::{ChainRoots, IndexKey, LogRoots, Pivot};
+    use crate::index::{ChainRoots, IndexKey, LogRoots, Pivot, Roots};
     use crate::local_id::LocalId;
     use crate::permission::PermissionRef;
     use crate::traits::{NonUniqueStruct, Shape, UniqueStruct, WaveDbStruct};
@@ -372,17 +415,12 @@ mod tests {
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
-        fn replace_roots(
-            &self,
-            secondaries: &[LocalId],
-            records: ChainRoots,
-            removals: LogRoots,
-        ) -> Self {
+        fn replace_roots(&self, roots: Roots<'_>) -> Self {
             let mut s = self.secondaries;
-            s.copy_from_slice(secondaries);
+            s.copy_from_slice(roots.secondaries);
             Self {
-                records,
-                removals,
+                records: roots.records,
+                removals: roots.removals,
                 secondaries: s,
                 permission: self.permission.clone(),
             }

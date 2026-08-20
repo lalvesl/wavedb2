@@ -28,7 +28,7 @@
 //! the payload: record bytes in a record lane, `()` in the removal log, where the
 //! anchor inside the key is the whole entry.
 //!
-//! [RFC 0050]: https://github.com/wavedb/wavedb/blob/main/rfcs/0050-clustered-record-chains-WIP.md
+//! [RFC 0050]: https://github.com/wavedb/wavedb/blob/main/rfcs/0050-clustered-record-chains.md
 
 use wavedb_wire::Cursor;
 
