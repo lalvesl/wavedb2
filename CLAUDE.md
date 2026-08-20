@@ -63,6 +63,15 @@ Full rationale in `docs/development_standards.md`. The load-bearing ones:
 - **No serde.** Byte layouts are the `WaveWire` codec (`docs/wire_format.md`):
   `[STACK fixed-size][HEAP variable]`, little-endian, `usize`/`isize` never encodable.
 - **`seahash` is pinned `=4.1.0`** — STRUCT_HASH identity is load-bearing; never loosen.
+- **Everything that reaches stored bytes folds into `STRUCT_HASH`.** Fields, shape,
+  `#[wavedb::key]`, `compress`, and every future layout knob (`page = N`,
+  `#[wavedb::list]` — RFCs 0051/0052) — as a synthetic `#name` hash entry when it
+  isn't a real field. The engine does **no** migration (RFC 0040), so the only
+  coherent answer to "can I change this on live data?" is that changing it yields a
+  **new type** and moving the data across is application code. Never add a knob that
+  touches stored bytes without folding it: a knob that can be flipped in place is a
+  knob that silently falsifies whatever guarantee it declares. Behaviour that never
+  reaches disk doesn't fold.
 - **No format versioning pre-release (policy).** `FORMAT_VERSION` pinned at 1; on-disk
   layouts change freely between commits with no bump, no migration notes. An old
   `data.bin` is simply unsupported.
