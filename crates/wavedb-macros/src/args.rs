@@ -6,7 +6,7 @@
 //! #[wavedb]                                  // Unique (default)
 //! #[wavedb(NonUnique)]                       // NonUnique shape
 //! #[wavedb(validate = path, preprocess = p)] // hook fns (either shape)
-//! #[wavedb(compress = false)]                // opt this type's pages out of zstd
+//! #[wavedb(compress = false)]                // opt out of zstd (folds into the hash)
 //! ```
 
 use syn::punctuated::Punctuated;
@@ -40,8 +40,9 @@ pub struct WavedbArgs {
     pub shape: Shape,
     pub validate: Option<Path>,
     pub preprocess: Option<Path>,
-    /// Whether this type's pages run through zstd (storage policy — not part
-    /// of the schema, so it never feeds the `STRUCT_HASH`).
+    /// Whether this type's pages run through zstd. Storage policy, but it
+    /// reaches stored bytes, so it **folds into** the `STRUCT_HASH` (RFC 0052):
+    /// flipping it mints a new type rather than reinterpreting old pages.
     pub compress: bool,
 }
 

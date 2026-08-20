@@ -138,12 +138,29 @@ pub mod billing {
     }
 }
 
-/// Already-compressed payloads opt their pages out of zstd — storage policy
-/// declared on the type, not schema identity (the hash ignores it).
+/// Already-compressed payloads opt their pages out of zstd. Storage policy —
+/// but it reaches stored bytes, so it **folds into the hash** (RFC 0052):
+/// flipping it is a new type, not a live setting.
 #[wavedb(compress = false)]
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct Attachment {
     pub media: Vec<u8>,
+}
+
+/// A twin of [`Attachment`], differing **only** in the compression declaration.
+///
+/// Same struct name, same field, same shape — it lives in its own module so the
+/// names really do collide, which is what makes the hash comparison in
+/// `compression_folds_into_the_identity` meaningful: anything else about the two
+/// would move the hash on its own.
+pub mod compressed_twin {
+    use wavedb_macros::wavedb;
+
+    #[wavedb]
+    #[derive(Debug, PartialEq, Eq, Clone, Default)]
+    pub struct Attachment {
+        pub media: Vec<u8>,
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +192,34 @@ mod tests {
         assert_ne!(AboutUser::STRUCT_HASH, Note::STRUCT_HASH);
         assert_ne!(AboutUser::STRUCT_HASH, Invoice::STRUCT_HASH);
         assert_ne!(Note::STRUCT_HASH, Invoice::STRUCT_HASH);
+    }
+
+    // Every declaration that reaches stored bytes folds into the identity
+    // (RFC 0052), and `compress` is one: it decides whether a type's pages go
+    // through zstd. WaveDB does no engine-side migration, so the only coherent
+    // answer to "can I flip this on live data?" is that flipping it gives you a
+    // **different type** and the move is application code.
+    #[test]
+    fn compression_folds_into_the_identity() {
+        use crate::Attachment as Uncompressed;
+        use crate::compressed_twin::Attachment as Compressed;
+
+        // The two differ in nothing a hash sees except the declaration: same
+        // struct name, same field name and type, same (default) shape.
+        assert!(!Uncompressed::struct_storage().compress());
+        assert!(Compressed::struct_storage().compress());
+        assert_ne!(
+            Uncompressed::STRUCT_HASH,
+            Compressed::STRUCT_HASH,
+            "flipping `compress` must mint a new type, not reinterpret the old \
+             one's pages"
+        );
+        // And the lanes move with it, since they derive from the type's hash —
+        // so the new type cannot land in the old one's storage.
+        assert_ne!(
+            Uncompressed::storage_entries()[0].struct_hash(),
+            Compressed::storage_entries()[0].struct_hash(),
+        );
     }
 
     // Shape is a compile-time `const` on the type — no runtime lookup.

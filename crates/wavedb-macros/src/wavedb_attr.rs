@@ -60,6 +60,14 @@ pub fn expand(
         args.shape,
         &mut hash_fields,
     )?;
+    // `compress` reaches stored bytes, so it folds like every other such
+    // declaration (RFC 0052): flipping it yields a **new type**, and the
+    // developer moves data across as application code. A synthetic entry, and
+    // only when opted out, exactly as `#[wavedb::key]` does it — so the
+    // default spelling keeps its identity.
+    if !args.compress {
+        hash_fields.push(("#compress".into(), "false".into()));
+    }
 
     let name = input.ident.clone();
     let hash = struct_hash::compute(

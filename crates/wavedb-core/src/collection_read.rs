@@ -116,7 +116,7 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// this with the field's exact encoding.
     ///
     /// This is the last B+tree read a collection makes, and it stays one: a
-    /// secondary index is *declared*, so RFC 0051's orderings are what will
+    /// secondary index is *declared*, so RFC 0051's lists are what will
     /// eventually replace it — not the built-in chain.
     pub fn search_by<'a, S: Store>(
         self,

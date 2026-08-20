@@ -24,7 +24,7 @@
 //!
 //! Every chain keys by [`SecKey`] — the modification-ordered chain puts the live
 //! version's authoring instant in `field` (byte-for-byte what the `recency` tree
-//! did), a declared ordering puts the encoded field value there. What varies is
+//! did), a declared list puts the encoded field value there. What varies is
 //! the payload: record bytes in a record lane, `()` in the removal log, where the
 //! anchor inside the key is the whole entry.
 //!

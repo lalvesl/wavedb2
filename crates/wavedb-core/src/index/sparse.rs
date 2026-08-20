@@ -57,7 +57,7 @@ const KIND_INTERNAL: u8 = 1;
 /// > pointer — and a segment id has no relationship to a record anchor, making the
 /// > descent land on the wrong side of the boundary about half the time. It breaks
 /// > wherever equal fields are reachable: an exact hit on a segment's own least
-/// > instant in the built-in chain, and *routinely* in a declared ordering over a
+/// > instant in the built-in chain, and *routinely* in a declared list over a
 /// > low-cardinality column, where a whole run of segments shares one value. The
 /// > separator must be the segment's least **record** key, verbatim, with the
 /// > segment id carried beside it.
