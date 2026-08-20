@@ -1,0 +1,249 @@
+//! Declared-list codegen for `#[wavedb::list]` ([RFC 0051]): taking the
+//! declarations off the struct, folding them into the identity, the
+//! `NonUniqueStruct` key hooks (`NUM_LISTS` + `list_key`), and the typed
+//! `listed_by_<fields>` enumeration surface.
+//!
+//! A list and a `#[wavedb::pivot(...)]` secondary impose the **same** order —
+//! `ResolvedPivot` is reused verbatim for that reason — and differ only in what
+//! they store under it: a secondary stores anchors and pays one random read per
+//! row, a list stores whole records inline and pays one read per segment. The
+//! two coexist on purpose; neither is sugar for the other.
+//!
+//! [RFC 0051]: https://github.com/wavedb/wavedb/blob/main/rfcs/0051-ordered-record-lists.md
+
+use proc_macro2::{Span, TokenStream};
+use quote::{format_ident, quote};
+use syn::{Attribute, Data, DeriveInput, Ident};
+
+use crate::args::{PivotSpec, Shape};
+use crate::secondaries::ResolvedPivot;
+
+/// Take every `#[wavedb::list]` declaration off `input` — the field-level
+/// spelling and the struct-level one — resolve them, and fold them into the
+/// STRUCT_HASH.
+///
+/// **Declaration order is field-level first**, in field order, then the
+/// struct-level attributes in the order written. The order is load-bearing: a
+/// list is addressed by its index in the `Pivot`'s root array, so reordering
+/// declarations reorders chains. That is exactly why the fold exists — the
+/// order is part of the identity, and changing it yields a new type rather than
+/// silently re-pointing live chains at each other's data.
+pub fn take_and_fold(
+    input: &mut DeriveInput,
+    named: &syn::FieldsNamed,
+    shape: Shape,
+    hash_fields: &mut Vec<(String, String)>,
+) -> syn::Result<Vec<ResolvedPivot>> {
+    let mut lists: Vec<ResolvedPivot> = take_field_lists(input)?
+        .into_iter()
+        .map(|(ident, ty)| ResolvedPivot {
+            fields: vec![(ident, ty)],
+        })
+        .collect();
+    for spec in take_list_specs(&mut input.attrs)? {
+        lists.push(ResolvedPivot {
+            fields: crate::declarations::resolve_fields(
+                &spec.fields,
+                named,
+                "#[wavedb::list(...)]",
+            )?,
+        });
+    }
+    if !lists.is_empty() && shape != Shape::NonUnique {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "#[wavedb::list] is only valid on a #[wavedb(NonUnique)] struct — \
+             a Unique type has one record per tenant and so nothing to order",
+        ));
+    }
+    for (i, list) in lists.iter().enumerate() {
+        let joined = list
+            .fields
+            .iter()
+            .map(|(f, _)| f.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        hash_fields.push((format!("#list{i}"), joined));
+    }
+    Ok(lists)
+}
+
+/// Strip `#[wavedb::list]` from the struct's fields, returning each marked
+/// field in declaration order.
+///
+/// The field spelling takes no arguments: the field it sits on *is* the
+/// ordering. A composite ordering has no single field to sit on, which is what
+/// the struct-level spelling is for.
+fn take_field_lists(
+    input: &mut DeriveInput,
+) -> syn::Result<Vec<(Ident, syn::Type)>> {
+    let Data::Struct(data) = &mut input.data else {
+        return Ok(Vec::new());
+    };
+    let mut marked = Vec::new();
+    for field in &mut data.fields {
+        let mut kept = Vec::with_capacity(field.attrs.len());
+        for attr in field.attrs.drain(..) {
+            if !is_list_attr(&attr) {
+                kept.push(attr);
+                continue;
+            }
+            if !matches!(attr.meta, syn::Meta::Path(_)) {
+                return Err(syn::Error::new_spanned(
+                    &attr,
+                    "a field's #[wavedb::list] takes no arguments — the field \
+                     it marks is the ordering; declare a composite ordering \
+                     as #[wavedb::list((f1, f2))] on the struct",
+                ));
+            }
+            let ident = field.ident.clone().ok_or_else(|| {
+                syn::Error::new_spanned(&attr, "unnamed field")
+            })?;
+            marked.push((ident, field.ty.clone()));
+        }
+        field.attrs = kept;
+    }
+    Ok(marked)
+}
+
+/// Remove every struct-level `#[wavedb::list(...)]`, parsing each into the
+/// fields it declares.
+fn take_list_specs(attrs: &mut Vec<Attribute>) -> syn::Result<Vec<PivotSpec>> {
+    let mut specs = Vec::new();
+    let mut kept = Vec::with_capacity(attrs.len());
+    for attr in attrs.drain(..) {
+        if is_list_attr(&attr) {
+            specs.push(attr.parse_args::<PivotSpec>()?);
+        } else {
+            kept.push(attr);
+        }
+    }
+    *attrs = kept;
+    Ok(specs)
+}
+
+/// `true` for a `#[wavedb::list]` helper attribute, either spelling.
+fn is_list_attr(attr: &Attribute) -> bool {
+    let segs = &attr.path().segments;
+    segs.len() == 2 && segs[0].ident == "wavedb" && segs[1].ident == "list"
+}
+
+/// The items injected into the `NonUniqueStruct` impl: the list count and the
+/// per-list sort-key encoder.
+pub fn trait_items(lists: &[ResolvedPivot]) -> TokenStream {
+    if lists.is_empty() {
+        return TokenStream::new();
+    }
+    let n = lists.len();
+    let arms = lists.iter().enumerate().map(|(i, list)| {
+        let expr = list.self_key_expr();
+        quote!(#i => #expr,)
+    });
+    quote! {
+        const NUM_LISTS: usize = #n;
+
+        fn list_key(&self, index: usize) -> ::std::vec::Vec<u8> {
+            match index {
+                #(#arms)*
+                _ => ::std::vec::Vec::new(),
+            }
+        }
+    }
+}
+
+/// The `{Name}Lists` trait + its `CollectionHandle<{Name}>` impl: per declared
+/// list, a whole-list enumeration and the paged entry point the sparse index's
+/// counts make one descent.
+pub fn listed_readers(name: &Ident, lists: &[ResolvedPivot]) -> TokenStream {
+    if lists.is_empty() {
+        return TokenStream::new();
+    }
+    let trait_ident = format_ident!("{}Lists", name);
+    let decls = lists.iter().map(|list| reader_decls(name, list, None));
+    let impls = lists
+        .iter()
+        .enumerate()
+        .map(|(i, list)| reader_decls(name, list, Some(i)));
+
+    quote! {
+        /// Typed list enumerations for this type's collection, one per
+        /// `#[wavedb::list]` (generated by `#[wavedb]`).
+        pub trait #trait_ident {
+            #(#decls)*
+        }
+
+        impl #trait_ident for ::wavedb_core::CollectionHandle<#name> {
+            #(#impls)*
+        }
+    }
+}
+
+/// One list's three readers, as declarations (`index = None`) or as the
+/// implementations calling into the collection at `index`.
+fn reader_decls(
+    name: &Ident,
+    list: &ResolvedPivot,
+    index: Option<usize>,
+) -> TokenStream {
+    let listed = list.listed_ident();
+    let at_page = format_ident!("{}_at_page", listed);
+    let len = format_ident!("{}_len", listed);
+    let stream = quote! {
+        impl ::wavedb_core::Stream<
+            Item = ::core::result::Result<#name, D::Error>,
+        >
+    };
+    let Some(i) = index else {
+        return quote! {
+            /// Stream every living record in this declared order — one read
+            /// per segment, records inline.
+            fn #listed<D: ::wavedb_core::DbHandle>(&self, db: &D) -> #stream;
+
+            /// The same list entered at page `page` of `page_size` rows: one
+            /// sparse-index descent instead of a walk. The stream runs on to
+            /// the end of the list; take `page_size` from it.
+            fn #at_page<D: ::wavedb_core::DbHandle>(
+                &self,
+                db: &D,
+                page: usize,
+                page_size: usize,
+            ) -> #stream;
+
+            /// How many living records this list holds — the pager's "of M".
+            ///
+            /// # Errors
+            /// The context's failure (backend/transport).
+            #[allow(clippy::future_not_send)]
+            fn #len<D: ::wavedb_core::DbHandle>(
+                &self,
+                db: &D,
+            ) -> impl ::core::future::Future<
+                Output = ::core::result::Result<u64, D::Error>,
+            >;
+        };
+    };
+    quote! {
+        fn #listed<D: ::wavedb_core::DbHandle>(&self, db: &D) -> #stream {
+            self.listed(db, #i)
+        }
+
+        fn #at_page<D: ::wavedb_core::DbHandle>(
+            &self,
+            db: &D,
+            page: usize,
+            page_size: usize,
+        ) -> #stream {
+            self.listed_at(db, #i, (page as u64).saturating_mul(page_size as u64))
+        }
+
+        #[allow(clippy::future_not_send)]
+        fn #len<D: ::wavedb_core::DbHandle>(
+            &self,
+            db: &D,
+        ) -> impl ::core::future::Future<
+            Output = ::core::result::Result<u64, D::Error>,
+        > {
+            self.list_len(db, #i)
+        }
+    }
+}
