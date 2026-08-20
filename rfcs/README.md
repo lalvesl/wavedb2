@@ -100,21 +100,25 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   lane of its own with **no index at all**, since nothing ever *searches* it, and a
   dense B+tree exists only where the developer declares one. The cost is storage,
   duplicated write bytes, and `all()` changing from insertion to modification order.
-  **Phases 1–6 are implemented, bar 5c.** The structure
+  **Phases 1–7a are implemented** — all but the declared lists (7b) and
+  compaction (8). The structure
   (`index/{segment,sparse,sparse_write,chain,chain_remove}.rs`): locate, insert
   with a 50/50 split at 2N, remove with a merge at N/2 or a redistribute when
   folding would breach the band, all as one batch. Liveness on the record
-  (`Metadata.removed`). The `Pivot` carrying the chain roots, and every write path
-  maintaining the chain **alongside** `current`/`recency` — a dual write, which is
-  what lets a test assert the two agree entry for entry and byte for byte. And both
-  reads off the chain: `all()` and the wire `All` walk it back from the tail,
-  records inline, no per-record fetch; and reconnect catch-up (`Changes`) scans the
-  chain's and the removal log's tails past the client's cursor, stopping at the
-  first segment that reaches it — so a caught-up client pays three reads for
+  (`Metadata.removed`). The `Pivot` carrying the chain roots, with the `current`,
+  `recency` and `dead` B+trees now **deleted** — they were written alongside the
+  chain for one phase so a test could assert the two agreed entry for entry and
+  byte for byte, then retired, taking `Collection::search` (the `CREATED_AT`
+  range) with them: zero callers, and a contract already false for
+  `#[wavedb::key]` types, whose anchor is a content hash rather than an instant.
+  Both reads come off the chain: `all()` and the wire `All` walk it back from the
+  tail, records inline, no per-record fetch; and reconnect catch-up (`Changes`)
+  scans the chain's and the removal log's tails past the client's cursor, stopping
+  at the first segment that reaches it — so a caught-up client pays three reads for
   "nothing new" whatever the collection's size, and a client behind pays segment
-  reads rather than one random read per change. What remains is retiring the old
-  trees (blocked on what a `CREATED_AT` range should mean), the macros and
-  compaction;
+  reads rather than one random read per change. Plus `page = N`, the
+  developer-declared segment capacity, folded into the identity so a chain is only
+  ever laid out one way. What remains is `#[wavedb::list]` and compaction;
   [0051](0051-ordered-record-lists-PLANNED.md) — built on it, and the repair for
   the one thing it gives up: a declared property materialises a *second* chain of
   the same records, kept sorted at write time (affordable because K extra segment

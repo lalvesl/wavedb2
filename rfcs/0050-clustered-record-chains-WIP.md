@@ -73,7 +73,8 @@ which is the one that changes the on-disk layout.
 | 5b | **Catch-up rewritten against the chain** — `expose_changes.rs` read the `recency` tree, which phase 5c deletes | **landed 2026-07-30** |
 | 5c | Retire `current`, `recency` and the `dead` tree: delete them, their roots, the dual write, and `Collection::search` | **landed 2026-07-31** |
 | 6 | Collection read paths: `all` (and the wire `All`) walk the chain | **landed 2026-07-30** — `search`/`search_by` still read trees, see below |
-| 7 | Macros: `#[wavedb::list]`, `page = N`, generated roots | |
+| 7a | Macros: `page = N` — parsed, folded into the identity, threaded to the chain | **landed 2026-07-31** |
+| 7b | Macros: `#[wavedb::list]` — declared lists ([RFC 0051](0051-ordered-record-lists-PLANNED.md) in full) | |
 | 8 | Compaction pass for sparse chains (RFC 0042's shape) | |
 
 Phase 3 was one row until the design was worked through: the index's write half is
@@ -351,6 +352,32 @@ rewritten rather than deleted: `the_record_chain_agrees_with_the_anchors_it_
 derives_from` keeps the same mixed workload and asserts what still stands —
 every inline copy byte-identical to its anchor, and chain membership agreeing
 with `Metadata.removed` in both directions.
+
+**Phase 7a** landed `page = N` — the small, independent half of the macro work.
+It parses as another `#[wavedb(...)]` argument, folds into the identity as a
+synthetic `#page` entry, and reaches the chain through a new
+`NonUniqueStruct::PAGE` const that `records_chain` feeds to `Chain::with_min`.
+
+Two things it forced, both worth keeping:
+
+**Zero is refused, not clamped.** The split trigger is `len >= 2N`, so `N = 0`
+splits every segment on every insert, including an empty one. Clamping would also
+be a lie now that the value folds — the type would not be the one the declaration
+names — so the macro errors at the declaration site instead.
+
+**The capacity is not applied at creation.** A mutation deleting the `with_min`
+from `create_rooted` left the suite green, and the reason is that the line was
+dead: creation only seeds the one empty segment that is both endpoints, and the
+handle it builds is read solely for `roots()`. The right response to a surviving
+mutation is sometimes to delete the code rather than to test it, and this was one
+— `records_chain` applies the capacity on every subsequent open, which is where
+splits and merges are actually decided.
+
+Proven by mutation in both directions: dropping the `#page` hash entry makes a
+`page = 4` type identical to the default one (which would let one chain hold
+segments laid out two ways); dropping `with_min` from `records_chain` puts 20
+records into a single default-sized segment instead of the 3+ that `page = 4`
+demands.
 
 The dense `BpTree` is **not** being retired — it is the right structure for cold or
 small collections, and [RFC 0054](0054-anchored-layout-PLANNED.md)
