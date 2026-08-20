@@ -135,6 +135,25 @@ pub trait NonUniqueStruct: WaveDbStruct {
     /// Must equal the generated pivot's `lists()` length.
     const NUM_LISTS: usize = 0;
 
+    /// Declared list `index`'s segment capacity — its own `page = N`, or the
+    /// struct's [`PAGE`](Self::PAGE) when it declared none.
+    ///
+    /// A per-list capacity exists because the two chain kinds have opposite
+    /// write profiles. The built-in chain is modification-ordered, so **every**
+    /// save rewrites its growth-end segment whole — which is why its default is
+    /// deliberately small (16). A declared list is keyed by a domain value, so
+    /// an ordinary save rewrites its entry *in place* in one segment; it can
+    /// afford the N a rendered page actually wants without taxing every write.
+    ///
+    /// It folds into the [`STRUCT_HASH`](crate::WaveDbStruct::STRUCT_HASH) with
+    /// the declaration it belongs to, so a list chain is only ever laid out at
+    /// one capacity (RFC 0052).
+    #[must_use]
+    fn list_page(index: usize) -> usize {
+        let _ = index;
+        Self::PAGE
+    }
+
     /// The order-preserving ([`IndexKey`](crate::index::IndexKey)-encoded) key
     /// of declared list `index` for this record's current values — the property
     /// that list is sorted by ([RFC 0051]).

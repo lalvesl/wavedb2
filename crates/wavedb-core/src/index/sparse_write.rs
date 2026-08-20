@@ -22,13 +22,18 @@
 //! ## What is deferred
 //!
 //! An emptied node is dropped from its parent and removed from the store, so
-//! removals leak nothing. A root left with a **single child** is *not* collapsed —
-//! the tree keeps a level it no longer needs until compaction re-levels it (RFC
-//! 0050 phase 8). Collapsing correctly would mean reading a child that may already
-//! have a pending write in the batch being planned, and the honest cost of not
-//! doing it is one extra node on the descent of a collection that shrank sharply.
+//! removals leak nothing. But this tree **never merges underfull nodes**, and a
+//! root left with a single child is not collapsed: nodes drain and stay drained,
+//! and a tree that grew a level never gives it back. The dense `BpTree` has the
+//! full cycle (`tree_delete`); this half of RFC 0050 phase 3a was not written.
 //!
-//! [RFC 0052]: https://github.com/wavedb/wavedb/blob/main/rfcs/0052-segment-size-as-the-pagination-unit-PLANNED.md
+//! It is **accepted debt**, not a design position (RFC 0050, phase 8a): this index
+//! holds one entry per *segment*, so a million records at N=16 is ~62 500 entries
+//! and two or three levels even drained. Collapsing also has a real cost — it means
+//! reading a child that may already have a pending write in the batch being
+//! planned. When it is paid, it mirrors `chain_remove`: synchronous, same batch.
+//!
+//! [RFC 0052]: https://github.com/wavedb/wavedb/blob/main/rfcs/0052-segment-size-as-the-pagination-unit.md
 //! [`plan_upsert`]: SparseTree::plan_upsert
 //! [`plan_remove`]: SparseTree::plan_remove
 

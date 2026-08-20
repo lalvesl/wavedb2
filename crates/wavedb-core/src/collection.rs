@@ -139,7 +139,7 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// copy is byte-comparable with the anchor it derives from — which is what
     /// makes the consistency invariant testable rather than arguable.
     pub(crate) fn records_chain(&self, pivot: &T::Pivot) -> Chain<Vec<u8>> {
-        self.record_chain(pivot.records())
+        self.record_chain(pivot.records(), T::PAGE)
     }
 
     /// The **removal log** this pivot names — the same chain shape with no
@@ -166,7 +166,8 @@ impl<T: NonUniqueStruct> Collection<T> {
         pivot
             .lists()
             .iter()
-            .map(|r| self.record_chain(*r))
+            .enumerate()
+            .map(|(i, r)| self.record_chain(*r, T::list_page(i)))
             .collect()
     }
 
@@ -182,14 +183,15 @@ impl<T: NonUniqueStruct> Collection<T> {
         pivot
             .lists()
             .get(index)
-            .map(|r| self.record_chain(*r))
+            .map(|r| self.record_chain(*r, T::list_page(index)))
             .ok_or(Error::ListOutOfRange(index))
     }
 
-    /// A record-lane chain handle at `roots` — the built-in chain and every
-    /// declared list are the same structure at the same capacity, differing
-    /// only in the key they are laid out by.
-    fn record_chain(&self, roots: ChainRoots) -> Chain<Vec<u8>> {
+    /// A record-lane chain handle at `roots` holding `min`…`2*min` records —
+    /// the built-in chain and every declared list are the same structure,
+    /// differing only in the key they are laid out by and the capacity they
+    /// were declared at.
+    fn record_chain(&self, roots: ChainRoots, min: usize) -> Chain<Vec<u8>> {
         Chain::at(
             roots.head,
             roots.tail,
@@ -201,7 +203,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         // The declared `page = N` (RFC 0052), or the engine default. It folds
         // into the `STRUCT_HASH`, so every segment this chain ever held was
         // laid out at this same capacity.
-        .with_min(T::PAGE)
+        .with_min(min)
     }
 
     /// Declared list `i`'s sort key for `value` stored at `id`.

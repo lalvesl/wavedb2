@@ -28,7 +28,7 @@
 //! keep their ids. The single exception is a chain collapsing to one segment,
 //! where head and tail necessarily become the same id again.
 //!
-//! [RFC 0052]: https://github.com/wavedb/wavedb/blob/main/rfcs/0052-segment-size-as-the-pagination-unit-PLANNED.md
+//! [RFC 0052]: https://github.com/wavedb/wavedb/blob/main/rfcs/0052-segment-size-as-the-pagination-unit.md
 
 use crate::error::Result;
 use crate::local_id::LocalId;
