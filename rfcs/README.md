@@ -124,7 +124,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   guarantee is bounded size, never residency). Ordered and range reads cost one
   dense read per segment of hits instead of one random read per hit; the price is
   `(K+2)` copies of every record on disk — anchor, built-in chain, K declared
-  orderings — accepted deliberately;
+  declared lists — accepted deliberately;
   [0052](0052-segment-size-as-the-pagination-unit-PLANNED.md) — the developer
   declares a chain's capacity as a **minimum** N, normally the page size the UI
   renders (undeclared: **16** for record chains, **256** for the removal log); a
@@ -246,7 +246,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0048](0048-chained-addressing-log.md) | The addressing log as a chain | Implemented |
 | [0049](0049-elastic-pages-and-load-driven-splits.md) | Elastic pages and load-driven splits | Implemented |
 | [0050](0050-clustered-record-chains-WIP.md) | Clustered record chains (B+trees become opt-in) | WIP |
-| [0051](0051-ordered-record-lists-PLANNED.md) | Declared orderings: sorted chains + sparse index | Planned |
+| [0051](0051-ordered-record-lists-PLANNED.md) | Declared lists: sorted chains + sparse index | Planned |
 | [0052](0052-segment-size-as-the-pagination-unit-PLANNED.md) | Segment size as the pagination unit | Planned |
 | [0053](0053-tenant-fair-cache-retention-PLANNED.md) | Tenant-fair cache retention | Planned |
 | [0054](0054-anchored-layout-PLANNED.md) | The anchored layout (no clustering) | Planned |

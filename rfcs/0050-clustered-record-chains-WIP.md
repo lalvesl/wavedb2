@@ -7,7 +7,7 @@
 - **Builds on:** [RFC 0049](0049-elastic-pages-and-load-driven-splits.md) (a page is
   however many blocks its content needs, with no ceiling)
 - **Completed by:** [RFC 0051](0051-ordered-record-lists-PLANNED.md) (the sparse
-  index and further orderings), [RFC 0052](0052-segment-size-as-the-pagination-unit-PLANNED.md)
+  index and further lists), [RFC 0052](0052-segment-size-as-the-pagination-unit-PLANNED.md)
   (segment sizing), [RFC 0053](0053-tenant-fair-cache-retention-PLANNED.md) (why
   every cost here is quoted cold)
 
@@ -73,7 +73,7 @@ which is the one that changes the on-disk layout.
 | 5b | **Catch-up rewritten against the chain** — `expose_changes.rs` read the `recency` tree, which phase 5c deletes | **landed 2026-07-30** |
 | 5c | Retire `current`, `recency` and the `dead` tree: delete them, their roots, the dual write, and `Collection::search` | **landed 2026-07-31** |
 | 6 | Collection read paths: `all` (and the wire `All`) walk the chain | **landed 2026-07-30** — `search`/`search_by` still read trees, see below |
-| 7 | Macros: `#[wavedb::order]`, `page = N`, generated roots | |
+| 7 | Macros: `#[wavedb::list]`, `page = N`, generated roots | |
 | 8 | Compaction pass for sparse chains (RFC 0042's shape) | |
 
 Phase 3 was one row until the design was worked through: the index's write half is
@@ -152,7 +152,7 @@ id. `SecKey` orders by `field` then `rec`, so whenever a search key and a separa
 share a `field` the comparison falls through to that trailing pointer — and a minted
 segment id bears no relation to a record anchor, so the descent lands on the wrong
 side of the boundary about half the time. It is reachable on an exact hit in the
-built-in chain and **routine** in a declared ordering over a low-cardinality column,
+built-in chain and **routine** in a declared list over a low-cardinality column,
 where a whole run of segments shares one value. `Slot` now mirrors `Branch` exactly
 — least key, pointer, count. None of phase 2's tests could see it; the regression
 that guards it is `a_run_of_segments_sharing_one_value_still_descends_exactly`.
@@ -344,7 +344,7 @@ never move, so a collection with no declared secondary index stops rewriting
 its `Pivot` entirely after the first split — where `current`/`recency` moved
 their roots constantly. And **`search_by` is the only B+tree read left** in a
 collection; it stays one deliberately, because a secondary index is *declared*,
-so RFC 0051's orderings are what replace it, not the built-in chain.
+so RFC 0051's lists are what replace it, not the built-in chain.
 
 The agreement test that justified the dual write lost its comparand, so it was
 rewritten rather than deleted: `the_record_chain_agrees_with_the_anchors_it_
@@ -419,7 +419,7 @@ Segment<P> {
 (`index/node_key.rs:73`), whose trailing anchor already "makes entries unique when
 many records share one field value". The modification-ordered chain puts the instant
 in `field`, which is byte-for-byte what `recency` does today
-(`collection_recency.rs:31`); a declared ordering puts the encoded field value there.
+(`collection_recency.rs:31`); a declared list puts the encoded field value there.
 So there is one key type across every chain and every sparse index, and no new key
 machinery at all.
 
@@ -482,7 +482,7 @@ placement means co-location cannot be arranged anyway.
 
 | lane | holds | entry payload | index | growth |
 | --- | --- | --- | --- | --- |
-| `SEG(T)` | the modification-ordered chain + every declared ordering | records, verbatim envelopes | sparse, one per chain | with the live set |
+| `SEG(T)` | the modification-ordered chain + every declared list | records, verbatim envelopes | sparse, one per chain | with the live set |
 | `DEAD(T)` | the `dead` chain | `[instant][anchor]` | **none** | forever |
 
 They separate on three counts. **Content:** a dictionary is per directory, and fat
@@ -782,7 +782,7 @@ draft's main regression is gone.
   order; and the pre-release policy lets the API break without ceremony.
   Building the ordering now would have been building for a hypothetical user.
   When a real one appears, RFC 0051 is the mechanism —
-  `#[wavedb::order(created_at)]` materialises the insertion-ordered chain with a
+  `#[wavedb::list(created_at)]` materialises the insertion-ordered chain with a
   sparse index, and `search` returns as a read of *that*, with declared
   semantics instead of implicit ones.
 - **Compaction trigger.** By occupancy ratio, by absolute hole count, or on the same

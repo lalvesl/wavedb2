@@ -1,10 +1,10 @@
-# RFC 0051 — Declared orderings: sorted record chains with a sparse index
+# RFC 0051 — Declared lists: sorted record chains with a sparse index
 
 - **Status:** Planned — opened 2026-07-29, revised 2026-07-30
 - **Crates:** `wavedb-core`, `wavedb-macros`
 - **Builds on:** [RFC 0050](0050-clustered-record-chains-WIP.md) — whose built-in
   modification-ordered chain **is** the first instance of this RFC's mechanism; here
-  it becomes general, one chain per declared ordering
+  it becomes general, one chain per declared list
 
 ## Summary
 
@@ -56,20 +56,54 @@ A new field attribute beside `#[wavedb::pivot(field)]`:
 ```rust
 #[wavedb(NonUnique)]
 struct Contact {
-    #[wavedb::order]           // one sorted chain, by this field
+    #[wavedb::list]           // one sorted chain, by this field
     name: String,
     city: String,
     created: u64,
 }
 ```
 
-Multi-field orderings spell out the tuple — `#[wavedb::order(city, name)]` at
+Multi-field lists spell out the tuple — `#[wavedb::list(city, name)]` at
 the struct level — because `IndexKey` already encodes several fields into one
 order-preserving byte string (`index/node_key.rs:74` calls the encoded bytes
 "field value(s)").
 
 Each declaration folds into `STRUCT_HASH` like every other schema fact, so
-adding or removing an ordering is a new type, not a migration.
+adding or removing a list is a new type, not a migration.
+
+#### Why `list` and not `order`
+
+The attribute names the **artifact**, not the sort. What a declaration buys is a
+materialised second copy of every record, kept sorted at write time and readable
+at roughly one IOp per page of results — that duplication *is* the design, and
+`order` describes only the arrangement while hiding the cost. It also lines the
+vocabulary up with what already exists: RFC 0050's built-in chain **is** a list,
+the one every collection gets, ordered by modification instant; this RFC makes
+lists declarable. One is the list you are given, the others are the lists you
+ask for.
+
+### The generated surface
+
+```rust
+impl Contact {
+    // #[wavedb::pivot(city)] — a B+tree lookup, unchanged, takes a value
+    pub fn by_city(db: &D, city: String) -> impl Stream<Item = Result<Contact>>;
+
+    // #[wavedb::list] — an enumeration; takes nothing, yields the whole list
+    pub fn listed_by_name(db: &D) -> impl Stream<Item = Result<(Id, Contact)>>;
+    pub fn listed_by_city_name(db: &D) -> impl Stream<Item = Result<(Id, Contact)>>;
+
+    // …and the order-statistic jump the sparse index's counts make O(descent)
+    pub fn listed_by_name_at_page(db: &D, page: usize)
+        -> impl Stream<Item = Result<(Id, Contact)>>;
+}
+```
+
+The two shapes differ deliberately: a lookup takes the value it is looking for, a
+list takes nothing because it *is* the whole ordering. `_at_page` reads as what it
+is — the same list, entered at a page boundary — and pairs with the `page = N`
+declaration of [RFC 0052](0052-segment-size-as-the-pagination-unit-PLANNED.md),
+which is what makes a page one segment read.
 
 ### The sort key is (value, anchor), and the anchor is why it's stable
 
@@ -153,7 +187,7 @@ live bytes ≈ (K + 2) × collection size        # anchor + the built-in chain +
            + the dead chain                   # key-sized entries, not records
 ```
 
-So four declared orderings mean roughly six copies of every record on disk.
+So four declared lists mean roughly six copies of every record on disk.
 Copy-on-write and un-compacted holes sit on top of that. This is the accepted
 price of the design, stated here so no later reader mistakes it for an oversight.
 
@@ -166,7 +200,7 @@ but the anchors.
 
 ### What a mutation costs
 
-For a type with K declared orderings, one insert is:
+For a type with K declared lists, one insert is:
 
 - 1 write of the authoritative record at its anchor (RFC 0050);
 - 1 insert into RFC 0050's built-in modification-ordered chain (one segment write);
@@ -185,7 +219,7 @@ chain instead of one. If it did not change, the record is rewritten in place in
 every sorted chain regardless, because its bytes are duplicated there. So **a
 save carries K× the record's bytes**. For the read-heavy, write-light shape
 WaveDB targets that is the intended bargain; a write-heavy collection should
-declare few orderings, and that is a documentation matter, not a mechanism.
+declare few lists, and that is a documentation matter, not a mechanism.
 
 ### What reads become
 
@@ -203,7 +237,7 @@ declare few orderings, and that is a documentation matter, not a mechanism.
 - **Dense secondary index only** (RFC 0050's declared `BpTree`). Smaller — no
   duplicated bytes — and the right choice when a property is used to *find* a
   record rather than to *list* records. The two should coexist: `#[wavedb::pivot]`
-  for lookup, `#[wavedb::order]` for enumeration. Making one sugar for the other
+  for lookup, `#[wavedb::list]` for enumeration. Making one sugar for the other
   is tempting and wrong; they optimise opposite operations.
 - **Covering projection instead of whole records.** Store the sort key, the
   anchor, and only the fields a listing renders. Bounds the duplication to what
@@ -225,7 +259,7 @@ declare few orderings, and that is a documentation matter, not a mechanism.
   would let a lookup detect an empty range without reading a segment. Probably
   not worth the doubled entry.
 - **A ceiling on K.** Should the macro refuse (or warn on) more than a handful of
-  orderings, given each one multiplies save bytes?
+  lists, given each one multiplies save bytes?
 - **Interaction with `#[wavedb::key]`.** A keyed type's anchor is a content hash,
   so `all()` over it comes out in hash order and its sorted chains are the only
   structure with meaningful order. Should declaring a key *imply* an ordering over
@@ -233,5 +267,5 @@ declare few orderings, and that is a documentation matter, not a mechanism.
   that the developer's call to make explicitly?
 - **Rebuild.** Derived chains can in principle be reconstructed from the
   anchors. Pre-release policy says an inconsistent `data.bin` is simply
-  unsupported — but a `rebuild_orderings` maintenance op is cheap to write and
+  unsupported — but a `rebuild_lists` maintenance op is cheap to write and
   makes the "derived" claim testable.

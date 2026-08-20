@@ -35,7 +35,7 @@ carry a dense index; a clustered chain is what makes a sparse one possible. Choo
 layout chooses both.
 
 Where cardinality *does* matter is a different question, and it favours clustering: a
-low-cardinality field under a declared ordering (RFC 0051) puts every record sharing a
+low-cardinality field under a declared list (RFC 0051) puts every record sharing a
 value in one contiguous run, so filtering on it becomes a dense sequential read.
 
 ## Motivation

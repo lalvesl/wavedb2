@@ -55,7 +55,7 @@ which is what a paginated view cannot use.
 ```rust
 #[wavedb(NonUnique, page = 50)]              // the built-in chain
 struct Contact {
-    #[wavedb::order(page = 25)]              // this ordering's own chain
+    #[wavedb::list(page = 25)]              // this ordering's own chain
     name: String,
     city: String,
 }
@@ -86,13 +86,49 @@ million records are ~62 500 segments rather than ~5 000, so the descent is 2–3
 nodes rather than 2. Still bounded, still cold, still logarithmic — the property
 that matters is unchanged.
 
-**Capacity does not fold into `STRUCT_HASH`.** It is a physical layout parameter,
-not part of the type's meaning: it changes neither the wire shape nor any address
-derivation (segment ids are minted, never computed from content). So it may be
-changed without minting a new type, and the consequence is only that existing
-segments keep their old fill until compaction re-levels them. Same stance RFC 0049
-takes on page sizing, and the deliberate opposite of `#[wavedb::key]`, which *does*
-fold in because it changes addressing.
+**Capacity folds into `STRUCT_HASH`** — like every other declaration that reaches
+stored bytes (see [the rule](#everything-that-reaches-stored-bytes-folds) below).
+
+An earlier draft said it does not, on the grounds that it "changes neither the
+wire shape nor any address derivation". Both halves are true and neither is the
+point. What changing `page` on a live collection actually does is **silently
+falsify the guarantee the knob exists to provide**:
+
+Take `page = 16` → `page = 50` with the identity unchanged. Existing segments hold
+16…32 entries. The new N puts the merge trigger at 25 and the split at 100, so
+every existing segment below 25 is now underfull and gets folded into a neighbour
+on the next removal that touches it, while those at 25…32 sit in limbo — above the
+merge, nowhere near the split. Nothing corrupts. But throughout that period the
+chain's segments hold 16…32 records, not 50…100, so "a rendered page is one
+segment read" is **false** — and it stays false until enough writes churn through
+to re-level the chain. A guarantee that is temporarily and invisibly wrong is
+worse than one that is absent.
+
+With the fold, `page = 50` is a different type: different lane hashes (they derive
+from `STRUCT_HASH`), a fresh empty chain, and the guarantee holding from the first
+record. A mixed-capacity chain stops being a state to manage and becomes
+unreachable by construction.
+
+### Everything that reaches stored bytes folds
+
+The general rule, and it is a project invariant rather than this RFC's local
+decision: **a declaration that reaches stored bytes or their layout folds into
+`STRUCT_HASH`.** `page = N`, `compress`, `#[wavedb::key]`, `#[wavedb::list]`, and
+whatever knob comes next.
+
+The reasoning is the migration stance ([RFC 0040](0040-schema-migration-and-version-skew-DEPRECATED.md)):
+WaveDB does no engine-side migration at all. Given that, the only coherent
+position is that changing anything about how bytes are laid out yields a **new
+type** — the developer declares a second struct and moves the data across as
+application code, exactly as for a changed field. The alternative is an engine
+that must reason, per knob, about whether existing data survives the change, and
+that reasoning is where the silent-falsehood class of bug lives (the `page`
+example above is one instance of it, not the only possible one).
+
+`compress` is the mildest case — zstd framing is per-page and self-describing, so
+mixing compressed and uncompressed pages genuinely works — and it folds anyway.
+Uniformity is the feature: there is no per-knob judgment call to get wrong, and no
+doc that can drift from the code about which knobs are "safe".
 
 ### Why N…2N and not exactly N
 
@@ -100,7 +136,7 @@ A fixed exact size is the expensive choice, not the precise one. Holding a segme
 exactly N means an insertion into a full one must displace an element into its
 neighbour — which may itself be full, so a single insert writes two segments in the
 lucky case and cascades in the unlucky one. And middle insertions are not an edge
-case: every declared ordering (RFC 0051) is keyed by a domain value, so arrivals land
+case: every declared list (RFC 0051) is keyed by a domain value, so arrivals land
 wherever the value falls.
 
 With a band, an insert is **one segment write** anywhere in N…2N, and only the 2N-th
