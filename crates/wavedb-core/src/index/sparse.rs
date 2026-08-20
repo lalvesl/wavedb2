@@ -29,7 +29,7 @@
 //! `WaveWire`. Index nodes take their own lane because they are *navigational*
 //! while segments are *streaming* ([RFC 0053]).
 //!
-//! [RFC 0052]: https://github.com/wavedb/wavedb/blob/main/rfcs/0052-segment-size-as-the-pagination-unit-PLANNED.md
+//! [RFC 0052]: https://github.com/wavedb/wavedb/blob/main/rfcs/0052-segment-size-as-the-pagination-unit.md
 //! [RFC 0053]: https://github.com/wavedb/wavedb/blob/main/rfcs/0053-tenant-fair-cache-retention-PLANNED.md
 
 use crate::error::{Error, Result};
