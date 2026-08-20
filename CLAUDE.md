@@ -64,9 +64,9 @@ Full rationale in `docs/development_standards.md`. The load-bearing ones:
   `[STACK fixed-size][HEAP variable]`, little-endian, `usize`/`isize` never encodable.
 - **`seahash` is pinned `=4.1.0`** — STRUCT_HASH identity is load-bearing; never loosen.
 - **Everything that reaches stored bytes folds into `STRUCT_HASH`.** Fields, shape,
-  `#[wavedb::key]`, `compress`, and every future layout knob (`page = N`,
-  `#[wavedb::list]` — RFCs 0051/0052) — as a synthetic `#name` hash entry when it
-  isn't a real field. The engine does **no** migration (RFC 0040), so the only
+  `#[wavedb::key]`, `compress`, `page = N`, and every `#[wavedb::list]`
+  declaration **including their order** (RFCs 0051/0052) — as a synthetic `#name`
+  hash entry when it isn't a real field. The engine does **no** migration (RFC 0040), so the only
   coherent answer to "can I change this on live data?" is that changing it yields a
   **new type** and moving the data across is application code. Never add a knob that
   touches stored bytes without folding it: a knob that can be flipped in place is a
@@ -121,7 +121,11 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
   secondary-index hooks from `#[wavedb::pivot(field)]`, and natural-key anchors
   from `#[wavedb::key(f1, …)]` (NonUnique only; emits `natural_key()` — seahash
   of the fields' wire bytes — and folds the declaration into the STRUCT_HASH,
-  so changing the key is a schema change). `#[server]` emits a fn-type
+  so changing the key is a schema change), and **declared lists** from
+  `#[wavedb::list]` (field-level) / `#[wavedb::list((f1, f2))]` (struct-level,
+  composite) — one more record chain per declaration, sorted by that property,
+  with `listed_by_*` / `_at_page` / `_len` readers; declarations *and their
+  order* fold into the STRUCT_HASH (RFC 0051). `#[server]` emits a fn-type
   (own STRUCT_HASH + dispatch), the body retyped onto `ServerDb`, and a client stub.
   `expose_server!`/`expose_client!` are the **declared allowlist registry**: one match
   per operation over exactly the listed items; unlisted/excluded/wrong-shape all refuse
@@ -211,17 +215,28 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
   order). A save addressing a foreign anchor refuses typed (`Error::KeyMismatch`)
   — renaming = explicit `remove` + `insert`. The key declaration folds into
   STRUCT_HASH (synthetic `#key` entry); keyed walks come out in hash order, not
-  insertion order (modification order lives in the recency log).
-- Every collection carries two instant-keyed system logs in its Pivot
-  (`[instant BE][anchor]` SecKey trees): **recency** — exactly one entry per
-  living record at its live version's instant (insert adds, save re-keys,
-  remove deletes) — and **dead**, keyed by removal instant. A tail scan from a
-  cursor over both is exactly "changed since" (the W6 catch-up structure).
+  insertion order (modification order lives in the record chain, and any other
+  order is a declared `#[wavedb::list]`).
+- Every collection carries two instant-keyed structures in its Pivot, both
+  `Chain`s of segments keyed `[instant BE][anchor]` (RFC 0050 phase 5c retired
+  the B+trees that used to be here): the **record chain** — records stored
+  **inline**, exactly one entry per living record at its live version's instant
+  (insert adds, save relocates, remove deletes) — and the **dead** log, keyed by
+  removal instant, holding references only. A tail scan from a cursor over both
+  is exactly "changed since" (the W6 catch-up structure).
   Every collection-minted instant goes through `core::mint::mint_instant(floor)`
-  where `floor` = both logs' maxima — strictly monotone per collection even
+  where `floor` = both chains' maxima — strictly monotone per collection even
   against a rewound clock (Unique needs no floor: catch-up is chain-forward).
+- `#[wavedb::list]` (RFC 0051) adds **one more record chain per declaration**,
+  same lane and same `page = N`, sorted by the declared property instead of by
+  modification instant and tie-broken by the **anchor** (immutable ⇒ a save
+  relocates only when that property changed). Every list is maintained in the
+  same atomic batch, gated on the built-in chain's liveness verdict, and read by
+  the generated `listed_by_*` / `_at_page` / `_len`. It costs a full copy of
+  every record per declaration — that duplication *is* the design.
 - Every mutating collection op is exactly **one atomic `Store::apply` batch**
-  (record + touched B+tree nodes + Pivot rewrite when a root moves).
+  (record + touched chain segments and sparse-index nodes + touched B+tree nodes
+  + Pivot rewrite when a root moves).
 - Stored values are STRUCT_HASH-headed: user records
   `[STRUCT_HASH][meta_len][Metadata][body]`; Pivots `[STRUCT_HASH][wire]`; BpTree
   nodes `[BPTREE_NODE_HASH][kind u8][wire]`. Decode verifies the head.
