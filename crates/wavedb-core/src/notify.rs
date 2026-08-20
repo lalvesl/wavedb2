@@ -72,7 +72,7 @@ mod tests {
     use crate::error::Result;
     use crate::id::Id;
     use crate::index::mem_store::MemStore;
-    use crate::index::{ChainRoots, LogRoots, Pivot};
+    use crate::index::{ChainRoots, LogRoots, Pivot, Roots};
     use crate::local_id::LocalId;
     use crate::permission::PermissionRef;
     use crate::record::save_unique;
@@ -139,15 +139,10 @@ mod tests {
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
-        fn replace_roots(
-            &self,
-            _: &[LocalId],
-            records: ChainRoots,
-            removals: LogRoots,
-        ) -> Self {
+        fn replace_roots(&self, roots: Roots<'_>) -> Self {
             Self {
-                records,
-                removals,
+                records: roots.records,
+                removals: roots.removals,
                 permission: self.permission.clone(),
             }
         }

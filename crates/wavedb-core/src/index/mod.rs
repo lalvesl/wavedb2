@@ -138,6 +138,28 @@ pub struct LogRoots {
     pub tail: LocalId,
 }
 
+/// Every root a collection holds, gathered so [`Pivot::replace_roots`] takes
+/// one argument instead of a growing positional list.
+///
+/// A struct rather than parameters because the members are three slices and two
+/// `LocalId`-shaped records: positionally, `secondaries` and `lists` are one
+/// transposition away from silently swapping. Every `Pivot` implementation is
+/// generated or hand-written to mirror the macro, so a field added here is a
+/// compile error everywhere it matters and nowhere it doesn't.
+pub struct Roots<'a> {
+    /// One root per `#[wavedb::pivot(...)]` secondary index.
+    pub secondaries: &'a [LocalId],
+    /// The built-in modification-ordered record chain.
+    pub records: ChainRoots,
+    /// The removal log.
+    pub removals: LogRoots,
+    /// One per `#[wavedb::list(...)]` declaration, declaration order
+    /// ([RFC 0051]).
+    ///
+    /// [RFC 0051]: https://github.com/wavedb/wavedb/blob/main/rfcs/0051-ordered-record-lists.md
+    pub lists: &'a [ChainRoots],
+}
+
 // ---- Pivot: the collection's roots holder -----------------------------------
 
 /// The collection's roots holder.
@@ -165,6 +187,17 @@ pub trait Pivot: WaveWire + Sized {
     /// The **removal log**'s endpoints — the same segment chain shape with no
     /// index, since nothing ever searches it. It replaced the `dead` B+tree.
     fn removals(&self) -> LogRoots;
+    /// One **declared list**'s roots per `#[wavedb::list(...)]`, in declaration
+    /// order ([RFC 0051]) — a second chain of the same records, kept sorted by
+    /// the declared property instead of by modification instant.
+    ///
+    /// Empty for a collection that declares none, which is the default: the
+    /// built-in chain is the list every collection gets.
+    ///
+    /// [RFC 0051]: https://github.com/wavedb/wavedb/blob/main/rfcs/0051-ordered-record-lists.md
+    fn lists(&self) -> &[ChainRoots] {
+        &[]
+    }
     /// Collection-default access rule: seeds new inserts and gates
     /// collection-scope ops (`Insert`, `All`). Each record's
     /// `Metadata.permission` overrides it (authoritative per record).
@@ -176,15 +209,10 @@ pub trait Pivot: WaveWire + Sized {
     /// In practice that is now rare: a chain's endpoints move at most once in
     /// its life (its first split) and its index root never moves, so only a
     /// secondary tree's root split still triggers a `Pivot` rewrite.
-    /// `secondaries` must hold exactly as many roots as
-    /// [`secondaries`](Self::secondaries) returns.
+    /// `roots.secondaries` and `roots.lists` must hold exactly as many entries
+    /// as [`secondaries`](Self::secondaries) and [`lists`](Self::lists) return.
     #[must_use]
-    fn replace_roots(
-        &self,
-        secondaries: &[LocalId],
-        records: ChainRoots,
-        removals: LogRoots,
-    ) -> Self;
+    fn replace_roots(&self, roots: Roots<'_>) -> Self;
 }
 
 #[cfg(test)]

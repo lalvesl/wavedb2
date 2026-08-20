@@ -31,7 +31,7 @@
 //! stops a chain thrashing at a boundary. RFC 0052 has the reasoning, and why the
 //! declared `page = N` is a minimum rather than an exact count.
 //!
-//! [RFC 0050]: https://github.com/wavedb/wavedb/blob/main/rfcs/0050-clustered-record-chains-WIP.md
+//! [RFC 0050]: https://github.com/wavedb/wavedb/blob/main/rfcs/0050-clustered-record-chains.md
 
 use core::marker::PhantomData;
 

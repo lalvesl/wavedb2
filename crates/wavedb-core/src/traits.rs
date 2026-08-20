@@ -131,6 +131,29 @@ pub trait NonUniqueStruct: WaveDbStruct {
     /// so a chain is only ever laid out at one capacity.
     const PAGE: usize = crate::index::DEFAULT_SEGMENT_MIN;
 
+    /// Number of `#[wavedb::list(...)]` declared lists, declaration order.
+    /// Must equal the generated pivot's `lists()` length.
+    const NUM_LISTS: usize = 0;
+
+    /// The order-preserving ([`IndexKey`](crate::index::IndexKey)-encoded) key
+    /// of declared list `index` for this record's current values — the property
+    /// that list is sorted by ([RFC 0051]).
+    ///
+    /// Same encoding as [`secondary_key`](Self::secondary_key), and deliberately
+    /// so: a list and a secondary index impose the *same* order, and differ only
+    /// in what they store under it (whole records inline versus anchors). The
+    /// tie-break, however, is the **anchor** rather than the live version's
+    /// authoring instant — the anchor is immutable, so a record moves inside a
+    /// sorted chain only when the declared property itself changed, where the
+    /// built-in chain moves it on every save by design.
+    ///
+    /// [RFC 0051]: https://github.com/wavedb/wavedb/blob/main/rfcs/0051-ordered-record-lists.md
+    #[must_use]
+    fn list_key(&self, index: usize) -> Vec<u8> {
+        let _ = index;
+        Vec::new()
+    }
+
     /// The order-preserving ([`IndexKey`](crate::index::IndexKey)-encoded) key
     /// of secondary index `index` for this record's current values. The macro
     /// implements it as a `match` over the declared `#[wavedb::pivot(...)]`
