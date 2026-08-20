@@ -4,7 +4,7 @@
 - **Crates:** `wavedb-core`, `wavedb-macros`
 - **Relates to:** [RFC 0050](0050-clustered-record-chains.md) (the chain that
   replaces the dense `current` tree), [RFC 0051](0051-ordered-record-lists.md)
-  (the sparse index over a chain), [RFC 0052](0052-segment-size-as-the-pagination-unit-PLANNED.md)
+  (the sparse index over a chain), [RFC 0052](0052-segment-size-as-the-pagination-unit.md)
   (segment sizing and the order-statistic descent)
 
 ## Summary

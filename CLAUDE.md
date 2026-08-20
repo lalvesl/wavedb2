@@ -123,9 +123,10 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
   of the fields' wire bytes — and folds the declaration into the STRUCT_HASH,
   so changing the key is a schema change), and **declared lists** from
   `#[wavedb::list]` (field-level) / `#[wavedb::list((f1, f2))]` (struct-level,
-  composite) — one more record chain per declaration, sorted by that property,
-  with `listed_by_*` / `_at_page` / `_len` readers; declarations *and their
-  order* fold into the STRUCT_HASH (RFC 0051). `#[server]` emits a fn-type
+  composite), each taking an optional `page = N` of its own — one more record
+  chain per declaration, sorted by that property, with `listed_by_*` /
+  `_at_page` / `_len` readers; declarations, their capacities *and their order*
+  fold into the STRUCT_HASH (RFCs 0051/0052). `#[server]` emits a fn-type
   (own STRUCT_HASH + dispatch), the body retyped onto `ServerDb`, and a client stub.
   `expose_server!`/`expose_client!` are the **declared allowlist registry**: one match
   per operation over exactly the listed items; unlisted/excluded/wrong-shape all refuse
@@ -228,9 +229,11 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
   where `floor` = both chains' maxima — strictly monotone per collection even
   against a rewound clock (Unique needs no floor: catch-up is chain-forward).
 - `#[wavedb::list]` (RFC 0051) adds **one more record chain per declaration**,
-  same lane and same `page = N`, sorted by the declared property instead of by
-  modification instant and tie-broken by the **anchor** (immutable ⇒ a save
-  relocates only when that property changed). Every list is maintained in the
+  same lane, at its own declared `page = N` (falling back to the struct's),
+  sorted by the declared property instead of by modification instant and
+  tie-broken by the **anchor** (immutable ⇒ a save relocates only when that
+  property changed — but it still **rewrites** the record in every list, since
+  the bytes are duplicated there and only the position is unchanged). Every list is maintained in the
   same atomic batch, gated on the built-in chain's liveness verdict, and read by
   the generated `listed_by_*` / `_at_page` / `_len`. It costs a full copy of
   every record per declaration — that duplication *is* the design.
