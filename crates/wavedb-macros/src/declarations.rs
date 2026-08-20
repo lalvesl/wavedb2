@@ -23,7 +23,7 @@ pub struct Declared {
     /// One entry per `#[wavedb::pivot(...)]` secondary index.
     pub secondaries: Vec<ResolvedPivot>,
     /// One entry per `#[wavedb::list]` declared ordering (RFC 0051).
-    pub lists: Vec<ResolvedPivot>,
+    pub lists: Vec<crate::lists::ResolvedList>,
 }
 
 /// Take every declaration off `input`, folding the ones that reach stored bytes

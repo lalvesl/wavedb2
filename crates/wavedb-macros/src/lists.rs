@@ -15,8 +15,18 @@ use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::{Attribute, Data, DeriveInput, Ident};
 
-use crate::args::{PivotSpec, Shape};
+use crate::args::{ListSpec, Shape};
 use crate::secondaries::ResolvedPivot;
+
+/// One resolved `#[wavedb::list(...)]`: the ordering, plus its own segment
+/// capacity when it declared one.
+pub struct ResolvedList {
+    /// The ordering itself — the same shape a secondary index takes, because
+    /// the two impose the same order.
+    pub order: ResolvedPivot,
+    /// This list's `page = N`, or `None` to inherit the struct's.
+    pub page: Option<usize>,
+}
 
 /// Take every `#[wavedb::list]` declaration off `input` — the field-level
 /// spelling and the struct-level one — resolve them, and fold them into the
@@ -33,20 +43,32 @@ pub fn take_and_fold(
     named: &syn::FieldsNamed,
     shape: Shape,
     hash_fields: &mut Vec<(String, String)>,
-) -> syn::Result<Vec<ResolvedPivot>> {
-    let mut lists: Vec<ResolvedPivot> = take_field_lists(input)?
+) -> syn::Result<Vec<ResolvedList>> {
+    let mut lists: Vec<ResolvedList> = take_field_lists(input)?
         .into_iter()
-        .map(|(ident, ty)| ResolvedPivot {
-            fields: vec![(ident, ty)],
+        .map(|(ident, ty, page)| ResolvedList {
+            order: ResolvedPivot {
+                fields: vec![(ident, ty)],
+            },
+            page,
         })
         .collect();
     for spec in take_list_specs(&mut input.attrs)? {
-        lists.push(ResolvedPivot {
-            fields: crate::declarations::resolve_fields(
-                &spec.fields,
-                named,
-                "#[wavedb::list(...)]",
-            )?,
+        if spec.fields.is_empty() {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "a struct-level #[wavedb::list(...)] must name the ordering's                  field(s) — the bare form belongs on the field it orders by",
+            ));
+        }
+        lists.push(ResolvedList {
+            order: ResolvedPivot {
+                fields: crate::declarations::resolve_fields(
+                    &spec.fields,
+                    named,
+                    "#[wavedb::list(...)]",
+                )?,
+            },
+            page: spec.page,
         });
     }
     if !lists.is_empty() && shape != Shape::NonUnique {
@@ -58,25 +80,32 @@ pub fn take_and_fold(
     }
     for (i, list) in lists.iter().enumerate() {
         let joined = list
+            .order
             .fields
             .iter()
             .map(|(f, _)| f.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        hash_fields.push((format!("#list{i}"), joined));
+        // The capacity rides the same entry: it lays the chain out, so it is a
+        // fact about stored bytes exactly as the struct-level `page` is.
+        let entry = match list.page {
+            Some(n) => format!("{joined}@{n}"),
+            None => joined,
+        };
+        hash_fields.push((format!("#list{i}"), entry));
     }
     Ok(lists)
 }
 
 /// Strip `#[wavedb::list]` from the struct's fields, returning each marked
-/// field in declaration order.
+/// field in declaration order with the capacity it declared.
 ///
-/// The field spelling takes no arguments: the field it sits on *is* the
-/// ordering. A composite ordering has no single field to sit on, which is what
-/// the struct-level spelling is for.
+/// The field spelling names no fields: the field it sits on *is* the ordering.
+/// It may still carry `page = N`. A composite ordering has no single field to
+/// sit on, which is what the struct-level spelling is for.
 fn take_field_lists(
     input: &mut DeriveInput,
-) -> syn::Result<Vec<(Ident, syn::Type)>> {
+) -> syn::Result<Vec<(Ident, syn::Type, Option<usize>)>> {
     let Data::Struct(data) = &mut input.data else {
         return Ok(Vec::new());
     };
@@ -88,18 +117,25 @@ fn take_field_lists(
                 kept.push(attr);
                 continue;
             }
-            if !matches!(attr.meta, syn::Meta::Path(_)) {
+            let spec = match &attr.meta {
+                syn::Meta::Path(_) => ListSpec {
+                    fields: Vec::new(),
+                    page: None,
+                },
+                _ => attr.parse_args::<ListSpec>()?,
+            };
+            if !spec.fields.is_empty() {
                 return Err(syn::Error::new_spanned(
                     &attr,
-                    "a field's #[wavedb::list] takes no arguments — the field \
-                     it marks is the ordering; declare a composite ordering \
-                     as #[wavedb::list((f1, f2))] on the struct",
+                    "a field's #[wavedb::list] names no fields — the field it \
+                     marks is the ordering; declare a composite ordering as \
+                     #[wavedb::list((f1, f2))] on the struct",
                 ));
             }
             let ident = field.ident.clone().ok_or_else(|| {
                 syn::Error::new_spanned(&attr, "unnamed field")
             })?;
-            marked.push((ident, field.ty.clone()));
+            marked.push((ident, field.ty.clone(), spec.page));
         }
         field.attrs = kept;
     }
@@ -108,12 +144,12 @@ fn take_field_lists(
 
 /// Remove every struct-level `#[wavedb::list(...)]`, parsing each into the
 /// fields it declares.
-fn take_list_specs(attrs: &mut Vec<Attribute>) -> syn::Result<Vec<PivotSpec>> {
+fn take_list_specs(attrs: &mut Vec<Attribute>) -> syn::Result<Vec<ListSpec>> {
     let mut specs = Vec::new();
     let mut kept = Vec::with_capacity(attrs.len());
     for attr in attrs.drain(..) {
         if is_list_attr(&attr) {
-            specs.push(attr.parse_args::<PivotSpec>()?);
+            specs.push(attr.parse_args::<ListSpec>()?);
         } else {
             kept.push(attr);
         }
@@ -128,24 +164,37 @@ fn is_list_attr(attr: &Attribute) -> bool {
     segs.len() == 2 && segs[0].ident == "wavedb" && segs[1].ident == "list"
 }
 
-/// The items injected into the `NonUniqueStruct` impl: the list count and the
-/// per-list sort-key encoder.
-pub fn trait_items(lists: &[ResolvedPivot]) -> TokenStream {
+/// The items injected into the `NonUniqueStruct` impl: the list count, the
+/// per-list sort-key encoder, and the per-list segment capacity.
+pub fn trait_items(lists: &[ResolvedList]) -> TokenStream {
     if lists.is_empty() {
         return TokenStream::new();
     }
     let n = lists.len();
-    let arms = lists.iter().enumerate().map(|(i, list)| {
-        let expr = list.self_key_expr();
+    let key_arms = lists.iter().enumerate().map(|(i, list)| {
+        let expr = list.order.self_key_expr();
         quote!(#i => #expr,)
     });
+    // Only the lists that declared one need an arm; the rest fall through to
+    // the struct's own `page`, which is the trait default's job.
+    let page_arms = lists
+        .iter()
+        .enumerate()
+        .filter_map(|(i, list)| list.page.map(|n| quote!(#i => #n,)));
     quote! {
         const NUM_LISTS: usize = #n;
 
         fn list_key(&self, index: usize) -> ::std::vec::Vec<u8> {
             match index {
-                #(#arms)*
+                #(#key_arms)*
                 _ => ::std::vec::Vec::new(),
+            }
+        }
+
+        fn list_page(index: usize) -> usize {
+            match index {
+                #(#page_arms)*
+                _ => <Self as ::wavedb_core::NonUniqueStruct>::PAGE,
             }
         }
     }
@@ -154,16 +203,16 @@ pub fn trait_items(lists: &[ResolvedPivot]) -> TokenStream {
 /// The `{Name}Lists` trait + its `CollectionHandle<{Name}>` impl: per declared
 /// list, a whole-list enumeration and the paged entry point the sparse index's
 /// counts make one descent.
-pub fn listed_readers(name: &Ident, lists: &[ResolvedPivot]) -> TokenStream {
+pub fn listed_readers(name: &Ident, lists: &[ResolvedList]) -> TokenStream {
     if lists.is_empty() {
         return TokenStream::new();
     }
     let trait_ident = format_ident!("{}Lists", name);
-    let decls = lists.iter().map(|list| reader_decls(name, list, None));
+    let decls = lists.iter().map(|l| reader_decls(name, &l.order, None));
     let impls = lists
         .iter()
         .enumerate()
-        .map(|(i, list)| reader_decls(name, list, Some(i)));
+        .map(|(i, l)| reader_decls(name, &l.order, Some(i)));
 
     quote! {
         /// Typed list enumerations for this type's collection, one per

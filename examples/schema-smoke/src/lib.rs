@@ -158,8 +158,12 @@ pub mod default_paged {
 /// The field spelling marks the field that *is* the ordering; the struct
 /// spelling names a composite. Both fold into the STRUCT_HASH — a list is a
 /// materialised copy of every record, so declaring one is a schema change.
+///
+/// The composite carries its **own** `page`: the built-in chain is rewritten at
+/// its growth end on every save and so wants a small N, while a list is
+/// rewritten in place and can hold the page a view renders (RFC 0052).
 #[wavedb(NonUnique, page = 4)]
-#[wavedb::list((city, name))]
+#[wavedb::list((city, name), page = 16)]
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct Person {
     #[wavedb::list]
@@ -175,6 +179,26 @@ pub mod unlisted {
     #[wavedb(NonUnique, page = 4)]
     #[derive(Debug, PartialEq, Eq, Clone, Default)]
     pub struct Person {
+        pub name: String,
+        pub city: String,
+    }
+}
+
+/// [`Person`]'s twin differing **only** in the composite list's capacity — same
+/// name, same fields, same shape, same struct `page`, same two orderings.
+///
+/// It proves the per-list capacity folds. It has to: a chain laid out at 16 and
+/// one laid out at 32 have different split and merge triggers, so sharing an
+/// identity would let one chain hold segments from both regimes and quietly
+/// falsify the "a rendered page is one segment read" guarantee (RFC 0052).
+pub mod wide_list {
+    use wavedb_macros::wavedb;
+
+    #[wavedb(NonUnique, page = 4)]
+    #[wavedb::list((city, name), page = 32)]
+    #[derive(Debug, PartialEq, Eq, Clone, Default)]
+    pub struct Person {
+        #[wavedb::list]
         pub name: String,
         pub city: String,
     }
@@ -337,6 +361,33 @@ mod tests {
             Plain::STRUCT_HASH,
             "declaring a list must be a new type — the engine does no \
              migration, so there is nowhere for the extra chain to come from"
+        );
+    }
+
+    // A list's `page` is its own, not the struct's. Here: that the macro plumbs
+    // it to the trait and folds it into the identity. That it reaches the
+    // *layout* is pinned in `wavedb-core`, where the two chains can be measured
+    // one at a time (`a_list_lays_out_at_its_own_page`).
+    #[test]
+    fn a_declared_list_page_is_independent_of_the_struct() {
+        use super::Person;
+        use wavedb_core::NonUniqueStruct;
+
+        assert_eq!(Person::PAGE, 4);
+        assert_eq!(Person::list_page(0), 4, "an undeclared list inherits");
+        assert_eq!(Person::list_page(1), 16, "a declared list overrides");
+        // Out of range falls back rather than panicking — nothing dispatches
+        // there (the engine loops `0..NUM_LISTS`), but a const that traps would
+        // be a footgun for any future caller.
+        assert_eq!(Person::list_page(99), 4);
+
+        // And it folds: the twin differs in nothing but this number.
+        assert_eq!(super::wide_list::Person::list_page(1), 32);
+        assert_ne!(
+            Person::STRUCT_HASH,
+            super::wide_list::Person::STRUCT_HASH,
+            "a list's capacity must be a different type — one chain holding \
+             segments laid out two ways is exactly what the fold prevents"
         );
     }
 
