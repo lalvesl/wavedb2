@@ -1,8 +1,13 @@
 # RFC 0051 — Declared lists: sorted record chains with a sparse index
 
-- **Status:** Planned — opened 2026-07-29, revised 2026-07-30
+- **Status:** Implemented 2026-07-31 — opened 2026-07-29, revised 2026-07-30.
+  Landed as [RFC 0050](0050-clustered-record-chains.md) phase 7b: the
+  declaration, the identity fold, the sorted chains and their maintenance, and
+  the `listed_by_*` readers. **Not** shipped: a wire command, so a client
+  calling one directly refuses exactly as `search_by` does — both land with the
+  streaming frames.
 - **Crates:** `wavedb-core`, `wavedb-macros`
-- **Builds on:** [RFC 0050](0050-clustered-record-chains-WIP.md) — whose built-in
+- **Builds on:** [RFC 0050](0050-clustered-record-chains.md) — whose built-in
   modification-ordered chain **is** the first instance of this RFC's mechanism; here
   it becomes general, one chain per declared list
 

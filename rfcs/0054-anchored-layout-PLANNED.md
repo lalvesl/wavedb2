@@ -2,8 +2,8 @@
 
 - **Status:** Planned — opened 2026-07-30
 - **Crates:** `wavedb-core`, `wavedb-macros`
-- **Relates to:** [RFC 0050](0050-clustered-record-chains-WIP.md) (the chain that
-  replaces the dense `current` tree), [RFC 0051](0051-ordered-record-lists-PLANNED.md)
+- **Relates to:** [RFC 0050](0050-clustered-record-chains.md) (the chain that
+  replaces the dense `current` tree), [RFC 0051](0051-ordered-record-lists.md)
   (the sparse index over a chain), [RFC 0052](0052-segment-size-as-the-pagination-unit-PLANNED.md)
   (segment sizing and the order-statistic descent)
 

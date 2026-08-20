@@ -82,9 +82,8 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   a ceiling on it, forcing the O(database) snapshot far more often than
   necessary. Each chunk now names the one before it, the frame names only the
   head, and it is a fixed 16 bytes however long the log grows.
-- **Proposed next (storage & query):**
-  [0050](0050-clustered-record-chains-WIP.md) — the open one, and the
-  largest: a collection's records are **additionally** stored inline in a chain of
+- **Landed, and the largest of them (storage & query):**
+  [0050](0050-clustered-record-chains.md) — a collection's records are **additionally** stored inline in a chain of
   segments ordered by the live version's **authoring instant**, so a scan costs one
   read per segment instead of one page read *and* one zstd decompression per record,
   a range keeps its logarithmic descent through the chain's sparse index, and — since
@@ -100,8 +99,13 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   lane of its own with **no index at all**, since nothing ever *searches* it, and a
   dense B+tree exists only where the developer declares one. The cost is storage,
   duplicated write bytes, and `all()` changing from insertion to modification order.
-  **Phases 1–7a are implemented** — all but the declared lists (7b) and
-  compaction (8). The structure
+  **Phases 1–7b are implemented**, and phase 8 ("compaction") was dissolved on
+  2026-07-31 once it turned out to name two unrelated things: the chain already
+  rebalances synchronously on every removal (phase 3b), leaving only the
+  sparse index's missing merge — **taken as accepted debt**, since that index
+  holds one entry per *segment* and a drained version of it is still two
+  levels — and removal-log retention, which is a client-liveness policy and
+  got moved out to its own planning. The structure
   (`index/{segment,sparse,sparse_write,chain,chain_remove}.rs`): locate, insert
   with a 50/50 split at 2N, remove with a merge at N/2 or a redistribute when
   folding would breach the band, all as one batch. Liveness on the record
@@ -118,9 +122,9 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   "nothing new" whatever the collection's size, and a client behind pays segment
   reads rather than one random read per change. Plus `page = N`, the
   developer-declared segment capacity, folded into the identity so a chain is only
-  ever laid out one way. What remains is `#[wavedb::list]` and compaction;
-  [0051](0051-ordered-record-lists-PLANNED.md) — built on it, and the repair for
-  the one thing it gives up: a declared property materialises a *second* chain of
+  ever laid out one way. Phase 7b then landed 0051 in full, and phase 8 dissolved;
+  [0051](0051-ordered-record-lists.md) — **landed 2026-07-31** as 0050 phase 7b,
+  built on it, and the repair for the one thing it gives up: a declared property materialises a *second* chain of
   the same records, kept sorted at write time (affordable because K extra segment
   rewrites still cost one barrier), with a **sparse** index above it — one entry
   per segment instead of per record, so the descent is two or three nodes **cold**
@@ -128,7 +132,8 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   guarantee is bounded size, never residency). Ordered and range reads cost one
   dense read per segment of hits instead of one random read per hit; the price is
   `(K+2)` copies of every record on disk — anchor, built-in chain, K declared
-  declared lists — accepted deliberately;
+  lists — accepted deliberately. What it does not yet ship is a wire command, so
+  a client calling `listed_by_name` directly refuses exactly as `search_by` does;
   [0052](0052-segment-size-as-the-pagination-unit-PLANNED.md) — the developer
   declares a chain's capacity as a **minimum** N, normally the page size the UI
   renders (undeclared: **16** for record chains, **256** for the removal log); a
@@ -249,8 +254,8 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0047](0047-generational-journal-retirement.md) | Generational journal retirement | Implemented |
 | [0048](0048-chained-addressing-log.md) | The addressing log as a chain | Implemented |
 | [0049](0049-elastic-pages-and-load-driven-splits.md) | Elastic pages and load-driven splits | Implemented |
-| [0050](0050-clustered-record-chains-WIP.md) | Clustered record chains (B+trees become opt-in) | WIP |
-| [0051](0051-ordered-record-lists-PLANNED.md) | Declared lists: sorted chains + sparse index | Planned |
+| [0050](0050-clustered-record-chains.md) | Clustered record chains (B+trees become opt-in) | Implemented |
+| [0051](0051-ordered-record-lists.md) | Declared lists: sorted chains + sparse index | Implemented |
 | [0052](0052-segment-size-as-the-pagination-unit-PLANNED.md) | Segment size as the pagination unit | Planned |
 | [0053](0053-tenant-fair-cache-retention-PLANNED.md) | Tenant-fair cache retention | Planned |
 | [0054](0054-anchored-layout-PLANNED.md) | The anchored layout (no clustering) | Planned |

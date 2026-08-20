@@ -1,12 +1,15 @@
 # RFC 0050 — Clustered record chains (B+trees become opt-in)
 
-- **Status:** WIP — opened 2026-07-29, revised 2026-07-30, implementation started 2026-07-30
+- **Status:** Implemented 2026-07-31 — opened 2026-07-29, revised 2026-07-30,
+  implementation started 2026-07-30. Phases 1–7b landed; phase 8 dissolved (see
+  the progress table). Remote list reads still refuse over the client
+  transport, alongside `search_by`.
 - **Crates:** `wavedb-core` (the index and collection layers), `wavedb-macros`
 - **Code (today):** `crates/wavedb-core/src/index/{tree,tree_insert,tree_delete,stream}.rs`,
   `collection.rs`, `collection_write.rs`, `collection_keyed.rs`, `collection_recency.rs`
 - **Builds on:** [RFC 0049](0049-elastic-pages-and-load-driven-splits.md) (a page is
   however many blocks its content needs, with no ceiling)
-- **Completed by:** [RFC 0051](0051-ordered-record-lists-PLANNED.md) (the sparse
+- **Completed by:** [RFC 0051](0051-ordered-record-lists.md) (the sparse
   index and further lists), [RFC 0052](0052-segment-size-as-the-pagination-unit-PLANNED.md)
   (segment sizing), [RFC 0053](0053-tenant-fair-cache-retention-PLANNED.md) (why
   every cost here is quoted cold)
@@ -74,8 +77,9 @@ which is the one that changes the on-disk layout.
 | 5c | Retire `current`, `recency` and the `dead` tree: delete them, their roots, the dual write, and `Collection::search` | **landed 2026-07-31** |
 | 6 | Collection read paths: `all` (and the wire `All`) walk the chain | **landed 2026-07-30** — `search`/`search_by` still read trees, see below |
 | 7a | Macros: `page = N` — parsed, folded into the identity, threaded to the chain | **landed 2026-07-31** |
-| 7b | Macros: `#[wavedb::list]` — declared lists ([RFC 0051](0051-ordered-record-lists-PLANNED.md) in full) | |
-| 8 | Compaction pass for sparse chains (RFC 0042's shape) | |
+| 7b | Macros: `#[wavedb::list]` — declared lists ([RFC 0051](0051-ordered-record-lists.md) in full) | **landed 2026-07-31** |
+| 8a | Sparse-index merge — the half phase 3a did not ship | **accepted debt 2026-07-31**, see below |
+| 8b | Removal-log retention | **out of scope 2026-07-31** — separate planning |
 
 Phase 3 was one row until the design was worked through: the index's write half is
 a B+tree write path in its own right (splits, count propagation up the path, root
@@ -378,6 +382,76 @@ Proven by mutation in both directions: dropping the `#page` hash entry makes a
 segments laid out two ways); dropping `with_min` from `records_chain` puts 20
 records into a single default-sized segment instead of the 3+ that `page = 4`
 demands.
+
+**Phase 7b** landed declared lists — [RFC 0051](0051-ordered-record-lists.md)
+— and the striking thing is how little of it is new mechanism. A list *is* the
+phase-3 chain, at the same capacity, in the same lane, with a different key. The
+whole write half is three planners over `plan_insert` / `plan_remove`
+(`collection_lists.rs`), and the read half is `all`'s segment walk with the
+direction flipped.
+
+Three decisions are worth keeping:
+
+**`Pivot::replace_roots` takes a struct, not parameters.** Adding a fourth root
+kind to a four-positional-argument signature would have put two slices
+(`secondaries`, `lists`) next to each other where a transposition compiles and
+silently swaps a collection's indexes for its lists. `index::Roots` makes the
+call sites named, and the seven hand-written fixtures churn once instead of once
+per future root kind.
+
+**The liveness gate is applied once, not per structure.** `plan_chain_move` now
+returns the envelope it wrote, or `None` when the record was not in the built-in
+chain — a dead record saved by address, a chainless first version. The lists ride
+that answer rather than each re-deriving it, so "a record the built-in chain does
+not hold enters no other chain" is one branch instead of K. Returning the
+envelope rather than a bool is what makes it free: the lists hold the same bytes,
+so the gate and the encode come out of the same call.
+
+**Ordering is part of the identity, and so is the fold order.** A list is
+addressed by its index in the `Pivot`'s root array, so reordering two
+declarations re-points two live chains at each other's data. Both the
+declarations and their order fold as `#list0`, `#list1`, … — reordering yields a
+new type, which is the only coherent answer under no-migration.
+
+What it does **not** ship: a wire command. `listed`/`list_len` resolve against a
+`LocalHandle` and a `ServerDb`, and refuse over the client transport exactly as
+`search_by` has since M4 — the streaming frames are where both land together.
+A `#[server]` function returning a page of a list works today; a client calling
+`listed_by_name` directly does not.
+
+**Phase 8** was one row called "compaction", and writing the plan out showed the
+name was hiding two problems of different natures. Neither is a gap in the
+chain's own upkeep: `chain_remove` merges a starved segment with its neighbour
+below `N/2` and redistributes when the merge would breach the band, synchronously,
+in the same atomic batch as the removal — including the removal half of a save's
+relocation. That landed in **phase 3b** and is the mechanism people usually mean
+by compaction here.
+
+**8a — the sparse index never merges.** `sparse_write::plan_remove` is
+`slots.remove(i)` followed by `climb` (`sparse_write.rs:214`): no underflow check,
+no sibling merge, no root collapse. So index nodes drain and stay drained, and a
+tree that grew a level never gives it back. This is not a design position, it is
+the half of phase 3a that did not get written — the dense `BpTree` has the full
+cycle (merge under ¾ capacity, redistribute otherwise, collapse the root:
+`tree_delete.rs:1`), and the fix is to mirror it, synchronously in the same batch,
+not as a background pass.
+
+**Taken as accepted debt** (user, 2026-07-31), on the size argument: the sparse
+index holds **one entry per segment**, not per record. At `N = 256` a million
+living records are roughly four thousand entries — a two-level tree. A drained
+version of it is still small enough that the wasted descent does not show up
+against the IOps the chain itself saves. Cheap to owe, cheap to pay later.
+
+**8b — the removal log grows forever, by construction.** `dead` is a `Chain`, so
+it inherits the merge rule, but nothing ever removes an entry from it, so the rule
+never fires. That is not a structural-health gap — the structure is healthy and
+correctly growing without bound. It is the absence of a **retention policy**, and
+the policy question is not "when does a node merge" but "when is it legitimate to
+forget a removal", which is really a question about how long a client may be
+absent before its catch-up develops a hole, and how it learns that it has one.
+**Out of scope for this RFC** (user, 2026-07-31): it gets its own planning, and
+answering it here would have meant designing a client-liveness horizon inside a
+storage-layout change.
 
 The dense `BpTree` is **not** being retired — it is the right structure for cold or
 small collections, and [RFC 0054](0054-anchored-layout-PLANNED.md)
@@ -732,9 +806,10 @@ record. The chains are derived read paths over it.
 ### What this gives up
 
 - **Space, and write bytes.** Two copies of every living record instead of one,
-  segments between half and fully packed, holes left by removals until compaction,
-  and a whole-segment rewrite per mutation in the CoW window. A save carries the
-  record's bytes twice. Accepted deliberately.
+  segments between half and fully packed, and a whole-segment rewrite per mutation
+  in the CoW window. A save carries the record's bytes twice. Accepted deliberately.
+  Note this is *occupancy*, not fragmentation: a removal rewrites the segment
+  without its entry and merges below `N/2`, so segments hold no holes to reclaim.
 - **A derived copy can disagree with its source.** An invariant that did not exist
   before. The single-batch rule makes it structural — anchor, segment, index and
   logs land in one atomic `Store::apply` or none of them do — and the verbatim
@@ -812,9 +887,16 @@ draft's main regression is gone.
   `#[wavedb::list(created_at)]` materialises the insertion-ordered chain with a
   sparse index, and `search` returns as a read of *that*, with declared
   semantics instead of implicit ones.
-- **Compaction trigger.** By occupancy ratio, by absolute hole count, or on the same
-  maintenance tick as defragmentation (RFC 0042) — and whether it may run while a
-  watch holds a cursor into the segments it is rewriting.
+- ~~**Compaction trigger.**~~ **Dissolved 2026-07-31.** The question assumed a
+  background pass over segments holding reclaimable holes. There are none: the
+  chain rebalances synchronously on every removal (phase 3b), so there is no
+  occupancy ratio to watch and no maintenance tick to schedule. What was left
+  under the name split into two unrelated items, both settled above — **8a**
+  (sparse-index merge, taken as debt) is a same-batch fix with no trigger policy
+  at all, and **8b** (removal-log retention) is a client-liveness question moved
+  out of this RFC. The one part of the original phrasing that survives belongs to
+  8b: whether a prune may run while a watch holds a cursor into what it is
+  dropping.
 - **Migration.** None, by policy — `FORMAT_VERSION` is pinned and old `data.bin`
   files are unsupported pre-release. Named because this is the largest on-disk
   layout change since the anchor restructure.
