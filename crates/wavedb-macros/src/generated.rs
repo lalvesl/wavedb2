@@ -136,7 +136,11 @@ pub fn nonunique_types(
     hash: u64,
     secondaries_specs: &[ResolvedPivot],
     key_fields: Option<&[(Ident, syn::Type)]>,
+    page: Option<usize>,
 ) -> syn::Result<TokenStream> {
+    // `page = N` rides the trait as a const the chain builders read; unset
+    // leaves the trait default (RFC 0052).
+    let page_const = page.map(|n| quote!(const PAGE: usize = #n;));
     let num_secondaries = secondaries_specs.len();
     let pivot_id = format_ident!("{}PivotId", name);
     let pivot = format_ident!("{}Pivot", name);
@@ -188,6 +192,7 @@ pub fn nonunique_types(
 
         impl ::wavedb_core::NonUniqueStruct for #name {
             type Pivot = #pivot;
+            #page_const
             #secondary_items
             #key_items
         }

@@ -116,6 +116,21 @@ pub trait NonUniqueStruct: WaveDbStruct {
     /// Must equal the generated pivot's `secondaries()` length.
     const NUM_SECONDARIES: usize = 0;
 
+    /// The record chain's segment capacity as a **minimum** — the developer's
+    /// `#[wavedb(NonUnique, page = N)]`, defaulting to
+    /// [`DEFAULT_SEGMENT_MIN`](crate::index::DEFAULT_SEGMENT_MIN).
+    ///
+    /// A segment holds `N…2N` records, splits 50/50 at `2N` and merges at
+    /// `N/2` (RFC 0052), so a rendered page of N rows is one segment read —
+    /// which is the whole reason the knob is spelled `page`. The cost lands on
+    /// the write side: the chain is modification-ordered, so **every save
+    /// rewrites the growth-end segment whole**, and that is `N…2N` records'
+    /// bytes re-encoded per save.
+    ///
+    /// It folds into the [`STRUCT_HASH`](crate::WaveDbStruct::STRUCT_HASH),
+    /// so a chain is only ever laid out at one capacity.
+    const PAGE: usize = crate::index::DEFAULT_SEGMENT_MIN;
+
     /// The order-preserving ([`IndexKey`](crate::index::IndexKey)-encoded) key
     /// of secondary index `index` for this record's current values. The macro
     /// implements it as a `match` over the declared `#[wavedb::pivot(...)]`
