@@ -148,6 +148,10 @@ impl<T: NonUniqueStruct> Collection<T> {
             T::STRUCT_HASH,
             Lane::Records,
         )
+        // The declared `page = N` (RFC 0052), or the engine default. It folds
+        // into the `STRUCT_HASH`, so every segment this chain ever held was
+        // laid out at this same capacity.
+        .with_min(T::PAGE)
     }
 
     /// The **removal log** this pivot names — the same chain shape with no
@@ -207,6 +211,10 @@ impl<T: NonUniqueStruct> Collection<T> {
             sec_roots.push(tree.root());
             batch.push(write);
         }
+        // No `with_min` here on purpose: creation only seeds the one empty
+        // segment that is both endpoints, and a capacity has nothing to say
+        // about an empty segment. `records_chain` applies `T::PAGE` on every
+        // subsequent open, which is where splits and merges are decided.
         let (records, record_writes) = Chain::<Vec<u8>>::plan_create(
             tenant,
             T::STRUCT_HASH,

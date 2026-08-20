@@ -127,6 +127,30 @@ pub struct Setting {
     pub value: String,
 }
 
+/// NonUnique with a declared **segment capacity**: its record chain holds
+/// 4…8 records per segment instead of the default 16…32 (RFC 0052).
+///
+/// `page` is the pagination unit — declare the page size the UI renders and a
+/// rendered page becomes one segment read. It folds into the STRUCT_HASH, so a
+/// chain is only ever laid out at one capacity.
+#[wavedb(NonUnique, page = 4)]
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct Row {
+    pub n: u64,
+}
+
+/// [`Row`]'s twin at the default capacity — same name, same field, same shape.
+/// Its only purpose is to prove `page` reaches the identity.
+pub mod default_paged {
+    use wavedb_macros::wavedb;
+
+    #[wavedb(NonUnique)]
+    #[derive(Debug, PartialEq, Eq, Clone, Default)]
+    pub struct Row {
+        pub n: u64,
+    }
+}
+
 /// A struct in a submodule — items are named by path, not found by a scanner.
 pub mod billing {
     use wavedb_macros::wavedb;
@@ -222,6 +246,53 @@ mod tests {
         );
     }
 
+    // `page = N` has to do two things, and they fail independently: reach the
+    // **identity** (so a chain is only ever laid out at one capacity) and reach
+    // the **chain** (so the declaration actually changes the layout).
+    #[test]
+    fn a_declared_page_reaches_both_the_identity_and_the_layout() {
+        use crate::Row as Paged;
+        use crate::default_paged::Row as Default;
+        use futures::executor::block_on;
+        use wavedb_core::{NonUniqueStruct, U48};
+
+        assert_eq!(Paged::PAGE, 4);
+        assert_eq!(Default::PAGE, wavedb_core::index::DEFAULT_SEGMENT_MIN);
+        assert_ne!(
+            Paged::STRUCT_HASH,
+            Default::STRUCT_HASH,
+            "a different capacity must be a different type — otherwise one \
+             chain could hold segments laid out two ways"
+        );
+
+        // And the layout: 20 records at `page = 4` must land in segments of
+        // 4…8, never the default 16…32. Counting distinct segment ids is the
+        // observation, since the collection API deliberately hides them.
+        block_on(async {
+            let store = mem::MemStore::default();
+            let db = wavedb_core::LocalHandle::new(&store, U48::from(7u32));
+            let paged =
+                Paged::collection(Paged::create_pivot(&db).await.unwrap());
+            let plain =
+                Default::collection(Default::create_pivot(&db).await.unwrap());
+            for n in 0..20u64 {
+                paged.insert(&db, &Paged { n }).await.unwrap();
+                plain.insert(&db, &Default { n }).await.unwrap();
+            }
+            // 20 records at 4…8 per segment is at least 3 segments; at the
+            // default 16…32 it is exactly one.
+            assert!(
+                store.lane_values(Paged::LANE_HASHES[0]) >= 3,
+                "the declared capacity did not reach the chain"
+            );
+            assert_eq!(
+                store.lane_values(Default::LANE_HASHES[0]),
+                1,
+                "the default capacity fits 20 records in one segment"
+            );
+        });
+    }
+
     // Shape is a compile-time `const` on the type — no runtime lookup.
     #[test]
     fn shape_is_a_const_not_a_lookup() {
@@ -265,6 +336,26 @@ mod tests {
 
         #[derive(Default)]
         pub struct MemStore(Mutex<BTreeMap<u128, Vec<u8>>>);
+
+        impl MemStore {
+            /// How many stored values carry `lane_hash` at their head.
+            ///
+            /// Every WaveDB value is `[STRUCT_HASH LE][…]`, and a chain
+            /// segment's head is its **lane** hash — so this counts the
+            /// segments of one lane without an accessor the engine does not
+            /// otherwise need.
+            pub fn lane_values(&self, lane_hash: u64) -> usize {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|bytes| {
+                        bytes.get(..8).and_then(|h| h.try_into().ok())
+                            == Some(lane_hash.to_le_bytes())
+                    })
+                    .count()
+            }
+        }
 
         impl Store for MemStore {
             async fn get(&self, id: Id) -> Result<Option<Vec<u8>>> {

@@ -60,14 +60,7 @@ pub fn expand(
         args.shape,
         &mut hash_fields,
     )?;
-    // `compress` reaches stored bytes, so it folds like every other such
-    // declaration (RFC 0052): flipping it yields a **new type**, and the
-    // developer moves data across as application code. A synthetic entry, and
-    // only when opted out, exactly as `#[wavedb::key]` does it — so the
-    // default spelling keeps its identity.
-    if !args.compress {
-        hash_fields.push(("#compress".into(), "false".into()));
-    }
+    fold_layout_args(&args, &mut hash_fields)?;
 
     let name = input.ident.clone();
     let hash = struct_hash::compute(
@@ -105,6 +98,7 @@ pub fn expand(
                 hash,
                 &secondaries,
                 key_fields.as_deref(),
+                args.page,
             )?;
             (quote!(#pivot_id), types)
         }
@@ -287,6 +281,39 @@ fn shape_scaffolding(
         }
     };
     (storage_slot, storage_entries, exec_steps, shape_marker)
+}
+
+/// Fold the `#[wavedb(...)]` arguments that **reach stored bytes** into the
+/// hash inputs, as synthetic `#name` entries (`#` cannot open a real field
+/// name, so they can never collide with one).
+///
+/// This is the project rule, not a local choice: a declaration that decides how
+/// bytes are laid out yields a **new type** when it changes, because the engine
+/// performs no migration and the alternative is data that silently no longer
+/// matches what its declaration claims (RFC 0052). Each entry is emitted only
+/// when the declaration departs from the default, exactly as `#[wavedb::key]`
+/// does it, so the plain spelling keeps its identity.
+///
+/// Arguments that never reach disk — the `validate` / `preprocess` hooks — do
+/// not fold: they are behaviour, and correcting one must not orphan the data.
+fn fold_layout_args(
+    args: &WavedbArgs,
+    hash_fields: &mut Vec<(String, String)>,
+) -> syn::Result<()> {
+    if !args.compress {
+        hash_fields.push(("#compress".into(), "false".into()));
+    }
+    if let Some(page) = args.page {
+        if args.shape != Shape::NonUnique {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "`page = N` is only valid on a #[wavedb(NonUnique)] struct — \
+                 a Unique type has no collection and so no record chain",
+            ));
+        }
+        hash_fields.push(("#page".into(), page.to_string()));
+    }
+    Ok(())
 }
 
 /// The reserved lane hashes this shape occupies, as the `&'static [u64]`
