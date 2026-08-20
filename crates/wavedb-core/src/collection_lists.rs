@@ -66,6 +66,16 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// comparison saves is the *removal*: an unchanged property means the entry
     /// stays where it is and `plan_insert` replaces its payload in place, one
     /// segment write instead of two.
+    ///
+    /// **Skipping the list entirely when the key is unchanged is not available**,
+    /// and the reason is worth stating because the shortcut looks free: the
+    /// question it would need answered is "did anything *else* about the record
+    /// change?", and the only authority on that is the anchor's previous version.
+    /// Consulting it costs a read to avoid a write that is already inside the
+    /// window this batch pays for — more resource, more machinery, for a
+    /// comparison that is wrong the moment any non-ordering field moves. An
+    /// unconditional rewrite is the only coherent rule, and
+    /// `a_save_refreshes_a_list_whose_order_it_did_not_change` is what keeps it.
     pub(crate) async fn plan_list_moves<S: Store>(
         &self,
         view: &mut Overlay<'_, S>,
@@ -89,6 +99,13 @@ impl<T: NonUniqueStruct> Collection<T> {
             let writes = chain
                 .plan_insert(&*view, new_key, envelope.to_vec())
                 .await?;
+            // Staging after the *last* plan on a chain is defensive rather than
+            // load-bearing — chains never share ids, so nothing later in this
+            // batch reads back what was just written, and a mutation deleting
+            // this line survives the suite. It stays because the discipline is
+            // "stage after every plan" (the secondaries loop in
+            // `collection_write` does the same), and a chain that skipped it
+            // would be quietly wrong the day an operation is added after it.
             view.stage(&writes);
             batch.extend(writes);
         }
@@ -224,5 +241,365 @@ impl<T: NonUniqueStruct> Collection<T> {
             )
         })
         .try_flatten()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::executor::block_on;
+
+    use crate::collection::Collection;
+    use crate::index::mem_store::MemStore;
+    use crate::index::{Chain, ChainRoots, IndexKey, LogRoots, Pivot, Roots};
+    use crate::local_id::LocalId;
+    use crate::permission::PermissionRef;
+    use crate::store::Store;
+    use crate::traits::{NonUniqueStruct, Shape, WaveDbStruct};
+    use crate::u48::U48;
+    use crate::wire::WaveWire;
+
+    // Hand-rolled fixture of what `#[wavedb(NonUnique, page = 4)]` with one
+    // `#[wavedb::list]` on `name` generates (core can't use the proc-macro).
+    // `page = 4` puts the split at 8 and the merge at 2, so a dozen records
+    // exercise both without a long setup.
+    #[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
+    struct Row {
+        name: String,
+        note: u64,
+    }
+
+    impl WaveDbStruct for Row {
+        const STRUCT_HASH: u64 = 0x115_0001;
+        const SHAPE: Shape = Shape::NonUnique;
+        type PivotId = ();
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
+    struct RowPivot {
+        records: ChainRoots,
+        removals: LogRoots,
+        lists: [ChainRoots; 1],
+        permission: Option<PermissionRef>,
+    }
+
+    impl Pivot for RowPivot {
+        const STRUCT_HASH: u64 = 0x115_0002;
+        fn secondaries(&self) -> &[LocalId] {
+            &[]
+        }
+        fn records(&self) -> ChainRoots {
+            self.records
+        }
+        fn removals(&self) -> LogRoots {
+            self.removals
+        }
+        fn lists(&self) -> &[ChainRoots] {
+            &self.lists
+        }
+        fn permission(&self) -> Option<&PermissionRef> {
+            self.permission.as_ref()
+        }
+        fn replace_roots(&self, roots: Roots<'_>) -> Self {
+            let mut lists = self.lists;
+            lists.copy_from_slice(roots.lists);
+            Self {
+                records: roots.records,
+                removals: roots.removals,
+                lists,
+                permission: self.permission.clone(),
+            }
+        }
+    }
+
+    impl NonUniqueStruct for Row {
+        type Pivot = RowPivot;
+        const PAGE: usize = 4;
+        const NUM_LISTS: usize = 1;
+        fn list_page(index: usize) -> usize {
+            match index {
+                0 => 16,
+                _ => Self::PAGE,
+            }
+        }
+        fn list_key(&self, index: usize) -> Vec<u8> {
+            match index {
+                0 => self.name.key_bytes(),
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    fn tenant() -> U48 {
+        U48::new(5).unwrap()
+    }
+
+    fn row(name: &str) -> Row {
+        Row {
+            name: name.into(),
+            note: 0,
+        }
+    }
+
+    /// Assert the sparse index's counts agree with the segments they name —
+    /// per segment and in aggregate.
+    ///
+    /// This is the invariant a pager rests on: `_at_page` descends by count, so
+    /// a count that has drifted from its segment does not fail, it silently
+    /// returns the wrong rows.
+    async fn counts_agree(
+        store: &MemStore,
+        chain: &Chain<Vec<u8>>,
+        what: &str,
+    ) {
+        let index = chain.index().expect("a record chain always has an index");
+        let mut total = 0;
+        let mut cursor = Some(chain.head());
+        while let Some(id) = cursor {
+            let seg = chain.segment(store, id).await.unwrap();
+            if let Some(first) = seg.first_key() {
+                let slot =
+                    index.find(store, first).await.unwrap().unwrap_or_else(
+                        || panic!("{what}: segment not indexed"),
+                    );
+                assert_eq!(slot.seg, id, "{what}: index names another segment");
+                assert_eq!(
+                    slot.count,
+                    seg.len() as u64,
+                    "{what}: count drifted from segment {id:?}"
+                );
+            }
+            total += seg.len() as u64;
+            cursor = seg.next();
+        }
+        assert_eq!(
+            index.total(store).await.unwrap(),
+            total,
+            "{what}: the root's sum disagrees with the chain"
+        );
+    }
+
+    /// Assert every entry a list holds is byte-identical to the record at its
+    /// anchor.
+    ///
+    /// A list stores **whole records**, so it is a derived copy that can drift
+    /// from its source — the one invariant RFC 0050 names as new, and the one a
+    /// count check cannot see: a stale body has exactly the right length.
+    async fn payloads_agree(
+        store: &MemStore,
+        chain: &Chain<Vec<u8>>,
+        tenant: U48,
+        what: &str,
+    ) {
+        for (key, payload) in chain.collect(store).await.unwrap() {
+            let anchor = Store::get(store, key.rec.to_id(tenant))
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{what}: names an absent record"));
+            assert_eq!(
+                payload, anchor,
+                "{what}: the list's copy diverged from its anchor"
+            );
+        }
+    }
+
+    /// Both of a collection's record chains, checked together — counts and
+    /// bytes.
+    async fn all_counts_agree(store: &MemStore, col: &Collection<Row>) {
+        let pivot = col.load_pivot(store).await.unwrap();
+        let records = col.records_chain(&pivot);
+        let list = col.list_chain(&pivot, 0).unwrap();
+        counts_agree(store, &records, "built-in chain").await;
+        counts_agree(store, &list, "list 0").await;
+        payloads_agree(store, &records, col.tenant(), "built-in chain").await;
+        payloads_agree(store, &list, col.tenant(), "list 0").await;
+    }
+
+    // RFC 0052 asked whether an index entry and its segment can ever disagree,
+    // and answered it with an argument: the single-batch rule makes it
+    // impossible. The chain's own tests check that over a bare `Chain`; this
+    // checks it where the batch is **composed** — the collection interleaves
+    // the record write, the built-in chain, every declared list and the pivot
+    // into one `apply`, and a plan that forgot an index write in that traffic
+    // would still leave a chain that reads correctly and a pager that lies.
+    #[test]
+    fn index_counts_track_the_segments_through_a_collection_mutation() {
+        block_on(async {
+            let store = MemStore::default();
+            let pivot =
+                Collection::<Row>::create(&store, tenant()).await.unwrap();
+            let col = Collection::<Row>::at(pivot, tenant());
+
+            // Past 2N = 8 in both chains, so both have really split.
+            let mut ids = Vec::new();
+            for n in 0..12u32 {
+                ids.push(
+                    col.insert(&store, &row(&format!("r{n:02}")))
+                        .await
+                        .unwrap(),
+                );
+                all_counts_agree(&store, &col).await;
+            }
+
+            // A save relocates in the built-in chain (its key is the authoring
+            // instant, which just changed) and, when the ordering property
+            // changed, in the list too — two counts revised per chain.
+            for (i, id) in ids.iter().enumerate().take(6) {
+                col.save(&store, *id, &row(&format!("s{i:02}")))
+                    .await
+                    .unwrap();
+                all_counts_agree(&store, &col).await;
+            }
+
+            // And down through the merges: N/2 = 2, so emptying a 12-record
+            // chain folds segments repeatedly.
+            for id in &ids {
+                assert!(col.remove(&store, *id).await.unwrap());
+                all_counts_agree(&store, &col).await;
+            }
+        });
+    }
+
+    // A save that leaves the ordering property alone still has to rewrite the
+    // record in every list — the bytes are duplicated there, and only the
+    // *position* is unchanged.
+    //
+    // This is the failure a count check cannot see: the entry stays where it
+    // was, the segment length is right, the index is right, and the body is
+    // last week's. Found by mutation — skipping the list when
+    // `old_key == new_key` reads like an obvious optimisation and passed the
+    // entire suite.
+    #[test]
+    fn a_save_refreshes_a_list_whose_order_it_did_not_change() {
+        block_on(async {
+            let store = MemStore::default();
+            let pivot =
+                Collection::<Row>::create(&store, tenant()).await.unwrap();
+            let col = Collection::<Row>::at(pivot, tenant());
+
+            let mut ids = Vec::new();
+            for n in 0..6u32 {
+                ids.push(
+                    col.insert(&store, &row(&format!("r{n:02}")))
+                        .await
+                        .unwrap(),
+                );
+            }
+
+            // Same name, new note: the list must not move the record, and must
+            // still carry the new bytes.
+            for (n, id) in ids.iter().enumerate() {
+                col.save(
+                    &store,
+                    *id,
+                    &Row {
+                        name: format!("r{n:02}"),
+                        note: 7,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            all_counts_agree(&store, &col).await;
+
+            let pivot = col.load_pivot(&store).await.unwrap();
+            let list = col.list_chain(&pivot, 0).unwrap();
+            let notes: Vec<u64> = list
+                .collect(&store)
+                .await
+                .unwrap()
+                .iter()
+                .map(|(_, bytes)| {
+                    crate::record::decode_record::<Row>(Row::STRUCT_HASH, bytes)
+                        .unwrap()
+                        .1
+                        .note
+                })
+                .collect();
+            assert_eq!(
+                notes,
+                vec![7; 6],
+                "the list served bodies from before the save"
+            );
+        });
+    }
+
+    // A list is laid out at **its own** capacity, not the struct's. The two
+    // chains hold the very same records, so a difference in segment count can
+    // only come from the capacity — which is the whole point of separating
+    // them: the built-in chain is rewritten whole on every save and wants a
+    // small N, a list is rewritten in place and can hold a rendered page.
+    #[test]
+    fn a_list_lays_out_at_its_own_page() {
+        block_on(async {
+            let store = MemStore::default();
+            let pivot =
+                Collection::<Row>::create(&store, tenant()).await.unwrap();
+            let col = Collection::<Row>::at(pivot, tenant());
+            for n in 0..20u32 {
+                col.insert(&store, &row(&format!("r{n:02}"))).await.unwrap();
+            }
+
+            let pivot = col.load_pivot(&store).await.unwrap();
+            let built_in = segments(&store, &col.records_chain(&pivot)).await;
+            let list =
+                segments(&store, &col.list_chain(&pivot, 0).unwrap()).await;
+
+            // 20 records at N=4 split into several; at N=16 they all fit in the
+            // one segment the chain was created with.
+            assert!(
+                built_in >= 3,
+                "the struct's page = 4 did not reach the built-in chain: \
+                 {built_in} segment(s)"
+            );
+            assert_eq!(
+                list, 1,
+                "the list ignored its own page = 16 and used the struct's 4"
+            );
+        });
+    }
+
+    /// How many segments a chain currently holds.
+    async fn segments(store: &MemStore, chain: &Chain<Vec<u8>>) -> usize {
+        let mut n = 0;
+        let mut cursor = Some(chain.head());
+        while let Some(id) = cursor {
+            n += 1;
+            cursor = chain.segment(store, id).await.unwrap().next();
+        }
+        n
+    }
+
+    // The same invariant under the arrival order that stresses it hardest: a
+    // list is keyed by a domain value, so records land in the *middle* of the
+    // chain rather than at its growth end, and every insert can split a segment
+    // that is not an endpoint.
+    #[test]
+    fn a_list_keeps_its_counts_under_middle_insertions() {
+        block_on(async {
+            let store = MemStore::default();
+            let pivot =
+                Collection::<Row>::create(&store, tenant()).await.unwrap();
+            let col = Collection::<Row>::at(pivot, tenant());
+
+            // Descending names: every arrival sorts below everything already
+            // in the list, so the list's head splits over and over while the
+            // built-in chain only ever appends at its tail.
+            let mut ids = Vec::new();
+            for n in (0..14u32).rev() {
+                ids.push(
+                    col.insert(&store, &row(&format!("r{n:02}")))
+                        .await
+                        .unwrap(),
+                );
+                all_counts_agree(&store, &col).await;
+            }
+
+            // Removing from the middle outward drains interior segments, which
+            // is the merge case the endpoints never exercise.
+            for id in ids.iter().skip(3).take(8) {
+                assert!(col.remove(&store, *id).await.unwrap());
+                all_counts_agree(&store, &col).await;
+            }
+        });
     }
 }
