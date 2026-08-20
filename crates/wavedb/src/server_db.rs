@@ -127,6 +127,26 @@ impl<S: Store> DbHandle for ServerDb<'_, S> {
         self.local.all(pivot).map_err(Error::from)
     }
 
+    fn listed<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+        index: usize,
+        offset: u64,
+    ) -> impl Stream<Item = Result<T>> {
+        self.local.listed(pivot, index, offset).map_err(Error::from)
+    }
+
+    async fn list_len<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+        index: usize,
+    ) -> Result<u64> {
+        self.local
+            .list_len::<T>(pivot, index)
+            .await
+            .map_err(Error::from)
+    }
+
     fn search_by<T: NonUniqueStruct + 'static>(
         &self,
         pivot: LocalId,

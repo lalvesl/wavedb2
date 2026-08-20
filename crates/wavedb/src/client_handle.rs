@@ -221,6 +221,28 @@ impl DbHandle for Db {
         refuse(T::STRUCT_HASH)
     }
 
+    fn listed<T: NonUniqueStruct + 'static>(
+        &self,
+        _pivot: LocalId,
+        _index: usize,
+        _offset: u64,
+    ) -> impl Stream<Item = Result<T>> {
+        // Same seam as `search_by`, and for the same reason: a declared list
+        // reads densely node-side, but there is no wire command to ask for a
+        // slice of one yet. It lands with the streaming frames (RFC 0051).
+        refuse(T::STRUCT_HASH)
+    }
+
+    async fn list_len<T: NonUniqueStruct + 'static>(
+        &self,
+        _pivot: LocalId,
+        _index: usize,
+    ) -> Result<u64> {
+        Err(Error::Core(wavedb_core::Error::UnknownStructHash(
+            T::STRUCT_HASH,
+        )))
+    }
+
     fn record_history<T: NonUniqueStruct + 'static>(
         &self,
         _pivot: LocalId,

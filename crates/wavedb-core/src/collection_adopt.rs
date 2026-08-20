@@ -139,7 +139,7 @@ mod tests {
     use crate::error::Error;
     use crate::id::Id;
     use crate::index::mem_store::MemStore;
-    use crate::index::{ChainRoots, IndexKey, LogRoots, Pivot};
+    use crate::index::{ChainRoots, IndexKey, LogRoots, Pivot, Roots};
     use crate::local_id::LocalId;
     use crate::permission::PermissionRef;
     use crate::traits::{NonUniqueStruct, Shape, WaveDbStruct};
@@ -191,17 +191,12 @@ mod tests {
         fn permission(&self) -> Option<&PermissionRef> {
             self.permission.as_ref()
         }
-        fn replace_roots(
-            &self,
-            secondaries: &[LocalId],
-            records: ChainRoots,
-            removals: LogRoots,
-        ) -> Self {
+        fn replace_roots(&self, roots: Roots<'_>) -> Self {
             let mut s = self.secondaries;
-            s.copy_from_slice(secondaries);
+            s.copy_from_slice(roots.secondaries);
             Self {
-                records,
-                removals,
+                records: roots.records,
+                removals: roots.removals,
                 secondaries: s,
                 permission: self.permission.clone(),
             }
