@@ -123,10 +123,11 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
   of the fields' wire bytes — and folds the declaration into the STRUCT_HASH,
   so changing the key is a schema change), and **declared lists** from
   `#[wavedb::list]` (field-level) / `#[wavedb::list((f1, f2))]` (struct-level,
-  composite), each taking an optional `page = N` of its own — one more record
-  chain per declaration, sorted by that property, with `listed_by_*` /
-  `_at_page` / `_len` readers; declarations, their capacities *and their order*
-  fold into the STRUCT_HASH (RFCs 0051/0052). `#[server]` emits a fn-type
+  composite), each taking an optional `page = N` of its own — one more chain per
+  declaration, this one holding **whole records inline**, sorted by that
+  property, with `listed_by_*` / `_at_page` / `_len` readers. **A list is the
+  only way to ask for duplication** (RFC 0054); declarations, their capacities
+  *and their order* fold into the STRUCT_HASH (RFCs 0051/0052). `#[server]` emits a fn-type
   (own STRUCT_HASH + dispatch), the body retyped onto `ServerDb`, and a client stub.
   `expose_server!`/`expose_client!` are the **declared allowlist registry**: one match
   per operation over exactly the listed items; unlisted/excluded/wrong-shape all refuse
@@ -218,22 +219,37 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
   STRUCT_HASH (synthetic `#key` entry); keyed walks come out in hash order, not
   insertion order (modification order lives in the record chain, and any other
   order is a declared `#[wavedb::list]`).
-- Every collection carries two instant-keyed structures in its Pivot, both
-  `Chain`s of segments keyed `[instant BE][anchor]` (RFC 0050 phase 5c retired
-  the B+trees that used to be here): the **record chain** — records stored
-  **inline**, exactly one entry per living record at its live version's instant
-  (insert adds, save relocates, remove deletes) — and the **dead** log, keyed by
-  removal instant, holding references only. A tail scan from a cursor over both
-  is exactly "changed since" (the W6 catch-up structure).
+- **No duplication by default** (RFC 0054). A record lives at its anchor and
+  nowhere else — it has to, since history and the dead log resolve it there, and
+  for a time-keyed NonUnique the anchor's own `KEY` **is** its `CREATED_AT`, so
+  creation order needs no structure at all.
+  Every collection carries two instant-keyed `Chain`s in its Pivot, **the same
+  shape as each other**: ids and nothing else (`Chain<()>`, keyed
+  `[instant BE][anchor]` — the key already names the record). They are the
+  **recency** chain — one entry per living record at its live version's
+  authoring instant (insert adds, save re-keys, remove deletes) — and the
+  **dead** log, keyed by the removal instant. Together they answer "what
+  changed" and "what died"; a tail scan from a cursor over both is exactly
+  "changed since" (the W6 catch-up structure). One read per segment gives
+  membership and order; each record is then resolved at its anchor.
+- **`all()` is recency-ordered, and that is the feature.** Most-recently-changed
+  first is what a listing usually wants, and it is why the same structure serves
+  live sync. A save therefore *does* move a record to the front — a caller who
+  wants a stable, domain-meaningful order declares a `#[wavedb::list]` on the
+  property they want it ordered by.
   Every collection-minted instant goes through `core::mint::mint_instant(floor)`
   where `floor` = both chains' maxima — strictly monotone per collection even
   against a rewound clock (Unique needs no floor: catch-up is chain-forward).
-- `#[wavedb::list]` (RFC 0051) adds **one more record chain per declaration**,
-  same lane, at its own declared `page = N` (falling back to the struct's),
-  sorted by the declared property instead of by modification instant and
+- `#[wavedb::list]` is **the only opt-in to duplication** (RFC 0051): each
+  declaration adds one more chain of the same records, same lane, this time
+  holding **whole records inline**, sorted by the declared property and
   tie-broken by the **anchor** (immutable ⇒ a save relocates only when that
   property changed — but it still **rewrites** the record in every list, since
-  the bytes are duplicated there and only the position is unchanged). Every list is maintained in the
+  the bytes are duplicated there and only the position is unchanged). Copies of
+  each record on disk: **1** by default, **1 + K** with K declared lists. Its
+  `page = N` (per list, falling back to the struct's) is what makes a rendered
+  page one segment read; the payload-free chains take the large log capacity
+  instead, since there is nothing in them to paginate. Every list is maintained in the
   same atomic batch, gated on the built-in chain's liveness verdict, and read by
   the generated `listed_by_*` / `_at_page` / `_len`. It costs a full copy of
   every record per declaration — that duplication *is* the design.
