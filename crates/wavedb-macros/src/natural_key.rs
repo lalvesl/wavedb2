@@ -6,7 +6,8 @@
 use proc_macro2::Span;
 use syn::{Attribute, Ident};
 
-use crate::args::{KeySpec, Shape};
+use crate::arg_specs::KeySpec;
+use crate::args::Shape;
 
 /// Take the `#[wavedb::key(...)]` natural-key declaration (at most one),
 /// resolve its fields, and fold it into the STRUCT_HASH field list as a

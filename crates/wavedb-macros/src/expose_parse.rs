@@ -8,9 +8,24 @@ use syn::{Ident, Path, Token, braced};
 
 /// The per-item ops an entry can override or exclude — one per wire
 /// [`Command`](wavedb_core::expose::Command).
-pub const OPS: [&str; 8] = [
+pub const OPS: [&str; 10] = [
     "get", "save", "insert", "update", "remove", "all", "history", "changes",
+    "listed", "list_len",
 ];
+
+/// An op's `Command` variant: the op name in PascalCase (`list_len` →
+/// `ListLen`), which is the naming rule the wire enum follows.
+pub fn variant(op: &str) -> String {
+    let mut out = String::with_capacity(op.len());
+    for word in op.split('_') {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
 
 /// What a declared entry contributes.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -90,8 +105,8 @@ impl Parse for OpOverride {
         if !OPS.contains(&op.to_string().as_str()) {
             return Err(syn::Error::new_spanned(
                 &op,
-                "unknown op; expected one of \
-                 get/save/insert/update/remove/all/history",
+                "unknown op; expected one of get/save/insert/update/remove/\
+                 all/history/changes/listed/list_len",
             ));
         }
         input.parse::<Token![:]>()?;

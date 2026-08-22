@@ -69,11 +69,12 @@ use wavedb_macros::{expose_client, expose_server, wavedb};
 expose_server! {
     AboutUser,
     Note,
+    Row,
     billing::Invoice { save: audited_invoice_save, get: never },
     store Attachment,
 }
 
-expose_client! { AboutUser, Note }
+expose_client! { AboutUser, Note, Row }
 
 /// A hardened per-op override — same signature as the generated step; the
 /// exposure arm calls this path instead (compiler-resolved, no callback).
@@ -203,6 +204,60 @@ pub mod wide_list {
     #[derive(Debug, PartialEq, Eq, Clone, Default)]
     pub struct Person {
         #[wavedb::list]
+        pub name: String,
+        pub city: String,
+    }
+}
+
+/// NonUnique with a **fuzzy index** (RFC 0056): an n-gram posting tree over
+/// `name`, so `"jhon smtih"` still finds `"John Smith"`.
+///
+/// The declaration sits on the **field**, not the struct header — a fuzzy
+/// index is built over exactly one string, so a header form would only restate
+/// a name the attribute already sits next to. It coexists with a
+/// `#[wavedb::pivot]` on the same field on purpose: exact lookup and
+/// approximate lookup are different questions, and neither is sugar for the
+/// other.
+#[wavedb(NonUnique)]
+#[wavedb::pivot(city)]
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct Member {
+    #[wavedb::fuzzy]
+    pub name: String,
+    pub city: String,
+}
+
+/// [`Member`]'s twin at a **different gram width**.
+///
+/// Its only purpose is to prove `n` reaches the identity: postings cut at 3 and
+/// at 4 are different keys entirely, so sharing a hash would let one tree hold
+/// both and answer neither correctly.
+pub mod wide_gram {
+    use wavedb_macros::wavedb;
+
+    #[wavedb(NonUnique)]
+    #[wavedb::pivot(city)]
+    #[derive(Debug, PartialEq, Eq, Clone, Default)]
+    pub struct Member {
+        #[wavedb::fuzzy(n = 4)]
+        pub name: String,
+        pub city: String,
+    }
+}
+
+/// [`Member`]'s twin differing only in the **fold profile**.
+///
+/// `fold = none` keeps diacritics, so `José` and `Jose` are filed under
+/// different grams — which is exactly why the profile has to reach the
+/// identity too.
+pub mod unfolded {
+    use wavedb_macros::wavedb;
+
+    #[wavedb(NonUnique)]
+    #[wavedb::pivot(city)]
+    #[derive(Debug, PartialEq, Eq, Clone, Default)]
+    pub struct Member {
+        #[wavedb::fuzzy(fold = none)]
         pub name: String,
         pub city: String,
     }
@@ -395,6 +450,64 @@ mod tests {
             super::wide_list::Person::STRUCT_HASH,
             "a list's capacity must be a different type — one chain holding \
              segments laid out two ways is exactly what the fold prevents"
+        );
+    }
+
+    // `#[wavedb::fuzzy]` sits on the **field**, and both of its knobs reach
+    // stored bytes — the gram width decides what the keys *are*, the fold
+    // decides which records share them. Neither can be changed on live data,
+    // so both must mint a new type.
+    #[test]
+    fn a_fuzzy_declaration_and_its_profile_reach_the_identity() {
+        use super::{Member, unfolded, wide_gram};
+        use wavedb_core::NonUniqueStruct;
+        use wavedb_core::fuzzy::{DEFAULT_N, Fold};
+
+        assert_eq!(Member::NUM_FUZZY, 1);
+        assert_eq!(Member::fuzzy_profile(0), (DEFAULT_N, Fold::Latin));
+        assert_eq!(wide_gram::Member::fuzzy_profile(0), (4, Fold::Latin));
+        assert_eq!(unfolded::Member::fuzzy_profile(0), (DEFAULT_N, Fold::None));
+
+        // The source is the marked field, borrowed — no clone to index.
+        let m = Member {
+            name: "Ada".into(),
+            city: "London".into(),
+        };
+        assert_eq!(m.fuzzy_source(0), "Ada");
+        assert_eq!(m.fuzzy_source(9), "", "out of range falls back");
+
+        // Three types, three identities: same name, same fields, same shape.
+        assert_ne!(
+            Member::STRUCT_HASH,
+            wide_gram::Member::STRUCT_HASH,
+            "grams cut at 3 and at 4 are different keys — one tree holding \
+             both would answer neither correctly"
+        );
+        assert_ne!(
+            Member::STRUCT_HASH,
+            unfolded::Member::STRUCT_HASH,
+            "`fold = none` files José and Jose apart; reusing the identity \
+             would leave the old postings claiming the new rule"
+        );
+        assert_ne!(
+            wide_gram::Member::STRUCT_HASH,
+            unfolded::Member::STRUCT_HASH
+        );
+    }
+
+    // The macro mirrors the engine's default gram width so it can fold a
+    // **resolved** value rather than eliding it. If the two ever drift, an
+    // undeclared `#[wavedb::fuzzy]` would hash as one width and be laid out at
+    // another — silently.
+    #[test]
+    fn the_macro_default_matches_the_engine() {
+        use super::Member;
+        use wavedb_core::NonUniqueStruct;
+
+        assert_eq!(
+            Member::fuzzy_profile(0).0,
+            wavedb_core::fuzzy::DEFAULT_N,
+            "the macro's mirrored DEFAULT_N drifted from the engine's"
         );
     }
 

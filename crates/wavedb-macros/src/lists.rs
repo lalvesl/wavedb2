@@ -15,7 +15,8 @@ use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::{Attribute, Data, DeriveInput, Ident};
 
-use crate::args::{ListSpec, Shape};
+use crate::arg_specs::ListSpec;
+use crate::args::Shape;
 use crate::secondaries::ResolvedPivot;
 
 /// One resolved `#[wavedb::list(...)]`: the ordering, plus its own segment

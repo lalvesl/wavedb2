@@ -100,6 +100,8 @@ pub enum NodeErrorKind {
     KeyMismatch,
     /// A list read named an ordering the type does not declare.
     ListOutOfRange,
+    /// A fuzzy read named an undeclared index.
+    FuzzyOutOfRange,
 }
 
 /// A structured node-side rejection, riding **inside** the 200 response —
@@ -139,6 +141,7 @@ impl NodeError {
             CoreError::ChainCorrupt(_) => NodeErrorKind::ChainCorrupt,
             CoreError::KeyMismatch(_) => NodeErrorKind::KeyMismatch,
             CoreError::ListOutOfRange(_) => NodeErrorKind::ListOutOfRange,
+            CoreError::FuzzyOutOfRange(_) => NodeErrorKind::FuzzyOutOfRange,
         };
         Self {
             kind,
