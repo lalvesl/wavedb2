@@ -42,6 +42,23 @@ impl<T: NonUniqueStruct> Collection<T> {
             .collect()
     }
 
+    /// The **fuzzy posting trees** this pivot declares, in declaration order
+    /// ([RFC 0056]).
+    ///
+    /// Structurally a secondary index and nothing more: the same `BpTree`, the
+    /// same `SecKey`, the same capacities. What differs is only what the key
+    /// means — one gram of the indexed value rather than the whole value — and
+    /// that a record contributes many keys instead of one.
+    ///
+    /// [RFC 0056]: https://github.com/wavedb/wavedb/blob/main/rfcs/0056-fuzzy-string-search-WIP.md
+    pub(crate) fn fuzzy_trees(&self, pivot: &T::Pivot) -> Vec<BpTree<SecKey>> {
+        pivot
+            .fuzzy()
+            .iter()
+            .map(|root| self.sec_tree(*root))
+            .collect()
+    }
+
     /// The **record chain** this pivot names: one entry per living record, in
     /// modification order, with a sparse index above it (RFC 0050).
     ///
@@ -222,11 +239,21 @@ impl<T: NonUniqueStruct> Collection<T> {
             list_roots.push(chain.roots());
             batch.extend(writes);
         }
+        // One posting tree per `#[wavedb::fuzzy]` (RFC 0056) — a `BpTree` like
+        // a secondary, because a posting is a key and an anchor and nothing
+        // else. Nothing here duplicates a record.
+        let mut fuzzy_roots = Vec::with_capacity(T::NUM_FUZZY);
+        for _ in 0..T::NUM_FUZZY {
+            let (tree, write) = BpTree::<SecKey>::plan_create(tenant);
+            fuzzy_roots.push(tree.root());
+            batch.push(write);
+        }
         let pivot_record = T::Pivot::default().replace_roots(Roots {
             secondaries: &sec_roots,
             recency,
             removals: removals.log_roots(),
             lists: &list_roots,
+            fuzzy: &fuzzy_roots,
         });
         batch.push(Write::Put(
             pivot_id,

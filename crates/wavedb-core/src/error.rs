@@ -76,6 +76,10 @@ pub enum Error {
     /// not declare (out of `0..NUM_SECONDARIES`).
     #[error("secondary index {0} out of range")]
     SecondaryIndexOutOfRange(usize),
+    /// A fuzzy read named an index this collection's `Pivot` does not
+    /// declare (out of `0..NUM_FUZZY`).
+    #[error("fuzzy index {0} out of range")]
+    FuzzyOutOfRange(usize),
     /// A list read named an ordering this collection's `Pivot` does not declare
     /// (out of `0..NUM_LISTS`).
     #[error("declared list {0} out of range")]

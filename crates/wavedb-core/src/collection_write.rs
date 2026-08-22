@@ -9,6 +9,7 @@
 //! logs only ever grow at their tails.
 
 use crate::collection::Collection;
+use crate::collection_reindex::Reindex;
 use crate::error::Result;
 use crate::id::Id;
 use crate::index::{BpTree, Chain, ChainRoots, LogRoots, Pivot, Roots, SecKey};
@@ -34,6 +35,8 @@ pub struct MovedRoots<'a> {
     pub removals: LogRoots,
     /// The declared lists' chains, in declaration order (RFC 0051).
     pub lists: &'a [Chain<Vec<u8>>],
+    /// The fuzzy posting trees, in declaration order (RFC 0056).
+    pub fuzzy: &'a [BpTree<SecKey>],
 }
 
 impl<T: NonUniqueStruct> Collection<T> {
@@ -55,16 +58,20 @@ impl<T: NonUniqueStruct> Collection<T> {
             moved.secondaries.iter().map(BpTree::root).collect();
         let list_roots: Vec<ChainRoots> =
             moved.lists.iter().map(Chain::roots).collect();
+        let fuzzy_roots: Vec<LocalId> =
+            moved.fuzzy.iter().map(BpTree::root).collect();
         if sec_roots.as_slice() != pivot.secondaries()
             || moved.recency != pivot.recency()
             || moved.removals != pivot.removals()
             || list_roots.as_slice() != pivot.lists()
+            || fuzzy_roots.as_slice() != pivot.fuzzy()
         {
             let rewritten = pivot.replace_roots(Roots {
                 secondaries: &sec_roots,
                 recency: moved.recency,
                 removals: moved.removals,
                 lists: &list_roots,
+                fuzzy: &fuzzy_roots,
             });
             batch.push(self.pivot_rewrite(&rewritten));
         }
@@ -137,6 +144,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         let mut records = self.recency_chain(pivot);
         let mut secs = self.sec_trees(pivot);
         let mut lists = self.list_chains(pivot);
+        let mut fuzzy = self.fuzzy_trees(pivot);
         let envelope = encode_record(T::STRUCT_HASH, &meta, value);
         let key = Self::instant_key(instant, LocalId::from_id(id));
         // The chain carries the record **inline**, keyed by the instant its
@@ -154,6 +162,10 @@ impl<T: NonUniqueStruct> Collection<T> {
             let key = Self::sec_key(value, i, id);
             batch.extend(tree.plan_insert(store, key).await?);
         }
+        // …and `L + n - 1` postings per fuzzy declaration (RFC 0056).
+        let mut view = Overlay::new(store);
+        self.plan_fuzzy_inserts(&mut view, &mut batch, &mut fuzzy, id, value)
+            .await?;
         self.push_root_moves(
             &mut batch,
             pivot,
@@ -162,6 +174,7 @@ impl<T: NonUniqueStruct> Collection<T> {
                 recency: records.roots(),
                 removals: pivot.removals(),
                 lists: &lists,
+                fuzzy: &fuzzy,
             },
         );
         store.apply(&batch).await?;
@@ -252,52 +265,26 @@ impl<T: NonUniqueStruct> Collection<T> {
         let mut records = self.recency_chain(&pivot);
         let mut secs = self.sec_trees(&pivot);
         let mut lists = self.list_chains(&pivot);
+        let mut fuzzy = self.fuzzy_trees(&pivot);
         // Removals and inserts mutate the same structures in one batch: each
         // plan reads through the overlay of the pending node writes.
         let mut view = Overlay::new(store);
         if let Some((old_instant, old_value)) = &old {
-            let anchor = LocalId::from_id(id);
-            // A save **relocates** the record in the chain: its key is the live
-            // version's authoring instant, and that instant just changed. Out of
-            // the old position, in at the new one — which is the movement that
-            // *is* the modification log (RFC 0050).
-            let moved = self
-                .plan_chain_move(
-                    &mut view,
-                    &mut batch,
-                    &mut records,
-                    Self::instant_key(*old_instant, anchor),
-                    &live_meta,
-                    value,
-                )
-                .await?;
-            // Only a record the built-in chain holds belongs in a declared list
-            // — the same liveness gate, applied once (RFC 0051).
-            if let Some(envelope) = moved {
-                self.plan_list_moves(
-                    &mut view,
-                    &mut batch,
-                    &mut lists,
-                    id,
-                    &envelope,
-                    (old_value, value),
-                )
-                .await?;
-            }
-            for (i, tree) in secs.iter_mut().enumerate() {
-                let old_key = Self::sec_key(old_value, i, id);
-                let new_key = Self::sec_key(value, i, id);
-                if old_key == new_key {
-                    continue; // this index's fields didn't change
-                }
-                if let Some(writes) = tree.plan_remove(&view, old_key).await? {
-                    view.stage(&writes);
-                    batch.extend(writes);
-                }
-                let writes = tree.plan_insert(&view, new_key).await?;
-                view.stage(&writes);
-                batch.extend(writes);
-            }
+            let mut moving = Reindex {
+                records: &mut records,
+                lists: &mut lists,
+                secs: &mut secs,
+                fuzzy: &mut fuzzy,
+            };
+            self.plan_reindex(
+                &mut view,
+                &mut batch,
+                &mut moving,
+                (id, *old_instant),
+                &live_meta,
+                (old_value, value),
+            )
+            .await?;
         } else if T::NUM_SECONDARIES > 0 {
             return Err(crate::Error::RecordMissing(id));
         }
@@ -309,6 +296,7 @@ impl<T: NonUniqueStruct> Collection<T> {
                 recency: records.roots(),
                 removals: pivot.removals(),
                 lists: &lists,
+                fuzzy: &fuzzy,
             },
         );
         store.apply(&batch).await?;
