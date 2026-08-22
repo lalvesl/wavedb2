@@ -82,7 +82,24 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   a ceiling on it, forcing the O(database) snapshot far more often than
   necessary. Each chunk now names the one before it, the frame names only the
   head, and it is a fixed 16 bytes however long the log grows.
-- **Landed, and the largest of them (storage & query):**
+- **The default, settled 2026-07-31 —
+  [0054](0054-no-duplication-by-default.md):** a record lives at its **anchor and
+  nowhere else**. A collection's two instant-keyed chains — **recency** and the
+  **removal log** — are the same shape, ids and nothing else (`Chain<()>`; a
+  `SecKey` already carries the anchor), answering "what changed" and "what died".
+  One segment read gives membership and order; each record is resolved at the
+  address it always had. `all()` stays recency-ordered on purpose: a save moving
+  a record to the front is the feature, and a caller wanting a stable
+  domain order declares a `#[wavedb::list]` for it.
+  `#[wavedb::list(...)]` is the **only** opt-in to duplication: 1 copy by
+  default, `1 + K` with K lists. It opened as `layout = anchored`, a declared
+  alternative, and the knob was built and deleted the same day — "not anchored"
+  is not a state a record can be in (history and the dead log resolve it there),
+  so the knob only ever controlled whether there was an *extra* copy, which is
+  what a list already controls. And since `Chain<P>` was already payload-generic
+  and the removal log was already `Chain<()>`, the whole model is one type
+  parameter, not a second engine.
+- **The structure it rides on (storage & query):**
   [0050](0050-clustered-record-chains.md) — a collection's records are **additionally** stored inline in a chain of
   segments ordered by the live version's **authoring instant**, so a scan costs one
   read per segment instead of one page read *and* one zstd decompression per record,
@@ -152,15 +169,15 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   then the per-list `page` (`#[wavedb::list(page = 25)]`), which exists because
   the two chain kinds have opposite write profiles: the built-in chain is
   rewritten whole at its growth end on every save and wants a small N, a list is
-  rewritten in place and can hold the page a view renders. What is left is one
-  hardening test — the counts across a **crash and replay**, which needs
-  `PageStore` — and two policy questions;
-  [0054](0054-anchored-layout-PLANNED.md) — the counterweight: 0050–0052 trade space
-  for bulk reads, the wrong bargain for a collection read one record at a time or
-  rarely at all, so the **anchored** layout — records only at their anchors, one dense
-  index over them — stays a declared choice rather than being retired. The two are
-  packages, not independent knobs: a sparse index is only possible over data ordered
-  by its key, so hash-scattered anchors can only ever carry a dense one;
+  rewritten in place and can hold the page a view renders. The counts are proven
+  across a **crash and replay** too (`counts_survive_recovery`, over `PageStore`:
+  a mid-batch tear during recovery is what makes the index and the segments
+  disagree, and the test reads that disagreement off the public `list_len` vs
+  the rows `listed` actually serves). What is left is two policy questions;
+  [0054](0054-no-duplication-by-default.md) — which then **inverted the default**
+  of all three (see above): duplication moved from something every collection pays
+  to something a `#[wavedb::list]` asks for, and 0050's chain machinery is what
+  both the pointer chains and the declared lists are built out of;
   [0053](0053-tenant-fair-cache-retention-PLANNED.md) — the policy that follows
   from that: which entries deserve to stay hot without one tenant monopolising the
   budget (navigational vs streaming, per-tenant accounting, no pinning ever). Held
@@ -264,7 +281,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0051](0051-ordered-record-lists.md) | Declared lists: sorted chains + sparse index | Implemented |
 | [0052](0052-segment-size-as-the-pagination-unit.md) | Segment size as the pagination unit | Implemented |
 | [0053](0053-tenant-fair-cache-retention-PLANNED.md) | Tenant-fair cache retention | Planned |
-| [0054](0054-anchored-layout-PLANNED.md) | The anchored layout (no clustering) | Planned |
+| [0054](0054-no-duplication-by-default.md) | No duplication by default | Implemented |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |

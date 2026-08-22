@@ -5,8 +5,8 @@
   (the N…2N band, the 50/50 split, the merge at N/2 and its two rules), 2/3a
   (element counts, the offset descent, the root's total) and 7a (the struct's
   `page = N`, folded); the per-list `page` landed here on 2026-07-31.
-  **Remaining:** a crash-and-replay test for the counts (see the open
-  questions), and two policy questions that want a real application.
+  **Remaining:** two policy questions that want a real application to settle;
+  the mechanism and its durability are done.
 - **Crates:** `wavedb-core`, `wavedb-macros`
 - **Builds on:** [RFC 0050](0050-clustered-record-chains.md) (the segment),
   [RFC 0051](0051-ordered-record-lists.md) (the sparse index),
@@ -194,6 +194,13 @@ segment write per N inserts, inside the one window a batch already writes
 (RFC 0041) — bytes, not IOps — but the earlier text said "a second segment write"
 and undercounted.
 
+> **Reviewed and accepted 2026-07-31 (user).** The third write is the neighbour's
+> re-link, and it is the price of a doubly-linked list: a new segment between two
+> others has to be named by the one before it. Left as is — the alternative
+> (singly-linked, or a level of indirection between segments) costs the backward
+> walk that `all()` and catch-up both depend on. Revisit if the write side ever
+> becomes the binding constraint.
+
 ### What that costs a reader, and why it is nearly free
 
 A segment holding 1.5N records does not line up with an N-row page. The second page
@@ -333,12 +340,22 @@ For a chain with minimum N and a UI page P ≤ N:
   the bare-chain tests never see. Both were mutation-checked: filing `len − 1`,
   and skipping the upsert when the separator is unchanged, each fail the suite.
 
-  What is **still** an argument rather than a test is the half the question
-  actually names — **crash and replay**. Every test above applies whole batches
-  to a store that cannot tear. Proving it needs `PageStore`: build a chain, kill
-  during the write, reopen, and assert the counts still agree. That is a
-  `wavedb-storage` durability test (the "reopen-and-replay or kill-during-write"
-  bar), and it is the one piece of this bullet left open.
+  **Answered in full 2026-07-31.** The crash half is now
+  `wavedb-storage/tests/counts_survive_recovery.rs`: a collection with a
+  declared list is grown past several splits and drained to `data.bin`, then
+  driven through saves, removals and inserts that are deliberately **not**
+  drained, and the store is dropped — so recovery crosses both paths, settled
+  pages and replayed journal frames, inside one chain.
+
+  The check runs through the **public** surface rather than the engine's
+  internals, which turned out to be the better assertion: `list_len` is the
+  index's answer (the root's subtree sum) and counting what `listed` yields is
+  the segments' answer, so comparing them is the user-visible form of "an entry
+  and its segment disagree". Three mutations to recovery are caught — replaying
+  only the first frame, tearing a batch's tail, and tearing it mid-way. The last
+  is the one that matters: it fails on the count comparison itself, reporting
+  *"the index reports 24 rows but the segments hold 27"*, which is precisely the
+  silently-wrong pager this bullet was worried about.
 
   A more valuable hole turned up while mutating for the above, and is worth
   recording because it is the class of bug this whole family of RFCs creates: a
