@@ -6,10 +6,13 @@
 //! - the **record chain** holds exactly one entry per **living** record,
 //!   keyed by the instant its live version was authored. An insert adds it,
 //!   a save relocates it, a remove takes it out — so a tail scan from a
-//!   cursor is precisely "every record changed since", each one once, with
-//!   the record's bytes riding inline.
+//!   cursor is precisely "every record changed since", each one once. The
+//!   entry carries **no payload** (RFC 0054): its key already names the
+//!   anchor, and the record lives there.
 //! - the **removal log** holds one entry per removed record, keyed by the
-//!   instant of the removal — what that same tail scan pairs with.
+//!   instant of the **removal** — "when was this killed", which is what that
+//!   same tail scan pairs with, and the half of the floor that survives a
+//!   record leaving the living set.
 //!
 //! Both are maintained inside the ops' single atomic batch. Their tails
 //! form the collection's **instant floor**: every instant minted for the
@@ -62,7 +65,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         store: &S,
         pivot: &T::Pivot,
     ) -> Result<u64> {
-        let records = self.records_chain(pivot);
+        let records = self.recency_chain(pivot);
         let removals = self.dead_log(pivot);
         let live = records.segment(store, records.tail()).await?;
         // The removal log is the other half and not an optimisation: a
@@ -101,7 +104,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         &self,
         view: &mut Overlay<'_, S>,
         batch: &mut Vec<Write>,
-        records: &mut Chain<Vec<u8>>,
+        records: &mut Chain<()>,
         old_key: SecKey,
         live_meta: &Metadata,
         value: &T,
@@ -122,13 +125,17 @@ impl<T: NonUniqueStruct> Collection<T> {
         };
         view.stage(&writes);
         batch.extend(writes);
+        // The chain entry carries nothing: its key already names the anchor,
+        // and the record is at that anchor. The envelope is still encoded here
+        // because the caller's declared lists DO hold it, and encoding once is
+        // the point of handing it back.
         let envelope =
             crate::record::encode_record(T::STRUCT_HASH, live_meta, value);
         let writes = records
             .plan_insert(
                 &*view,
                 Self::instant_key(instant, LocalId::from_id(id)),
-                envelope.clone(),
+                (),
             )
             .await?;
         view.stage(&writes);

@@ -148,11 +148,12 @@ impl<T: NonUniqueStruct> Collection<T> {
 
     /// Stream every living record, **most recently changed first**.
     ///
-    /// This walks the record chain (RFC 0050) back from its tail, and the
-    /// records come out of the segments **inline** — there is no per-record
-    /// fetch, so a listing costs one read per segment instead of one page read
-    /// *and* one dictionary decompression per record. It is the read the whole
-    /// clustering exists for.
+    /// This walks the record chain (RFC 0050) back from its tail. The chain
+    /// holds **pointers** (RFC 0054 — a record is stored once, at its anchor),
+    /// so one read per segment gives membership and order and each record is
+    /// then resolved at its address. A collection that wants a listing without
+    /// that per-record read declares a `#[wavedb::list]`, which is the
+    /// structure that holds records inline.
     ///
     /// ## The order changed
     ///
@@ -176,7 +177,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         let handle = self;
         futures::stream::once(async move {
             let pivot = handle.load_pivot(store).await?;
-            let chain = handle.records_chain(&pivot);
+            let chain = handle.recency_chain(&pivot);
             let tenant = handle.tenant();
             Ok::<_, Error>(
                 futures::stream::try_unfold(
@@ -186,14 +187,21 @@ impl<T: NonUniqueStruct> Collection<T> {
                             return Ok::<_, Error>(None);
                         };
                         let seg = chain.segment(store, id).await?;
-                        // The payload is the record's stored envelope verbatim,
-                        // so decoding it is the whole fetch. Reversed: a segment
-                        // holds its keys ascending, the walk runs descending.
+                        // The chain holds pointers, not records: one segment
+                        // read gives the membership and the order, and each
+                        // record is then resolved at its anchor. Reversed: a
+                        // segment holds its keys ascending, the walk runs
+                        // descending.
                         let mut page = Vec::with_capacity(seg.len());
-                        for (key, bytes) in seg.entries() {
+                        for (key, ()) in seg.entries() {
+                            let rec = key.rec.to_id(tenant);
+                            let bytes = store
+                                .get_of(T::STRUCT_HASH, rec)
+                                .await?
+                                .ok_or(Error::RecordMissing(rec))?;
                             let (_, value) =
-                                decode_record::<T>(T::STRUCT_HASH, bytes)?;
-                            page.push(Ok((key.rec.to_id(tenant), value)));
+                                decode_record::<T>(T::STRUCT_HASH, &bytes)?;
+                            page.push(Ok((rec, value)));
                         }
                         page.reverse();
                         Ok(Some((futures::stream::iter(page), seg.prev())))

@@ -1,11 +1,15 @@
 //! **Declared lists** ([RFC 0051]) — `#[wavedb::list(...)]`: one more chain of
-//! the same records, kept sorted by a declared property instead of by
-//! modification instant.
+//! the same records, sorted by a declared property instead of by modification
+//! instant, and holding **whole records inline**.
 //!
-//! The mechanism is RFC 0050's, unchanged. What a declaration changes is only
-//! *which* key the chain is laid out by, so this module is thin on purpose: the
-//! write half threads each list through the same `plan_insert`/`plan_remove` the
-//! built-in chain uses, and the read half is the same segment walk.
+//! That last part is the whole reason to declare one, and the only duplication
+//! WaveDB ever performs ([RFC 0054]): the built-in chain carries pointers, so a
+//! collection that declares nothing stores each record exactly once. A list buys
+//! a dense bulk read in its order, and pays a full copy for it.
+//!
+//! The mechanism is RFC 0050's, unchanged: the write half threads each list
+//! through the same `plan_insert`/`plan_remove` the built-in chain uses, and the
+//! read half is the same segment walk.
 //!
 //! Two differences from the built-in chain are load-bearing:
 //!
@@ -23,6 +27,7 @@
 //! deciding membership on its own.
 //!
 //! [RFC 0051]: https://github.com/wavedb/wavedb/blob/main/rfcs/0051-ordered-record-lists.md
+//! [RFC 0054]: https://github.com/wavedb/wavedb/blob/main/rfcs/0054-no-duplication-by-default.md
 
 use futures::{Stream, TryStreamExt};
 
@@ -135,8 +140,9 @@ impl<T: NonUniqueStruct> Collection<T> {
 
     /// Stream every living record in declared list `index`'s order, ascending.
     ///
-    /// One read per segment, records inline — the same shape as
-    /// [`all`](Collection::all), in a declared order instead of recency order.
+    /// One read per segment, records **inline** — unlike
+    /// [`all`](Collection::all), which walks pointers and resolves each record
+    /// at its anchor. Buying that difference is what declaring a list is for.
     /// The generated `listed_by_<fields>` wrapper calls this with the
     /// declaration's index.
     pub fn listed<'a, S: Store>(
@@ -276,7 +282,7 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct RowPivot {
-        records: ChainRoots,
+        recency: ChainRoots,
         removals: LogRoots,
         lists: [ChainRoots; 1],
         permission: Option<PermissionRef>,
@@ -287,8 +293,8 @@ mod tests {
         fn secondaries(&self) -> &[LocalId] {
             &[]
         }
-        fn records(&self) -> ChainRoots {
-            self.records
+        fn recency(&self) -> ChainRoots {
+            self.recency
         }
         fn removals(&self) -> LogRoots {
             self.removals
@@ -303,7 +309,7 @@ mod tests {
             let mut lists = self.lists;
             lists.copy_from_slice(roots.lists);
             Self {
-                records: roots.records,
+                recency: roots.recency,
                 removals: roots.removals,
                 lists,
                 permission: self.permission.clone(),
@@ -346,9 +352,9 @@ mod tests {
     /// This is the invariant a pager rests on: `_at_page` descends by count, so
     /// a count that has drifted from its segment does not fail, it silently
     /// returns the wrong rows.
-    async fn counts_agree(
+    async fn counts_agree<P: crate::wire::WaveWire>(
         store: &MemStore,
-        chain: &Chain<Vec<u8>>,
+        chain: &Chain<P>,
         what: &str,
     ) {
         let index = chain.index().expect("a record chain always has an index");
@@ -406,11 +412,12 @@ mod tests {
     /// bytes.
     async fn all_counts_agree(store: &MemStore, col: &Collection<Row>) {
         let pivot = col.load_pivot(store).await.unwrap();
-        let records = col.records_chain(&pivot);
+        let records = col.recency_chain(&pivot);
         let list = col.list_chain(&pivot, 0).unwrap();
         counts_agree(store, &records, "built-in chain").await;
         counts_agree(store, &list, "list 0").await;
-        payloads_agree(store, &records, col.tenant(), "built-in chain").await;
+        // Only a declared list duplicates bytes, so only a list can drift from
+        // its anchor; the built-in chain holds pointers and cannot.
         payloads_agree(store, &list, col.tenant(), "list 0").await;
     }
 
@@ -526,8 +533,9 @@ mod tests {
     // A list is laid out at **its own** capacity, not the struct's. The two
     // chains hold the very same records, so a difference in segment count can
     // only come from the capacity — which is the whole point of separating
-    // them: the built-in chain is rewritten whole on every save and wants a
-    // small N, a list is rewritten in place and can hold a rendered page.
+    // them: the built-in chain holds only pointers (RFC 0054 — no duplication
+    // by default) and wants the removal log's large capacity, while a list
+    // holds whole records and wants the page a view renders.
     #[test]
     fn a_list_lays_out_at_its_own_page() {
         block_on(async {
@@ -535,31 +543,38 @@ mod tests {
             let pivot =
                 Collection::<Row>::create(&store, tenant()).await.unwrap();
             let col = Collection::<Row>::at(pivot, tenant());
-            for n in 0..20u32 {
+            for n in 0..40u32 {
                 col.insert(&store, &row(&format!("r{n:02}"))).await.unwrap();
             }
 
             let pivot = col.load_pivot(&store).await.unwrap();
-            let built_in = segments(&store, &col.records_chain(&pivot)).await;
+            let built_in = segments(&store, &col.recency_chain(&pivot)).await;
             let list =
                 segments(&store, &col.list_chain(&pivot, 0).unwrap()).await;
 
-            // 20 records at N=4 split into several; at N=16 they all fit in the
-            // one segment the chain was created with.
+            // 40 records, three capacities, three answers — which is what makes
+            // this an assertion rather than a coincidence:
+            //   the struct's `page = 4`   → ~10 segments
+            //   the list's   `page = 16`  → 2…4 segments   ← what it declared
+            //   the pointer chain's 256   → 1 segment
             assert!(
-                built_in >= 3,
-                "the struct's page = 4 did not reach the built-in chain: \
-                 {built_in} segment(s)"
+                (2..=4).contains(&list),
+                "the list is not laid out at its own page = 16: {list} \
+                 segment(s) — a 4 would give ~10, a 256 would give 1"
             );
             assert_eq!(
-                list, 1,
-                "the list ignored its own page = 16 and used the struct's 4"
+                built_in, 1,
+                "the built-in chain holds pointers, so it takes the removal \
+                 log's capacity rather than the struct's page"
             );
         });
     }
 
     /// How many segments a chain currently holds.
-    async fn segments(store: &MemStore, chain: &Chain<Vec<u8>>) -> usize {
+    async fn segments<P: crate::wire::WaveWire>(
+        store: &MemStore,
+        chain: &Chain<P>,
+    ) -> usize {
         let mut n = 0;
         let mut cursor = Some(chain.head());
         while let Some(id) = cursor {
