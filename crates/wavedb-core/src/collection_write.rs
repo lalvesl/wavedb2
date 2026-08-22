@@ -29,7 +29,7 @@ pub struct MovedRoots<'a> {
     /// The secondary trees, in declaration order.
     pub secondaries: &'a [BpTree<SecKey>],
     /// The record chain's endpoints and index root (RFC 0050).
-    pub records: ChainRoots,
+    pub recency: ChainRoots,
     /// The removal log's endpoints.
     pub removals: LogRoots,
     /// The declared lists' chains, in declaration order (RFC 0051).
@@ -56,13 +56,13 @@ impl<T: NonUniqueStruct> Collection<T> {
         let list_roots: Vec<ChainRoots> =
             moved.lists.iter().map(Chain::roots).collect();
         if sec_roots.as_slice() != pivot.secondaries()
-            || moved.records != pivot.records()
+            || moved.recency != pivot.recency()
             || moved.removals != pivot.removals()
             || list_roots.as_slice() != pivot.lists()
         {
             let rewritten = pivot.replace_roots(Roots {
                 secondaries: &sec_roots,
-                records: moved.records,
+                recency: moved.recency,
                 removals: moved.removals,
                 lists: &list_roots,
             });
@@ -134,7 +134,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         let Succession::CreatedAt(instant) = meta.succession else {
             return Err(crate::Error::ChainCorrupt(id));
         };
-        let mut records = self.records_chain(pivot);
+        let mut records = self.recency_chain(pivot);
         let mut secs = self.sec_trees(pivot);
         let mut lists = self.list_chains(pivot);
         let envelope = encode_record(T::STRUCT_HASH, &meta, value);
@@ -143,7 +143,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         // live version was authored. That one entry is the membership set and
         // the modification log at once (RFC 0050).
         let mut batch = vec![Write::Put(id, envelope.clone())];
-        batch.extend(records.plan_insert(store, key, envelope.clone()).await?);
+        batch.extend(records.plan_insert(store, key, ()).await?);
         // …and one more copy per declared list, sorted by its own property
         // (RFC 0051).
         self.plan_list_inserts(
@@ -159,7 +159,7 @@ impl<T: NonUniqueStruct> Collection<T> {
             pivot,
             &MovedRoots {
                 secondaries: &secs,
-                records: records.roots(),
+                recency: records.roots(),
                 removals: pivot.removals(),
                 lists: &lists,
             },
@@ -249,7 +249,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         };
         let (mut batch, old, live_meta) =
             plan_chained_save::<T, S>(store, &plan, value).await?;
-        let mut records = self.records_chain(&pivot);
+        let mut records = self.recency_chain(&pivot);
         let mut secs = self.sec_trees(&pivot);
         let mut lists = self.list_chains(&pivot);
         // Removals and inserts mutate the same structures in one batch: each
@@ -306,7 +306,7 @@ impl<T: NonUniqueStruct> Collection<T> {
             &pivot,
             &MovedRoots {
                 secondaries: &secs,
-                records: records.roots(),
+                recency: records.roots(),
                 removals: pivot.removals(),
                 lists: &lists,
             },

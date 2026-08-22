@@ -33,10 +33,13 @@
 use std::marker::PhantomData;
 
 use crate::error::{Error, Result};
+// Only the test-only `load_record` still names an `Id` here; the addressing
+// half moved to `collection_roots`.
+#[cfg(test)]
 use crate::id::Id;
-use crate::index::{BpTree, Chain, ChainRoots, Lane, Pivot, Roots, SecKey};
+use crate::index::Pivot;
 use crate::local_id::LocalId;
-use crate::record::{decode_envelope, encode_envelope, mint_floored_id};
+use crate::record::{decode_envelope, encode_envelope};
 use crate::store::{Store, Write};
 use crate::traits::NonUniqueStruct;
 use crate::u48::U48;
@@ -57,10 +60,11 @@ pub use crate::record::{
 #[derive(Debug)]
 pub struct Collection<T: NonUniqueStruct> {
     pivot: LocalId,
-    tenant: U48,
+    // Read by `collection_roots`, which opens the structures this handle names.
+    pub(crate) tenant: U48,
     user: U48,
-    leaf_cap: usize,
-    internal_cap: usize,
+    pub(crate) leaf_cap: usize,
+    pub(crate) internal_cap: usize,
     _record: PhantomData<fn() -> T>,
 }
 
@@ -115,190 +119,6 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// The authorship stamped in mutations' `Metadata.user`.
     pub(crate) const fn user(&self) -> U48 {
         self.user
-    }
-
-    /// A secondary-index tree handle at `root` with the same capacities.
-    pub(crate) fn sec_tree(&self, root: LocalId) -> BpTree<SecKey> {
-        BpTree::at(root, self.tenant)
-            .with_caps(self.leaf_cap, self.internal_cap)
-    }
-
-    /// The secondary-index trees this pivot declares, in declaration order.
-    pub(crate) fn sec_trees(&self, pivot: &T::Pivot) -> Vec<BpTree<SecKey>> {
-        pivot
-            .secondaries()
-            .iter()
-            .map(|root| self.sec_tree(*root))
-            .collect()
-    }
-
-    /// The **record chain** this pivot names: living records stored inline in
-    /// modification order, with a sparse index above them (RFC 0050).
-    ///
-    /// The payload is the record's stored envelope **verbatim**, so the chain
-    /// copy is byte-comparable with the anchor it derives from — which is what
-    /// makes the consistency invariant testable rather than arguable.
-    pub(crate) fn records_chain(&self, pivot: &T::Pivot) -> Chain<Vec<u8>> {
-        self.record_chain(pivot.records(), T::PAGE)
-    }
-
-    /// The **removal log** this pivot names — the same chain shape with no
-    /// index, keyed by removal instant, payload-free.
-    pub(crate) fn dead_log(&self, pivot: &T::Pivot) -> Chain<()> {
-        let roots = pivot.removals();
-        Chain::log_at(
-            roots.head,
-            roots.tail,
-            self.tenant,
-            T::STRUCT_HASH,
-            Lane::Dead,
-        )
-    }
-
-    /// The **declared lists** this pivot names, in declaration order — the same
-    /// chain shape as the built-in one, sorted by a declared property instead of
-    /// by modification instant (RFC 0051).
-    ///
-    /// They share `Lane::Records` with the built-in chain: their payload is the
-    /// same record envelope, so one directory and one zstd dictionary model all
-    /// of them, which is exactly what a lane is for.
-    pub(crate) fn list_chains(&self, pivot: &T::Pivot) -> Vec<Chain<Vec<u8>>> {
-        pivot
-            .lists()
-            .iter()
-            .enumerate()
-            .map(|(i, r)| self.record_chain(*r, T::list_page(i)))
-            .collect()
-    }
-
-    /// One declared list's chain, by declaration index.
-    ///
-    /// # Errors
-    /// [`Error::ListOutOfRange`] when the pivot declares no such list.
-    pub(crate) fn list_chain(
-        &self,
-        pivot: &T::Pivot,
-        index: usize,
-    ) -> Result<Chain<Vec<u8>>> {
-        pivot
-            .lists()
-            .get(index)
-            .map(|r| self.record_chain(*r, T::list_page(index)))
-            .ok_or(Error::ListOutOfRange(index))
-    }
-
-    /// A record-lane chain handle at `roots` holding `min`…`2*min` records —
-    /// the built-in chain and every declared list are the same structure,
-    /// differing only in the key they are laid out by and the capacity they
-    /// were declared at.
-    fn record_chain(&self, roots: ChainRoots, min: usize) -> Chain<Vec<u8>> {
-        Chain::at(
-            roots.head,
-            roots.tail,
-            roots.index,
-            self.tenant,
-            T::STRUCT_HASH,
-            Lane::Records,
-        )
-        // The declared `page = N` (RFC 0052), or the engine default. It folds
-        // into the `STRUCT_HASH`, so every segment this chain ever held was
-        // laid out at this same capacity.
-        .with_min(min)
-    }
-
-    /// Declared list `i`'s sort key for `value` stored at `id`.
-    ///
-    /// Tie-broken by the **anchor**, not by the live version's instant: the
-    /// anchor never changes, so a save relocates the record only when the
-    /// declared property did (RFC 0051).
-    pub(crate) fn list_key(value: &T, i: usize, id: Id) -> SecKey {
-        SecKey {
-            field: value.list_key(i),
-            rec: LocalId::from_id(id),
-        }
-    }
-
-    /// Secondary index `i`'s key for `value` stored at `id`.
-    pub(crate) fn sec_key(value: &T, i: usize, id: Id) -> SecKey {
-        SecKey {
-            field: value.secondary_key(i),
-            rec: LocalId::from_id(id),
-        }
-    }
-
-    /// Create a new, empty collection under `tenant`: the record chain and
-    /// its sparse index, the removal log, one B+tree per
-    /// `#[wavedb::pivot(...)]`, and the `Pivot` record pointing at them all,
-    /// committed in one atomic batch. Returns the pivot's `LocalId` — the caller stores it (via the
-    /// generated `{Name}PivotId`) in an owning record.
-    ///
-    /// # Errors
-    /// Propagates a [`Store`] failure.
-    pub async fn create<S: Store>(store: &S, tenant: U48) -> Result<LocalId> {
-        let pivot_id = mint_floored_id(
-            tenant,
-            <T::Pivot as Pivot>::STRUCT_HASH,
-            0, // a pivot's id is pure addressing — no cursor scans it
-        );
-        Self::create_rooted(store, tenant, pivot_id).await?;
-        Ok(LocalId::from_id(pivot_id))
-    }
-
-    /// [`create`](Self::create)'s body with the pivot's identity supplied
-    /// instead of minted — the seam [`adopt_pivot`](Self::adopt_pivot)
-    /// bootstraps a cache-local copy of a **node-minted** collection through.
-    pub(crate) async fn create_rooted<S: Store>(
-        store: &S,
-        tenant: U48,
-        pivot_id: Id,
-    ) -> Result<()> {
-        // One B+tree per declared `#[wavedb::pivot(...)]` index, and nothing
-        // else: the record chain IS the membership set and the modification
-        // log, the removal log replaced the `dead` tree (RFC 0050 phase 5c).
-        let mut batch = Vec::new();
-        let mut sec_roots = Vec::with_capacity(T::NUM_SECONDARIES);
-        for _ in 0..T::NUM_SECONDARIES {
-            let (tree, write) = BpTree::<SecKey>::plan_create(tenant);
-            sec_roots.push(tree.root());
-            batch.push(write);
-        }
-        // No `with_min` here on purpose: creation only seeds the one empty
-        // segment that is both endpoints, and a capacity has nothing to say
-        // about an empty segment. `records_chain` applies `T::PAGE` on every
-        // subsequent open, which is where splits and merges are decided.
-        let (records, record_writes) = Chain::<Vec<u8>>::plan_create(
-            tenant,
-            T::STRUCT_HASH,
-            Lane::Records,
-        );
-        let (removals, removal_writes) =
-            Chain::<()>::plan_create_log(tenant, T::STRUCT_HASH, Lane::Dead);
-        batch.extend(record_writes);
-        batch.extend(removal_writes);
-        // One more chain per `#[wavedb::list(...)]` — same shape, same lane,
-        // sorted by the declared property instead of by modification instant
-        // (RFC 0051).
-        let mut list_roots = Vec::with_capacity(T::NUM_LISTS);
-        for _ in 0..T::NUM_LISTS {
-            let (chain, writes) = Chain::<Vec<u8>>::plan_create(
-                tenant,
-                T::STRUCT_HASH,
-                Lane::Records,
-            );
-            list_roots.push(chain.roots());
-            batch.extend(writes);
-        }
-        let pivot_record = T::Pivot::default().replace_roots(Roots {
-            secondaries: &sec_roots,
-            records: records.roots(),
-            removals: removals.log_roots(),
-            lists: &list_roots,
-        });
-        batch.push(Write::Put(
-            pivot_id,
-            encode_envelope(T::Pivot::STRUCT_HASH, &pivot_record),
-        ));
-        store.apply(&batch).await
     }
 
     /// The `LocalId` of this collection's `Pivot` record.
@@ -376,7 +196,7 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct DocPivot {
-        records: ChainRoots,
+        recency: ChainRoots,
         removals: LogRoots,
         permission: Option<PermissionRef>,
     }
@@ -386,8 +206,8 @@ mod tests {
         fn secondaries(&self) -> &[LocalId] {
             &[]
         }
-        fn records(&self) -> ChainRoots {
-            self.records
+        fn recency(&self) -> ChainRoots {
+            self.recency
         }
         fn removals(&self) -> LogRoots {
             self.removals
@@ -397,7 +217,7 @@ mod tests {
         }
         fn replace_roots(&self, roots: Roots<'_>) -> Self {
             Self {
-                records: roots.records,
+                recency: roots.recency,
                 removals: roots.removals,
                 permission: self.permission.clone(),
             }
@@ -424,7 +244,7 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct TaggedPivot {
-        records: ChainRoots,
+        recency: ChainRoots,
         removals: LogRoots,
         secondaries: [LocalId; 1],
         permission: Option<PermissionRef>,
@@ -435,8 +255,8 @@ mod tests {
         fn secondaries(&self) -> &[LocalId] {
             &self.secondaries
         }
-        fn records(&self) -> ChainRoots {
-            self.records
+        fn recency(&self) -> ChainRoots {
+            self.recency
         }
         fn removals(&self) -> LogRoots {
             self.removals
@@ -448,7 +268,7 @@ mod tests {
             let mut s = self.secondaries;
             s.copy_from_slice(roots.secondaries);
             Self {
-                records: roots.records,
+                recency: roots.recency,
                 removals: roots.removals,
                 secondaries: s,
                 permission: self.permission.clone(),
@@ -891,7 +711,7 @@ mod tests {
             // were comparing two empty structures.
             let pivot = col.load_pivot(&store).await.unwrap();
             assert!(
-                !col.records_chain(&pivot)
+                !col.recency_chain(&pivot)
                     .collect(&store)
                     .await
                     .unwrap()
@@ -915,18 +735,14 @@ mod tests {
         use crate::store::Store;
 
         let pivot = col.load_pivot(store).await.unwrap();
-        let chain = col.records_chain(&pivot).collect(store).await.unwrap();
+        let chain = col.recency_chain(&pivot).collect(store).await.unwrap();
         let mut in_chain: Vec<LocalId> = Vec::with_capacity(chain.len());
-        for (key, payload) in &chain {
+        for (key, ()) in &chain {
             let id = key.rec.to_id(col.tenant());
-            let stored = Store::get(store, id)
+            Store::get(store, id)
                 .await
                 .unwrap()
                 .expect("the chain names a record that is not at its anchor");
-            assert_eq!(
-                payload, &stored,
-                "the chain's copy diverged from its anchor"
-            );
             // The two answers to "does this live?" — the structure's and the
             // record's own — are what every read path now depends on agreeing.
             assert!(
@@ -1001,12 +817,12 @@ mod tests {
             store: &MemStore,
         ) -> Vec<crate::id::Id> {
             let pivot = col.load_pivot(store).await.unwrap();
-            col.records_chain(&pivot)
+            col.recency_chain(&pivot)
                 .collect(store)
                 .await
                 .unwrap()
                 .into_iter()
-                .map(|(key, _)| key.rec.to_id(col.tenant()))
+                .map(|(key, ())| key.rec.to_id(col.tenant()))
                 .collect()
         }
 
@@ -1028,8 +844,8 @@ mod tests {
             assert!(live_instant > b.key(), "the chain tail is the newest");
             let pivot_rec = col.load_pivot(&store).await.unwrap();
             let entries =
-                col.records_chain(&pivot_rec).collect(&store).await.unwrap();
-            let (key, _) = entries.last().unwrap();
+                col.recency_chain(&pivot_rec).collect(&store).await.unwrap();
+            let (key, ()) = entries.last().unwrap();
             assert_eq!(
                 (
                     u64::from_be_bytes(key.field.clone().try_into().unwrap()),
@@ -1089,7 +905,7 @@ mod tests {
             assert!(col.remove(&store, b).await.unwrap());
             let pivot_rec = col.load_pivot(&store).await.unwrap();
             assert!(
-                col.records_chain(&pivot_rec)
+                col.recency_chain(&pivot_rec)
                     .collect(&store)
                     .await
                     .unwrap()

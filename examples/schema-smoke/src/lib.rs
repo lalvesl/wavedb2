@@ -127,26 +127,30 @@ pub struct Setting {
     pub value: String,
 }
 
-/// NonUnique with a declared **segment capacity**: its record chain holds
+/// NonUnique with a declared **segment capacity**: its declared list holds
 /// 4…8 records per segment instead of the default 16…32 (RFC 0052).
 ///
 /// `page` is the pagination unit — declare the page size the UI renders and a
-/// rendered page becomes one segment read. It folds into the STRUCT_HASH, so a
-/// chain is only ever laid out at one capacity.
+/// rendered page becomes one segment read. It governs the **lists**, which are
+/// the chains that hold records; the built-in chain holds only pointers and
+/// takes a large capacity of its own (RFC 0054). It folds into the STRUCT_HASH,
+/// so a chain is only ever laid out at one capacity.
 #[wavedb(NonUnique, page = 4)]
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct Row {
+    #[wavedb::list]
     pub n: u64,
 }
 
-/// [`Row`]'s twin at the default capacity — same name, same field, same shape.
-/// Its only purpose is to prove `page` reaches the identity.
+/// [`Row`]'s twin at the default capacity — same name, same field, same shape,
+/// same list. Its only purpose is to prove `page` reaches the identity.
 pub mod default_paged {
     use wavedb_macros::wavedb;
 
     #[wavedb(NonUnique)]
     #[derive(Debug, PartialEq, Eq, Clone, Default)]
     pub struct Row {
+        #[wavedb::list]
         pub n: u64,
     }
 }
@@ -332,16 +336,20 @@ mod tests {
                 paged.insert(&db, &Paged { n }).await.unwrap();
                 plain.insert(&db, &Default { n }).await.unwrap();
             }
-            // 20 records at 4…8 per segment is at least 3 segments; at the
-            // default 16…32 it is exactly one.
+            // Every record chain of a type shares one lane, so the count is
+            // the built-in pointer chain (always 1 here — pointers take the
+            // log's large capacity) plus the declared list's segments. At
+            // `page = 4` the list needs 4…8 per segment, so at least 3; at the
+            // default 16…32 it holds all 20 in one.
             assert!(
-                store.lane_values(Paged::LANE_HASHES[0]) >= 3,
-                "the declared capacity did not reach the chain"
+                store.lane_values(Paged::LANE_HASHES[0]) >= 4,
+                "the declared capacity did not reach the list's chain"
             );
             assert_eq!(
                 store.lane_values(Default::LANE_HASHES[0]),
-                1,
-                "the default capacity fits 20 records in one segment"
+                2,
+                "the default capacity fits 20 records in one list segment, \
+                 beside the one pointer segment"
             );
         });
     }
@@ -578,7 +586,7 @@ mod tests {
     #[test]
     fn nonunique_generates_pivot_types() {
         let pivot = NotePivot {
-            records: wavedb_core::ChainRoots {
+            recency: wavedb_core::ChainRoots {
                 head: LocalId::new(10, false, 1),
                 tail: LocalId::new(11, false, 1),
                 index: LocalId::new(12, false, 1),
