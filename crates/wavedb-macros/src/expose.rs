@@ -103,7 +103,7 @@ fn execute_arm(entry: &Entry) -> TokenStream {
         };
     }
     let ops = OPS.iter().map(|op| {
-        let variant = format_ident!("{}{}", op[..1].to_uppercase(), &op[1..]);
+        let variant = format_ident!("{}", crate::expose_parse::variant(op));
         let call = op_call(entry, op);
         quote!(::wavedb_core::expose::Command::#variant => #call,)
     });

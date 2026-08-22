@@ -27,11 +27,11 @@
 //! and a tree that grew a level never gives it back. The dense `BpTree` has the
 //! full cycle (`tree_delete`); this half of RFC 0050 phase 3a was not written.
 //!
-//! It is **accepted debt**, not a design position (RFC 0050, phase 8a): this index
-//! holds one entry per *segment*, so a million records at N=16 is ~62 500 entries
-//! and two or three levels even drained. Collapsing also has a real cost — it means
-//! reading a child that may already have a pending write in the batch being
-//! planned. When it is paid, it mirrors `chain_remove`: synchronous, same batch.
+//! It is **accepted debt**, not a design position (RFC 0050 phase 8a, written up as
+//! RFC 0055): this index holds one entry per *segment*, so a million records at
+//! N=16 is ~62 500 entries and two or three levels even drained. Collapsing costs a
+//! sideways read of a node that may have a pending write in the batch being planned
+//! — so through the `Overlay`, not the `Store`; paid, it mirrors `chain_remove`.
 //!
 //! [RFC 0052]: https://github.com/wavedb/wavedb/blob/main/rfcs/0052-segment-size-as-the-pagination-unit.md
 //! [`plan_upsert`]: SparseTree::plan_upsert
