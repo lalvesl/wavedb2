@@ -105,15 +105,21 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   read per segment instead of one page read *and* one zstd decompression per record,
   a range keeps its logarithmic descent through the chain's sparse index, and — since
   that is exactly the key `recency` uses — **the `recency` log disappears into the
-  chain**, records inline instead of references. The record at its anchor stays put and
+  chain**. (As proposed the chain held the records inline, a byte-identical derived
+  duplicate; [0054](0054-no-duplication-by-default.md) kept the merge and dropped the
+  payload — the chain that survives is `recency` itself, ids only. Records inline is
+  now what a declared list is.) The record at its anchor stays put and
   stays authoritative, so every computed address, history walk and `Expect` guard is
-  untouched; the chain is a byte-identical derived duplicate. No chain stores a pointer
+  untouched. No chain stores a pointer
   *to* a record — position is derived from the record's own key — so splits are free of
   consequences, and because a split can always give its new id to the *interior* side,
   a chain's `head` and `tail` ids are permanent and a growing chain never rewrites the
   `Pivot`. The `current` B+tree disappears (the chain is the membership set, liveness
   moves into the anchor's `Metadata`), `dead` stays as a reference-only log chain in a
-  lane of its own with **no index at all**, since nothing ever *searches* it, and a
+  lane of its own with **no index at all**, since nothing ever *searches* it (post-0054
+  `recency` is that same shape and has its own lane too — an ~18-byte id entry and a
+  segment of whole records are different content, and a per-type zstd dictionary can
+  only model one of them well), and a
   dense B+tree exists only where the developer declares one. The cost is storage,
   duplicated write bytes, and `all()` changing from insertion to modification order.
   **Phases 1–7b are implemented**, and phase 8 ("compaction") was dissolved on
@@ -121,7 +127,9 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   rebalances synchronously on every removal (phase 3b), leaving only the
   sparse index's missing merge — **taken as accepted debt**, since that index
   holds one entry per *segment* and a drained version of it is still two
-  levels — and removal-log retention, which is a client-liveness policy and
+  levels, and written up as
+  [0055](0055-sparse-index-merge-PLANNED-LOW.md) so the bound is on the
+  record — and removal-log retention, which is a client-liveness policy and
   got moved out to its own planning. The structure
   (`index/{segment,sparse,sparse_write,chain,chain_remove}.rs`): locate, insert
   with a 50/50 split at 2N, remove with a merge at N/2 or a redistribute when
@@ -133,7 +141,8 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   range) with them: zero callers, and a contract already false for
   `#[wavedb::key]` types, whose anchor is a content hash rather than an instant.
   Both reads come off the chain: `all()` and the wire `All` walk it back from the
-  tail, records inline, no per-record fetch; and reconnect catch-up (`Changes`)
+  tail (post-0054 resolving each entry at its anchor — one segment read still gives
+  membership and order); and reconnect catch-up (`Changes`)
   scans the chain's and the removal log's tails past the client's cursor, stopping
   at the first segment that reaches it — so a caught-up client pays three reads for
   "nothing new" whatever the collection's size, and a client behind pays segment
@@ -148,9 +157,16 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   (nothing is resident: 0053 forbids pinning in a multi-tenant engine, so the
   guarantee is bounded size, never residency). Ordered and range reads cost one
   dense read per segment of hits instead of one random read per hit; the price is
-  `(K+2)` copies of every record on disk — anchor, built-in chain, K declared
-  lists — accepted deliberately. What it does not yet ship is a wire command, so
-  a client calling `listed_by_name` directly refuses exactly as `search_by` does;
+  `(K+1)` copies of every record on disk — the anchor plus K declared lists; it was
+  `(K+2)` until 0054 emptied the built-in chain — accepted deliberately, and after
+  0054 it is the *only* duplication there is. Its **wire commands landed
+  2026-08-01** — `Command::Listed` (bounded: `(pivot, index, offset, limit)`) and
+  `Command::ListLen` answering a new `Reply::Count` — closing the gap where an app
+  could declare a list, pay a full record copy per save for it, and still not
+  render a page without wrapping it in a `#[server]` fn. They needed none of the
+  streaming-frame work `search_by` waits on, because a page is bounded by the
+  caller's own `limit`; the typed surface gained `listed_page` so that limit is
+  reachable, and the unbounded `listed` pages over it at a fixed chunk;
   [0052](0052-segment-size-as-the-pagination-unit.md) — the developer
   declares a chain's capacity as a **minimum** N, normally the page size the UI
   renders (undeclared: **16** for record chains, **256** for the removal log); a
@@ -186,16 +202,44 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   [0044](0044-page-cache-PLANNED-LOW.md) — a page-granular cache so the read
   that precedes a write also serves the settle's read-modify-write (the weaker
   answer to 0050's problem: it pays to tolerate a random access pattern rather
-  than removing it — still worth having);
+  than removing it — still worth having), **superseded 2026-08-01** by
+  [0057](0057-page-arena-and-checkpoint-staging.md), which gives it a single
+  block-aligned arena keyed by `BlockDescriptor` (copy-on-write descriptors make
+  invalidation *disappear* rather than merely be cheap), lets a settle round
+  assemble its window inside that arena so the pages it just wrote stay resident
+  for the next round, and — the reason it opened — records why two neighbouring
+  proposals are rejected: a crash-recovery "was this already written?" check
+  (there is no fault to detect; a `Commit` retires only the rotated-out journal,
+  so data in `data.bin` ahead of the boundary is never *only* there), and
+  pre-building the checkpoint window between checkpoints (a page image depends
+  on its bucket's full contents and on a zstd dictionary that is not final until
+  the round closes);
   [0045](0045-vector-search-PLANNED.md) — nearest-neighbour search as a
-  declared index kind (IVF over the existing `BpTree`, per-tenant centroids).
+  declared index kind (IVF over the existing `BpTree`, per-tenant centroids);
+  [0056](0056-fuzzy-string-search-WIP.md) *(engine side landed 2026-08-01;
+  no wire command, so a client reaches it through a `#[server]` fn — see
+  `search_todos` in the todo-app)* — the same move for a different
+  distance: `#[wavedb::fuzzy]` **on the field**, n-gram postings keyed
+  `[gram][len][anchor]` in an ordinary `BpTree<SecKey>`, so one gram lookup is a
+  `Bound::Prefix` scan and the length filter rides in bytes the scan already
+  read. A count filter (`T - n*k` shared grams) bounds the candidates, then each
+  survivor is verified at its anchor. Unlike a list it duplicates **no record
+  bytes** — a posting is a pure function of the indexed field, so a save that
+  left the field alone writes nothing at all; the price is `L + n - 1` scattered
+  key writes per record.
 - **Deferred (low priority):**
   [0036](0036-offline-write-queue-PLANNED-LOW.md) — W8 offline write queue
   (slice 1, Unique offline, *shipped*; the NonUnique/durable/conflict-surface
   remainder is deferred — the near-term focus is online + small offline),
   [0037](0037-multi-node-cluster-PLANNED-LOW.md) (multi-node cluster),
   [0038](0038-argon2-and-oauth-credentials-PLANNED-LOW.md) (Argon2/OAuth),
-  [0039](0039-developer-experience-PLANNED-LOW.md) (M9 dev tooling).
+  [0039](0039-developer-experience-PLANNED-LOW.md) (M9 dev tooling),
+  [0055](0055-sparse-index-merge-PLANNED-LOW.md) — the sparse index's merge,
+  redistribute and root collapse: it grows and never shrinks, which is bounded
+  (one entry per *segment*, so drained is still two or three levels) but
+  permanent, and the sideways read a merge needs has to go through the
+  `Overlay` rather than the `Store` — the reason this half of 0050 phase 3a
+  was skipped while the rest landed.
 - **Partial seams:** [0013](0013-permissions.md) (per-record grants, gate 4),
   [0023](0023-quick-node-and-gates.md) (node gates 5–6).
 

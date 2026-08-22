@@ -60,9 +60,10 @@ because both compile this crate.
    `insert`/`update`/`remove` for NonUnique) that the registry's `match command`
    calls — these drive the storage internals (block allocator, journal, the
    object's page directory, `Pivot`/`BpTree`) directly, monomorphized, no `dyn`.
-   So the wire command set is `Get`/`Save` (Unique) and
+   So the write half of the wire command set is `Get`/`Save` (Unique) and
    `Insert`/`Update`/`Remove` (NonUnique); the client-side `save()` method emits
-   the `Update` command for NonUnique. Same typed calls compile native and wasm —
+   the `Update` command for NonUnique. The read half adds `All`, `History`,
+   `Changes` (catch-up) and — for declared lists — `Listed`/`ListLen`. Same typed calls compile native and wasm —
    only the local [`Store`](../wavedb-core/README.md#store--the-local-backend-trait) swaps.
 6. **Wires up the schema-evolution hooks** — the optional `first_try` /
    `fallback_not_found` functions; see
