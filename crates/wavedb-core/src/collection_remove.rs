@@ -72,7 +72,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         // The chains: the record leaves the living one — which is *why* the
         // removal log can stay skinny, since the anchor becomes the only home
         // for its bytes — and an instant-keyed reference joins the removal log.
-        let mut records = self.records_chain(&pivot);
+        let mut records = self.recency_chain(&pivot);
         let mut removals = self.dead_log(&pivot);
         let mut lists = self.list_chains(&pivot);
         if let Succession::CreatedAt(instant) = meta.succession
@@ -102,7 +102,7 @@ impl<T: NonUniqueStruct> Collection<T> {
             &pivot,
             &MovedRoots {
                 secondaries: &secs,
-                records: records.roots(),
+                recency: records.roots(),
                 removals: removals.log_roots(),
                 lists: &lists,
             },

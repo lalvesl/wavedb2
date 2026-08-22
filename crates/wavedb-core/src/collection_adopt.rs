@@ -172,7 +172,7 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct ItemPivot {
-        records: ChainRoots,
+        recency: ChainRoots,
         removals: LogRoots,
         secondaries: [LocalId; 1],
         permission: Option<PermissionRef>,
@@ -182,8 +182,8 @@ mod tests {
         fn secondaries(&self) -> &[LocalId] {
             &self.secondaries
         }
-        fn records(&self) -> ChainRoots {
-            self.records
+        fn recency(&self) -> ChainRoots {
+            self.recency
         }
         fn removals(&self) -> LogRoots {
             self.removals
@@ -195,7 +195,7 @@ mod tests {
             let mut s = self.secondaries;
             s.copy_from_slice(roots.secondaries);
             Self {
-                records: roots.records,
+                recency: roots.recency,
                 removals: roots.removals,
                 secondaries: s,
                 permission: self.permission.clone(),

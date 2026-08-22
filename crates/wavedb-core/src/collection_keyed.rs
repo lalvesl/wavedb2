@@ -97,7 +97,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         };
         // Distinct structures, so their plans don't overlap (the writes
         // already in `batch` are record slots, never nodes) — no overlay.
-        let mut records = self.records_chain(pivot);
+        let mut records = self.recency_chain(pivot);
         let mut secs = self.sec_trees(pivot);
         let mut lists = self.list_chains(pivot);
         let key = Self::instant_key(instant, LocalId::from_id(id));
@@ -107,7 +107,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         // record's prior copy left it when the key was removed, so there is
         // nothing to relocate — only to insert, at the new live instant. Every
         // declared list re-enters the same way.
-        batch.extend(records.plan_insert(store, key, envelope.clone()).await?);
+        batch.extend(records.plan_insert(store, key, ()).await?);
         self.plan_list_inserts(
             store, &mut batch, &mut lists, id, &envelope, value,
         )
@@ -121,7 +121,7 @@ impl<T: NonUniqueStruct> Collection<T> {
             pivot,
             &MovedRoots {
                 secondaries: &secs,
-                records: records.roots(),
+                recency: records.roots(),
                 removals: pivot.removals(),
                 lists: &lists,
             },
@@ -191,7 +191,7 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct CredPivot {
-        records: ChainRoots,
+        recency: ChainRoots,
         removals: LogRoots,
         secondaries: [LocalId; 1],
         permission: Option<PermissionRef>,
@@ -201,8 +201,8 @@ mod tests {
         fn secondaries(&self) -> &[LocalId] {
             &self.secondaries
         }
-        fn records(&self) -> ChainRoots {
-            self.records
+        fn recency(&self) -> ChainRoots {
+            self.recency
         }
         fn removals(&self) -> LogRoots {
             self.removals
@@ -214,7 +214,7 @@ mod tests {
             let mut s = self.secondaries;
             s.copy_from_slice(roots.secondaries);
             Self {
-                records: roots.records,
+                recency: roots.recency,
                 removals: roots.removals,
                 secondaries: s,
                 permission: self.permission.clone(),

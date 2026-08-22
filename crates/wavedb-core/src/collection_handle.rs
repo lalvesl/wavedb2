@@ -144,7 +144,8 @@ impl<T: NonUniqueStruct> CollectionHandle<T> {
     }
 
     /// Stream every living record in declared list `index`'s order — one read
-    /// per segment, records inline. The generated `listed_by_<fields>` wrappers
+    /// per segment with the records **inline** — where `all` walks pointers and
+    /// resolves each record at its anchor. The generated `listed_by_<fields>` wrappers
     /// call this with the declaration's index.
     pub fn listed<'d, D: DbHandle>(
         &self,
