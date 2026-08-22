@@ -109,6 +109,12 @@ pub fn unique_ops(name: &Ident) -> TokenStream {
             .await
         },
     );
+    let listed =
+        op_fn("listed", &quote!(let _ = (store, caller, payload); #refuse));
+    let list_len = op_fn(
+        "list_len",
+        &quote!(let _ = (store, caller, payload); #refuse),
+    );
     quote! {
         impl #name {
             #get
@@ -119,8 +125,42 @@ pub fn unique_ops(name: &Ident) -> TokenStream {
             #all
             #history
             #changes
+            #listed
+            #list_len
         }
     }
+}
+
+/// The NonUnique declared-list steps (`Listed` / `ListLen`): a page of one
+/// `#[wavedb::list]` in its declared order, and its length.
+///
+/// The index rides as a `u32` and the offset as a `u64` because `usize` is
+/// never encodable on the wire — the steps widen back at the seam.
+fn nonunique_list_steps(name: &Ident) -> (TokenStream, TokenStream) {
+    let listed = op_fn(
+        "listed",
+        &quote! {
+            let (pivot, index, offset, limit): (
+                ::wavedb_core::LocalId, u32, u64, u32,
+            ) = ::wavedb_core::wire::from_wire(payload)?;
+            ::wavedb_core::expose::listed_values::<#name, S>(
+                store, pivot, caller.tenant, index as usize, offset, limit,
+            )
+            .await
+        },
+    );
+    let list_len = op_fn(
+        "list_len",
+        &quote! {
+            let (pivot, index): (::wavedb_core::LocalId, u32) =
+                ::wavedb_core::wire::from_wire(payload)?;
+            ::wavedb_core::expose::list_len_value::<#name, S>(
+                store, pivot, caller.tenant, index as usize,
+            )
+            .await
+        },
+    );
+    (listed, list_len)
 }
 
 /// The NonUnique `changes` step: catch-up navigation over the collection's
@@ -224,6 +264,7 @@ pub fn nonunique_ops(name: &Ident) -> TokenStream {
         &quote!(let _ = (store, caller, payload); #refuse),
     );
     let changes = nonunique_changes_step(name);
+    let (listed, list_len) = nonunique_list_steps(name);
     quote! {
         impl #name {
             #get
@@ -234,6 +275,8 @@ pub fn nonunique_ops(name: &Ident) -> TokenStream {
             #all
             #history
             #changes
+            #listed
+            #list_len
         }
     }
 }

@@ -10,7 +10,8 @@
 use proc_macro2::Span;
 use syn::{Attribute, DeriveInput, Ident};
 
-use crate::args::{PivotSpec, Shape, WavedbArgs};
+use crate::arg_specs::PivotSpec;
+use crate::args::{Shape, WavedbArgs};
 use crate::lists;
 use crate::natural_key::take_and_fold_key;
 use crate::secondaries::ResolvedPivot;
@@ -24,15 +25,21 @@ pub struct Declared {
     pub secondaries: Vec<ResolvedPivot>,
     /// One entry per `#[wavedb::list]` declared ordering (RFC 0051).
     pub lists: Vec<crate::lists::ResolvedList>,
+    /// One entry per `#[wavedb::fuzzy]` declared field (RFC 0056).
+    pub fuzzy: Vec<crate::fuzzy::ResolvedFuzzy>,
 }
 
 /// Take every declaration off `input`, folding the ones that reach stored bytes
 /// into `hash_fields`.
 ///
 /// Order is fixed and load-bearing: the fold order **is** part of the identity,
-/// so the sequence here (key, layout knobs, lists) must not be shuffled for
-/// tidiness. Secondary indexes are last and fold nothing — a secondary is a
-/// derived lookup structure, not a fact about the record's own bytes.
+/// so the sequence here (key, layout knobs, lists, fuzzy) must not be shuffled
+/// for tidiness — and a new kind is **appended**, never inserted, so adding one
+/// leaves every existing type's hash alone. Secondary indexes are last and fold
+/// nothing: a secondary is a derived lookup structure over the record's own
+/// values, not a fact about the bytes stored for it. A fuzzy index is not in
+/// that company — its postings are a normalization and a gram width away from
+/// the field, and both choices are stored.
 pub fn take_declarations(
     input: &mut DeriveInput,
     named: &syn::FieldsNamed,
@@ -43,6 +50,7 @@ pub fn take_declarations(
         take_and_fold_key(&mut input.attrs, named, args.shape, hash_fields)?;
     fold_layout_args(args, hash_fields)?;
     let lists = lists::take_and_fold(input, named, args.shape, hash_fields)?;
+    let fuzzy = crate::fuzzy::take_and_fold(input, args.shape, hash_fields)?;
     let pivot_specs = take_pivot_specs(&mut input.attrs)?;
     let secondaries = resolve_pivot_fields(&pivot_specs, named)?;
     if !secondaries.is_empty() && args.shape != Shape::NonUnique {
@@ -55,6 +63,7 @@ pub fn take_declarations(
         key_fields,
         secondaries,
         lists,
+        fuzzy,
     })
 }
 

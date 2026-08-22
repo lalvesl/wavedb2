@@ -85,18 +85,22 @@ fn pivot_identity(
     pivot: &Ident,
     num_secondaries: usize,
     num_lists: usize,
+    num_fuzzy: usize,
 ) -> u64 {
-    struct_hash::compute(
-        &pivot.to_string(),
-        "Pivot",
-        &[
-            ("records".into(), "ChainRoots".into()),
-            ("removals".into(), "LogRoots".into()),
-            ("secondaries".into(), format!("[LocalId;{num_secondaries}]")),
-            ("lists".into(), format!("[ChainRoots;{num_lists}]")),
-            ("permission".into(), "Option<PermissionRef>".into()),
-        ],
-    )
+    // A pivot with no fuzzy index keeps the identity it had before the kind
+    // existed: the entry appears only when one is declared, exactly as the
+    // record type's `#fuzzy` fold does.
+    let mut shape = vec![
+        ("records".into(), "ChainRoots".into()),
+        ("removals".into(), "LogRoots".into()),
+        ("secondaries".into(), format!("[LocalId;{num_secondaries}]")),
+        ("lists".into(), format!("[ChainRoots;{num_lists}]")),
+    ];
+    if num_fuzzy > 0 {
+        shape.push(("fuzzy".into(), format!("[LocalId;{num_fuzzy}]")));
+    }
+    shape.push(("permission".into(), "Option<PermissionRef>".into()));
+    struct_hash::compute(&pivot.to_string(), "Pivot", &shape)
 }
 
 /// The `Pivot` trait impl for the generated roots holder: the B+tree roots
@@ -111,6 +115,7 @@ fn pivot_impl(pivot: &Ident, pivot_hash: u64) -> TokenStream {
             fn recency(&self) -> ::wavedb_core::ChainRoots { self.recency }
             fn removals(&self) -> ::wavedb_core::LogRoots { self.removals }
             fn lists(&self) -> &[::wavedb_core::ChainRoots] { &self.lists }
+            fn fuzzy(&self) -> &[::wavedb_core::LocalId] { &self.fuzzy }
             fn permission(&self) -> ::core::option::Option<&::wavedb_core::PermissionRef> {
                 self.permission.as_ref()
             }
@@ -120,16 +125,19 @@ fn pivot_impl(pivot: &Ident, pivot_hash: u64) -> TokenStream {
             ) -> Self {
                 let mut secs = self.secondaries;
                 let mut lists = self.lists;
+                let mut fuzzy = self.fuzzy;
                 // The engine always passes exactly this pivot's root counts
-                // (it derives both slices from the accessors); a mismatch is
+                // (it derives every slice from the accessors); a mismatch is
                 // a caller bug worth failing loudly on.
                 secs.copy_from_slice(roots.secondaries);
                 lists.copy_from_slice(roots.lists);
+                fuzzy.copy_from_slice(roots.fuzzy);
                 Self {
                     recency: roots.recency,
                     removals: roots.removals,
                     secondaries: secs,
                     lists,
+                    fuzzy,
                     permission: ::core::clone::Clone::clone(&self.permission),
                 }
             }
@@ -151,9 +159,11 @@ pub fn nonunique_types(
     let secondaries_specs = &declared.secondaries;
     let num_secondaries = secondaries_specs.len();
     let num_lists = declared.lists.len();
+    let num_fuzzy = declared.fuzzy.len();
     let pivot_id = format_ident!("{}PivotId", name);
     let pivot = format_ident!("{}Pivot", name);
-    let pivot_hash = pivot_identity(&pivot, num_secondaries, num_lists);
+    let pivot_hash =
+        pivot_identity(&pivot, num_secondaries, num_lists, num_fuzzy);
     let pivot_id_tokens = pivot_id_tokens(&pivot_id)?;
 
     // `struct {Name}Pivot { current, dead, secondaries: [LocalId; N], permission }`.
@@ -174,6 +184,8 @@ pub fn nonunique_types(
     let by_lookups = secondaries::by_lookups(name, secondaries_specs);
     let list_items = lists::trait_items(&declared.lists);
     let listed_readers = lists::listed_readers(name, &declared.lists);
+    let fuzzy_items = crate::fuzzy::trait_items(&declared.fuzzy);
+    let fuzzy_lookups = crate::fuzzy::fuzzy_lookups(name, &declared.fuzzy);
     let key_items = natural_key_items(declared.key_fields.as_deref());
 
     // The per-command execution steps (`__wavedb_<op>`) — defined here,
@@ -191,6 +203,7 @@ pub fn nonunique_types(
             pub removals: ::wavedb_core::LogRoots,
             pub secondaries: [::wavedb_core::LocalId; #num_secondaries],
             pub lists: [::wavedb_core::ChainRoots; #num_lists],
+            pub fuzzy: [::wavedb_core::LocalId; #num_fuzzy],
             pub permission: ::core::option::Option<::wavedb_core::PermissionRef>,
         }
     };
@@ -207,10 +220,12 @@ pub fn nonunique_types(
             #page_const
             #secondary_items
             #list_items
+            #fuzzy_items
             #key_items
         }
 
         #by_lookups
+        #fuzzy_lookups
         #listed_readers
 
         impl #name {
