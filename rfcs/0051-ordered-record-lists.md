@@ -3,10 +3,10 @@
 - **Status:** Implemented 2026-07-31 — opened 2026-07-29, revised 2026-07-30.
   Landed as [RFC 0050](0050-clustered-record-chains.md) phase 7b: the
   declaration, the identity fold, the sorted chains and their maintenance, and
-  the `listed_by_*` readers. **Not** shipped: a wire command, so a client
-  calling one directly refuses exactly as `search_by` does — both land with the
-  streaming frames.
-- **Crates:** `wavedb-core`, `wavedb-macros`
+  the `listed_by_*` readers. The **wire commands** followed on 2026-08-01
+  (`Command::Listed` / `Command::ListLen`, `Reply::Count`) — see
+  "Reaching a list over the wire" below.
+- **Crates:** `wavedb-core`, `wavedb-macros`, `wavedb`, `wavedb-quick-node`
 - **Builds on:** [RFC 0050](0050-clustered-record-chains.md) — whose built-in
   modification-ordered chain **is** the first instance of this RFC's mechanism; here
   it becomes general, one chain per declared list
@@ -264,6 +264,56 @@ declare few lists, and that is a documentation matter, not a mechanism.
   dense, one entry per record, ~200× larger for no gain. The sparse form is the same
   idea with the redundant levels removed: the chain's `next` pointers do the work
   the lowest index levels were doing.
+
+## Reaching a list over the wire (landed 2026-08-01)
+
+For one release this RFC shipped a structure no client could read. A declared
+list resolved against a `LocalHandle` or a `ServerDb` and refused over the
+transport exactly as `search_by` does — so an app could declare a list, pay a
+full copy of every record for it on every save, and still not render a page
+without wrapping it in a `#[server]` function. The thing that renders the page
+was the one thing that could not ask for it.
+
+Two commands close that:
+
+```
+Command::Listed   payload = (LocalId pivot, u32 index, u64 offset, u32 limit)
+Command::ListLen  payload = (LocalId pivot, u32 index)
+Reply::Values(Vec<Vec<u8>>)   // frames of (Id, Metadata, T), as `All` ships
+Reply::Count(u64)             // new — the pager's "of M"
+```
+
+**Why this did not have to wait for streaming frames.** `All` buffers a whole
+collection because the POST tunnel answers one request with one response; that
+is a compromise, and `search_by` — an unbounded range — is waiting with it. A
+list page is not waiting on anything, because `limit` is the caller's page
+size: the answer is bounded **by construction**. The reply carries the ordinary
+pager rule and needs no truncation flag — exactly `limit` entries means there
+may be more, a shorter answer is the end — and since the client chose `limit`,
+it is never guessing.
+
+The limit is deliberately **uncapped**. Capping the narrower command while `All`
+buffers an entire collection unbounded would protect nothing and would make one
+command lie about what it served; a node-wide read budget is the M8 gates'
+business, not one op's.
+
+The typed surface gained `listed_page(db, index, offset, limit)` alongside the
+unbounded `listed`/`listed_at`, because otherwise the wire's `limit` is
+unreachable from typed code: `listed_at(..).take(25)` would fetch the client's
+whole internal chunk and discard most of it. The unbounded reader pages at a
+fixed 256 — deliberately *not* the declared `page`, since a type declaring
+`page = 4` would turn a full walk into a round trip per four records.
+
+Paging is **not** a snapshot: between two chunks the list can change, so a
+record can be seen twice or missed if its ordering property moves under the
+walk. That is inherent to any offset pager, and a caller who needs a coherent
+"what changed" wants `watch_collection`, which is built for it.
+
+The cache follows the same three rules as every other read (node first, mirrors
+best-effort, absence is not an answer): each page mirrors under the node's
+identity and metadata as it passes, and a *transport* fault on the first chunk
+falls back to the warm local list — where a cold cache propagates the fault
+rather than minting an empty list, which would read as "there is nothing here".
 
 ## Open questions
 

@@ -424,11 +424,12 @@ declarations re-points two live chains at each other's data. Both the
 declarations and their order fold as `#list0`, `#list1`, … — reordering yields a
 new type, which is the only coherent answer under no-migration.
 
-What it does **not** ship: a wire command. `listed`/`list_len` resolve against a
-`LocalHandle` and a `ServerDb`, and refuse over the client transport exactly as
-`search_by` has since M4 — the streaming frames are where both land together.
-A `#[server]` function returning a page of a list works today; a client calling
-`listed_by_name` directly does not.
+The **wire commands followed on 2026-08-01** (RFC 0051, "Reaching a list over
+the wire"): `Command::Listed` / `Command::ListLen` plus `Reply::Count`, so
+`listed` / `listed_page` / `list_len` now resolve against the client transport
+too. They did not have to wait for the streaming frames `search_by` is waiting
+on, because a list page is bounded by the caller's `limit` — the answer has a
+size the caller named, where a range does not.
 
 **Phase 8** was one row called "compaction", and writing the plan out showed the
 name was hiding two problems of different natures. Neither is a gap in the
