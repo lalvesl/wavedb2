@@ -30,6 +30,7 @@ mod collection_lists;
 mod collection_read;
 mod collection_recency;
 mod collection_remove;
+mod collection_roots;
 mod collection_write;
 pub mod error;
 pub mod expose;

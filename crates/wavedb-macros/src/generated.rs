@@ -108,7 +108,7 @@ fn pivot_impl(pivot: &Ident, pivot_hash: u64) -> TokenStream {
             const STRUCT_HASH: u64 = #pivot_hash;
 
             fn secondaries(&self) -> &[::wavedb_core::LocalId] { &self.secondaries }
-            fn records(&self) -> ::wavedb_core::ChainRoots { self.records }
+            fn recency(&self) -> ::wavedb_core::ChainRoots { self.recency }
             fn removals(&self) -> ::wavedb_core::LogRoots { self.removals }
             fn lists(&self) -> &[::wavedb_core::ChainRoots] { &self.lists }
             fn permission(&self) -> ::core::option::Option<&::wavedb_core::PermissionRef> {
@@ -126,7 +126,7 @@ fn pivot_impl(pivot: &Ident, pivot_hash: u64) -> TokenStream {
                 secs.copy_from_slice(roots.secondaries);
                 lists.copy_from_slice(roots.lists);
                 Self {
-                    records: roots.records,
+                    recency: roots.recency,
                     removals: roots.removals,
                     secondaries: secs,
                     lists,
@@ -154,7 +154,6 @@ pub fn nonunique_types(
     let pivot_id = format_ident!("{}PivotId", name);
     let pivot = format_ident!("{}Pivot", name);
     let pivot_hash = pivot_identity(&pivot, num_secondaries, num_lists);
-
     let pivot_id_tokens = pivot_id_tokens(&pivot_id)?;
 
     // `struct {Name}Pivot { current, dead, secondaries: [LocalId; N], permission }`.
@@ -188,7 +187,7 @@ pub fn nonunique_types(
         #[derive(::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq,
                  ::core::fmt::Debug, ::core::default::Default)]
         pub struct #pivot {
-            pub records: ::wavedb_core::ChainRoots,
+            pub recency: ::wavedb_core::ChainRoots,
             pub removals: ::wavedb_core::LogRoots,
             pub secondaries: [::wavedb_core::LocalId; #num_secondaries],
             pub lists: [::wavedb_core::ChainRoots; #num_lists],

@@ -121,7 +121,7 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct NotePivot {
-        records: ChainRoots,
+        recency: ChainRoots,
         removals: LogRoots,
         permission: Option<PermissionRef>,
     }
@@ -130,8 +130,8 @@ mod tests {
         fn secondaries(&self) -> &[LocalId] {
             &[]
         }
-        fn records(&self) -> ChainRoots {
-            self.records
+        fn recency(&self) -> ChainRoots {
+            self.recency
         }
         fn removals(&self) -> LogRoots {
             self.removals
@@ -141,7 +141,7 @@ mod tests {
         }
         fn replace_roots(&self, roots: Roots<'_>) -> Self {
             Self {
-                records: roots.records,
+                recency: roots.recency,
                 removals: roots.removals,
                 permission: self.permission.clone(),
             }

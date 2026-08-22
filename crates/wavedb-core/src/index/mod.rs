@@ -150,7 +150,7 @@ pub struct Roots<'a> {
     /// One root per `#[wavedb::pivot(...)]` secondary index.
     pub secondaries: &'a [LocalId],
     /// The built-in modification-ordered record chain.
-    pub records: ChainRoots,
+    pub recency: ChainRoots,
     /// The removal log.
     pub removals: LogRoots,
     /// One per `#[wavedb::list(...)]` declaration, declaration order
@@ -183,7 +183,7 @@ pub trait Pivot: WaveWire + Sized {
     /// This *is* the membership set and the modification log — it replaced the
     /// `current` and `recency` B+trees the collection used to carry. Liveness
     /// is read off each record's own `Metadata`, not off a tree.
-    fn records(&self) -> ChainRoots;
+    fn recency(&self) -> ChainRoots;
     /// The **removal log**'s endpoints — the same segment chain shape with no
     /// index, since nothing ever searches it. It replaced the `dead` B+tree.
     fn removals(&self) -> LogRoots;
