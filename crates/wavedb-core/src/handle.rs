@@ -1,10 +1,13 @@
 //! [`DbHandle`] — the one execution-context seam typed generated code runs
-//! over, and [`LocalHandle`], its `Store`-backed implementation.
+//! over.
+//!
+//! Its `Store`-backed implementation is [`LocalHandle`](crate::LocalHandle),
+//! next door in [`local_handle`](crate::local_handle).
 //!
 //! The `#[wavedb]` macro emits `T::get(&db)` / `value.save(&db)` /
 //! `T::collection(&db, pivot)` methods generic over this trait, so the same
-//! call sites resolve against every context: a [`LocalHandle`] driving a
-//! [`Store`] directly (engine tests, in-process embedding), the client `Db`
+//! call sites resolve against every context: a [`LocalHandle`](crate::LocalHandle)
+//! driving a [`Store`](crate::Store) directly (engine tests, in-process embedding), the client `Db`
 //! sending command frames, and the node-side `ServerDb` a `#[server]` body
 //! runs against.
 //!
@@ -20,21 +23,20 @@
 
 use std::future::Future;
 
-use futures::{Stream, TryStreamExt};
+use futures::Stream;
 
-use crate::collection::Collection;
 use crate::error::Error;
+use crate::fuzzy::{Fuzzy, Scored};
 use crate::id::Id;
 use crate::index::Bound;
 use crate::local_id::LocalId;
 use crate::metadata::Metadata;
-use crate::record;
-use crate::store::Store;
 use crate::traits::{NonUniqueStruct, UniqueStruct};
 use crate::u48::U48;
 
 /// An execution context bound to one tenant: somewhere typed operations can
-/// run — locally against a [`Store`], or remotely over a transport.
+/// run — locally against a [`Store`](crate::Store), or remotely over a
+/// transport.
 ///
 /// The tenant is bound **once, in the handle** — the partition key is
 /// structural, never restated per call. Collection ops address their
@@ -175,6 +177,21 @@ pub trait DbHandle: Sized {
         offset: u64,
     ) -> impl Stream<Item = Result<T, Self::Error>>;
 
+    /// One **bounded** page of declared list `index`: at most `limit` records
+    /// from global `offset`.
+    ///
+    /// This is what a pager rendering "rows 50…75 of M" wants, and over the
+    /// wire it is one exchange — where [`listed`](Self::listed), being
+    /// unbounded, has to page internally and would fetch far more than the
+    /// window asked for.
+    fn listed_page<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+        index: usize,
+        offset: u64,
+        limit: u32,
+    ) -> impl Stream<Item = Result<T, Self::Error>>;
+
     /// How many living records declared list `index` holds — the pager's
     /// "of M", one read cold.
     fn list_len<T: NonUniqueStruct + 'static>(
@@ -183,6 +200,22 @@ pub trait DbHandle: Sized {
         index: usize,
     ) -> impl Future<Output = Result<u64, Self::Error>>;
 
+    /// Records whose fuzzy index `index` matches `query` under `mode`, best
+    /// first, at most `limit` ([RFC 0056]).
+    ///
+    /// The one read that is **buffered and ranked** rather than streamed: a
+    /// best-first order cannot be known until the last candidate is scored.
+    ///
+    /// [RFC 0056]: https://github.com/wavedb/wavedb/blob/main/rfcs/0056-fuzzy-string-search-WIP.md
+    fn fuzzy_search<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+        index: usize,
+        query: &str,
+        mode: Fuzzy,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<Scored<(Id, T)>>, Self::Error>>;
+
     /// Stream the record at `id`'s versions **newest-first** along the
     /// modification chain (the live version, then each archive).
     fn record_history<T: NonUniqueStruct + 'static>(
@@ -190,326 +223,4 @@ pub trait DbHandle: Sized {
         pivot: LocalId,
         id: Id,
     ) -> impl Stream<Item = Result<(Metadata, T), Self::Error>>;
-}
-
-/// A [`DbHandle`] over a borrowed [`Store`] — the engine-local context.
-///
-/// Core/storage tests and in-process embeddings drive typed code through it;
-/// every op is a direct [`Collection`] / record call.
-#[derive(Debug)]
-pub struct LocalHandle<'a, S> {
-    store: &'a S,
-    tenant: U48,
-}
-
-// Manual impls: a derive would demand `S: Clone`, but only the reference is
-// copied.
-impl<S> Clone for LocalHandle<'_, S> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<S> Copy for LocalHandle<'_, S> {}
-
-impl<'a, S: Store> LocalHandle<'a, S> {
-    /// A local context over `store`, bound to `tenant`.
-    #[must_use]
-    pub const fn new(store: &'a S, tenant: U48) -> Self {
-        Self { store, tenant }
-    }
-
-    /// The backing store.
-    #[must_use]
-    pub const fn store(&self) -> &'a S {
-        self.store
-    }
-
-    /// This type's collection engine handle at `pivot`.
-    fn col<T: NonUniqueStruct>(&self, pivot: LocalId) -> Collection<T> {
-        Collection::at(pivot, self.tenant)
-    }
-}
-
-impl<S: Store> DbHandle for LocalHandle<'_, S> {
-    type Error = Error;
-
-    fn tenant(&self) -> U48 {
-        self.tenant
-    }
-
-    fn as_tenant(&self, tenant: U48) -> Self {
-        Self {
-            store: self.store,
-            tenant,
-        }
-    }
-
-    async fn get_unique<T: UniqueStruct>(&self) -> Result<Option<T>, Error> {
-        record::get_unique(self.store, self.tenant).await
-    }
-
-    async fn save_unique<T: UniqueStruct>(
-        &self,
-        value: &T,
-    ) -> Result<(), Error> {
-        record::save_unique(self.store, self.tenant, value).await
-    }
-
-    fn unique_history<T: UniqueStruct + 'static>(
-        &self,
-    ) -> impl Stream<Item = Result<(Metadata, T), Error>> {
-        record::unique_history(self.store, self.tenant)
-    }
-
-    async fn create_pivot<T: NonUniqueStruct>(&self) -> Result<LocalId, Error> {
-        Collection::<T>::create(self.store, self.tenant).await
-    }
-
-    async fn insert<T: NonUniqueStruct>(
-        &self,
-        pivot: LocalId,
-        value: &T,
-    ) -> Result<Id, Error> {
-        self.col::<T>(pivot).insert(self.store, value).await
-    }
-
-    async fn get_record<T: NonUniqueStruct>(
-        &self,
-        pivot: LocalId,
-        id: Id,
-    ) -> Result<Option<T>, Error> {
-        self.col::<T>(pivot).get(self.store, id).await
-    }
-
-    async fn update<T: NonUniqueStruct>(
-        &self,
-        pivot: LocalId,
-        id: Id,
-        value: &T,
-    ) -> Result<(), Error> {
-        self.col::<T>(pivot).save(self.store, id, value).await
-    }
-
-    async fn remove<T: NonUniqueStruct>(
-        &self,
-        pivot: LocalId,
-        id: Id,
-    ) -> Result<bool, Error> {
-        self.col::<T>(pivot).remove(self.store, id).await
-    }
-
-    fn all<T: NonUniqueStruct + 'static>(
-        &self,
-        pivot: LocalId,
-    ) -> impl Stream<Item = Result<T, Error>> {
-        self.col::<T>(pivot)
-            .all(self.store)
-            .map_ok(|(_, value)| value)
-    }
-
-    fn search_by<T: NonUniqueStruct + 'static>(
-        &self,
-        pivot: LocalId,
-        index: usize,
-        bound: Bound,
-    ) -> impl Stream<Item = Result<T, Error>> {
-        self.col::<T>(pivot)
-            .search_by(self.store, index, bound)
-            .map_ok(|(_, value)| value)
-    }
-
-    fn listed<T: NonUniqueStruct + 'static>(
-        &self,
-        pivot: LocalId,
-        index: usize,
-        offset: u64,
-    ) -> impl Stream<Item = Result<T, Error>> {
-        self.col::<T>(pivot)
-            .listed_at(self.store, index, offset)
-            .map_ok(|(_, value)| value)
-    }
-
-    async fn list_len<T: NonUniqueStruct + 'static>(
-        &self,
-        pivot: LocalId,
-        index: usize,
-    ) -> Result<u64, Error> {
-        self.col::<T>(pivot).list_len(self.store, index).await
-    }
-
-    fn record_history<T: NonUniqueStruct + 'static>(
-        &self,
-        pivot: LocalId,
-        id: Id,
-    ) -> impl Stream<Item = Result<(Metadata, T), Error>> {
-        self.col::<T>(pivot).history(self.store, id)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use futures::TryStreamExt;
-    use futures::executor::block_on;
-
-    use super::{DbHandle, LocalHandle};
-    use crate::index::mem_store::MemStore;
-    use crate::index::{ChainRoots, IndexKey, LogRoots, Pivot, Roots};
-    use crate::local_id::LocalId;
-    use crate::permission::PermissionRef;
-    use crate::traits::{NonUniqueStruct, Shape, UniqueStruct, WaveDbStruct};
-    use crate::u48::U48;
-    use crate::wire::WaveWire;
-
-    // Hand-rolled fixtures — exactly what `#[wavedb]` generates (core can't
-    // use the proc-macro; it lives downstream).
-    #[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
-    struct Settings {
-        volume: u64,
-    }
-    impl WaveDbStruct for Settings {
-        const STRUCT_HASH: u64 = 0x5E77_1001;
-        const SHAPE: Shape = Shape::Unique;
-        type PivotId = ();
-    }
-    impl UniqueStruct for Settings {}
-
-    #[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
-    struct Note {
-        label: String,
-        n: u64,
-    }
-    impl WaveDbStruct for Note {
-        const STRUCT_HASH: u64 = 0x2077_1001;
-        const SHAPE: Shape = Shape::NonUnique;
-        type PivotId = ();
-    }
-    impl NonUniqueStruct for Note {
-        type Pivot = NotePivot;
-        const NUM_SECONDARIES: usize = 1;
-        fn secondary_key(&self, index: usize) -> Vec<u8> {
-            match index {
-                0 => self.label.key_bytes(),
-                _ => Vec::new(),
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
-    struct NotePivot {
-        recency: ChainRoots,
-        removals: LogRoots,
-        secondaries: [LocalId; 1],
-        permission: Option<PermissionRef>,
-    }
-    impl Pivot for NotePivot {
-        const STRUCT_HASH: u64 = 0x2077_1002;
-        fn secondaries(&self) -> &[LocalId] {
-            &self.secondaries
-        }
-        fn recency(&self) -> ChainRoots {
-            self.recency
-        }
-        fn removals(&self) -> LogRoots {
-            self.removals
-        }
-        fn permission(&self) -> Option<&PermissionRef> {
-            self.permission.as_ref()
-        }
-        fn replace_roots(&self, roots: Roots<'_>) -> Self {
-            let mut s = self.secondaries;
-            s.copy_from_slice(roots.secondaries);
-            Self {
-                recency: roots.recency,
-                removals: roots.removals,
-                secondaries: s,
-                permission: self.permission.clone(),
-            }
-        }
-    }
-
-    fn tenant() -> U48 {
-        U48::from(7u32)
-    }
-
-    #[test]
-    fn unique_roundtrip_and_history_through_the_handle() {
-        block_on(async {
-            let store = MemStore::default();
-            let db = LocalHandle::new(&store, tenant());
-
-            assert_eq!(db.get_unique::<Settings>().await.unwrap(), None);
-            db.save_unique(&Settings { volume: 3 }).await.unwrap();
-            db.save_unique(&Settings { volume: 7 }).await.unwrap();
-            assert_eq!(
-                db.get_unique::<Settings>().await.unwrap(),
-                Some(Settings { volume: 7 })
-            );
-
-            let versions: Vec<(crate::metadata::Metadata, Settings)> =
-                db.unique_history().try_collect().await.unwrap();
-            assert_eq!(
-                versions.iter().map(|(_, s)| s.volume).collect::<Vec<_>>(),
-                vec![7, 3],
-                "history walks newest-first"
-            );
-
-            // Another tenant's context sees nothing — same store, own space.
-            let other = db.as_tenant(U48::from(8u32));
-            assert_eq!(other.get_unique::<Settings>().await.unwrap(), None);
-            assert_eq!(other.tenant(), U48::from(8u32));
-        });
-    }
-
-    #[test]
-    fn collection_lifecycle_through_the_handle() {
-        block_on(async {
-            let store = MemStore::default();
-            let db = LocalHandle::new(&store, tenant());
-            let pivot = db.create_pivot::<Note>().await.unwrap();
-
-            let note = |label: &str, n| Note {
-                label: label.into(),
-                n,
-            };
-            let a = db.insert(pivot, &note("red", 1)).await.unwrap();
-            let b = db.insert(pivot, &note("blue", 2)).await.unwrap();
-
-            let walked: Vec<Note> =
-                db.all::<Note>(pivot).try_collect().await.unwrap();
-            assert_eq!(
-                walked.iter().map(|v| v.n).collect::<Vec<_>>(),
-                vec![2, 1],
-                "walk is newest-first and yields values"
-            );
-
-            db.update(pivot, b, &note("blue", 22)).await.unwrap();
-            assert_eq!(
-                db.get_record::<Note>(pivot, b).await.unwrap(),
-                Some(note("blue", 22))
-            );
-
-            // Secondary lookup through the handle: index 0 = `label`.
-            let reds: Vec<Note> = db
-                .search_by::<Note>(
-                    pivot,
-                    0,
-                    crate::index::Bound::Exact("red".key_bytes()),
-                )
-                .try_collect()
-                .await
-                .unwrap();
-            assert_eq!(reds, vec![note("red", 1)]);
-
-            assert!(db.remove::<Note>(pivot, a).await.unwrap());
-            assert!(!db.remove::<Note>(pivot, a).await.unwrap());
-            let after: Vec<Note> =
-                db.all::<Note>(pivot).try_collect().await.unwrap();
-            assert_eq!(after, vec![note("blue", 22)]);
-            assert_eq!(
-                db.get_record::<Note>(pivot, a).await.unwrap(),
-                Some(note("red", 1)),
-                "removed record bytes survive (history)"
-            );
-        });
-    }
 }

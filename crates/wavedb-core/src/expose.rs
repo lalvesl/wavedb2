@@ -33,6 +33,9 @@ pub use crate::expose_salt::{SaltGuard, salts_distinct, salts_self_distinct};
 // module; re-exported so the wire vocabulary reads from one place.
 pub use crate::expose_changes::{Change, collection_changes, unique_changes};
 
+// Likewise the declared-list reads (`Listed` / `ListLen`).
+pub use crate::expose_lists::{list_len_value, listed_values};
+
 /// The wire command set: `Get`/`Save` for a `Unique` type,
 /// `Insert`/`Update`/`Remove`/`Get` for a NonUnique one. A `#[server]`
 /// function (M4) ignores it — its hash *is* the operation.
@@ -60,6 +63,18 @@ pub enum Command {
     /// since = register: answer the current tail, no events). Answered as
     /// `Values` of [`Change`] entries, `Cursor` first.
     Changes,
+    /// One page of a NonUnique **declared list**, in its declared order
+    /// (payload = `(LocalId pivot, u32 index, u64 offset, u32 limit)`).
+    ///
+    /// Unlike `All`, this one is **bounded by construction** — the caller's
+    /// `limit` is the page it renders — which is why it needs none of the
+    /// streaming-frame work `search_by` is waiting on. A reply holding
+    /// exactly `limit` entries means "there may be more"; a shorter one is
+    /// the end of the list.
+    Listed,
+    /// How many living records a declared list holds — the pager's "of M"
+    /// (payload = `(LocalId pivot, u32 index)`). Answered as `Count`.
+    ListLen,
 }
 
 /// What an executed command yields. Derives [`WaveWire`] so the transport
@@ -79,6 +94,8 @@ pub enum Reply {
     Values(Vec<Vec<u8>>),
     /// A `#[server]` function's wire-encoded return value.
     Returned(Vec<u8>),
+    /// A `ListLen`'s answer: how many living records the list holds.
+    Count(u64),
 }
 
 /// The verified identity a command executes as — gate 1's output.
