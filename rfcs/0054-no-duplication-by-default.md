@@ -1,118 +1,162 @@
-# RFC 0054 — The anchored layout as a declared alternative to clustering
+# RFC 0054 — No duplication by default
 
-- **Status:** Planned — opened 2026-07-30
+- **Status:** Implemented 2026-07-31 — opened 2026-07-30 as "the anchored layout
+  as a declared alternative to clustering", then **inverted** on the same day
+  (see below): it is not an alternative, it is the default, and there is no knob.
 - **Crates:** `wavedb-core`, `wavedb-macros`
-- **Relates to:** [RFC 0050](0050-clustered-record-chains.md) (the chain that
-  replaces the dense `current` tree), [RFC 0051](0051-ordered-record-lists.md)
-  (the sparse index over a chain), [RFC 0052](0052-segment-size-as-the-pagination-unit.md)
-  (segment sizing and the order-statistic descent)
+- **Supersedes the default of:** [RFC 0050](0050-clustered-record-chains.md)
+  (which made every collection carry a second inline copy of every record)
+- **Completed by:** [RFC 0051](0051-ordered-record-lists.md) — a declared list is
+  now the *only* way to ask for duplication
 
 ## Summary
 
-RFCs 0050–0052 optimise for a collection that is **read in bulk**: records inline in
-chained segments, `(K+2)` copies on disk, a sparse index above each chain. That
-bargain is wrong for a collection that is rarely read, or small, or read one record at
-a time — there the duplication is pure cost.
+A record lives at its **anchor** and nowhere else. Every collection carries two
+chains keyed by instant — **recency** and the **removal log** — and they are the
+same shape: ids and nothing else. A `SecKey` already carries `rec: LocalId`,
+which is the anchor, so there is nothing left to put in the payload. One segment
+read gives membership and order; each record is then resolved at the address it
+always had.
 
-The alternative kept here is the **anchored** layout: records live only at their
-anchors, as today, with one *dense* index over them. A developer declares which layout
-a type uses.
+Naming matters here, because the corpus spent a while calling recency "the record
+chain" — a name it had earned when it held records inline and lost when it stopped.
+What it is now is exactly the removal log with a different question: *what changed*
+instead of *what died*.
 
-### On the words
+`#[wavedb::list(...)]` is the opt-in to duplication. Each declaration adds one
+more chain, sorted by the declared property, this one holding whole records
+inline — which is what buys a dense bulk read, at the cost of a full copy.
 
-The axis is **duplication**, and it is worth naming carefully because "dense" is easy
-to misread as a property of the data:
+| declaration | copies of each record on disk |
+| --- | --- |
+| (none) | **1** — the anchor |
+| K × `#[wavedb::list]` | **1 + K** |
 
-- **dense index** / **sparse index** describe the *index*'s granularity — one entry per
-  record versus one entry per segment. Nothing to do with cardinality.
-- **anchored** / **clustered** describe the *records* — one copy at the anchor, versus
-  additional copies grouped into chains.
+## Why there is no knob
 
-They are not independent knobs, and that is why one declaration covers both: a sparse
-index only works over data physically ordered by its key. Records placed by SeaHash of
-their `Id` (`directory.rs:12`) have no such order, so an anchored layout can only ever
-carry a dense index; a clustered chain is what makes a sparse one possible. Choosing a
-layout chooses both.
+The RFC opened proposing `#[wavedb(NonUnique, layout = anchored)]`, and that
+spelling was built and then deleted the same day. Two observations killed it, both
+the reviewer's:
 
-Where cardinality *does* matter is a different question, and it favours clustering: a
-low-cardinality field under a declared list (RFC 0051) puts every record sharing a
-value in one contiguous run, so filtering on it becomes a dense sequential read.
+**1. A chain is a linked list, and `Chain<P>` is already generic over its
+payload.** The first draft of this RFC described "one dense B+tree" over the
+records and an implementation followed it literally: a second root kind on the
+`Pivot`, a second set of lanes, a second engine path — and, from the B+tree's
+forward-only walk, an invented "ordering blocker" about `all()` coming out
+oldest-first.
+
+None of it was necessary. The removal log has been `Chain<()>` — a chain of
+pointers with no payload — since RFC 0050 phase 3b. So the no-duplication model is
+**the same chain with an empty payload**, and everything follows for free: the
+chain is doubly linked with both `head` and `tail` in the `Pivot`, so it still
+reads newest-first by walking `tail → prev`; `instant_floor` still reads the
+endpoints; catch-up still walks it (`expose_changes::tail_since` was already
+payload-generic); the lanes and the storage slots do not move; and a split still
+does not rewrite the `Pivot`, because RFC 0050 gives the growth end its id
+permanently.
+
+**2. "Not anchored" is not a state a record can be in.** The record has to be at
+its anchor regardless — history resolves it there, the dead log names it there,
+and `Collection::get` is a computed address. So `anchored` was never a mode; it
+was the only possibility wearing the costume of an option. What the old knob
+actually controlled was whether there was an *extra* copy — which is exactly what
+`#[wavedb::list]` already controls, per ordering.
+
+Which leaves one axis, not two: **every ordering is a chain, and a chain either
+carries records or does not.** The built-in one (keyed by modification instant) is
+the ordering you always get and never carries them; a declared list is an ordering
+you ask for and always does.
 
 ## Motivation
 
-The anchored layout is not legacy. It is proven, it is already implemented, and its
-cost profile is the opposite of the chain's in exactly the way some collections
-need:
+RFCs 0050–0052 optimise for a collection that is **read in bulk**, and made that
+bargain for everyone: records inline in chained segments, a second copy of every
+record whether or not anything ever lists them. That is the wrong default.
 
-| | **anchored** (dense index over stored records) | **clustered** (chains + sparse index, 0050–0052) |
+| | **no duplication** (the default) | **a declared list** (opt-in) |
 | --- | --- | --- |
-| disk per record | 1 copy | `K + 2` copies |
-| write bytes per save | record + one leaf | record + one segment per chain |
-| bulk read of N records | N random reads, one page pulled and decompressed each | N/segment dense reads |
-| single-record read | 1 read (or 0 index reads — the anchor is a computed address) | 1 read, identical |
-| index size | one entry per record | one entry per segment |
+| disk per record | 1 copy | 1 more copy per list |
+| write bytes per save | the record, once | + the record's bytes per list |
+| bulk read of N records | 1 read per segment of pointers, then N reads | 1 read per segment, records inline |
+| single-record read | 1 read — the anchor is a computed address | identical |
+| index size | one entry per segment | one entry per segment |
 
-Read the last two rows together and the case makes itself: a **point-lookup-only**
-collection gains nothing from clustering, because the anchor was always a computed
-address, and pays for every duplicate. An **audit log nobody lists**, a
-**configuration table read by key**, a **join table probed one row at a time** — all
-of these want one copy and a dense index, not six copies and a segment chain.
+The last row is the one that decides it: a **point-lookup** collection gains
+nothing from duplication, because the anchor was always a computed address — so
+an audit log nobody lists, a configuration table read by key, a join row probed
+one at a time were all paying for a copy no read ever touched.
 
-The chain's win begins at the bulk read. Below some size it does not exist at all:
-a collection whose records fit in one page is one read either way.
+And the collection that *does* list still gets everything RFC 0050 built: it
+declares `#[wavedb::list]` on the property it lists by, and that ordering — not
+the incidental modification order — is the one laid out densely. The duplication
+lands where the read is, instead of everywhere.
 
-## Design sketch
+What the pointer chain keeps, for free, is the part every collection needs: it is
+the membership set, the modification order, and the "changed since" cursor
+(W6/W7 live sync), at ~18 bytes an entry instead of a whole record.
 
-Deliberately a sketch — the RFC exists now to keep the option from being lost while
-0050–0052 land, and the syntax should be settled against real schemas.
+## What landed
 
-- **A declaration on the type**, since it decides the physical model:
-  something in the shape of `#[wavedb(NonUnique, layout = anchored)]`, with `clustered`
-  the default (bulk reads being the common case for a collection a UI renders).
-- **It folds into `STRUCT_HASH`.** Unlike RFC 0052's `page` — a layout knob that
-  changes no addressing — the *model* changes what structures exist for a type, so
-  it is a schema fact.
-- **`Collection`'s surface must not change.** `all`, `search`, `search_by`, `insert`,
-  `save`, `remove` mean the same thing in both models; only the plans behind them
-  differ. Two monomorphized paths, chosen at compile time by the declaration — no
-  `dyn`, no runtime branch, per the workspace's dispatch rule.
-- **`recency` does not come back — the anchored index *is* it.** Key it by the live
-  version's authoring instant (`Metadata.succession`'s `CreatedAt`) and it
-  holds exactly one entry per living record at that instant, which is `recency`'s
-  definition word for word (`collection_recency.rs:1`). So an anchored type needs
-  **one** tree where today's engine has three: no `current` (liveness is a field of the
-  anchor's `Metadata`, per RFC 0050), no separate `recency`, and `dead` stays the
-  index-less log chain. The same absorption RFC 0050 got from its chain, obtained
-  here from the index's choice of key.
-- **An insert needs no search.** `mint_instant` is strictly monotone per collection
-  (`mint.rs:46`), so a freshly minted instant is greater than every instant already
-  in the collection: the entry always belongs at the tree's extreme right edge, and
-  the descent that would look for its position can be skipped outright.
+All of it, on 2026-07-31, by deletion as much as by addition:
 
-  One honest qualification: this is a **fast path, not an invariant.** The client
-  cache's `adopt` path imposes the node's `Metadata` rather than minting locally, so a
-  mirrored instant is not guaranteed to exceed everything the local index holds —
-  which is precisely why `mint_instant` takes a floor at all. So the rule is "if the
-  key exceeds the current maximum, insert at the right edge; otherwise descend" — one
-  comparison to buy the common case, with the general path still correct underneath.
+- The built-in record chain is `Chain<()>` — `collection_roots::records_chain`
+  opens it at the removal log's capacity, because an ~18-byte pointer entry has
+  nothing to paginate. `page = N` on the type consequently governs the
+  **lists**, which are the chains that hold records.
+- The write paths insert `()`. `plan_chain_move` still encodes the envelope and
+  still hands it back, now for one reason instead of two: the declared lists hold
+  it, and it doubles as the liveness gate.
+- The read paths — `Collection::all`, the wire `All`, and catch-up — take
+  membership and order from one read per segment and then resolve each record at
+  its anchor.
+- The `layout` knob, the `Layout` enum, the `records_tree` root, the second lane
+  set and the two contradiction refusals were all **deleted**. There is nothing
+  left to declare.
 
-  A **save** still descends, since it deletes the entry at the record's *old* instant
-  before adding the new one, and that old instant may sit anywhere. The old value is
-  in the record's `Metadata`, read for free with the record, so it is an ordinary
-  keyed delete — the operation a dense `BpTree` is already good at.
+One test's premise inverted with the default and was rewritten rather than
+patched: `a_collection_catch_up_reads_segments_not_records` asserted that
+catch-up never resolves a record by address, which is now false by design. It is
+`a_collection_catch_up_is_segment_shaped_not_collection_shaped`, and it asserts
+what is actually true and actually valuable — every changed record *is* fetched,
+and finding **which** ones stays proportional to what changed rather than to the
+collection.
+
+Two `page`-layout tests inverted with it, and were rewritten against three
+distinguishable capacities (4 → ~10 segments, 16 → 2…4, 256 → 1) so they cannot
+pass by coincidence.
+
+## Why `all()` stays recency-ordered
+
+A save moves a record to the front of `all()`, so a listing reshuffles as it is
+edited. That was raised as a defect and is not one — it is the feature (reviewer,
+2026-07-31): "always list what was modified last" is what a listing usually wants,
+and it is the same property that lets one structure serve live sync.
+
+The alternative considered and rejected was keying the chain by `created_at`
+instead: stable order, no relocation on save. It loses "what changed since",
+which is not optional, so it would need recency back as a *second* chain — and
+then the collection carries two structures to answer what one answers now. The
+stable, domain-meaningful order a caller actually wants is almost never
+"insertion order" anyway; it is "by name", "by due date", "by city" — which is
+what `#[wavedb::list]` is for.
+
+Worth recording because it nearly went the other way, and the obstacle that
+would have surfaced later: for a `#[wavedb::key]` type the anchor is a **content
+hash**, so it carries no creation instant at all, and `Metadata` stores the live
+version's instant and its predecessor's — never the first. A `created_at`
+ordering would have been well defined for one shape and silently undefined for
+the other, until creation was promoted to a stored field.
 
 ## Open questions
 
-- **Per type, or per ordering?** A type might want an anchored primary and one declared
-  ordering (or the reverse). Allowing the mix doubles the paths to test; forbidding
-  it is a cliff.
-- **Is there a size below which the engine should just decide?** A collection under
-  one page is one read either way, so the declaration only starts to matter past
-  some threshold. An engine that picked automatically would have to change physical
-  model at runtime, which the compile-time dispatch rule forbids — so probably no,
-  but worth stating why.
-- **How much of today's engine survives verbatim?** The anchored layout is close to it
-  but not identical: today has `current` + `recency` + `dead`, and the design above
-  has one instant-keyed tree + `dead`. So it is *less* code than today, not merely
-  code that keeps working — which is the appealing part, and also the part that means
-  the collapse has to be written rather than preserved.
+- **Should `#[wavedb::pivot(...)]` be absorbed?** A secondary index already *is*
+  "an ordering by a field, pointers only" — the same thing a payload-free chain
+  is, implemented as a dense `BpTree` instead. Unifying them would leave one
+  concept (an ordering, which does or does not carry records) where there are now
+  two spellings. Not done here: a pointer chain and a dense tree are **not**
+  equivalent for exact-value lookup, which is what `pivot` is for, so the merge
+  needs its own cost argument and its own RFC.
+- **The removal log's key.** It is keyed by the *removal* instant, which is what
+  answers "removed since \<cursor\>". The only record data it holds is the anchor
+  — which, for a NonUnique record, is its `CREATED_AT`. Worth restating because
+  the two instants are easy to conflate.
