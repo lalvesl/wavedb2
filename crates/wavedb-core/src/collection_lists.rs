@@ -154,6 +154,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         T: 'a,
     {
         self.listed_from(store, index, None)
+            .map_ok(|(id, _, value)| (id, value))
     }
 
     /// [`listed`](Self::listed) entered at global offset `offset` — the pager's
@@ -167,6 +168,28 @@ impl<T: NonUniqueStruct> Collection<T> {
         index: usize,
         offset: u64,
     ) -> impl Stream<Item = Result<(Id, T)>> + 'a
+    where
+        T: 'a,
+    {
+        self.listed_from(store, index, Some(offset))
+            .map_ok(|(id, _, value)| (id, value))
+    }
+
+    /// [`listed_at`](Self::listed_at) keeping each record's [`Metadata`].
+    ///
+    /// The wire `Listed` reads through this: a list segment holds the whole
+    /// **envelope**, so the metadata is decoded either way and dropping it
+    /// would only force a client mirror to author its own — one that disagrees
+    /// with the node about the version chain. It costs nothing here and it is
+    /// what lets `adopt_with` write the node's chain data verbatim.
+    ///
+    /// [`Metadata`]: crate::Metadata
+    pub(crate) fn listed_meta_at<'a, S: Store>(
+        self,
+        store: &'a S,
+        index: usize,
+        offset: u64,
+    ) -> impl Stream<Item = Result<(Id, crate::metadata::Metadata, T)>> + 'a
     where
         T: 'a,
     {
@@ -192,14 +215,14 @@ impl<T: NonUniqueStruct> Collection<T> {
         }
     }
 
-    /// Both list readers: walk the chain forward from `offset` (or from the
-    /// head), yielding whole segments' worth of records.
+    /// Every list reader: walk the chain forward from `offset` (or from the
+    /// head), yielding whole segments' worth of records with their metadata.
     fn listed_from<'a, S: Store>(
         self,
         store: &'a S,
         index: usize,
         offset: Option<u64>,
-    ) -> impl Stream<Item = Result<(Id, T)>> + 'a
+    ) -> impl Stream<Item = Result<(Id, crate::metadata::Metadata, T)>> + 'a
     where
         T: 'a,
     {
@@ -234,9 +257,9 @@ impl<T: NonUniqueStruct> Collection<T> {
                     for (key, bytes) in
                         seg.entries().skip(usize::try_from(skip).unwrap_or(0))
                     {
-                        let (_, value) =
+                        let (meta, value) =
                             decode_record::<T>(T::STRUCT_HASH, bytes)?;
-                        page.push(Ok((key.rec.to_id(tenant), value)));
+                        page.push(Ok((key.rec.to_id(tenant), meta, value)));
                     }
                     Ok(Some((
                         futures::stream::iter(page),

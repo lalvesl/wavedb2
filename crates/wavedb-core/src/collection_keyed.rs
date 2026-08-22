@@ -116,6 +116,10 @@ impl<T: NonUniqueStruct> Collection<T> {
             let key = Self::sec_key(value, i, id);
             batch.extend(tree.plan_insert(store, key).await?);
         }
+        let mut fuzzy = self.fuzzy_trees(pivot);
+        let mut view = crate::overlay::Overlay::new(store);
+        self.plan_fuzzy_inserts(&mut view, &mut batch, &mut fuzzy, id, value)
+            .await?;
         self.push_root_moves(
             &mut batch,
             pivot,
@@ -124,6 +128,7 @@ impl<T: NonUniqueStruct> Collection<T> {
                 recency: records.roots(),
                 removals: pivot.removals(),
                 lists: &lists,
+                fuzzy: &fuzzy,
             },
         );
         store.apply(&batch).await?;

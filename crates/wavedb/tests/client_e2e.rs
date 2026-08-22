@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
-use schema_smoke::{AboutUser, Note, NotePivotId, REGISTRY};
+use schema_smoke::{AboutUser, Note, NotePivotId, REGISTRY, Row, RowPivotId};
 use tokio::sync::oneshot;
 use wavedb::prelude::*;
 use wavedb_quick_node::{Bound, Server};
@@ -44,6 +44,8 @@ fn access_token() -> Vec<u8> {
 struct Node {
     addr: SocketAddr,
     pivot: NotePivotId,
+    /// A collection of a type declaring a `#[wavedb::list]`.
+    rows: RowPivotId,
     stop: oneshot::Sender<()>,
     thread: thread::JoinHandle<()>,
 }
@@ -75,7 +77,8 @@ fn start(dir: PathBuf) -> Node {
             let seed =
                 wavedb_core::LocalHandle::new(bound.store(), U48::from(TENANT));
             let pivot = Note::create_pivot(&seed).await.expect("seed pivot");
-            info_tx.send((addr, pivot)).expect("test dropped");
+            let rows = Row::create_pivot(&seed).await.expect("seed rows");
+            info_tx.send((addr, pivot, rows)).expect("test dropped");
             bound
                 .run_with_shutdown(async move {
                     let _ = stop_rx.await;
@@ -84,10 +87,11 @@ fn start(dir: PathBuf) -> Node {
                 .expect("serve");
         });
     });
-    let (addr, pivot) = info_rx.recv().expect("server never bound");
+    let (addr, pivot, rows) = info_rx.recv().expect("server never bound");
     Node {
         addr,
         pivot,
+        rows,
         stop,
         thread,
     }
@@ -110,6 +114,7 @@ async fn typed_surface_drives_a_live_node() {
 
     unique_phase(&db).await;
     nonunique_phase(&db, node.pivot).await;
+    list_phase(&db, node.rows).await;
 
     // ── ops without a wire command refuse uniformly ────────────────────────
     let err = Note::create_pivot(&db).await.expect_err("must refuse");
@@ -220,5 +225,74 @@ async fn nonunique_phase(db: &Db, pivot: NotePivotId) {
     assert_eq!(
         all.iter().map(|n| n.body.as_str()).collect::<Vec<_>>(),
         vec!["write docs"]
+    );
+}
+
+/// Declared lists over the wire: the ordering, the pager's two reads, and the
+/// chunk loop the unbounded reader is built from.
+///
+/// Until `Command::Listed` existed all three refused here — a declared list was
+/// reachable only from a `LocalHandle` or a `#[server]` body, which is to say
+/// from everywhere except the thing that renders a page.
+async fn list_phase(db: &Db, pivot: RowPivotId) {
+    // Enough to cross the client's internal chunk (256) so the loop really
+    // runs more than once, and by a margin that makes the last page short.
+    const N: u64 = 270;
+
+    let rows = Row::collection(pivot);
+    // Descending arrival: the list must sort them anyway, which is what
+    // separates its order from `all()`'s.
+    for n in (0..N).rev() {
+        rows.insert(db, &Row { n }).await.expect("insert row");
+    }
+
+    assert_eq!(
+        rows.list_len(db, 0).await.expect("list_len"),
+        N,
+        "the pager's `of M` now crosses the wire"
+    );
+
+    // The unbounded reader: chunked underneath, whole and ascending on top.
+    let all: Vec<u64> = rows
+        .listed(db, 0)
+        .map_ok(|r| r.n)
+        .try_collect()
+        .await
+        .expect("listed");
+    assert_eq!(
+        all,
+        (0..N).collect::<Vec<_>>(),
+        "the whole list, in the declared order, across chunk boundaries"
+    );
+
+    // The bounded reader: exactly the window a pager renders, one exchange.
+    let page: Vec<u64> = rows
+        .listed_page(db, 0, 50, 25)
+        .map_ok(|r| r.n)
+        .try_collect()
+        .await
+        .expect("listed_page");
+    assert_eq!(page, (50..75).collect::<Vec<_>>(), "rows 50…75 of M");
+
+    // A window running off the end comes back short rather than refusing.
+    let tail: Vec<u64> = rows
+        .listed_page(db, 0, N - 3, 25)
+        .map_ok(|r| r.n)
+        .try_collect()
+        .await
+        .expect("listed_page tail");
+    assert_eq!(tail, vec![N - 3, N - 2, N - 1]);
+
+    // An undeclared ordering refuses typed, where an empty answer would be a
+    // lie about the collection.
+    let err = rows
+        .listed(db, 9)
+        .map_ok(|r| r.n)
+        .try_collect::<Vec<_>>()
+        .await
+        .expect_err("must refuse");
+    assert!(
+        matches!(err, Error::Node(ref e) if e.message.contains("out of range")),
+        "an undeclared list index must refuse: {err}"
     );
 }

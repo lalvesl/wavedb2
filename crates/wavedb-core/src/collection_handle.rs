@@ -20,6 +20,7 @@ use std::marker::PhantomData;
 
 use futures::Stream;
 
+use crate::fuzzy::{Fuzzy, Scored};
 use crate::handle::DbHandle;
 use crate::id::Id;
 use crate::index::Bound;
@@ -172,6 +173,25 @@ impl<T: NonUniqueStruct> CollectionHandle<T> {
         db.listed(self.pivot, index, offset)
     }
 
+    /// One **bounded** page of declared list `index` — at most `limit`
+    /// records from `offset`, in one exchange.
+    ///
+    /// The pager's read: `listed_at(..).take(n)` would ask the node for far
+    /// more than the window renders, because the unbounded reader pages at its
+    /// own chunk size. This asks for exactly the window.
+    pub fn listed_page<'d, D: DbHandle>(
+        &self,
+        db: &'d D,
+        index: usize,
+        offset: u64,
+        limit: u32,
+    ) -> impl Stream<Item = Result<T, D::Error>> + use<'d, D, T>
+    where
+        T: 'static,
+    {
+        db.listed_page(self.pivot, index, offset, limit)
+    }
+
     /// How many living records declared list `index` holds — the pager's
     /// "of M".
     ///
@@ -186,6 +206,31 @@ impl<T: NonUniqueStruct> CollectionHandle<T> {
         T: 'static,
     {
         db.list_len::<T>(self.pivot, index).await
+    }
+
+    /// Records whose fuzzy index `index` matches `query`, best first, at most
+    /// `limit` of them ([RFC 0056]).
+    ///
+    /// **Buffered and ranked**, unlike every other read here: a best-first
+    /// order is not known until the last candidate is scored. The generated
+    /// `fuzzy_<field>` wrapper calls this with the declaration's index.
+    ///
+    /// [RFC 0056]: https://github.com/wavedb/wavedb/blob/main/rfcs/0056-fuzzy-string-search-WIP.md
+    ///
+    /// # Errors
+    /// A backend/transport failure, or an undeclared fuzzy index.
+    pub async fn fuzzy<D: DbHandle>(
+        &self,
+        db: &D,
+        index: usize,
+        query: &str,
+        mode: Fuzzy,
+        limit: usize,
+    ) -> Result<Vec<Scored<(Id, T)>>, D::Error>
+    where
+        T: 'static,
+    {
+        db.fuzzy_search(self.pivot, index, query, mode, limit).await
     }
 
     /// Stream the record at `id`'s versions **newest-first** along the
