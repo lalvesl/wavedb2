@@ -216,20 +216,25 @@ where
     // Walked off the **record chain** (RFC 0050), back from its tail, for two
     // reasons. It is the same order `Collection::all` yields — most recently
     // written first — and the two surfaces must not disagree about what "all"
-    // means. And the chain's payload *is* the stored envelope, so the metadata
-    // this needs comes out of the same decode: no per-record fetch at all,
-    // where the tree walk paid one page read and one decompression each.
+    // means. The chain gives membership and order in one read per segment; each
+    // record is then resolved at its anchor, which is where it lives (RFC 0054 —
+    // no duplication by default).
     let pivot_record = col.load_pivot(store).await?;
-    let chain = col.records_chain(&pivot_record);
+    let chain = col.recency_chain(&pivot_record);
     let mut items: Vec<(Id, crate::metadata::Metadata, T)> = Vec::new();
     let mut cursor = Some(chain.tail());
     while let Some(seg_id) = cursor {
         let seg = chain.segment(store, seg_id).await?;
         let from = items.len();
-        for (key, bytes) in seg.entries() {
+        for (key, ()) in seg.entries() {
+            let rec = key.rec.to_id(col.tenant());
+            let bytes = store
+                .get_of(T::STRUCT_HASH, rec)
+                .await?
+                .ok_or(crate::Error::RecordMissing(rec))?;
             let (meta, value) =
-                crate::record::decode_record::<T>(T::STRUCT_HASH, bytes)?;
-            items.push((key.rec.to_id(col.tenant()), meta, value));
+                crate::record::decode_record::<T>(T::STRUCT_HASH, &bytes)?;
+            items.push((rec, meta, value));
         }
         // A segment holds its keys ascending; the walk runs descending.
         items[from..].reverse();

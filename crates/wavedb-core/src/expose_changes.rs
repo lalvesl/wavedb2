@@ -130,15 +130,20 @@ where
     };
 
     let saved =
-        tail_since(&col.records_chain(&pivot_record), store, cursor).await?;
+        tail_since(&col.recency_chain(&pivot_record), store, cursor).await?;
     let removed =
         tail_since(&col.dead_log(&pivot_record), store, cursor).await?;
 
     // Merge the two tails into one instant-ordered timeline.
     let mut timeline = Vec::with_capacity(saved.len() + removed.len());
-    for (instant, rec, bytes) in saved {
-        let (meta, body) = record::split_record(T::STRUCT_HASH, &bytes)?;
+    for (instant, rec, ()) in saved {
         let id = rec.to_id(tenant);
+        // The chain names the record; the record is at its anchor.
+        let bytes = store
+            .get_of(T::STRUCT_HASH, id)
+            .await?
+            .ok_or(crate::Error::RecordMissing(id))?;
+        let (meta, body) = record::split_record(T::STRUCT_HASH, &bytes)?;
         timeline.push((instant, Change::Saved(id, meta, body.to_vec())));
     }
     timeline.extend(removed.into_iter().map(|(instant, rec, ())| {
@@ -271,7 +276,7 @@ mod tests {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, WaveWire)]
     struct DocPivot {
-        records: ChainRoots,
+        recency: ChainRoots,
         removals: LogRoots,
         permission: Option<PermissionRef>,
     }
@@ -280,8 +285,8 @@ mod tests {
         fn secondaries(&self) -> &[LocalId] {
             &[]
         }
-        fn records(&self) -> ChainRoots {
-            self.records
+        fn recency(&self) -> ChainRoots {
+            self.recency
         }
         fn removals(&self) -> LogRoots {
             self.removals
@@ -291,7 +296,7 @@ mod tests {
         }
         fn replace_roots(&self, roots: Roots<'_>) -> Self {
             Self {
-                records: roots.records,
+                recency: roots.recency,
                 removals: roots.removals,
                 permission: self.permission.clone(),
             }
@@ -424,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn a_collection_catch_up_reads_segments_not_records() {
+    fn a_collection_catch_up_is_segment_shaped_not_collection_shaped() {
         block_on(async {
             let store = MemStore::default();
             let pivot =
@@ -460,17 +465,24 @@ mod tests {
                 .collect();
             assert_eq!(bodies, (0..n).collect::<Vec<_>>());
 
-            // The claim: the bodies above came out of the segments, so not
-            // one record was fetched by address.
+            // The claim, restated for RFC 0054's no-duplication default: the
+            // *scan* is segment-shaped even though the *bodies* are not. The
+            // chain holds pointers, so a change's record is fetched at its
+            // anchor — but only for records that actually changed, and finding
+            // which ones took a handful of segment reads rather than a walk
+            // over the collection.
             let reads = watched.reads();
             assert!(
-                anchors.iter().all(|id| !reads.contains(id)),
-                "a catch-up must never resolve a record by address"
+                anchors.iter().all(|id| reads.contains(id)),
+                "every changed record is resolved at its anchor"
             );
+            // 40 changes: 40 anchors + the pivot + a few segments. What the
+            // chain buys is that the second number stays small — the cost is
+            // proportional to what changed, never to the collection.
             assert!(
-                reads.len() < anchors.len(),
-                "{n} changes in {} reads — the chain exists to make this \
-                 segment-shaped, not record-shaped",
+                reads.len() < anchors.len() + 10,
+                "{n} changes in {} reads — finding them must stay \
+                 segment-shaped",
                 reads.len()
             );
 
