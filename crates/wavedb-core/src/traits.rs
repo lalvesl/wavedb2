@@ -188,6 +188,38 @@ pub trait NonUniqueStruct: WaveDbStruct {
         Vec::new()
     }
 
+    /// Number of `#[wavedb::fuzzy]` declarations, declaration order
+    /// ([RFC 0056]). Must equal the generated pivot's `fuzzy()` length.
+    ///
+    /// [RFC 0056]: https://github.com/wavedb/wavedb/blob/main/rfcs/0056-fuzzy-string-search-WIP.md
+    const NUM_FUZZY: usize = 0;
+
+    /// The raw text fuzzy index `index` is built over — the marked field's
+    /// value, borrowed rather than cloned, since normalization copies anyway.
+    // The default body returns a literal, which reads to clippy as a `'static`
+    // opportunity; every real implementation borrows from `self`.
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[must_use]
+    fn fuzzy_source(&self, index: usize) -> &str {
+        let _ = index;
+        ""
+    }
+
+    /// Fuzzy index `index`'s gram width and normalization profile.
+    ///
+    /// Both reach stored bytes — they decide which grams a record is filed
+    /// under — so both fold into the
+    /// [`STRUCT_HASH`](crate::WaveDbStruct::STRUCT_HASH) and neither can be
+    /// changed on live data. The macro emits the **resolved** values rather
+    /// than eliding defaults, so a future change to
+    /// [`DEFAULT_N`](crate::fuzzy::DEFAULT_N) mints new types instead of
+    /// silently re-reading old postings at a new width.
+    #[must_use]
+    fn fuzzy_profile(index: usize) -> (usize, crate::fuzzy::Fold) {
+        let _ = index;
+        (crate::fuzzy::DEFAULT_N, crate::fuzzy::Fold::Latin)
+    }
+
     /// The content-derived anchor key of a `#[wavedb::key(...)]` type —
     /// SeaHash over the declared key fields' wire bytes in declaration
     /// order (the macro implements it via

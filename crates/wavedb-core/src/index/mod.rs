@@ -158,6 +158,11 @@ pub struct Roots<'a> {
     ///
     /// [RFC 0051]: https://github.com/wavedb/wavedb/blob/main/rfcs/0051-ordered-record-lists.md
     pub lists: &'a [ChainRoots],
+    /// One root per `#[wavedb::fuzzy]` declaration, declaration order
+    /// ([RFC 0056]) — an n-gram posting tree.
+    ///
+    /// [RFC 0056]: https://github.com/wavedb/wavedb/blob/main/rfcs/0056-fuzzy-string-search-WIP.md
+    pub fuzzy: &'a [LocalId],
 }
 
 // ---- Pivot: the collection's roots holder -----------------------------------
@@ -196,6 +201,17 @@ pub trait Pivot: WaveWire + Sized {
     ///
     /// [RFC 0051]: https://github.com/wavedb/wavedb/blob/main/rfcs/0051-ordered-record-lists.md
     fn lists(&self) -> &[ChainRoots] {
+        &[]
+    }
+    /// One **fuzzy index**'s root per `#[wavedb::fuzzy]` declaration, in
+    /// declaration order ([RFC 0056]) — an n-gram posting `BpTree<SecKey>`.
+    ///
+    /// A posting tree, unlike a list, holds no record bytes: a gram, a length
+    /// and an anchor. That is what lets a save whose indexed field did not
+    /// change write nothing here at all.
+    ///
+    /// [RFC 0056]: https://github.com/wavedb/wavedb/blob/main/rfcs/0056-fuzzy-string-search-WIP.md
+    fn fuzzy(&self) -> &[LocalId] {
         &[]
     }
     /// Collection-default access rule: seeds new inserts and gates
