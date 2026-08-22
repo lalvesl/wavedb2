@@ -72,18 +72,21 @@ pub fn statics_for(
 /// Emit `storage_entries()` on the record type: every slot the type needs
 /// registered at `PageStore::open` — its own, plus its Pivot's for NonUnique.
 pub fn entries_for(name: &Ident, pivot: Option<&Ident>) -> TokenStream {
-    // A NonUnique type also owns three reserved lanes (RFC 0050) — the record
-    // chain, the removal log and the sparse index — each a directory of its
-    // own, so each needs its own registered slot.
+    // A NonUnique type owns four reserved lanes — declared-list segments, the
+    // recency chain, the removal log and the sparse index — each a directory of
+    // its own, so each needs its own registered slot. Recency and `dead` are
+    // separated from the record lane because they hold ids, not records
+    // (RFC 0054), and a lane exists so one dictionary models one kind of thing.
     let (len, list) = pivot.map_or_else(
         || (quote!(1usize), quote!([Self::struct_storage()])),
         |pivot| {
             (
-                quote!(5usize),
+                quote!(6usize),
                 quote!([
                     Self::struct_storage(),
                     #pivot::struct_storage(),
                     Self::records_lane_storage(),
+                    Self::recency_lane_storage(),
                     Self::dead_lane_storage(),
                     Self::index_lane_storage(),
                 ]),
@@ -114,12 +117,24 @@ pub fn entries_for(name: &Ident, pivot: Option<&Ident>) -> TokenStream {
 /// ([`struct_hash::lane_hash`]) because a `static` needs a `const` initialiser.
 pub fn lane_statics(name: &Ident, hash: u64) -> TokenStream {
     let records = crate::struct_hash::lane_hash(b"WDB.SEG", hash);
+    let recency = crate::struct_hash::lane_hash(b"WDB.REC", hash);
     let dead = crate::struct_hash::lane_hash(b"WDB.DEAD", hash);
     let index = crate::struct_hash::lane_hash(b"WDB.IDX", hash);
     quote! {
         #[cfg(not(target_arch = "wasm32"))]
         impl #name {
-            /// Storage slot for this type's **record chain** segments.
+            /// Storage slot for this type's **recency chain** segments —
+            /// id-only, like the removal log's.
+            #[must_use]
+            pub fn recency_lane_storage()
+            -> &'static ::wavedb_storage::StructStorage {
+                static SLOT: ::wavedb_storage::StructStorage =
+                    ::wavedb_storage::StructStorage::new(#recency);
+                &SLOT
+            }
+
+            /// Storage slot for this type's **declared list** segments — the
+            /// only ones holding whole records.
             #[must_use]
             pub fn records_lane_storage()
             -> &'static ::wavedb_storage::StructStorage {

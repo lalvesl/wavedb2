@@ -68,9 +68,13 @@ pub trait WaveDbStruct: WaveWire {
     const SHAPE: Shape;
 
     /// The reserved lane hashes this type's storage occupies **beyond** its
-    /// own records — one per chain a collection rides (RFC 0050): the record
-    /// chain, the removal log, and the sparse index above the chain. A
-    /// `Unique` type has no collection and so no lanes, which is the default.
+    /// own records — one directory per kind of thing a collection stores: the
+    /// **declared lists'** segments (the only ones holding records), the
+    /// **recency** chain, the **removal log**, and the **sparse index** above
+    /// them. Recency and `dead` are split from the record lane because they
+    /// hold ids rather than records (RFC 0054), and a lane exists so one page
+    /// and one zstd dictionary model one kind of content. A `Unique` type has
+    /// no collection and so no lanes, which is the default.
     ///
     /// Derived by the macro at expansion time, because SeaHash is not a
     /// `const fn` (the same reason the `StructStorage` slots carry literals).

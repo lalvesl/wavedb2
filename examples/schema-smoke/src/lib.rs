@@ -336,20 +336,19 @@ mod tests {
                 paged.insert(&db, &Paged { n }).await.unwrap();
                 plain.insert(&db, &Default { n }).await.unwrap();
             }
-            // Every record chain of a type shares one lane, so the count is
-            // the built-in pointer chain (always 1 here — pointers take the
-            // log's large capacity) plus the declared list's segments. At
-            // `page = 4` the list needs 4…8 per segment, so at least 3; at the
-            // default 16…32 it holds all 20 in one.
+            // `LANE_HASHES[0]` is the record lane, and since RFC 0054 the only
+            // things in it are the declared lists' segments — recency lives in
+            // its own lane, being ids rather than records. So this counts the
+            // list directly: at `page = 4`, 20 records need 4…8 per segment, so
+            // at least 3; at the default 16…32 they fit in one.
             assert!(
-                store.lane_values(Paged::LANE_HASHES[0]) >= 4,
+                store.lane_values(Paged::LANE_HASHES[0]) >= 3,
                 "the declared capacity did not reach the list's chain"
             );
             assert_eq!(
                 store.lane_values(Default::LANE_HASHES[0]),
-                2,
-                "the default capacity fits 20 records in one list segment, \
-                 beside the one pointer segment"
+                1,
+                "the default capacity fits 20 records in one list segment"
             );
         });
     }
@@ -703,17 +702,19 @@ mod tests {
         assert!(!crate::Attachment::struct_storage().compress());
 
         // Unique registers itself; NonUnique bundles its Pivot's slot and the
-        // three reserved lanes its collection lives in (RFC 0050) — the record
-        // chain, the removal log, and the sparse index, each its own directory
-        // so a page never mixes fat records with skinny log entries.
+        // four reserved lanes its collection lives in — declared-list segments,
+        // the recency chain, the removal log, and the sparse index. Each is its
+        // own directory so a page never mixes fat records with skinny id
+        // entries, and so each lane's zstd dictionary models one kind of thing.
         assert_eq!(AboutUser::storage_entries().len(), 1);
         let entries = Note::storage_entries();
-        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.len(), 6);
         assert!(std::ptr::eq(entries[0], Note::struct_storage()));
         assert!(std::ptr::eq(entries[1], NotePivot::struct_storage()));
         assert!(std::ptr::eq(entries[2], Note::records_lane_storage()));
-        assert!(std::ptr::eq(entries[3], Note::dead_lane_storage()));
-        assert!(std::ptr::eq(entries[4], Note::index_lane_storage()));
+        assert!(std::ptr::eq(entries[3], Note::recency_lane_storage()));
+        assert!(std::ptr::eq(entries[4], Note::dead_lane_storage()));
+        assert!(std::ptr::eq(entries[5], Note::index_lane_storage()));
 
         // The exposure's StorageRegistry flattens struct entries AND the
         // `store` entry — Attachment's slot registers with no wire surface.
@@ -1252,6 +1253,7 @@ mod lane_tests {
         for (lane, slot) in [
             (Lane::Records, Note::records_lane_storage()),
             (Lane::Dead, Note::dead_lane_storage()),
+            (Lane::Recency, Note::recency_lane_storage()),
             (Lane::Index, Note::index_lane_storage()),
         ] {
             assert_eq!(
@@ -1274,6 +1276,7 @@ mod lane_tests {
             Note::LANE_HASHES,
             [
                 Lane::Records.hash(Note::STRUCT_HASH),
+                Lane::Recency.hash(Note::STRUCT_HASH),
                 Lane::Dead.hash(Note::STRUCT_HASH),
                 Lane::Index.hash(Note::STRUCT_HASH),
             ],

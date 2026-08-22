@@ -60,7 +60,7 @@ impl<T: NonUniqueStruct> Collection<T> {
             roots.index,
             self.tenant,
             T::STRUCT_HASH,
-            Lane::Records,
+            Lane::Recency,
         )
         // Pointer entries are ~18 bytes, so this chain wants the removal
         // log's kind of capacity, not a page size — there are no records in
@@ -85,9 +85,10 @@ impl<T: NonUniqueStruct> Collection<T> {
     /// chain shape as the built-in one, sorted by a declared property instead of
     /// by modification instant (RFC 0051).
     ///
-    /// They share `Lane::Records` with the built-in chain: their payload is the
-    /// same record envelope, so one directory and one zstd dictionary model all
-    /// of them, which is exactly what a lane is for.
+    /// These own `Lane::Records` outright: they are the only chains that carry
+    /// record envelopes, so one directory and one zstd dictionary model one kind
+    /// of content — which is exactly what a lane is for. Recency and the removal
+    /// log, being id-only, are filed elsewhere.
     pub(crate) fn list_chains(&self, pivot: &T::Pivot) -> Vec<Chain<Vec<u8>>> {
         pivot
             .lists()
@@ -199,7 +200,7 @@ impl<T: NonUniqueStruct> Collection<T> {
         // about an empty segment. `recency_chain` applies the capacity on every
         // subsequent open, which is where splits and merges are decided.
         let (recency_chain, record_writes) =
-            Chain::<()>::plan_create(tenant, T::STRUCT_HASH, Lane::Records);
+            Chain::<()>::plan_create(tenant, T::STRUCT_HASH, Lane::Recency);
         let recency = recency_chain.roots();
         batch.extend(record_writes);
         // The removal log: the same shape again, minus the index, since nothing

@@ -50,9 +50,20 @@ const LANE_PREFIX: usize = 8;
 /// forever and is read almost never.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
-    /// Record chains: the built-in modification-ordered one and every declared
-    /// ordering. Payload = the record's stored envelope, verbatim.
+    /// **Declared list** chains ([RFC 0051]) — the only segments that carry
+    /// records. Payload = the record's stored envelope, verbatim.
+    ///
+    /// [RFC 0051]: https://github.com/wavedb/wavedb/blob/main/rfcs/0051-ordered-record-lists.md
     Records,
+    /// The **recency** chain: one id per living record, keyed by its live
+    /// version's instant. Payload = `()`.
+    ///
+    /// Its own lane rather than sharing the record one, for the reason lanes
+    /// exist: an ~18-byte id entry and a segment of whole records are different
+    /// content, and a per-type zstd dictionary can only model one of them well.
+    /// It is the removal log's twin in every respect but the question it
+    /// answers, and it is filed like one.
+    Recency,
     /// The removal log. Payload = `()`.
     Dead,
     /// Sparse-index nodes — the descent above a chain.
@@ -75,6 +86,7 @@ impl Lane {
     pub fn hash(self, struct_hash: u64) -> u64 {
         let tag: &[u8] = match self {
             Self::Records => b"WDB.SEG",
+            Self::Recency => b"WDB.REC",
             Self::Dead => b"WDB.DEAD",
             Self::Index => b"WDB.IDX",
         };
