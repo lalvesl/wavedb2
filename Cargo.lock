@@ -826,6 +826,7 @@ dependencies = [
  "wavedb-core",
  "wavedb-quick-node",
  "wavedb-storage",
+ "wavedb-wire",
 ]
 
 [[package]]

@@ -27,6 +27,10 @@ client-side = []
 wavedb = { path = "../../../crates/wavedb" }
 # The derive-emitted code names ::wavedb_core:: paths directly.
 wavedb-core = { path = "../../../crates/wavedb-core" }
+# `#[derive(WaveWire)]` emits absolute `::wavedb_wire::` paths, so any crate
+# deriving it on a plain (non-`#[wavedb]`) type — here `TodoHit`, the shaped
+# return of `search_todos` — names the codec directly.
+wavedb-wire = { path = "../../../crates/wavedb-wire" }
 # Placeholder credential hashing (real Argon2 lands with M8 auth) — used
 # only inside `#[server]` bodies, so it rides `server-side`.
 sha2 = { workspace = true, optional = true }
