@@ -112,6 +112,12 @@ All of it, on 2026-07-31, by deletion as much as by addition:
 - The `layout` knob, the `Layout` enum, the `records_tree` root, the second lane
   set and the two contradiction refusals were all **deleted**. There is nothing
   left to declare.
+- **Recency moved to a lane of its own** (`Lane::Recency`, tag `WDB.REC`), so a
+  NonUnique type now occupies four: declared-list segments, recency, the removal
+  log, the sparse index. It shared the record lane while it carried records, and
+  the moment it stopped, that sharing became the thing lanes exist to prevent —
+  one directory and one zstd dictionary trying to model both ~18-byte id entries
+  and segments of whole records. `storage_entries()` is 6.
 
 One test's premise inverted with the default and was rewritten rather than
 patched: `a_collection_catch_up_reads_segments_not_records` asserted that
