@@ -5,6 +5,7 @@
 
 use todo_app_schema::{
     add_todo, all_todos, complete_todo, delete_todo, login, register,
+    search_todos,
 };
 use wavedb::prelude::*;
 
@@ -39,6 +40,20 @@ async fn main() -> anyhow::Result<()> {
     println!("\n── todos ──");
     print_todos(&db).await?;
 
+    // ── Search ─────────────────────────────────────────────────────────────
+    //
+    // None of these is a title, and the first three still find one: the index
+    // is built over the title's trigrams, so a partial word — or one with a
+    // letter dropped — still shares enough of them. The last shares none and
+    // comes back empty rather than ranked-but-wrong.
+    //
+    // `search` is not a DSL. It is one more `#[server]` function, run next to
+    // the data, exactly like `all_todos`.
+    println!("\n── search ──");
+    for query in ["milk", "rust", "mlk", "quantum chromodynamics"] {
+        search(&db, query).await?;
+    }
+
     // ── Mutate ─────────────────────────────────────────────────────────────
     complete_todo(&db, id_milk).await?;
     delete_todo(&db, id_docs).await?;
@@ -46,6 +61,30 @@ async fn main() -> anyhow::Result<()> {
     println!("\n── todos after complete + delete ──");
     print_todos(&db).await?;
 
+    // Completing a todo does not touch the fuzzy index at all — a posting
+    // holds a gram, a length and an anchor, never the record, so a save that
+    // leaves the title alone has nothing to rewrite. "Buy milk" is still
+    // exactly as findable, and "Write docs" is gone with its postings.
+    println!("\n── search again, after the mutations ──");
+    for query in ["milk", "docs"] {
+        search(&db, query).await?;
+    }
+
+    Ok(())
+}
+
+/// Run one fuzzy search and print what came back, best first.
+async fn search(db: &Db, query: &str) -> anyhow::Result<()> {
+    // Ranked, so buffered: a best-first order is not known until the last
+    // candidate has been scored. Every other read here streams.
+    let hits = search_todos(db, query.into(), 5).await?;
+    if hits.is_empty() {
+        println!("  {query:>14?} → (nothing close enough)");
+        return Ok(());
+    }
+    for hit in hits {
+        println!("  {query:>14?} → {:.2}  {}", hit.score, hit.todo.title);
+    }
     Ok(())
 }
 

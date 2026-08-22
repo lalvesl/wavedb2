@@ -1,6 +1,6 @@
 //! The todo-app schema crate — compiled into the node AND every client.
 //!
-//! The M4 target surface: the app's whole wire API is its six `#[server]`
+//! The M4 target surface: the app's whole wire API is its nine `#[server]`
 //! functions; **every struct is storage-only** (`store` entries — engine
 //! slots, no wire address). The patterns this pins down:
 //!
@@ -40,7 +40,7 @@ use wavedb::prelude::*;
 
 wavedb::expose_server! {
     fn register, fn login, fn refresh, fn logout,
-    fn add_todo, fn all_todos, fn complete_todo, fn delete_todo,
+    fn add_todo, fn all_todos, fn search_todos, fn complete_todo, fn delete_todo,
     store AllUserNamesToTenants,
     store UserEntry,
     store Auth,
@@ -52,7 +52,7 @@ wavedb::expose_server! {
 
 wavedb::expose_client! {
     fn register, fn login, fn refresh, fn logout,
-    fn add_todo, fn all_todos, fn complete_todo, fn delete_todo,
+    fn add_todo, fn all_todos, fn search_todos, fn complete_todo, fn delete_todo,
 }
 
 // ── Global username registry (system tenant = 0) ──────────────────────────
@@ -93,112 +93,59 @@ pub struct Profile {
     pub todos: <Todo as WaveDbStruct>::PivotId,
 }
 
-/// Todo item — NonUnique, many per tenant, ordered by insertion time.
+/// Todo item — NonUnique, many per tenant.
+///
+/// `#[wavedb::fuzzy]` on `title` adds an n-gram posting tree beside the
+/// record ([RFC 0056]), which is what makes [`search_todos()`] find
+/// `"Buy milk"` from a typed-out `"mlk"`. It sits on the **field**: the index is
+/// built over exactly that string.
+///
+/// The cost is honest and worth stating next to the declaration: an insert
+/// writes `L + n - 1` posting keys (a 20-character title is ~22), all inside
+/// the same atomic batch as the record. What it does *not* cost is a save
+/// that leaves the title alone — a posting holds a gram, a length and an
+/// anchor, never the record, so an unchanged title has nothing to rewrite.
+/// `complete_todo` is exactly that save, and it touches this index not at all.
+///
+/// [RFC 0056]: https://github.com/wavedb/wavedb/blob/main/rfcs/0056-fuzzy-string-search-WIP.md
 #[wavedb(NonUnique)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Todo {
+    #[wavedb::fuzzy]
     pub title: String,
     pub completed: bool,
 }
 
-// ── Auth server functions (called on a system-tenant connection) ──────────
-
-/// Register a new user: allocate a tenant id, write the global `UserEntry`,
-/// and bootstrap `Auth` + `Profile` (+ the todo collection) in the new
-/// tenant's space. Returns the assigned tenant id — the client stores it and
-/// reconnects as that tenant.
-#[server(public)]
-pub async fn register(
-    db: &Db,
-    username: String,
-    password: String,
-) -> Result<u64> {
-    let registry = ensure_registry(db).await?;
-    let col = UserEntry::collection(registry.entries);
-
-    // Scope the lookup stream so its borrow of `username` ends before the
-    // insert consumes it.
-    {
-        let mut existing = std::pin::pin!(col.by_username(db, &username));
-        if existing.next().await.is_some() {
-            return Err(Error::already_exists("username already taken"));
-        }
-    }
-
-    let tenant_id = new_tenant_id();
-    col.insert(
-        db,
-        &UserEntry {
-            username: username.clone(),
-            tenant_id,
-        },
-    )
-    .await?;
-
-    // Bootstrap the new tenant's own records — the server-side cross-tenant
-    // seam (`as_tenant` never crosses the wire).
-    let user_db = db.as_tenant(U48::try_from(tenant_id)?);
-    Auth {
-        password_hash: hash_password(&password),
-    }
-    .save(&user_db)
-    .await?;
-    let todos = Todo::create_pivot(&user_db).await?;
-    Profile { username, todos }.save(&user_db).await?;
-
-    Ok(tenant_id)
+/// One [`search_todos()`] result: the todo, its stable `Id` so the caller can
+/// act on it, and how well it matched.
+///
+/// The `Id` is here because a search result is the one read you almost always
+/// want to *do* something with — `complete_todo(db, hit.id)` is the point.
+/// It is **not** a DTO, and the distinction matters here: there is no
+/// translation layer, no second definition of `Todo`. This is a shaped
+/// *return* — the same pattern `wavedb::TokenPair` uses — and it carries the
+/// real record inside it.
+#[derive(Debug, Clone, PartialEq, wavedb_core::WaveWire)]
+pub struct TodoHit {
+    pub id: Id,
+    pub todo: Todo,
+    /// How much of the query appears in the title, 0.0…1.0 — higher is closer.
+    pub score: f64,
 }
 
-/// Verify credentials and open a session. Returns
-/// `(tenant_id, token pair)`: the client reconnects with the access token
-/// and keeps the refresh token to mint the next pair.
-#[server(public)]
-pub async fn login(
-    db: &Db,
-    username: String,
-    password: String,
-) -> Result<(u64, wavedb::TokenPair)> {
-    let registry = ensure_registry(db).await?;
-    let col = UserEntry::collection(registry.entries);
-
-    let mut matches = std::pin::pin!(col.by_username(db, &username));
-    let entry = matches
-        .next()
-        .await
-        .ok_or_else(|| Error::not_found("user not found"))??;
-
-    let tenant = U48::try_from(entry.tenant_id)?;
-    let user_db = db.as_tenant(tenant);
-    let auth = Auth::get(&user_db)
-        .await?
-        .ok_or_else(|| Error::not_found("auth record missing"))?;
-    if auth.password_hash != hash_password(&password) {
-        return Err(Error::unauthorized("wrong password"));
-    }
-
-    let pair = wavedb::auth::issue_pair(&user_db, tenant).await?;
-    Ok((entry.tenant_id, pair))
-}
-
-/// Trade a refresh token for the next pair (rotates it; a replayed token
-/// revokes the whole session). Public: the caller's access token may
-/// already be dead — the refresh token itself is the credential.
-#[server(public)]
-pub async fn refresh(
-    db: &Db,
-    tenant_id: u64,
-    token: Vec<u8>,
-) -> Result<wavedb::TokenPair> {
-    let user_db = db.as_tenant(U48::try_from(tenant_id)?);
-    wavedb::auth::refresh_pair(&user_db, &token).await
-}
-
-/// Revoke the session behind `token` (logout): its next refresh fails and
-/// the outstanding access token dies within one TTL.
-#[server(public)]
-pub async fn logout(db: &Db, tenant_id: u64, token: Vec<u8>) -> Result<()> {
-    let user_db = db.as_tenant(U48::try_from(tenant_id)?);
-    wavedb::auth::revoke(&user_db, &token).await
+/// A `#[server]` return has to carry a signature tag, so that changing any
+/// type in the signature **renames the function** and a stale client fails
+/// the header gate instead of mis-decoding bytes.
+///
+/// Composed from `Todo`'s own `STRUCT_HASH` rather than fixed: this shape
+/// exists to carry a `Todo`, so editing `Todo` must rename `search_todos`
+/// too. (`TokenPair` uses a fixed tag because its shape belongs to the
+/// platform, not to any app schema — the opposite case.)
+impl wavedb_core::FnArgTag for TodoHit {
+    const TAG: u64 = wavedb_core::fn_identity::compose(
+        0x0054_6F64_6F48_6974, // "TodoHit"
+        &[<Todo as WaveDbStruct>::STRUCT_HASH],
+    );
 }
 
 // ── Todo server functions (called on the user's tenant connection) ────────
@@ -245,6 +192,53 @@ fn async_profile_todos<D: DbHandle<Error = Error>>(
         .flatten()
 }
 
+/// Todos whose title approximately matches `query`, best first.
+///
+/// This is what "filtered reads are `#[server]` functions" looks like when the
+/// filter is a *fuzzy* one. There is no query DSL and the client never names a
+/// struct — it calls this, and the node does the work next to the data:
+///
+/// ```text
+/// search_todos(&db, "by mlik".into(), 5)  →  [ TodoHit { "Buy milk", 0.4… } ]
+/// ```
+///
+/// `Fuzzy::contains(t)` is the type-ahead mode: "at least this fraction of
+/// what you typed appears in the title". It is **asymmetric**, which is what
+/// makes a short query work against a long title — `"milk"` scores 0.67
+/// against `"Buy milk"` and would score the same against
+/// `"Buy milk before the shop closes"`.
+///
+/// The other two modes answer different questions off the same postings:
+/// `Fuzzy::similarity(t)` is symmetric Jaccard ("are these two strings
+/// alike?" — right for "did someone already add this?"), and
+/// `Fuzzy::distance(k)` is exact edit distance ("within k typos").
+///
+/// **Ranked, therefore buffered** — unlike [`all_todos`], which streams. A
+/// best-first order is not known until the last candidate has been scored, so
+/// there is nothing honest to emit early.
+#[server]
+pub async fn search_todos(
+    db: &Db,
+    query: String,
+    limit: u32,
+) -> Result<Vec<TodoHit>> {
+    let profile = get_profile(db).await?;
+    // 0.3: a whole word matches around 0.5–0.7 and one dropped letter still
+    // clears 0.4, while an unrelated query lands at 0.0. Tuning this is the
+    // app's call — it is the knob between "forgiving" and "noisy".
+    let hits = Todo::collection(profile.todos)
+        .fuzzy_title(db, &query, Fuzzy::contains(0.3), limit as usize)
+        .await?;
+    Ok(hits
+        .into_iter()
+        .map(|hit| TodoHit {
+            id: hit.item.0,
+            todo: hit.item.1,
+            score: hit.score,
+        })
+        .collect())
+}
+
 /// Mark a todo completed (the old version stays on the history chain).
 #[server]
 pub async fn complete_todo(db: &Db, id: Id) -> Result<()> {
@@ -266,50 +260,10 @@ pub async fn delete_todo(db: &Db, id: Id) -> Result<()> {
     Ok(())
 }
 
-// ── Private helpers — generic over the execution context ──────────────────
-//
-// All server-side only: they exist to serve `#[server]` bodies, so they are
-// cfg-gated out of client builds along with them (no leaked logic).
-
-/// Lazily initialise the global username registry on first call. Generic
-/// over [`DbHandle`], so the same helper serves the node bodies and any
-/// engine-local test.
 #[cfg(feature = "server-side")]
-async fn ensure_registry<D: DbHandle>(
-    db: &D,
-) -> core::result::Result<AllUserNamesToTenants, D::Error> {
-    if let Some(r) = AllUserNamesToTenants::get(db).await? {
-        return Ok(r);
-    }
-    let entries = UserEntry::create_pivot(db).await?;
-    let r = AllUserNamesToTenants { entries };
-    r.save(db).await?;
-    Ok(r)
-}
-
-/// The caller tenant's profile — the root of the profile→pivot path.
+mod helpers;
 #[cfg(feature = "server-side")]
-async fn get_profile<D: DbHandle<Error = Error>>(db: &D) -> Result<Profile> {
-    Profile::get(db)
-        .await?
-        .ok_or_else(|| Error::not_found("profile missing"))
-}
+use helpers::get_profile;
 
-#[cfg(feature = "server-side")]
-fn hash_password(password: &str) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::new().chain_update(password).finalize())
-}
-
-/// Mint a 48-bit tenant id from the current nanosecond timestamp — a
-/// placeholder allocator (collisions astronomically unlikely at demo scale).
-#[cfg(feature = "server-side")]
-fn new_tenant_id() -> u64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let masked = nanos & u128::from(U48::MASK);
-    // Masked to 48 bits, so the narrowing is infallible.
-    u64::try_from(masked).expect("48-bit value fits u64")
-}
+pub mod auth_fns;
+pub use auth_fns::{login, logout, refresh, register};

@@ -16,7 +16,7 @@ use std::thread;
 
 use todo_app_schema::{
     REGISTRY, add_todo, all_todos, complete_todo, delete_todo, login, refresh,
-    register,
+    register, search_todos,
 };
 use tokio::sync::oneshot;
 use wavedb::prelude::*;
@@ -75,6 +75,16 @@ async fn collect_todos(db: &Db) -> Result<Vec<todo_app_schema::Todo>> {
     all_todos(db).try_collect().await
 }
 
+/// The titles `search_todos` returns for `query`, best first.
+async fn found(db: &Db, query: &str) -> Vec<String> {
+    search_todos(db, query.into(), 5)
+        .await
+        .expect("search")
+        .into_iter()
+        .map(|hit| hit.todo.title)
+        .collect()
+}
+
 fn titles(todos: &[todo_app_schema::Todo]) -> Vec<(&str, bool)> {
     todos
         .iter()
@@ -83,6 +93,7 @@ fn titles(todos: &[todo_app_schema::Todo]) -> Vec<(&str, bool)> {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn full_client_flow_and_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
@@ -162,8 +173,33 @@ async fn full_client_flow_and_restart() {
         "most recently written first"
     );
 
+    // ── fuzzy search over the title (RFC 0056) ────────────────────────────
+    //
+    // A partial word finds its todo, which is the type-ahead case and the one
+    // an exact index cannot answer at all.
+    assert_eq!(found(&db, "milk").await, vec!["Buy milk"]);
+    assert_eq!(found(&db, "rust").await, vec!["Read the Rust book"]);
+    // Case is not a distinction — the fold lowercases before cutting grams.
+    assert_eq!(found(&db, "RUST").await, vec!["Read the Rust book"]);
+    // …and a dropped letter still lands: `mlk` shares enough of `milk`'s
+    // trigrams to clear the threshold.
+    assert_eq!(found(&db, "mlk").await, vec!["Buy milk"]);
+    // Something genuinely unrelated shares no grams at all, so it comes back
+    // empty rather than ranked-but-wrong.
+    assert!(found(&db, "quantum chromodynamics").await.is_empty());
+
     complete_todo(&db, id_milk).await.expect("complete");
     delete_todo(&db, id_docs).await.expect("delete");
+
+    // A save that leaves the title alone writes nothing to the fuzzy index —
+    // a posting holds a gram, a length and an anchor, never the record. So
+    // completing "Buy milk" leaves it exactly as findable.
+    assert_eq!(found(&db, "milk").await, vec!["Buy milk"]);
+    // A removal, by contrast, takes every posting with it.
+    assert!(
+        found(&db, "docs").await.is_empty(),
+        "a deleted todo must leave no postings pointing at it"
+    );
 
     let all = collect_todos(&db).await.expect("all after mutate");
     assert_eq!(
