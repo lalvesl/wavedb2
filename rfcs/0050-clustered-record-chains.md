@@ -14,6 +14,17 @@
   (segment sizing), [RFC 0053](0053-tenant-fair-cache-retention-PLANNED.md) (why
   every cost here is quoted cold)
 
+> **Superseded in its default 2026-07-31 by
+> [RFC 0054](0054-no-duplication-by-default.md).** Everything below about the
+> chain — the segments, the sparse index, the size band, the permanent
+> endpoints, the single-batch rule — stands and is what runs. What changed is
+> **what rides in a segment entry**: the built-in chain holds *pointers*, not
+> records, so there is no second copy by default. Read every "records inline"
+> here as describing a `#[wavedb::list]` (RFC 0051), which is now the only
+> declaration that asks for duplication. The reason is in 0054: "not anchored" is
+> not a state a record can be in, so the inline copy was an *extra*, and an extra
+> belongs where a read actually wants it.
+
 ## Summary
 
 A collection's living records are **additionally** stored inline inside a chain of
@@ -454,7 +465,7 @@ answering it here would have meant designing a client-liveness horizon inside a
 storage-layout change.
 
 The dense `BpTree` is **not** being retired — it is the right structure for cold or
-small collections, and [RFC 0054](0054-anchored-layout-PLANNED.md)
+small collections, and [RFC 0054](0054-no-duplication-by-default.md)
 records that as a declared choice so the option survives this work.
 
 ## Motivation

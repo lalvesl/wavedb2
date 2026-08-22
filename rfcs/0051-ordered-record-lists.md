@@ -11,6 +11,13 @@
   modification-ordered chain **is** the first instance of this RFC's mechanism; here
   it becomes general, one chain per declared list
 
+> **Promoted 2026-07-31 by [RFC 0054](0054-no-duplication-by-default.md).** A
+> declared list is no longer "a second chain beside the built-in one" — it is the
+> **only** structure that duplicates records at all. The built-in chain holds
+> pointers, so the copy count is `1 + K`, not `K + 2`. Everything else in this
+> RFC is unchanged, and its argument gets stronger: the duplication now lands
+> exactly where a read asked for it.
+
 ## Summary
 
 A developer may declare that a property **orders** a collection. Each such
@@ -187,12 +194,13 @@ original idea already accepted — high storage in exchange for read IOps.
 The duplication is explicit and linear, not a side effect to be minimised:
 
 ```text
-live bytes ≈ (K + 2) × collection size        # anchor + the built-in chain + K declared ones
+live bytes ≈ (K + 1) × collection size        # the anchor + K declared lists
            + K × (collection size / N)        # the sparse indexes, one entry per segment
            + the dead chain                   # key-sized entries, not records
 ```
 
-So four declared lists mean roughly six copies of every record on disk.
+So four declared lists mean roughly five copies of every record on disk, and
+zero declared lists mean one (RFC 0054).
 Copy-on-write and un-compacted holes sit on top of that. This is the accepted
 price of the design, stated here so no later reader mistakes it for an oversight.
 
