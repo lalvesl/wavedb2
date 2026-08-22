@@ -50,6 +50,14 @@ pub const fn removed(reply: &Reply) -> Result<bool> {
     }
 }
 
+/// A `ListLen`'s reply → the declared list's living count.
+pub const fn count(reply: &Reply) -> Result<u64> {
+    match reply {
+        Reply::Count(total) => Ok(*total),
+        _ => Err(Error::UnexpectedReply),
+    }
+}
+
 /// A `#[server]` function's reply → its decoded return value.
 pub fn returned<R: WaveWire>(reply: Reply) -> Result<R> {
     match reply {

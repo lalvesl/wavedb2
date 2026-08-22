@@ -17,6 +17,11 @@
 //! [`UnknownStructHash`](wavedb_core::Error::UnknownStructHash):
 //! `create_pivot` (collections bootstrap inside `#[server]` bodies),
 //! `search_by`, and `record_history`.
+//!
+//! The declared-list reads (`listed` / `listed_page` / `list_len`) used to be
+//! on that list and no longer are: a list page is bounded by the caller's
+//! `limit`, so it needed none of the streaming work `search_by` waits on. See
+//! [`crate::client_lists`].
 
 use futures::{Stream, StreamExt, TryStreamExt};
 use wavedb_core::expose::Command;
@@ -223,21 +228,49 @@ impl DbHandle for Db {
 
     fn listed<T: NonUniqueStruct + 'static>(
         &self,
-        _pivot: LocalId,
-        _index: usize,
-        _offset: u64,
+        pivot: LocalId,
+        index: usize,
+        offset: u64,
     ) -> impl Stream<Item = Result<T>> {
-        // Same seam as `search_by`, and for the same reason: a declared list
-        // reads densely node-side, but there is no wire command to ask for a
-        // slice of one yet. It lands with the streaming frames (RFC 0051).
-        refuse(T::STRUCT_HASH)
+        // Unlike `search_by`, this one does not wait on streaming frames: the
+        // wire `Listed` is bounded by a limit, so the unbounded reader is a
+        // chunk loop over bounded exchanges (see `client_lists`).
+        crate::client_lists::cached_listed::<T>(self, pivot, index, offset)
+    }
+
+    fn listed_page<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+        index: usize,
+        offset: u64,
+        limit: u32,
+    ) -> impl Stream<Item = Result<T>> {
+        crate::client_lists::cached_listed_page::<T>(
+            self, pivot, index, offset, limit,
+        )
     }
 
     async fn list_len<T: NonUniqueStruct + 'static>(
         &self,
+        pivot: LocalId,
+        index: usize,
+    ) -> Result<u64> {
+        crate::client_lists::cached_list_len::<T>(self, pivot, index).await
+    }
+
+    async fn fuzzy_search<T: NonUniqueStruct + 'static>(
+        &self,
         _pivot: LocalId,
         _index: usize,
-    ) -> Result<u64> {
+        _query: &str,
+        _mode: wavedb_core::fuzzy::Fuzzy,
+        _limit: usize,
+    ) -> Result<Vec<wavedb_core::fuzzy::Scored<(wavedb_core::Id, T)>>> {
+        // No wire command yet (RFC 0056 leaves it open). Unlike `listed`,
+        // this one has a natural home without one: the todo-app shape —
+        // every struct storage-only, the whole API `#[server]` functions —
+        // reaches it node-side, where a search can also decide what a hit
+        // should even look like to the app.
         Err(Error::Core(wavedb_core::Error::UnknownStructHash(
             T::STRUCT_HASH,
         )))

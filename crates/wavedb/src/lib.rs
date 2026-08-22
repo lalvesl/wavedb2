@@ -39,6 +39,7 @@ pub mod auth;
 pub mod cache;
 mod client_cache;
 mod client_handle;
+mod client_lists;
 mod db;
 mod error;
 mod offline_queue;
@@ -75,6 +76,9 @@ pub mod prelude {
         CollectionHandle, DbHandle, Id, LocalId, Metadata, NonUniqueStruct,
         PermissionRef, PivotHandle, U48, UniqueStruct, WaveDbStruct, WaveWire,
     };
+
+    // What a `#[wavedb::fuzzy]` lookup takes and yields (RFC 0056).
+    pub use wavedb_core::fuzzy::{Fuzzy, Scored};
 
     // Collection iterators are async streams.
     pub use futures::{Stream, StreamExt, TryStreamExt};

@@ -136,6 +136,18 @@ impl<S: Store> DbHandle for ServerDb<'_, S> {
         self.local.listed(pivot, index, offset).map_err(Error::from)
     }
 
+    fn listed_page<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+        index: usize,
+        offset: u64,
+        limit: u32,
+    ) -> impl Stream<Item = Result<T>> {
+        self.local
+            .listed_page(pivot, index, offset, limit)
+            .map_err(Error::from)
+    }
+
     async fn list_len<T: NonUniqueStruct + 'static>(
         &self,
         pivot: LocalId,
@@ -143,6 +155,20 @@ impl<S: Store> DbHandle for ServerDb<'_, S> {
     ) -> Result<u64> {
         self.local
             .list_len::<T>(pivot, index)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn fuzzy_search<T: NonUniqueStruct + 'static>(
+        &self,
+        pivot: LocalId,
+        index: usize,
+        query: &str,
+        mode: wavedb_core::fuzzy::Fuzzy,
+        limit: usize,
+    ) -> Result<Vec<wavedb_core::fuzzy::Scored<(wavedb_core::Id, T)>>> {
+        self.local
+            .fuzzy_search::<T>(pivot, index, query, mode, limit)
             .await
             .map_err(Error::from)
     }
