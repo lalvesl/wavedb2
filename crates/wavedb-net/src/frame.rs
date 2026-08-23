@@ -102,6 +102,11 @@ pub enum NodeErrorKind {
     ListOutOfRange,
     /// A fuzzy read named an undeclared index.
     FuzzyOutOfRange,
+    /// A struct command's verified token carried `user != tenant` — the
+    /// engine's model is one user per tenant. Distinct from
+    /// [`Unauthorized`](Self::Unauthorized) on purpose: the caller *is*
+    /// authenticated, and the fix is the token's shape rather than a login.
+    IdentityMismatch,
 }
 
 /// A structured node-side rejection, riding **inside** the 200 response —
@@ -142,6 +147,7 @@ impl NodeError {
             CoreError::KeyMismatch(_) => NodeErrorKind::KeyMismatch,
             CoreError::ListOutOfRange(_) => NodeErrorKind::ListOutOfRange,
             CoreError::FuzzyOutOfRange(_) => NodeErrorKind::FuzzyOutOfRange,
+            CoreError::IdentityMismatch(..) => NodeErrorKind::IdentityMismatch,
         };
         Self {
             kind,
