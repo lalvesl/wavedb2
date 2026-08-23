@@ -214,6 +214,29 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   pre-building the checkpoint window between checkpoints (a page image depends
   on its bucket's full contents and on a zstd dictionary that is not final until
   the round closes);
+  [0058](0058-per-type-actors-PLANNED.md) — the concurrency the two above ran
+  into: `drain`/`settle`/`commit_journal` are synchronous `fn`s on a
+  current-thread runtime, so a checkpoint blocks the request path by occupying
+  the only thread — and that single-threadedness is *silently* supplying two
+  invariants nothing documents (batch application being atomic, and
+  `pending` empty ⇒ everything settled, which `evict_settled` trusts while
+  `drain`'s `mem::take` has already emptied it mid-round). The answer is **one
+  actor per type**, owning that type's whole family — the partition already
+  exists in the storage layout (six slots per type; a batch never spans two user
+  types), just not in the concurrency — with the journal and the writer staying
+  single because one file means one fsync, and one fsync shared across many
+  types' batches is group commit rather than a bottleneck. It needs a
+  `Lane::Tree` first: `BPTREE_NODE_STORAGE` is one process-global slot for every
+  type's B+tree nodes, and it is the only thing that makes the partition
+  incomplete. **The engine becomes `Send` on native** (user decision
+  2026-08-01, reversing `CLAUDE.md`'s non-`Send` stance): `Store`'s
+  async-fn-in-trait desugars to `-> impl Future + MaybeSend`, a cfg'd bound in
+  `wavedb-platform` keeps wasm paying nothing, and work-stealing then balances
+  hot types automatically — which is what the pinned-thread alternative could
+  never do, since an actor cannot migrate without its state. `Sync`, by
+  contrast, mostly *disappears*, and that is the actor's doing rather than
+  `Send`'s: actors own instead of sharing, so the locks that exist only to
+  satisfy `Sync` on a `static` stop existing rather than stop contending;
   [0045](0045-vector-search-PLANNED.md) — nearest-neighbour search as a
   declared index kind (IVF over the existing `BpTree`, per-tenant centroids);
   [0056](0056-fuzzy-string-search-WIP.md) *(engine side landed 2026-08-01;
