@@ -1,0 +1,64 @@
+[package]
+name = "wavedb-bench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+# Deliberately OUTSIDE the workspace (`workspace.exclude` in the root
+# `Cargo.toml`): the competitor drivers must never enter the shipped dependency
+# graph or `cargo deny check`'s audit surface. See RFC 0060 §5.
+[workspace]
+
+[lib]
+name = "wavedb_bench"
+path = "src/lib.rs"
+
+# The measuring binary, and the filler that builds seed derivations inside a
+# Nix builder (RFC 0060 §6). They share the library; only the filler runs where
+# nothing may be timed.
+[[bin]]
+name = "wavedb-bench"
+path = "src/bin/wavedb-bench.rs"
+
+[[bin]]
+name = "bench-gen"
+path = "src/bin/bench-gen.rs"
+
+[features]
+default = ["servers"]
+# The server bracket (RFC 0060 §2). Optional because `bench-gen` needs none of
+# it, and `bench-gen` is a build input of *every* seed derivation: without this
+# gate, each seed rebuild would compile three database clients before writing a
+# TSV. `nix build .#bench-gen` passes `--no-default-features`.
+servers = ["dep:mongodb", "dep:postgres", "dep:mysql"]
+
+[dependencies]
+wavedb-core = { path = "../crates/wavedb-core" }
+wavedb-macros = { path = "../crates/wavedb-macros" }
+wavedb-storage = { path = "../crates/wavedb-storage" }
+# block_on for the engine's non-Send futures (current-thread model).
+futures = "0.3"
+# System SQLite, NOT `bundled` — the version must come from `flake.lock` like
+# every other competitor, which is the whole point of RFC 0060 §7.
+rusqlite = "0.37"
+# The server-bracket drivers, all **synchronous** APIs. The workload is one
+# connection issuing one operation at a time (§3), so an async client would add
+# a runtime and buy nothing; `mongodb`'s `sync` feature is its own blocking
+# wrapper, and `postgres`/`mysql` are blocking crates by construction.
+postgres = { version = "0.19.14", optional = true }
+mysql = { version = "28.0.0", optional = true }
+# Spelled out rather than defaulted, and both halves of that are forced. The
+# crate `compile_error!`s without a TLS backend, a bson version and its
+# forward-compatibility flag — but its default set also pulls `dns-resolver`,
+# whose `hickory-proto ^0.26` has no stable release, so `default-features` does
+# not resolve at all. Nothing here needs DNS: the URI is a loopback address.
+mongodb = { version = "3.8.0", optional = true, default-features = false, features = [
+  "sync",
+  "bson-3",
+  "rustls-tls",
+  "compat-3-3-0",
+] }
+
+[profile.release]
+debug = true
