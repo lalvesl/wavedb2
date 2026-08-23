@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use crate::id::Id;
 use crate::local_id::LocalId;
+use crate::u48::U48;
 
 /// Errors raised by `wavedb-core`. Wire (de)serialization faults arrive through
 /// the [`Wire`](Error::Wire) variant (from the standalone `wavedb-wire` crate);
@@ -89,6 +90,24 @@ pub enum Error {
     /// evidence for the log; the wire flattens it to one uniform kind.
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+    /// A **client** struct command arrived with `user != tenant`.
+    ///
+    /// The engine's identity model is one user per tenant: a tenant is the
+    /// isolation boundary *and* the principal, so a verified token whose two
+    /// halves disagree describes an authorization question the engine has no
+    /// answer for — `Metadata.permission` is carried but never consulted
+    /// (`crate::permission`), so admitting the write would silently grant
+    /// blanket access inside the tenant rather than the narrower one the
+    /// mismatch implies.
+    ///
+    /// Refusing here is the honest answer until intra-tenant permissions
+    /// exist. It binds the **client** path only: server-side code runs as
+    /// whatever identity it chooses (`ServerDb::as_identity`), because the
+    /// node is the authority, not a principal being checked.
+    #[error(
+        "identity mismatch: user {0:?} under tenant {1:?} (one user per tenant)"
+    )]
+    IdentityMismatch(U48, U48),
     /// A failure inside a [`Store`](crate::Store) backend — disk I/O, on-disk
     /// corruption, or similar. Core stays I/O-free, so the concrete cause is
     /// flattened to a message at the trait boundary.

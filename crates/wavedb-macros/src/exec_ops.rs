@@ -26,9 +26,22 @@ fn refuse(name: &Ident) -> TokenStream {
 
 /// The op-fn skeleton: `#[doc(hidden)] pub async fn __wavedb_<op>(…)`.
 ///
-/// Every struct command starts with the tier guard: the unauthenticated
-/// caller (`user == U48::MAX`) may only reach `#[server(public)]` functions
-/// — direct object ops refuse uniformly, whatever the command.
+/// Every struct command opens with two identity guards, in order:
+///
+/// 1. **Tier** — the unauthenticated caller (`user == U48::MAX`) may only
+///    reach `#[server(public)]` functions; direct object ops refuse
+///    uniformly, whatever the command.
+/// 2. **One user per tenant** — a verified caller whose `user` is not its
+///    `tenant` refuses as
+///    [`IdentityMismatch`](::wavedb_core::Error::IdentityMismatch). The
+///    engine isolates by tenant and stamps `user` as provenance only, so a
+///    token whose halves disagree asks an intra-tenant authorization
+///    question nothing answers yet.
+///
+/// Both bind the **client** path. `#[server]` bodies reach the engine
+/// through `ServerDb`, never through these fns, so server-side code keeps
+/// acting as any identity it likes (`as_tenant` — the node is the authority,
+/// not a principal being checked).
 fn op_fn(op: &str, body: &TokenStream) -> TokenStream {
     let ident = quote::format_ident!("__wavedb_{}", op);
     quote! {
@@ -43,6 +56,14 @@ fn op_fn(op: &str, body: &TokenStream) -> TokenStream {
                 return ::core::result::Result::Err(
                     ::wavedb_core::Error::Unauthorized(
                         ::std::string::String::from("login required"),
+                    ),
+                );
+            }
+            if caller.user.get() != caller.tenant.get() {
+                return ::core::result::Result::Err(
+                    ::wavedb_core::Error::IdentityMismatch(
+                        caller.user,
+                        caller.tenant,
                     ),
                 );
             }

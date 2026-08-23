@@ -53,6 +53,29 @@ impl<'a, S: Store> ServerDb<'a, S> {
     pub const fn user(&self) -> U48 {
         self.user
     }
+
+    /// Re-scope to an explicit `(user, tenant)` — the node's impersonation
+    /// seam, and the counterpart to [`as_tenant`](DbHandle::as_tenant).
+    ///
+    /// `as_tenant` moves the tenant and **keeps the caller's user**, which is
+    /// what acting *on that caller's behalf* means. This one replaces both,
+    /// which is what a node acting as its own authority wants: records a
+    /// `#[server(public)]` body writes into a space the caller does not own
+    /// should be stamped with the identity that owns them, not with whoever
+    /// happened to call the function — inside a public body that user is
+    /// `U48::MAX`, the anonymous tier, which would otherwise be recorded as
+    /// the author in `Metadata`.
+    ///
+    /// There is no client equivalent, by construction: the node is the
+    /// authority over identity, so this is deliberately absent from
+    /// [`DbHandle`] and reachable only server-side.
+    #[must_use]
+    pub fn as_identity(&self, user: U48, tenant: U48) -> Self {
+        Self {
+            local: self.local.as_tenant(tenant),
+            user,
+        }
+    }
 }
 
 impl<S: Store> DbHandle for ServerDb<'_, S> {
