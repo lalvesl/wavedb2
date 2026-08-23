@@ -287,6 +287,45 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   and 0033's three charges (a migration path, hot/cold routing, cross-tier
   consistency) are respectively already built, a compile-time bit test, and
   vacuous for immutable single-reader data.
+- **Nothing here is measured, opened 2026-08-12 —
+  [0060](0060-comparative-benchmark-suite-PLANNED.md):** there is no benchmark in
+  this repository (`crates/wavedb-net/benches/` is empty, `criterion` sits unused
+  in the workspace table), so every performance claim above is an argument about
+  the code rather than a number. 0060 plans a reproducible **insert / read /
+  update** comparison against **MongoDB**, PostgreSQL, MySQL and SQLite. Mongo is
+  the reference peer, being the closest model — a document *is* a record (one
+  self-describing value, no join to reassemble), `_id` *is* an anchor, both encode
+  client-side, and the oplog is structurally the recency chain
+  ([0022](0022-live-sync-navigation-catchup.md)). It runs through
+  `nix run .#bench`, so `flake.lock` pins the *competitor* versions alongside the
+  toolchain, and the **filled datasets are themselves derivations** — the fill is a
+  pure function of (system, version, size, seed), so the Nix store caches it and a
+  bump correctly invalidates it, where a `~/.cache` dir would hand a PG 18 datadir
+  to PG 19. **Every run is committed** to `benches/results/`, keyed by a host
+  fingerprint (rows compare only within one machine lane), the WaveDB SHA and the
+  seed store paths, making a regression bisectable. The rest is what makes the
+  numbers mean anything: **durability** is a row dimension, not a setting (WaveDB
+  `fsync`s once per op and has *no* relaxed mode to offer — `append_deferred` is
+  the checkpoint's, not a caller's), and **transport** is two brackets never merged
+  (engine vs SQLite in-process; `quick-node` vs Mongo/PG/MySQL over sockets). This
+  pass compares **without history on the other side** by decision: WaveDB retains
+  every version ([0009](0009-anchors-succession-and-history.md)) and they retain
+  none, so the update row carries that annotation and a mandatory footprint
+  column rather than laundering the difference into a speed claim — the `+history`
+  control and the version-walk read are designed but deferred to phase 4.
+  **Storage is a headline metric**, measured at three points (hot / settled /
+  compacted, since each system defers different work) and reported *decomposed* —
+  live bytes vs retained history vs page slack, plus an amplification ratio
+  against the identical logical dataset. WaveDB is expected to lose it outright;
+  the useful output is which share of the gap is the price of a feature and which
+  share is untuned overhead. Page slack comes almost free from the
+  `BlockDescriptor` occupation gauge (`block.rs:73`), and compression defaults are
+  recorded per system (WiredTiger snappy-by-default vs uncompressed InnoDB/heap vs
+  WaveDB's zstd dictionaries), with Mongo measured both ways.
+  Predictions are written *before* the first run, including where WaveDB should
+  lose: bulk insert badly, and concurrent writes against Mongo hardest of all,
+  since one op is one batch is one barrier and there is no group commit to
+  amortise it — sizing that gap is half the point.
 - **Deferred (low priority):**
   [0036](0036-offline-write-queue-PLANNED-LOW.md) — W8 offline write queue
   (slice 1, Unique offline, *shipped*; the NonUnique/durable/conflict-surface
@@ -387,6 +426,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0053](0053-tenant-fair-cache-retention-PLANNED.md) | Tenant-fair cache retention | Planned |
 | [0054](0054-no-duplication-by-default.md) | No duplication by default | Implemented |
 | [0059](0059-object-storage-capacity-tier-PLANNED.md) | Object storage as the capacity tier | Planned |
+| [0060](0060-comparative-benchmark-suite-PLANNED.md) | Comparative benchmark suite (vs MongoDB/PostgreSQL/MySQL/SQLite) | Planned |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |
