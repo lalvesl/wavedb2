@@ -232,11 +232,22 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   2026-08-01, reversing `CLAUDE.md`'s non-`Send` stance): `Store`'s
   async-fn-in-trait desugars to `-> impl Future + MaybeSend`, a cfg'd bound in
   `wavedb-platform` keeps wasm paying nothing, and work-stealing then balances
-  hot types automatically — which is what the pinned-thread alternative could
-  never do, since an actor cannot migrate without its state. `Sync`, by
-  contrast, mostly *disappears*, and that is the actor's doing rather than
-  `Send`'s: actors own instead of sharing, so the locks that exist only to
-  satisfy `Sync` on a `static` stop existing rather than stop contending;
+  *different* actors across cores — which is what the pinned-thread alternative
+  could never do, since an actor cannot migrate without its state (it does not
+  make any *one* actor faster; a hot type is one core at a time regardless).
+  `Sync`, by contrast, mostly *disappears*, and that is the actor's doing rather
+  than `Send`'s: actors own instead of sharing, so the locks that exist only to
+  satisfy `Sync` on a `static` stop existing rather than stop contending.
+  **Parked 2026-08-04 at low priority, status Planning rather than Planned** —
+  the design is not accepted and the planning is unfinished. The gate it fails:
+  the engine must be able to run as **one actor on one thread** (the wasm
+  target), and "N actors as N tasks on one worker" is a different execution
+  model, not that one — the degenerate case is where the failures live and it
+  has no design here. Behind it: actor-to-actor request/reply is an unaddressed
+  deadlock surface, `Lane::Tree` charges a `STRUCT_HASH` break for a concurrency
+  refactor, and every performance number in it is an estimate. What survives is
+  the *motivation* — the synchronous `fn`s on the request path and the two
+  invariants single-threadedness silently supplies, documented nowhere else;
   [0045](0045-vector-search-PLANNED.md) — nearest-neighbour search as a
   declared index kind (IVF over the existing `BpTree`, per-tenant centroids);
   [0056](0056-fuzzy-string-search-WIP.md) *(engine side landed 2026-08-01;

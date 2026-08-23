@@ -11,7 +11,10 @@
   blocking is the motivation)
 - **Reverses:** the deliberate non-`Send` stance recorded in `CLAUDE.md`
   (user decision, 2026-08-01 — *"when I started the database the priority was the
-  database; now comes the refinement, which is decent multithreading"*)
+  database; now comes the refinement, which is decent multithreading"*). The
+  decision stands on its own; the migration is parked with this RFC because this
+  is its only vehicle. Nothing has changed in the tree — `CLAUDE.md` still
+  describes the engine as it is, non-`Send`, and the `allow`s are still there.
 
 ## Why this is parked
 

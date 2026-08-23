@@ -22,10 +22,6 @@ members = [
   "examples/todo-app/server",
   "examples/todo-app/client",
 ]
-exclude = [
-  "crates/wavedb-bench",
-  "crates/wavedb-test-cluster",
-]
 
 [workspace.package]
 edition = "2024"
