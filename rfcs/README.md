@@ -214,7 +214,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   pre-building the checkpoint window between checkpoints (a page image depends
   on its bucket's full contents and on a zstd dictionary that is not final until
   the round closes);
-  [0058](0058-per-type-actors-PLANNED.md) — the concurrency the two above ran
+  [0058](0058-per-type-actors-PLANNED-LOW.md) — the concurrency the two above ran
   into: `drain`/`settle`/`commit_journal` are synchronous `fn`s on a
   current-thread runtime, so a checkpoint blocks the request path by occupying
   the only thread — and that single-threadedness is *silently* supplying two
