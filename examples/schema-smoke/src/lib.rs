@@ -1013,6 +1013,89 @@ mod tests {
         });
     }
 
+    // A verified caller whose two identity halves disagree is refused before
+    // the engine sees it. The engine isolates by tenant and stamps `user` as
+    // provenance only, so `user != tenant` asks an intra-tenant authorization
+    // question nothing answers yet — the honest reply is a typed refusal, not
+    // a write that would silently grant the whole tenant.
+    #[test]
+    fn a_caller_whose_user_is_not_its_tenant_is_refused() {
+        use futures::executor::block_on;
+        use wavedb_core::U48;
+        use wavedb_core::expose::{Command, Exposure as _};
+        use wavedb_core::wire::to_wire;
+
+        use super::REGISTRY;
+
+        block_on(async {
+            let store = mem::MemStore::default();
+            let tenant = U48::from(9u32);
+            let stranger = wavedb_core::Caller {
+                user: U48::from(10u32),
+                tenant,
+            };
+            let ada = AboutUser {
+                name: "Ada".into(),
+                city: "London".into(),
+            };
+
+            let refused = REGISTRY
+                .execute(
+                    &store,
+                    stranger,
+                    AboutUser::STRUCT_HASH,
+                    Command::Save,
+                    &to_wire(&ada),
+                )
+                .await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(wavedb_core::Error::IdentityMismatch(u, t))
+                        if u == U48::from(10u32) && t == tenant
+                ),
+                "expected IdentityMismatch, got {refused:?}"
+            );
+
+            // Reads refuse on the same terms: the mismatch is about who the
+            // caller is, not about which way the bytes travel.
+            let refused = REGISTRY
+                .execute(
+                    &store,
+                    stranger,
+                    AboutUser::STRUCT_HASH,
+                    Command::Get,
+                    &[],
+                )
+                .await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(wavedb_core::Error::IdentityMismatch(..))
+                ),
+                "expected IdentityMismatch, got {refused:?}"
+            );
+
+            // And nothing was written on the way to the refusal.
+            let owner = wavedb_core::Caller::tenant_owned(tenant);
+            let got = REGISTRY
+                .execute(
+                    &store,
+                    owner,
+                    AboutUser::STRUCT_HASH,
+                    Command::Get,
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                got,
+                wavedb_core::expose::Reply::Value(None),
+                "the refused save must not have reached the store"
+            );
+        });
+    }
+
     // The NonUnique command set through the dispatch: Insert mints, Get
     // resolves, Update re-keys through the record's Metadata pivot back-link
     // (no handle in the payload), Remove moves to dead.
