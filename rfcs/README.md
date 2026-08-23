@@ -261,6 +261,32 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   bytes** — a posting is a pure function of the indexed field, so a save that
   left the field alone writes nothing at all; the price is `L + n - 1` scattered
   key writes per record.
+- **Where the bytes live, opened 2026-08-08 —
+  [0059](0059-object-storage-capacity-tier-PLANNED.md):** three tiers (memory for
+  the write path and the hottest pages, `data.bin` for the working set, an
+  S3-compatible bucket for capacity), addressed by one reserved bit in the
+  existing `BlockDescriptor` — a remote page is a descriptor whose remaining
+  bits name a derived object key instead of a block run, so a tier change *is* a
+  descriptor change and rides the settle window like any other
+  ([0043](0043-descriptors-in-the-commit-frame.md)/[0046](0046-directory-deltas-in-the-window.md)).
+  The target is **history**: archives are identifiable from the id alone (the
+  shape's anchor `FLAG`, inverted — no read), immutable, and reached only by
+  `record_history`/`unique_history`, so they are the one cold set whose sole
+  access path already tolerates 100 ms. The enabling change is not the tier
+  though — it is giving archives **their own lane**, a fifth emitted
+  `StructStorage` slot beside `WDB.SEG`/`WDB.REC`/`WDB.DEAD`/`WDB.IDX`: because
+  the directory hashes the id and an archive id is effectively random, archives
+  and live anchors are evenly mixed across every bucket, so after N saves the
+  average page is 95% ballast and *no page is cold* — temperature measurement has
+  nothing true to report, and the fix has to be spatial. That phase 1 is worth
+  landing alone (homogeneous live pages, a second dictionary, history stops
+  spending the split budget). Idle *live* pages are phase 3 and explicitly low:
+  it is nearly free to build and it is the only part that changes what a `get`
+  promises. This revives [0033](0033-cold-history-slow-node-tier-DEPRECATED.md)'s
+  **problem** while still rejecting its answer — a bucket rather than a slow node,
+  and 0033's three charges (a migration path, hot/cold routing, cross-tier
+  consistency) are respectively already built, a compile-time bit test, and
+  vacuous for immutable single-reader data.
 - **Deferred (low priority):**
   [0036](0036-offline-write-queue-PLANNED-LOW.md) — W8 offline write queue
   (slice 1, Unique offline, *shipped*; the NonUnique/durable/conflict-surface
@@ -360,6 +386,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0052](0052-segment-size-as-the-pagination-unit.md) | Segment size as the pagination unit | Implemented |
 | [0053](0053-tenant-fair-cache-retention-PLANNED.md) | Tenant-fair cache retention | Planned |
 | [0054](0054-no-duplication-by-default.md) | No duplication by default | Implemented |
+| [0059](0059-object-storage-capacity-tier-PLANNED.md) | Object storage as the capacity tier | Planned |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |
