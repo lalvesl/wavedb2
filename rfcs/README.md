@@ -287,11 +287,11 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   and 0033's three charges (a migration path, hot/cold routing, cross-tier
   consistency) are respectively already built, a compile-time bit test, and
   vacuous for immutable single-reader data.
-- **Nothing here is measured, opened 2026-08-12 —
-  [0060](0060-comparative-benchmark-suite-PLANNED.md):** there is no benchmark in
-  this repository (`crates/wavedb-net/benches/` is empty, `criterion` sits unused
-  in the workspace table), so every performance claim above is an argument about
-  the code rather than a number. 0060 plans a reproducible **insert / read /
+- **Measuring it, opened 2026-08-12; phases 1–3 landed 2026-08-13/14 —
+  [0060](0060-comparative-benchmark-suite.md) *(Partial)*:** until this, nothing
+  in the repository was measured (`crates/wavedb-net/benches/` empty, `criterion`
+  unused in the workspace table), so every performance claim above was an argument
+  about the code rather than a number. 0060 is a reproducible **insert / read /
   update** comparison against **MongoDB**, PostgreSQL, MySQL and SQLite. Mongo is
   the reference peer, being the closest model — a document *is* a record (one
   self-describing value, no join to reassemble), `_id` *is* an anchor, both encode
@@ -326,6 +326,28 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   lose: bulk insert badly, and concurrent writes against Mongo hardest of all,
   since one op is one batch is one barrier and there is no group commit to
   amortise it — sizing that gap is half the point.
+  **Both brackets are built** (phases 1–3, the last on 2026-08-14): `benches/`
+  outside the workspace, `nix run .#bench`, all five seed derivations, the
+  corpus, the guards, and nine rows — each server adapter starting its own
+  server in the run's scratch directory and taking its write bytes from that
+  server's `/proc/<pid>/io`. The history control (phase 4) and the concurrency
+  sweep (phase 5) are not built. What the measurements have said so far, none of
+  it recorded (the load guard refused): a **harness bug the method caught before
+  the corpus did** — journal retirement is generational
+  ([0047](0047-generational-journal-retirement.md)), so quiescing with one
+  checkpoint counts a whole retained journal as stored data and reported a 1.4 MB
+  database as 34 MB; the **storage prediction is wrong**, WaveDB settling at
+  0.93× amplification against SQLite's 1.20× *while retaining every version*
+  (the zstd dictionaries pay for the history and then some); and the real
+  outlier is the **cold read** — hot reads 14× SQLite, cold reads ~950× slower
+  and degrading with scale, on an NVMe with the whole database in page cache, so
+  the miss path is CPU, not IO, and it is the same defect as the update row
+  (an update reads before it writes). Two measurement rules came out of building
+  the server bracket, both in §4.1: **preallocated log capacity is reported
+  apart from payload** (MongoDB's journal is 200 MB beside a 22 MB collection,
+  MySQL's redo+binlog 150 MB — configuration, not data), and the **empty-system
+  baseline** is recorded as a correction term (an empty PostgreSQL is ~24 MB of
+  catalogs, an empty MySQL ~55 MB).
 - **Deferred (low priority):**
   [0036](0036-offline-write-queue-PLANNED-LOW.md) — W8 offline write queue
   (slice 1, Unique offline, *shipped*; the NonUnique/durable/conflict-surface
@@ -426,7 +448,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0053](0053-tenant-fair-cache-retention-PLANNED.md) | Tenant-fair cache retention | Planned |
 | [0054](0054-no-duplication-by-default.md) | No duplication by default | Implemented |
 | [0059](0059-object-storage-capacity-tier-PLANNED.md) | Object storage as the capacity tier | Planned |
-| [0060](0060-comparative-benchmark-suite-PLANNED.md) | Comparative benchmark suite (vs MongoDB/PostgreSQL/MySQL/SQLite) | Planned |
+| [0060](0060-comparative-benchmark-suite.md) | Comparative benchmark suite (vs MongoDB/PostgreSQL/MySQL/SQLite) | Partial |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |
