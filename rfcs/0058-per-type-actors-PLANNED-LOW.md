@@ -13,6 +13,47 @@
   (user decision, 2026-08-01 — *"when I started the database the priority was the
   database; now comes the refinement, which is decent multithreading"*)
 
+## Why this is parked
+
+**The gating requirement, stated first because the design below does not meet
+it: the whole engine must be able to run as a *single actor on a single
+thread*.** That is the wasm target, and it is not the same thing as "N actors as
+N tasks on one worker", which is what this RFC actually describes. N mailboxes
+interleaving on one thread is a different execution model from one mailbox, and
+the degenerate case is where the failures would be — not in the parallel one.
+Any successor has to make the single-actor configuration the *base* case and
+multi-actor the elaboration, rather than the reverse.
+
+The rest of what is unresolved, so reopening starts from a list rather than from
+a re-read:
+
+1. **Actor-to-actor request/reply is an unaddressed deadlock surface.** The rule
+   here — *never await anything slow inside the loop* — covers IO and says
+   nothing about awaiting another actor. A batch already spans at least three
+   mailboxes (type → journal → writer). With one thread and one actor, every one
+   of those hops is a self-call.
+2. **The single-actor collapse has no design.** With everything in one actor,
+   the per-type state separation buys nothing and costs a routing layer; the
+   RFC never says what the structure degrades *to*.
+3. **`Lane::Tree` charges a `STRUCT_HASH` change** — a schema break for every
+   type with a secondary index — to buy a concurrency refactor. That price was
+   accepted in a sentence.
+4. **The `Send` migration is wide and reverses a documented hard rule**, against
+   a benefit that has not been measured.
+5. **Every number here is an estimate.** ~1 µs per message, ~10⁶ messages/s,
+   "the mailbox cannot be the bottleneck" — none of it was measured.
+6. **Ordering across actors was left open**, not answered (see the last open
+   question below) — and it is exactly the invariant single-threadedness is
+   hiding today.
+7. **The read path's answer, `get_many`, does not exist**; it is a proposed API
+   standing in for a proof.
+8. **Arena ownership (RFC 0057) has no answer**, and it decides whether `Sync`
+   actually disappears or quietly comes back.
+
+What survives regardless of the answer is the **Motivation** section: the
+synchronous `fn`s on the request path, and the two invariants single-threadedness
+is silently supplying. Those are real today and documented nowhere else.
+
 ## Summary
 
 Two changes that only make sense together:
