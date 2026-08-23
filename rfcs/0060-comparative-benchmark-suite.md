@@ -1,11 +1,20 @@
 # RFC 0060 — Comparative benchmark suite (WaveDB vs MongoDB, PostgreSQL, MySQL, SQLite)
 
-- **Status:** Planned — opened 2026-08-12. Design only; nothing is built.
-- **Crates:** a new `benches/` package, **excluded** from the workspace
+- **Status:** Partial — opened 2026-08-12; **phase 1 implemented 2026-08-13**
+  (embedded bracket, footprints, results corpus, `nix run .#bench`),
+  **phases 1b, 2 and 3 implemented 2026-08-14** (all five seed derivations, and
+  the server bracket: MongoDB, PostgreSQL and MySQL adapters, each starting its
+  own server, both durability rows — nine rows in all). Phases 4–5 are still
+  design only. See *Implementation status* below.
+- **Crates:** the `benches/` package, **excluded** from the workspace
   (`Cargo.toml`); `flake.nix` (the runner and the seed derivations); no change to
   any shipped crate
-- **Code (target):** `benches/`, `benches/results/`, `nix/bench/`, `flake.nix`
-  (`apps.bench`, `packages.bench-seed-*`), `Cargo.toml` (`workspace.exclude`)
+- **Code:** `benches/src/{cli,schema,metrics,footprint,host,json,report,seed}.rs`,
+  `benches/src/systems/{wavedb,sqlite,mongodb,postgres,mysql,server}.rs`,
+  `benches/src/bin/{wavedb-bench,bench-gen}.rs`, `benches/results/`,
+  `flake.nix` (`apps.bench`, `apps.bench-seeded`, `packages.bench-seed-*`),
+  `Cargo.toml` (`workspace.exclude`). Still target-only: the history
+  comparison (§8) and the concurrency sweep.
 - **Related:** [RFC 0041](0041-single-barrier-checkpoint.md) and
   [RFC 0047](0047-generational-journal-retirement.md) (the barrier accounting
   this measures), [RFC 0009](0009-anchors-succession-and-history.md) (the
@@ -218,6 +227,80 @@ workload exercises them. Single-threaded first; a concurrency sweep only after
 the single-client numbers are trusted (see §9 — it is where WaveDB is predicted
 to lose hardest, and [0058](0058-per-type-actors-PLANNED-LOW.md) is parked).
 
+### 3.1 The second workload: an e-commerce shop
+
+Everything above measures **one operation on one flat type**, which is what a
+micro benchmark is for and is also its limit: no application asks a database for
+one row of one table. So there is a second workload, reported in its own table,
+whose phases are the things a customer actually waits on — and reported as
+**latency, not throughput**, because a rate hides exactly the tail a page render
+lives or dies by.
+
+Three types, and every one of the modelling decisions is a claim being priced:
+
+```rust
+#[wavedb]                                  // Unique: one per tenant
+struct User { name, address, city, email, shoppings: ShoppingPivotId }
+
+#[wavedb(NonUnique, page = 32)]
+struct Shopping {
+    #[wavedb::list(page = 10)] bought_at: u64,
+    discount_cents: u64, transport_cents: u64,
+    items: ProductPivotId,
+}
+
+#[wavedb(NonUnique, page = 32)]
+struct Product { #[wavedb::list(page = 10)] name: String, quantity, unit_cents }
+```
+
+- **A user is a tenant.** The tenant is 48 bits *of the `Id`*, so "one shop,
+  many customers" is what tenancy is for, and this is the first workload here
+  that has more than one of them — it is the answer to open question 9, at least
+  for the access paths. `User::get(&db)` takes **no key**: the identity is in the
+  handle. The other four carry a `user_id` column plus an index on it, and that
+  difference is what the profile row prices.
+- **Records hold pivots**, which is how trees nest: the user holds its order
+  collection's `PivotId`, each order holds its line items'. The SQL schema's two
+  foreign keys are the same relationship from the other side.
+- **The lists are the read path.** `Shopping` is listed by `bought_at`,
+  `Product` by `name`, both at `page = 10`, so rendering a page of ten is one
+  segment read holding whole records — against `ORDER BY … LIMIT 10 OFFSET n`
+  over an index everywhere else. This is where RFC 0051's duplication either
+  pays for itself or does not.
+
+The five phases:
+
+| Phase | What it is | WaveDB | The other four |
+|---|---|---|---|
+| `signup` | create a user | order pivot + `save` | one `INSERT` |
+| `checkout` | one order **and its line items** | `2 + items` batches, one barrier each | **one transaction**, one barrier |
+| `profile` | the user's own record | `User::get` — no key | `SELECT … WHERE id = ?` |
+| `order_page` | user + ten orders | one page descent on the declared list | `ORDER BY … LIMIT 10 OFFSET n` |
+| `order_detail` | one order's line items | a second list's page | a second indexed range |
+
+**The checkout is the point.** An e-commerce checkout is inherently several
+records, and the other four commit them together for one barrier because that is
+how an application would write it. WaveDB has no multi-record transaction —
+every collection op is its own atomic `Store::apply` batch — so it pays one
+barrier per record. Pricing that is worth more than any number in the micro
+table, because it is not a tuning gap: it is the data model, and no amount of
+tuning changes it.
+
+Two deliberate non-choices, stated so they are not mistaken for oversights.
+MongoDB gets the **reference model, not embedded line items** — embedding is
+what a Mongo application would really do, and it would be one document write per
+checkout and no join for a detail; holding the shape equal across all five keeps
+the row about access paths rather than about modelling, and the embedded variant
+deserves its own row rather than a silent substitution. And the preload is
+**bulk** wherever a system offers it (one transaction, `insert_many`), because
+it is never timed and the stored form is identical either way — WaveDB, which
+has no bulk path, therefore takes minutes where the others take seconds, and
+that shows up in wall clock rather than in a measured phase.
+
+Everything is measured **after a reopen or restart**, uniformly: the preload's
+writes would otherwise still be warm, and WaveDB's per-type cache is a *write*
+cache, so it would be reading back what it had just written.
+
 ### 4. What gets measured
 
 Throughput alone is the least interesting column. Every run records, per
@@ -251,18 +334,47 @@ defers different work. Three points, all three reported, never conflated:
 
 | Point | Meaning | WaveDB | MongoDB | PostgreSQL | MySQL | SQLite |
 |---|---|---|---|---|---|---|
+| **0. baseline** | the system running, with none of this dataset in it | superblock | empty `--dbpath` | post-`initdb` cluster | post-`--initialize` datadir | empty file |
 | **a. hot** | right after the run, deferred work still pending | settle queue may be undrained | — | — | — | — |
-| **b. settled** | after each system's own natural quiescence | checkpoint + settle drained | `fsync` + checkpoint | `CHECKPOINT` + autovacuum idle | undo purge complete | `wal_checkpoint(TRUNCATE)` |
+| **b. settled** | after each system's own natural quiescence | checkpoint + settle drained | clean shutdown (WT checkpoint) | clean shutdown (checkpoints and closes) | clean shutdown (buffer pool flushed, purge complete) | `wal_checkpoint(TRUNCATE)` |
 | **c. compacted** | after explicitly asking for the smallest form | defrag ([0042](0042-free-space-defragmentation.md)) | `compact` | `VACUUM FULL` | `OPTIMIZE TABLE` | `VACUUM` |
 
 Point **b** is the fair comparison and the one a headline may quote. Point **a**
 exposes who is hiding work; **c** shows the floor — and for WaveDB it is a floor
 with history still in it, which is exactly the honest picture.
 
+Point **0** is not a comparison row; it is a **correction term**, and the
+implementation added it because without it the small-scale numbers lie. An
+empty PostgreSQL cluster measures ~24 MB of system catalogs and an empty MySQL
+datadir ~55 MB, so at 2 000 rows their amplification comes out at 49× and 101× —
+figures that describe `initdb`, not the dataset. Recording the baseline lets a
+reader see the furniture instead of inferring it. Note that for the two servers
+the settled measurement covers a **clean shutdown**: that is the strongest
+quiescence available and the only one that is the same operation on all three
+servers, where "checkpoint and wait for purge" is three different guesses.
+
 **What counts.** Everything the system needs to serve the data after a restart:
 data files, journal/WAL, indexes, and dictionaries. Both `du --apparent-size`
 and allocated blocks are recorded, since WaveDB allocates in 4 KiB block runs and
 leaves free runs behind — the gap between the two *is* fragmentation.
+
+**Split into payload and log capacity, or the metric measures configuration
+defaults.** The seeds settled this empirically at 200 000 rows: MongoDB's data
+directory is 227 MB, of which **200 MB is the WiredTiger journal** against a
+22 MB collection; MySQL's is 309 MB, of which 100 MB is preallocated
+`#innodb_redo` and 50 MB is a binlog, against 72 MB of table; PostgreSQL's 167 MB
+is 87 MB of `base` beside 80 MB of preallocated `pg_wal`. Those log areas are
+**fixed capacities chosen by the server's defaults**, not functions of the
+dataset — they are the same size at 200 000 rows and at 20 rows. Counting them
+into one total would make the footprint headline a comparison of default log
+settings, and it would flatter WaveDB for a reason that has nothing to do with
+WaveDB: its journals are 29 bytes each after a checkpoint retires them
+([0047](0047-generational-journal-retirement.md)), because it preallocates
+nothing. So the table reports **payload** (data files + indexes) and **log
+capacity** as separate columns, sums them for completeness, and quotes payload in
+any headline. The same rule is what keeps the WaveDB row honest in the other
+direction: a `data.bin` measured before the settle queue drains counts a whole
+retained journal as though it were stored data.
 
 **Derived numbers**, which is where the metric becomes comparable at all:
 
@@ -375,6 +487,27 @@ Two honest limits:
   competitors and a small one for WaveDB. That asymmetry is stated, not
   engineered around; scoping the seed's inputs to "only the storage crates" would
   be a clever way to serve a stale `data.bin` to changed code.
+
+And one implementation constraint worth recording, because it is invisible until
+it isn't: **`mongod` cannot start in the Nix build sandbox.** Its bundled
+tcmalloc reads `/sys/devices/system/cpu/possible` to size the per-CPU caches and
+`CHECK`-fails — `SIGABRT`, before a single command-line argument is parsed —
+when the file is absent. The sandbox does not mount `/sys`, and the builder
+cannot create it either, because the sandbox root is read-only. The Mongo seed
+therefore runs its whole fill inside a `bubblewrap` namespace whose root is a
+fresh tmpfs with a synthetic `/sys` (nested unprivileged user namespaces are
+permitted inside the sandbox; `bwrap --dev-bind / /` is not, since that root
+inherits the read-only mount). The CPU mask written there is a **fixed** value:
+a seed must be a pure function of its declared inputs, and reading the builder's
+real core count would make it a function of the machine as well.
+
+The package choice has the same flavour of hidden cost. `mongodb` in nixpkgs is
+unfree, and unfree packages are not distributed by `cache.nixos.org` — pointing
+at it silently compiles the whole server locally, hours of C++ at every version
+bump, more than the rest of the suite combined. `mongodb-ce` is the official
+prebuilt tarball plus `autoPatchelf`: the licence then costs a download. It
+ships `mongod`/`mongos` only, so `mongosh` and `mongoimport` come from their own
+(free) packages.
 
 ### 7. Nix is the runner, and the results corpus lives in git
 
@@ -505,6 +638,184 @@ Recorded here so the results cannot be reinterpreted after the fact.
 If a prediction is wrong, the results file says so in a line of prose. That
 sentence is the most valuable thing the suite can produce.
 
+## Implementation status
+
+**Landed (phase 1, 2026-08-13).** `benches/` builds outside the workspace,
+`nix run .#bench` links the `flake.lock`-pinned system SQLite (never
+`rusqlite`'s bundled copy), and one run produces the append-only record of §7 —
+host key, provenance, per-phase percentiles, and the three footprint points.
+The noise guard and the dirty-tree marking both work: a machine above load 1.0
+refuses to record.
+
+**The seed derivations of §6 are built** (2026-08-13), for **all five systems**,
+including the three whose Rust adapters do not exist yet. That is possible
+because of one change to the plan: `bench-gen emit-tsv` writes the dataset once
+in a portable form, and each seed loads that same file with its own bulk tool
+(`.import`, `\copy`, `LOAD DATA`, `mongoimport`) inside the builder. So a
+PostgreSQL, MySQL or MongoDB seed is version-pinned and verified **now**, and
+phases 2–3 only have to write the client code. WaveDB is the exception: it has
+no bulk path, so it fills through the engine, and the sidecar it writes
+(`ids.bin`, `pivot.bin`) is not optional — a NonUnique anchor id is minted from
+the clock and cannot be recomputed from the seed.
+
+All five verify their own row count in the builder, and at 200 000 rows they
+measure (apparent size, as loaded, before any adapter-driven compaction):
+
+| Seed | Total | Payload (data + indexes) | Log capacity | Build |
+|---|---|---|---|---|
+| wavedb | 23 MB | 20.9 MB `data.bin` (+3.2 MB id sidecar) | 58 B (two retired journals) | ~11 min |
+| sqlite | 54 MB | 54 MB (post-`VACUUM`) | 0 (checkpointed + truncated) | seconds |
+| postgres | 167 MB | 87 MB `base` | 80 MB `pg_wal` | seconds |
+| mongodb | 227 MB | 22 MB collection + 4.2 MB indexes | 200 MB WT journal | seconds |
+| mysql | 309 MB | 72 MB `bench` (+26 MB `mysql.ibd`) | 100 MB redo + 50 MB binlog | seconds |
+
+Three things to read out of that table before any adapter exists. The log column
+is why §4.1 now insists on the split — it is configuration, not data. The WaveDB
+payload is the **smallest of the five while retaining history**, which is the
+same doubt §9's storage prediction already collected, now at real scale. And the
+build column is the group-commit gap seen from the build side: one insert is one
+batch is one `fsync`, so WaveDB's fill takes minutes where a bulk loader takes
+seconds.
+
+**The server bracket landed (phases 2–3, 2026-08-14).** MongoDB, PostgreSQL and
+MySQL adapters, each in both durability rows, bringing the table to nine rows.
+Four decisions in them are worth stating because they are what make the rows
+mean anything:
+
+- **Each adapter starts its own server**, in the run's scratch directory, on a
+  unix socket (MongoDB: a port derived from the process id). Nothing is measured
+  against a machine-wide instance, because the durability column has to describe
+  a server *this run* configured or it is a guess. `pg_ctl` and `--fork` are
+  both avoided for the same reason: they hand back the pid of a process that
+  exits, and the write-bytes column would read zero.
+- **Write bytes come from the server's `/proc/<pid>/io`**, not ours. In the
+  embedded bracket the engine writes in the benchmark's own process and
+  `/proc/self/io` is exactly right; in the server bracket our process writes
+  socket traffic and nothing else.
+- **The synchronous drivers.** `postgres`, `mysql` and `mongodb`'s `sync`
+  feature. The workload is one connection issuing one operation at a time (§3),
+  so an async client would add a runtime and buy nothing — and MongoDB's pool is
+  pinned to one connection so a row cannot quietly measure concurrency the other
+  adapters do not have.
+- **A `servers` cargo feature**, on by default. `bench-gen` needs no database
+  client and is a build input of *every* seed derivation, so without the gate a
+  seed rebuild would compile three drivers before writing a TSV.
+
+**Not built yet.** The history comparison (§8, phase 4), the recency-listing
+row, the exceeds-RAM size, and the concurrency sweep (phase 5).
+
+**One gap found while building.** The barrier count of §4 is not recorded:
+`PageStore` exposes no public accessor for its `IoCounts`, and this RFC forbids
+changing a shipped crate to serve the benchmark. A one-line accessor would close
+it, which is a decision for the engine, not for the harness. Bytes-written *is*
+recorded, from `/proc/self/io`.
+
+### What the first measurements said
+
+None of this is recorded — one machine, and a load average the guard rightly
+refused (1.66 on the embedded-only pass, 7.30 on the nine-row one). The figures
+below are the default pass: 100 000 rows, 50 000 reads, 50 000 updates, one
+i5-8300H on btrfs. They are an estimate, not a corpus row — the second pass ran
+under enough load to halve every rate, so read them **within** a row and not
+against the first pass. They are here because several of them bear on the RFC's
+own claims.
+
+```
+system/row          bracket   insert/s  read_hot/s read_cold/s  update/s  payload     log    amp
+wavedb/durable     embedded        172     808079         120        49    23.7M    0.0M  0.93×
+sqlite/durable     embedded        259      94579       78891       248    30.5M    0.0M  1.20×
+sqlite/relaxed     embedded       5165      94319       78209      3410    30.5M    0.0M  1.20×
+mongodb/durable      server        228       2149        2134       279    27.5M  210.0M  1.08×
+mongodb/relaxed      server       2095       2132        2137      1877    24.6M  209.9M  0.97×
+postgres/durable     server        274      12376       11588       264    59.4M   67.1M  2.34×
+postgres/relaxed     server       9500      11980       11455      7879    59.0M   67.1M  2.32×
+mysql/durable        server        142       7333        6629       159    83.7M  241.6M  3.30×
+mysql/relaxed        server        245       7041        6752       318    83.7M  241.6M  3.30×
+
+empty-system baseline (payload): mongodb 0.1M, postgres 24.0M, mysql 55.1M
+```
+
+- **A methodology trap, caught before it entered the corpus.** Journal
+  retirement is generational ([0047](0047-generational-journal-retirement.md)):
+  the journal a checkpoint supersedes is deleted by the *next* one. Quiescing
+  with a single checkpoint therefore counts a whole retained journal as stored
+  data, and reported a 1.4 MB database as **34 MB** — a 26× amplification that
+  was pure harness error. `quiesce` now checkpoints until the footprint stops
+  moving. Every future adapter will meet the same class of bug, which is the
+  argument for §4.1's three measurement points existing at all.
+- **The storage prediction in §9 is wrong.** WaveDB measured *below* SQLite's
+  settled footprint **while retaining every superseded version** — the opposite
+  of "expected to lose it outright". At 100 000 rows plus 50 000 updates it
+  settles at 23.7 MB against SQLite's 30.5 MB, an amplification of **0.93×**
+  against 1.20×: less than the logical payload, with 150 000 record versions in
+  it. The per-type zstd dictionaries pay for the history and then some.
+- **Cold read is the outlier, it is CPU, and it gets worse with scale.** Hot
+  reads run 1.4 M/s against SQLite's 95 K/s — **14× faster**, as predicted.
+  Cold reads run 206/s against SQLite's 196 K/s: a **~950× loss**, on an NVMe
+  with the whole database in the OS page cache, which rules out IO. It was
+  ~100× at 2 000 rows, so the miss path degrades as pages fill — consistent
+  with per-page decode (decompress a whole page, keep one record). The gap is
+  not "reads are slow"; it is entirely in the miss path, and it is the single
+  most valuable thing the suite has produced so far.
+- **The server bracket made that finding worse, and it is the headline.** On
+  the nine-row pass WaveDB's cold read is **120/s while MongoDB's is 2 134/s,
+  PostgreSQL's 11 588/s and MySQL's 6 629/s** — every one of them paying a
+  connection round trip per read that WaveDB, in-process, does not. An
+  in-process engine losing 18× to a remote document store on a point lookup is
+  not a tuning gap; it is a defect in the read-through path, and it is the same
+  defect as the update row. Formally these are different brackets and the
+  numbers are not comparable — which is exactly why this comparison is worth
+  making anyway: the bracket rule exists to stop a *round trip* being mistaken
+  for a database, and here the in-process side loses regardless.
+- **The storage result holds against all four.** WaveDB's settled payload is
+  23.7 MB against MongoDB's 24.6 MB (snappy, relaxed row), PostgreSQL's 59.4 MB
+  and MySQL's 83.7 MB — the smallest of the five, retaining 150 000 record
+  versions where the others retain 100 000. The peer it barely beats is the one
+  that also compresses by default, which is the honest reading: this is the
+  zstd dictionaries, not the layout.
+- **MySQL's relaxed row barely moves** (142 → 245/s, where PostgreSQL goes 274 →
+  9 500 and SQLite 259 → 5 165), because `innodb_flush_log_at_trx_commit=2`
+  leaves `sync_binlog=1` in place and the binlog is still `fsync`ed per commit.
+  A durability row is a *set* of settings, not one knob — which is why §2 pins
+  them by name rather than by profile.
+- **Insert is at parity; update is not, and the difference is the miss path.**
+  Insert runs 222/s against SQLite's durable 259/s — both `fsync`-bound, both
+  scale-stable (222/s at 100 000 rows against 236/s at 2 000). Update runs 65/s
+  against 375/s, and that gap *grew* with scale (1.4× at 2 000 rows, 5.8× here)
+  — as it must, since an update reads before it writes and the read it does is
+  a cold one. Fixing the miss path is the same work as fixing the update row.
+- **The relaxed row behaves as predicted.** SQLite relaxed reaches 7 486/s
+  insert and 4 623/s update, ~29× and ~71× its own durable row — the
+  group-commit gap of §9, and the reason WaveDB has no relaxed row to offer.
+- **The cache is a write cache.** A read that misses does not populate it, so a
+  store nobody has just written to has no warm state at all: on a seeded run
+  `read_hot` does not exist as a distinct measurement. That is
+  [RFC 0044](0044-page-cache-PLANNED-LOW.md), currently *Planned-low*, and it
+  is the other half of the cold-read finding above.
+
+### Two bugs the seeds found, both in this suite
+
+Worth recording because both are the kind that produce a *plausible number*
+rather than an error, which is the failure mode a benchmark must be built
+against.
+
+1. **A green build with an empty database.** `psql` returns 0 after a failed
+   `\copy` unless `ON_ERROR_STOP` is set, so the first PostgreSQL seed built
+   successfully and held **zero rows** — a benchmark run against it would have
+   measured an empty table and reported the result. Every seed now verifies its
+   own row count inside the builder and fails loudly.
+2. **The dataset was not the same on every system.** `score` was a full `u64`,
+   which is above `i64::MAX`: PostgreSQL's `COPY` rejected the row outright,
+   and SQLite silently stored it as a **float**, losing precision. Two systems
+   holding different values breaks the one property the shared dataset exists
+   to provide, and the amplification denominator with it. The generator now
+   keeps `score` inside signed-64-bit range, and the reason is a comment in
+   `schema.rs` rather than folklore.
+
+A third, smaller: a seed copied out of the store is world-readable, and
+**PostgreSQL refuses to start** on a data directory group- or other-readable, so
+materialising is `chmod -R u+w,go-rwx`, not `u+w`.
+
 ## What this deliberately does not do
 
 - **Not a CI gate.** Benchmarks in CI are noise generators; the machine varies,
@@ -593,13 +904,25 @@ sentence is the most valuable thing the suite can produce.
    unable to attribute *page slack* to one side or the other. If that turns out to
    be too coarse to be useful, the archive lane becomes a prerequisite rather than
    a nice-to-have.
+9. **Every row runs under one tenant (`TENANT = 1`), and nothing here measures a
+   second one.** That is defensible for the three operations measured: the tenant
+   is 48 bits *of the `Id`*, a partition of the key space rather than a filter
+   applied at read, so a second tenant changes which anchor a lookup lands on and
+   not how many it touches — and none of the four competitors has the concept at
+   all, so a tenant column would be a constant on their side and would stop the
+   datasets from being byte-identical, which is what makes amplification one
+   number on one scale. What it leaves unmeasured is real, though: whether the
+   linear-hashed page directory degrades when many tenants interleave inside one
+   type's lane, and what a cross-tenant listing costs. Neither is visible in an
+   insert/read/update row, so it wants its own workload rather than a column here.
 
 ## Phasing
 
 | Phase | Content | Priority |
 |---|---|---|
-| **1** | The embedded bracket: WaveDB engine vs SQLite, three operations, both durability rows, the seed derivations, the results corpus + host key + `nix run .#bench`. Stands alone and is where the methodology gets proven. | first |
-| **2** | **MongoDB** in the server bracket against `quick-node` — the reference peer, and the comparison worth getting right before any other server lands. | primary |
-| **3** | PostgreSQL and MySQL in the server bracket; the recency-listing row; the exceeds-RAM size. | high |
+| **1** | The embedded bracket: WaveDB engine vs SQLite, three operations, both durability rows, the results corpus + host key + `nix run .#bench`. Stands alone and is where the methodology gets proven. | **done 2026-08-13** |
+| **1b** | The seed derivations of §6 — **all five systems**, via one portable dataset each loads with its own bulk tool, so the three server seeds exist before their adapters. | **done 2026-08-13** |
+| **2** | **MongoDB** in the server bracket — the reference peer, and the comparison worth getting right before any other server lands. Landed against `mongod` directly; against `quick-node` it is the same adapter with a different peer, and that pairing is still to come. | **done 2026-08-14** |
+| **3** | PostgreSQL and MySQL in the server bracket. Landed. The recency-listing row and the exceeds-RAM size did **not** land with them. | **partly done 2026-08-14** |
 | **4** | The `+history` control and the version-walk row (§8) — deferred by decision, not by oversight. | later |
 | **5** | Concurrency sweep and the client-cache bracket — gated on open questions 5 and 6. | low |

@@ -22,6 +22,11 @@ members = [
   "examples/todo-app/server",
   "examples/todo-app/client",
 ]
+# The comparative benchmark (RFC 0060). Excluded deliberately and permanently:
+# it links the competitor drivers (rusqlite today; mongodb/tokio-postgres/
+# mysql_async in later phases), and none of those may enter the shipped
+# dependency graph or `cargo deny check`'s audit surface.
+exclude = ["benches"]
 
 [workspace.package]
 edition = "2024"
