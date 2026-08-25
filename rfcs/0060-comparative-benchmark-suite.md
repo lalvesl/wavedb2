@@ -436,6 +436,66 @@ Four engine facts the harness has to be built around:
    checkpoint boundary without saying so. A run that straddles one and reports
    the mean has measured a checkpoint and called it an update.
 
+#### The cage: every system gets the same machine
+
+A comparison in which each system sees a different machine is not a comparison,
+and by default each of them *does* see a different machine — because each infers
+its budget from the host rather than being told one. So the whole run executes
+inside a fixed cage, and every server's cache is pinned rather than inferred.
+
+```sh
+systemd-run --user --scope -p MemoryMax=2G -p MemorySwapMax=0 -- \
+  taskset -c 0-3 \
+  bwrap --dev-bind / / --unshare-pid --proc /proc -- wavedb-bench …
+```
+
+Three tools, because no one of them does all three jobs, and it is worth being
+precise about which does what:
+
+- **`systemd-run` — the memory cap.** cgroup v2's `MemoryMax`, and the only one
+  of the three that can bound memory at all. It bounds the **page cache** as
+  well as anonymous memory, which is the point: without it a 900 MB dataset
+  simply lives in RAM and a "cold" read is a memory read. This is also the
+  mechanism the exceeds-RAM question (open question 4) needs, at a size that
+  fits in an afternoon.
+- **`taskset` — the CPU budget.** `AllowedCPUs` on the scope would be tidier,
+  but `cpuset` is not among the controllers delegated to a user scope here
+  (`cpu io memory pids`), so affinity it is. Affinity is also what `nproc`
+  reports, so the servers size their thread pools from the budget rather than
+  from the host.
+- **`bwrap` — the namespace, and *nothing else*.** Bubblewrap caps no resource
+  whatsoever; it is here for a private PID namespace, so a killed run cannot
+  leave a `mongod` behind (it did, twice, during development), and for one
+  uniform filesystem shape. `--dev-bind / /` is deliberate: the databases must
+  write to the real disk, and a tmpfs would put them in RAM and measure the
+  wrong thing.
+
+**Each server's cache is pinned to the same budget** — MongoDB
+`--wiredTigerCacheSizeGB 0.5`, MySQL `--innodb-buffer-pool-size=512M`,
+PostgreSQL `-c shared_buffers=512MB` — and that is not tidiness either. Every
+one of them sizes its cache from the *machine's* RAM, not the cgroup's, so under
+a 2 GiB cage an unpinned MongoDB asks for gigabytes it cannot have and is
+OOM-killed, while MySQL and PostgreSQL quietly take different fractions of a
+machine none of them can see. Equal budgets are what make the row a comparison.
+The embedded pair has no equivalent knob: SQLite's page cache defaults to a
+couple of megabytes and WaveDB's per-type cache is unbounded, which under the
+cage is itself a thing worth watching.
+
+**The cage is part of the lane identity.** `Host` records the *effective*
+budget, not the physical machine: CPUs from `Cpus_allowed_list` (which
+`/proc/cpuinfo` would not show) and memory from the cgroup's `memory.max` (which
+`/proc/meminfo` would not show), and both fold into the host key. A caged run
+and an uncaged one on the same hardware are different lanes, because as far as
+any number here is concerned they are different machines.
+
+One measurement bug the cage's arrival exposed, recorded because it is the
+suite's characteristic failure mode: write bytes were being read from the
+server's own `/proc/<pid>/io`, which is right for MySQL and MongoDB and **wrong
+for PostgreSQL**, which is process-per-connection — the postmaster writes
+essentially nothing and every byte comes from a backend, the WAL writer or the
+checkpointer. It reported a confident `0.0 kB/insert`. The counter now sums the
+process tree.
+
 ### 6. Seeded datasets are Nix derivations
 
 Refilling ten million rows into four servers before every run is the single
