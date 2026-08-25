@@ -4,13 +4,17 @@
   (embedded bracket, footprints, results corpus, `nix run .#bench`),
   **phases 1b, 2 and 3 implemented 2026-08-14** (all five seed derivations, and
   the server bracket: MongoDB, PostgreSQL and MySQL adapters, each starting its
-  own server, both durability rows — nine rows in all). Phases 4–5 are still
-  design only. See *Implementation status* below.
+  own server, both durability rows — nine rows in all), and the **e-commerce
+  workload of §3.1 implemented 2026-08-14** (a second nine-row table, reported
+  as latency of composed operations, with one tenant per user). Phases 4–5 are
+  still design only. See *Implementation status* below.
 - **Crates:** the `benches/` package, **excluded** from the workspace
   (`Cargo.toml`); `flake.nix` (the runner and the seed derivations); no change to
   any shipped crate
-- **Code:** `benches/src/{cli,schema,metrics,footprint,host,json,report,seed}.rs`,
+- **Code:** `benches/src/{cli,schema,shop,metrics,footprint,host,json,report,seed}.rs`,
   `benches/src/systems/{wavedb,sqlite,mongodb,postgres,mysql,server}.rs`,
+  `benches/src/systems/shop/` (the e-commerce workload, one adapter per system
+  plus its phases),
   `benches/src/bin/{wavedb-bench,bench-gen}.rs`, `benches/results/`,
   `flake.nix` (`apps.bench`, `apps.bench-seeded`, `packages.bench-seed-*`),
   `Cargo.toml` (`workspace.exclude`). Still target-only: the history
@@ -700,6 +704,14 @@ mean anything:
 - **A `servers` cargo feature**, on by default. `bench-gen` needs no database
   client and is a build input of *every* seed derivation, so without the gate a
   seed rebuild would compile three drivers before writing a TSV.
+
+**The e-commerce workload landed (§3.1, 2026-08-14).** A second nine-row table
+under the first, selected with `--workload micro|shop|both`. It reports
+**milliseconds, p50 beside p99** rather than a rate, because its phases are
+composed operations a customer waits on and a rate hides the tail. It is also
+the first workload with more than one tenant — one per user — which is a partial
+answer to open question 9: the access paths are exercised, the directory
+behaviour under interleaved tenants still is not.
 
 **Not built yet.** The history comparison (§8, phase 4), the recency-listing
 row, the exceeds-RAM size, and the concurrency sweep (phase 5).

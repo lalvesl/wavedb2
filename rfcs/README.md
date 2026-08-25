@@ -330,7 +330,15 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   outside the workspace, `nix run .#bench`, all five seed derivations, the
   corpus, the guards, and nine rows — each server adapter starting its own
   server in the run's scratch directory and taking its write bytes from that
-  server's `/proc/<pid>/io`. The history control (phase 4) and the concurrency
+  server's `/proc/<pid>/io`. **A second workload** landed the same day (§3.1):
+  an e-commerce schema — users, orders, line items, `#[wavedb::list]` paged at
+  ten, and **one tenant per user** — whose phases are what a customer waits on
+  (signup, checkout, profile, order page, order detail) and which reports
+  **milliseconds p50/p99 rather than a rate**, because a rate hides the tail a
+  page render lives on. Its `checkout` is the measurement no micro benchmark can
+  make: the other four commit an order and its line items in one transaction for
+  one barrier, and WaveDB, having no multi-record transaction, pays one barrier
+  per record. The history control (phase 4) and the concurrency
   sweep (phase 5) are not built. What the measurements have said so far, none of
   it recorded (the load guard refused): a **harness bug the method caught before
   the corpus did** — journal retirement is generational
