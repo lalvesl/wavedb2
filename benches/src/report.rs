@@ -80,7 +80,9 @@ fn record(
             j.str("key", &host.key);
             j.str("cpu", &host.cpu);
             j.num("cores", host.cores);
+            j.num("cpu_budget", host.cpu_budget);
             j.num("mem_bytes", host.mem_bytes);
+            j.num("mem_budget_bytes", host.mem_budget);
             j.str("kernel", &host.kernel);
             j.str("filesystem", &host.filesystem);
             match host.rotational {

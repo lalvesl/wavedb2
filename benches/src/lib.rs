@@ -30,4 +30,5 @@ pub mod report;
 pub mod schema;
 pub mod seed;
 pub mod shop;
+pub mod tables;
 pub mod systems;

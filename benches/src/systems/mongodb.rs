@@ -17,7 +17,7 @@ use mongodb::options::{Acknowledgment, ClientOptions, WriteConcern};
 use mongodb::sync::{Client, Collection};
 use mongodb::IndexModel;
 
-use super::server::{self, Server};
+use super::server::{self, CACHE_GB, Server};
 use super::{Cfg, Durability, SystemReport};
 use crate::footprint::{Footprint, Point};
 use crate::metrics::{self, Phase, Writer};
@@ -100,6 +100,7 @@ pub fn run(cfg: &Cfg, durability: Durability) -> Result<SystemReport, String> {
                 format!("{{ w: 1, j: {journal} }}"),
             ),
             ("storage_engine".into(), "WiredTiger".into()),
+            ("wiredTigerCacheSizeGB".into(), CACHE_GB.into()),
             ("transport".into(), "loopback TCP".into()),
             ("operation".into(), "one document per request".into()),
         ],
@@ -214,6 +215,12 @@ fn start(dir: &Path) -> Result<Server, String> {
             "127.0.0.1",
             "--port",
             &port().to_string(),
+            // Pinned, not inferred: WiredTiger sizes its cache from the
+            // HOST's RAM, not the cgroup's, so under the 2 GiB cage an
+            // unpinned mongod asks for gigabytes it cannot have and is
+            // OOM-killed. Every server gets the same budget (RFC 0060 §5).
+            "--wiredTigerCacheSizeGB",
+            CACHE_GB,
             "--logpath",
             &s(&log),
         ],
