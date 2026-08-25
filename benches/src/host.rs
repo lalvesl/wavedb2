@@ -12,13 +12,25 @@ use crate::json::fnv1a;
 
 pub struct Host {
     pub cpu: String,
+    /// CPUs the machine has.
     pub cores: u64,
+    /// CPUs this run may actually use — `Cpus_allowed_list`, so a `taskset`
+    /// cage shows up. `/proc/cpuinfo` would keep reporting all of them.
+    pub cpu_budget: u64,
+    /// RAM the machine has.
     pub mem_bytes: u64,
+    /// RAM this run may actually use — the cgroup's `memory.max`, falling back
+    /// to physical when unlimited. This bounds the **page cache** too, which is
+    /// what makes a working set genuinely exceed memory (RFC 0060 §5).
+    pub mem_budget: u64,
     pub kernel: String,
     pub filesystem: String,
     pub rotational: Option<bool>,
     pub virtualised: bool,
-    /// `<cpu-slug>-<mem>g-<fs>-<hash4>` — the lane identity.
+    /// `<cpu-slug>-<budget>c-<budget>g-<fs>-<hash4>` — the lane identity. The
+    /// budgets are in it on purpose: a caged run and an uncaged one on the same
+    /// machine are different lanes, because they are different machines as far
+    /// as any number here is concerned.
     pub key: String,
 }
 
@@ -29,21 +41,29 @@ impl Host {
     pub fn probe(data_dir: &Path) -> Self {
         let cpu = cpu_model();
         let cores = num_cpus();
+        let cpu_budget = allowed_cpus().unwrap_or(cores);
         let mem_bytes = mem_total();
+        let mem_budget = cgroup_memory_max().unwrap_or(mem_bytes).min(mem_bytes);
         let kernel = read_trim("/proc/sys/kernel/osrelease");
         let filesystem = fs_type(data_dir);
         let rotational = rotational(data_dir);
         let virtualised = cpu_flag("hypervisor");
-        let mut key =
-            format!("{}-{}g-{}", slug(&cpu), mem_bytes / (1 << 30), filesystem);
+        let mut key = format!(
+            "{}-{cpu_budget}c-{}g-{filesystem}",
+            slug(&cpu),
+            mem_budget / (1 << 30)
+        );
         let fingerprint = format!(
-            "{cpu}|{cores}|{mem_bytes}|{kernel}|{filesystem}|{rotational:?}|{virtualised}"
+            "{cpu}|{cores}|{cpu_budget}|{mem_bytes}|{mem_budget}|{kernel}|\
+             {filesystem}|{rotational:?}|{virtualised}"
         );
         let _ = write!(key, "-{:04x}", fnv1a(fingerprint.as_bytes()) & 0xffff);
         Self {
             cpu,
             cores,
+            cpu_budget,
             mem_bytes,
+            mem_budget,
             kernel,
             filesystem,
             rotational,
@@ -86,6 +106,38 @@ fn num_cpus() -> u64 {
         .lines()
         .filter(|l| l.starts_with("processor"))
         .count() as u64
+}
+
+/// CPUs in this process's affinity mask, parsed from `Cpus_allowed_list`
+/// (`0-3`, `0,2,4`, …). This is what `taskset` moves and `/proc/cpuinfo` does
+/// not.
+fn allowed_cpus() -> Option<u64> {
+    let list = read_trim("/proc/self/status")
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:").map(str::to_string))?;
+    let mut n = 0;
+    for part in list.trim().split(',') {
+        match part.split_once('-') {
+            Some((lo, hi)) => {
+                let (lo, hi): (u64, u64) = (lo.parse().ok()?, hi.parse().ok()?);
+                n += hi.saturating_sub(lo) + 1;
+            }
+            None if !part.is_empty() => n += 1,
+            None => {}
+        }
+    }
+    (n > 0).then_some(n)
+}
+
+/// This process's cgroup v2 `memory.max`, or `None` when unlimited or v1.
+fn cgroup_memory_max() -> Option<u64> {
+    // `0::/user.slice/…` — the unified hierarchy's line has an empty
+    // controller field.
+    let rel = read_trim("/proc/self/cgroup")
+        .lines()
+        .find_map(|l| l.strip_prefix("0::").map(str::to_string))?;
+    let raw = read_trim(&format!("/sys/fs/cgroup{rel}/memory.max"));
+    raw.trim().parse().ok()
 }
 
 fn mem_total() -> u64 {
