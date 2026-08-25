@@ -26,7 +26,7 @@ use crate::shop::{
     logical_bytes, product_count, product_row, shopping_count,
     shopping_row, user_row,
 };
-use crate::systems::server::{self, Server};
+use crate::systems::server::{self, CACHE_GB, Server};
 use crate::systems::{Durability, SystemReport};
 
 pub fn run(
@@ -84,6 +84,7 @@ pub fn run(
         settings: vec![
             ("writeConcern".into(), format!("{{ w: 1, j: {journal} }}")),
             ("tenancy".into(), "user_id field + index".into()),
+            ("cache".into(), format!("{CACHE_GB} GB")),
             ("transport".into(), "loopback TCP".into()),
             ("transaction".into(), "one per checkout".into()),
         ],
@@ -131,25 +132,44 @@ fn indexes(db: &Database) -> Result<(), String> {
 fn preload(cfg: &ShopCfg, db: &Database) -> Result<(), String> {
     let mut order_id = 0u64;
     let mut item_id = 0u64;
-    // Batched inserts: the preload is never timed, and the stored form is the
-    // same either way.
-    let mut users = Vec::new();
-    let mut os = Vec::new();
-    let mut is = Vec::new();
+    // Batched, but **flushed every `CHUNK`**: the preload is never timed, so
+    // batching is free, and holding a million documents in a Vec is not — the
+    // run lives inside a 2 GiB cgroup (RFC 0060 §5) and the client shares it
+    // with the server.
+    const CHUNK: usize = 10_000;
+    let mut users = Vec::with_capacity(CHUNK);
+    let mut os = Vec::with_capacity(CHUNK);
+    let mut is = Vec::with_capacity(CHUNK);
     for u in 0..cfg.users {
         users.push(user_doc(u, cfg));
+        flush_if_full(&profiles(db), &mut users, CHUNK)?;
         for s in 0..shopping_count(u, cfg.seed, cfg.orders_max) {
             order_id += 1;
             os.push(order_doc(order_id, u, s, cfg));
+            flush_if_full(&orders(db), &mut os, CHUNK)?;
             for p in 0..product_count(u, s, cfg.seed, cfg.items_max) {
                 item_id += 1;
                 is.push(item_doc(item_id, order_id, u, s, p, cfg));
+                flush_if_full(&items(db), &mut is, CHUNK)?;
             }
         }
     }
-    profiles(db).insert_many(users).run().map_err(drv)?;
-    orders(db).insert_many(os).run().map_err(drv)?;
-    items(db).insert_many(is).run().map_err(drv)?;
+    flush_if_full(&profiles(db), &mut users, 1)?;
+    flush_if_full(&orders(db), &mut os, 1)?;
+    flush_if_full(&items(db), &mut is, 1)?;
+    Ok(())
+}
+
+/// Insert and clear `buf` once it holds `at_least` documents.
+fn flush_if_full(
+    col: &Collection<Document>,
+    buf: &mut Vec<Document>,
+    at_least: usize,
+) -> Result<(), String> {
+    if buf.len() < at_least || buf.is_empty() {
+        return Ok(());
+    }
+    col.insert_many(std::mem::take(buf)).run().map_err(drv)?;
     Ok(())
 }
 
@@ -219,6 +239,12 @@ fn start(dir: &Path) -> Result<Server, String> {
             "127.0.0.1",
             "--port",
             &port().to_string(),
+            // Pinned, not inferred: WiredTiger sizes its cache from the
+            // HOST's RAM, not the cgroup's, so under the 2 GiB cage an
+            // unpinned mongod asks for gigabytes it cannot have and is
+            // OOM-killed. Every server gets the same budget (RFC 0060 §5).
+            "--wiredTigerCacheSizeGB",
+            CACHE_GB,
             "--replSet",
             "bench",
             "--logpath",
