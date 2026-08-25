@@ -116,6 +116,7 @@ pub fn run(cfg: &Cfg, durability: Durability) -> Result<SystemReport, String> {
         settings: vec![
             ("synchronous_commit".into(), sync.into()),
             ("fsync".into(), "on".into()),
+            ("shared_buffers".into(), server::CACHE_POSTGRES.into()),
             ("transport".into(), "unix socket".into()),
             (
                 "transaction".into(),
@@ -249,6 +250,8 @@ fn start(dir: &Path, sync: &str) -> Result<Server, String> {
             "listen_addresses=",
             "-c",
             &format!("synchronous_commit={sync}"),
+            "-c",
+            &format!("shared_buffers={}", server::CACHE_POSTGRES),
         ],
         &log,
     )?;

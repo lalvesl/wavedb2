@@ -112,6 +112,7 @@ pub fn run(
         settings: vec![
             ("synchronous_commit".into(), sync.into()),
             ("tenancy".into(), "user_id column + index".into()),
+            ("cache".into(), server::CACHE_POSTGRES.into()),
             ("transport".into(), "unix socket".into()),
             ("transaction".into(), "one per checkout".into()),
         ],
@@ -232,6 +233,8 @@ fn start(dir: &Path, sync: &str) -> Result<Server, String> {
             "listen_addresses=",
             "-c",
             &format!("synchronous_commit={sync}"),
+            "-c",
+            &format!("shared_buffers={}", server::CACHE_POSTGRES),
         ],
         &log,
     )?;

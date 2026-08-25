@@ -119,6 +119,7 @@ pub fn run(
         settings: vec![
             ("innodb_flush_log_at_trx_commit".into(), flush.into()),
             ("tenancy".into(), "user_id column + index".into()),
+            ("cache".into(), server::CACHE_MYSQL.into()),
             ("transport".into(), "unix socket".into()),
             ("transaction".into(), "one per checkout".into()),
         ],
@@ -228,6 +229,7 @@ fn start(dir: &Path, flush: &str) -> Result<Server, String> {
             &format!("--pid-file={}", s(&dir.join("mysqld.pid"))),
             &format!("--log-error={}", s(&log)),
             &format!("--innodb-flush-log-at-trx-commit={flush}"),
+            &format!("--innodb-buffer-pool-size={}", server::CACHE_MYSQL),
             "--skip-networking",
         ],
         &dir.join("mysqld.out"),

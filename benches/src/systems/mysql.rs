@@ -114,6 +114,7 @@ pub fn run(cfg: &Cfg, durability: Durability) -> Result<SystemReport, String> {
         settings: vec![
             ("innodb_flush_log_at_trx_commit".into(), flush.into()),
             ("engine".into(), "InnoDB".into()),
+            ("innodb_buffer_pool_size".into(), server::CACHE_MYSQL.into()),
             ("transport".into(), "unix socket".into()),
             (
                 "transaction".into(),
@@ -240,6 +241,7 @@ fn start(dir: &Path, flush: &str) -> Result<Server, String> {
             &format!("--pid-file={}", s(&dir.join("mysqld.pid"))),
             &format!("--log-error={}", s(&log)),
             &format!("--innodb-flush-log-at-trx-commit={flush}"),
+            &format!("--innodb-buffer-pool-size={}", server::CACHE_MYSQL),
             "--skip-networking",
         ],
         &dir.join("mysqld.out"),
