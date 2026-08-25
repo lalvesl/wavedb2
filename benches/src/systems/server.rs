@@ -80,9 +80,30 @@ impl Server {
     }
 }
 
-/// `write_bytes` from `/proc/<pid>/io`.
+/// `write_bytes` for `pid` **and every descendant of it**.
+///
+/// The tree walk is not defensive programming, it is required: PostgreSQL is
+/// process-per-connection, so the postmaster we spawn writes essentially
+/// nothing and every byte comes from a backend, the WAL writer or the
+/// checkpointer. Reading the postmaster alone reported a flat `0.0 kB/insert` —
+/// a wrong number rather than a missing one, which is the failure mode this
+/// suite is built against. MySQL and MongoDB are threaded and would have been
+/// fine either way.
 #[must_use]
 pub fn write_bytes(pid: u32) -> u64 {
+    let mut total = own_write_bytes(pid);
+    let mut frontier = vec![pid];
+    let children = child_map();
+    while let Some(p) = frontier.pop() {
+        for child in children.get(&p).into_iter().flatten() {
+            total += own_write_bytes(*child);
+            frontier.push(*child);
+        }
+    }
+    total
+}
+
+fn own_write_bytes(pid: u32) -> u64 {
     let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/io")) else {
         return 0;
     };
@@ -92,6 +113,35 @@ pub fn write_bytes(pid: u32) -> u64 {
         }
     }
     0
+}
+
+/// Parent → children, from `/proc/<pid>/status`'s `PPid`. Cheap enough to
+/// rebuild per sample (twice per phase), and the run's PID namespace keeps the
+/// table to this run's own processes.
+fn child_map() -> std::collections::HashMap<u32, Vec<u32>> {
+    let mut map: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue; // not a process directory
+        };
+        let Ok(status) =
+            std::fs::read_to_string(format!("/proc/{pid}/status"))
+        else {
+            continue; // exited between the readdir and here
+        };
+        if let Some(ppid) = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            map.entry(ppid).or_default().push(pid);
+        }
+    }
+    map
 }
 
 /// Poll `ready` until it answers true or `secs` elapse.
@@ -139,3 +189,16 @@ pub fn log_tail(log: &Path, lines: usize) -> String {
     let all: Vec<&str> = text.lines().collect();
     all[all.len().saturating_sub(lines)..].join("\n")
 }
+
+/// The cache budget every server in the suite is given, spelled the same way
+/// three times because the three servers spell it differently.
+///
+/// It is **pinned rather than inferred**, and that is the whole point: each of
+/// these sizes its cache from the machine's RAM by default, not from the
+/// cgroup's — so under the suite's 2 GiB cage an unpinned MongoDB asks for
+/// gigabytes it cannot have and is OOM-killed, while MySQL and PostgreSQL
+/// quietly take different fractions of a machine none of them can see. Equal
+/// budgets are what makes the row a comparison (RFC 0060 §5).
+pub const CACHE_GB: &str = "0.5";
+pub const CACHE_MYSQL: &str = "512M";
+pub const CACHE_POSTGRES: &str = "512MB";
