@@ -130,6 +130,35 @@
           buildInputs = [ pkgs.sqlite ];
         };
 
+        # The cage every measured run executes inside, so all five systems get
+        # the *same* machine rather than whatever this one happens to be
+        # (RFC 0060 §5). Three tools, because no one of them does all three
+        # jobs:
+        #
+        #   systemd-run  the cgroup, and the only one of the three that can cap
+        #                memory. `MemoryMax` bounds the **page cache** too,
+        #                which is what stops a 2 GiB dataset from simply living
+        #                in RAM and makes a cold read genuinely cold.
+        #   taskset      the CPU budget. `AllowedCPUs` would be tidier, but
+        #                `cpuset` is not among the controllers delegated to a
+        #                user scope here (`cpu io memory pids`), so affinity it
+        #                is — and affinity is what `nproc` reports, so the
+        #                servers size their thread pools from it.
+        #   bwrap        the namespace. It caps *nothing*: it is here for a
+        #                private PID namespace, so a killed run cannot leave a
+        #                mongod behind, and for one uniform filesystem shape.
+        #
+        # `--dev-bind / /` on purpose: the databases must write to the real
+        # disk. A tmpfs would put them in RAM and measure the wrong thing.
+        benchCpus = "0-3";
+        benchMemMax = "2G";
+        benchCage = ''
+          exec systemd-run --user --scope -q \
+            -p MemoryMax=${benchMemMax} -p MemorySwapMax=0 -- \
+            taskset -c ${benchCpus} \
+            bwrap --dev-bind / / --unshare-pid --proc /proc -- \
+        '';
+
         # Default seed size. Deliberately modest: the exceeds-RAM sizes of
         # RFC 0060 §3 take hours to fill through a per-op-fsync engine, which is
         # open question 4 in that RFC and is not answered here.
@@ -459,13 +488,16 @@
                 postgresql_18 # postgres, initdb, pg_ctl
                 mysql84 # mysqld, mysqladmin
                 mongodb-ce # mongod
+                bubblewrap # the sandbox
+                util-linux # taskset
+                systemd # systemd-run, for the cgroup
               ];
               text = ''
                 set -euo pipefail
                 repo="$(git rev-parse --show-toplevel)"
                 export PKG_CONFIG_PATH="${pkgs.sqlite.dev}/lib/pkgconfig"
                 cargo build --release --manifest-path "$repo/benches/Cargo.toml"
-                exec "$repo/benches/target/release/wavedb-bench" \
+                ${benchCage} "$repo/benches/target/release/wavedb-bench" \
                   --repo "$repo" "$@"
               '';
             }
@@ -499,6 +531,9 @@
                 postgresql_18
                 mysql84
                 mongodb-ce
+                bubblewrap
+                util-linux
+                systemd
               ];
               text = ''
                 set -euo pipefail
@@ -510,7 +545,7 @@
                 export BENCH_SEED_MYSQL="${benchSeeds.mysql}"
                 export BENCH_SEED_MONGODB="${benchSeeds.mongodb}"
                 cargo build --release --manifest-path "$repo/benches/Cargo.toml"
-                exec "$repo/benches/target/release/wavedb-bench" \
+                ${benchCage} "$repo/benches/target/release/wavedb-bench" \
                   --repo "$repo" --rows ${rows} "$@"
               '';
             }
