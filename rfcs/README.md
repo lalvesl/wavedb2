@@ -457,6 +457,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0054](0054-no-duplication-by-default.md) | No duplication by default | Implemented |
 | [0059](0059-object-storage-capacity-tier-PLANNED.md) | Object storage as the capacity tier | Planned |
 | [0060](0060-comparative-benchmark-suite.md) | Comparative benchmark suite (vs MongoDB/PostgreSQL/MySQL/SQLite) | Partial |
+| [0061](0061-relaxed-durability-window-PLANNED.md) | Relaxed durability: a group-commit window | Planned |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |

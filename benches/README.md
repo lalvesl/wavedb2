@@ -37,6 +37,30 @@ shuts it down cleanly. No row is ever measured against whatever the machine
 happens to be running: the durability column has to describe a server this run
 configured, or it is a guess.
 
+## The cage
+
+Every run executes inside a fixed budget, so all five systems get the same
+machine instead of each inferring a different one from the host:
+
+| | |
+|---|---|
+| CPUs | **4**, via `taskset -c 0-3` |
+| Memory | **2 GiB**, via a `systemd-run --user --scope` cgroup (`MemoryMax`, `MemorySwapMax=0`) |
+| Namespace | `bwrap --dev-bind / / --unshare-pid` |
+| Server cache | **512 MB each**, pinned: `--wiredTigerCacheSizeGB 0.5`, `--innodb-buffer-pool-size=512M`, `shared_buffers=512MB` |
+
+Three things about that table are worth reading twice. **Bubblewrap caps
+nothing** — it is the namespace only; the limits are cgroups and affinity. The
+memory cap bounds the **page cache**, which is what makes a cold read actually
+cold instead of a memory read. And the server caches are pinned because each
+server sizes its cache from the *machine's* RAM rather than the cgroup's — an
+unpinned MongoDB asks for gigabytes it cannot have and is OOM-killed.
+
+The budget is part of the **host key**, so a caged run and an uncaged one on the
+same hardware are different lanes. Both budgets are read back from the kernel
+(`Cpus_allowed_list`, the cgroup's `memory.max`) rather than assumed, so a
+recorded row states what it really ran under.
+
 ## Seeds
 
 Refilling every database before every run is the tedium that stops a benchmark
