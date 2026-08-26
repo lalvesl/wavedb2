@@ -23,8 +23,11 @@ use crate::shop::{
 };
 use crate::systems::{Durability, SystemReport};
 
-pub fn run(cfg: &ShopCfg) -> Result<SystemReport, String> {
-    let dir = cfg.work_dir.join("shop-wavedb");
+pub fn run(cfg: &ShopCfg, d: Durability) -> Result<SystemReport, String> {
+    let dir = cfg.work_dir.join(match d {
+        Durability::Durable => "shop-wavedb-durable",
+        Durability::Relaxed => "shop-wavedb-relaxed",
+    });
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
 
     {
@@ -36,8 +39,9 @@ pub fn run(cfg: &ShopCfg) -> Result<SystemReport, String> {
     // Reopened: the per-type cache is a *write* cache, so everything the
     // preload just wrote would otherwise still be warm and the read phases
     // would measure RAM. Every other adapter restarts its server here for the
-    // same reason.
-    let store = open(&dir)?;
+    // same reason. The reopen is also where the measured durability is chosen
+    // — the fill's window never survives it.
+    let store = open_measured(&dir, d)?;
     let mut phases = vec![
         signup_phase(cfg, &store),
         checkout_phase(cfg, &store),
@@ -57,7 +61,7 @@ pub fn run(cfg: &ShopCfg) -> Result<SystemReport, String> {
         system: "wavedb",
         bracket: "embedded",
         workload: "shop",
-        durability: Durability::Durable,
+        durability: d,
         version: env!("CARGO_PKG_VERSION").into(),
         settings: vec![
             ("tenancy".into(), "one tenant per user".into()),
@@ -66,13 +70,22 @@ pub fn run(cfg: &ShopCfg) -> Result<SystemReport, String> {
                 format!("Shopping by bought_at, page = {PAGE}"),
             ),
             ("transaction".into(), "none: one op is one batch".into()),
-            // Recorded because it is the one place this row is not the
-            // default engine: the untimed fill only.
+            // The measured window, named so a reader can discount the row
+            // against the competitors' own relaxed knobs (RFC 0061).
+            (
+                "relax_window".into(),
+                match d {
+                    Durability::Durable => {
+                        "0 — one barrier per batch".to_string()
+                    }
+                    Durability::Relaxed => format!("{RELAXED_WINDOW:?}"),
+                },
+            ),
+            // Recorded separately: the untimed fill runs its own window
+            // whichever row this is, so it is never what the row reports.
             (
                 "preload".into(),
-                format!(
-                    "relax_window {PRELOAD_WINDOW:?}; measured phases durable"
-                ),
+                format!("relax_window {PRELOAD_WINDOW:?}, untimed"),
             ),
         ],
         compression: "per-type zstd dictionaries",
@@ -108,7 +121,8 @@ fn preload(cfg: &ShopCfg, dir: &Path) -> Result<(), String> {
         }
         // The per-type cache is a *write* cache with no automatic eviction on
         // a bare `PageStore` (a node gets that from `quick-node`'s maintenance
-        // loop). A 200 000-user fill is ~8.6M records, which would sit in RAM
+        // loop). At ~43 records a user a large fill is millions of records,
+        // which without this would sit in RAM
         // until the single drain at the end and be OOM-killed long before it
         // — the 500 MB cage is the whole run's, server included. Settling in
         // rounds is what a node does anyway; the fill is untimed, so the cost
@@ -312,23 +326,34 @@ fn tenant(store: &PageStore, u: u64) -> LocalHandle<'_, PageStore> {
     LocalHandle::new(store, U48::from(u32::try_from(u + 1).unwrap_or(1)))
 }
 
+/// The **measured** store, opened at the row's own durability: the default
+/// (one barrier per batch) or [`RELAXED_WINDOW`](crate::RELAXED_WINDOW).
+///
 /// Each type contributes a different number of `StructStorage` slots — a
 /// Unique one, a NonUnique with a declared list six — so they are collected
 /// rather than concatenated as arrays.
-fn open(dir: &Path) -> Result<PageStore, String> {
-    open_with(dir, StoreOptions::default())
+fn open_measured(dir: &Path, d: Durability) -> Result<PageStore, String> {
+    open_with(
+        dir,
+        StoreOptions {
+            relax_window: match d {
+                Durability::Durable => std::time::Duration::ZERO,
+                Durability::Relaxed => RELAXED_WINDOW,
+            },
+        },
+    )
 }
 
-/// The **fill**'s store: a durability window, because a preload is not a
-/// measurement (RFC 0061).
+/// The **fill**'s store: always a durability window, whichever row is running,
+/// because a preload is not a measurement (RFC 0061).
 ///
 /// This is the bulk-load-then-serve pattern the window exists for, and it is
-/// the only reason a 200 000-user preload is affordable: one op is one batch
-/// is one barrier, so filling 8.6M records durably is 8.6M `fsync`s. The
-/// measured phases reopen with [`open`] — the default, one barrier per batch —
-/// so **no measured number is taken against a relaxed store**. The other four
-/// systems do the same thing by different names: their bulk loaders are not
-/// running the per-statement commit path either.
+/// what makes a large preload affordable at all: one op is one batch is one
+/// barrier, so filling millions of records durably is millions of `fsync`s.
+/// The measured phases reopen through [`open_measured`], so the fill's window
+/// is never what a row reports. The other four systems do the same thing by
+/// different names: their bulk loaders are not running the per-statement
+/// commit path either.
 fn open_relaxed(dir: &Path) -> Result<PageStore, String> {
     open_with(
         dir,
@@ -338,7 +363,7 @@ fn open_relaxed(dir: &Path) -> Result<PageStore, String> {
     )
 }
 
-use crate::FILL_WINDOW as PRELOAD_WINDOW;
+use crate::{FILL_WINDOW as PRELOAD_WINDOW, RELAXED_WINDOW};
 
 /// Users between settle rounds during the fill — ~2 000 records a round at
 /// the default order/item spread, which keeps the write cache bounded well
@@ -353,9 +378,10 @@ const DRAIN_EVERY: u64 = 200;
 /// took 164 s at 8 000. Cold reads are this engine's known weak path; a fill
 /// is the last place to force them.
 ///
-/// 4 GB, because the fill runs with the cage open (`crate::cage::for_fill`,
-/// 10 GB ceiling) — generous on purpose, and still a bound, since an
-/// unbounded write cache would simply move the failure to that ceiling.
+/// 192 MB: comfortably inside the measurement cage, so the fill behaves the
+/// same whether or not `crate::cage::for_fill` opened it — and still a bound,
+/// since an unbounded write cache would simply move the failure to whatever
+/// ceiling is in force.
 const FILL_CACHE_BYTES: usize = 192 << 20;
 
 fn open_with(dir: &Path, options: StoreOptions) -> Result<PageStore, String> {

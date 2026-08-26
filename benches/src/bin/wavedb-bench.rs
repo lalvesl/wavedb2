@@ -84,9 +84,13 @@ fn run(opts: &Options) -> Result<(), String> {
         host.cpu_budget,
         host.cores,
         host.mem_budget / (1 << 20),
-        match host.data_fill {
-            Some(f) => format!("{} {:.0}% full", host.filesystem, f * 100.0),
-            None => host.filesystem.clone(),
+        match (host.data_fill, host.filesystem.as_str()) {
+            (Some(f), fs) => format!("{fs} {:.0}% full", f * 100.0),
+            // Loud on purpose: on btrfs the fill guard is the one that matters,
+            // and a probe that quietly returns nothing reads exactly like a
+            // healthy disk.
+            (None, "btrfs") => "btrfs (FILL UNREADABLE — guard blind)".into(),
+            (None, fs) => fs.to_string(),
         },
         if prov.dirty {
             "dirty tree"
@@ -187,7 +191,13 @@ fn run_micro(
     out: &mut Vec<SystemReport>,
 ) -> Result<(), String> {
     if opts.wants("wavedb") {
-        take(out, "wavedb", systems::wavedb::run(cfg))?;
+        for d in [Durability::Durable, Durability::Relaxed] {
+            take(
+                out,
+                &format!("wavedb/{}", d.name()),
+                systems::wavedb::run(cfg, d),
+            )?;
+        }
     }
     if opts.wants("sqlite") {
         for d in [Durability::Durable, Durability::Relaxed] {
@@ -249,7 +259,13 @@ fn run_shop(
         cfg.detail_reads
     );
     if opts.wants("wavedb") {
-        take(out, "shop wavedb", systems::shop::wavedb::run(cfg))?;
+        for d in [Durability::Durable, Durability::Relaxed] {
+            take(
+                out,
+                &format!("shop wavedb/{}", d.name()),
+                systems::shop::wavedb::run(cfg, d),
+            )?;
+        }
     }
     if opts.wants("sqlite") {
         for d in [Durability::Durable, Durability::Relaxed] {
