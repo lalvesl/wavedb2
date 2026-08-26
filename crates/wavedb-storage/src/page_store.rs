@@ -23,13 +23,15 @@
 //!   under it so cache order always equals journal (= replay) order;
 //! - `alloc` (`Mutex`) — block space is one shared resource.
 //!
-//! Lock order: `journal → pending → dir → cache` on the commit path (the
-//! directory is only taken to route a `Remove` whose owner is no longer
-//! cached; the pending push stays under the journal so eviction's
-//! "queue empty ⇒ everything settled" check can't race a commit);
-//! `pending → dir → cache(read) → alloc` on the settle drain; `dir → dict`
-//! on the read-through path. No path takes them in a conflicting order, so
-//! the graph is acyclic.
+//! Lock order: `journal → pending → cache` on the commit path (the pending
+//! push stays under the journal so eviction's "queue empty ⇒ everything
+//! settled" check can't race a commit); `pending → dir → cache(read) →
+//! alloc` on the settle drain; `dir → dict` on the read-through path. No
+//! path takes them in a conflicting order, so the graph is acyclic.
+//!
+//! The commit path takes no directory at all since RFC 0063: every write
+//! carries the STRUCT_HASH it routes by, so committing a batch is memory
+//! work and cannot touch a page.
 //!
 //! `retiring` sits outside that order entirely, by rule: it is **never held
 //! across another lock**. A checkpoint publishes under it (`alloc → retiring`)
@@ -216,7 +218,7 @@ impl PageStore {
         };
         for batch in &recovered.replay {
             store.route_batch(batch)?; // rebuild caches + pages, no re-journal
-            let touched = store.commit_to_caches(batch)?;
+            let touched = store.commit_to_caches(batch);
             store.settle(&touched)?;
         }
         Ok(store)
@@ -674,7 +676,7 @@ mod tests {
                 Some(rec(SH, b"alpha"))
             );
             assert_eq!(s.get_of(SH ^ 1, nonunique(1)).await.unwrap(), None);
-            s.apply(&[Write::Remove(nonunique(1))]).await.unwrap();
+            s.apply(&[Write::Remove(SH, nonunique(1))]).await.unwrap();
             assert_eq!(s.get(nonunique(1)).await.unwrap(), None);
         });
     }
@@ -726,7 +728,7 @@ mod tests {
                 s.apply(&[Write::Put(nonunique(1), rec(SH, b"x"))])
                     .await
                     .unwrap();
-                s.apply(&[Write::Remove(nonunique(1))]).await.unwrap();
+                s.apply(&[Write::Remove(SH, nonunique(1))]).await.unwrap();
             }
             let s = open(d.path());
             assert_eq!(s.get(nonunique(1)).await.unwrap(), None);
@@ -750,8 +752,8 @@ mod tests {
                     .unwrap();
                 // Satisfied guards (present + absent) ride with a Put.
                 s.apply(&[
-                    Write::Expect(nonunique(1), Some(rec(SH, b"v1"))),
-                    Write::Expect(nonunique(2), None),
+                    Write::Expect(SH, nonunique(1), Some(rec(SH, b"v1"))),
+                    Write::Expect(SH, nonunique(2), None),
                     Write::Put(nonunique(1), rec(SH, b"v2")),
                 ])
                 .await
@@ -759,7 +761,7 @@ mod tests {
                 // A stale expectation refuses the whole batch, typed.
                 let err = s
                     .apply(&[
-                        Write::Expect(nonunique(1), Some(rec(SH, b"v1"))),
+                        Write::Expect(SH, nonunique(1), Some(rec(SH, b"v1"))),
                         Write::Put(nonunique(1), rec(SH, b"lost-race")),
                     ])
                     .await
@@ -776,6 +778,96 @@ mod tests {
                 s.get(nonunique(1)).await.unwrap(),
                 Some(rec(SH, b"v2")),
                 "the guarded batch must survive a reopen"
+            );
+        });
+    }
+
+    /// RFC 0063's A2. An `Expect` guard used to resolve its id's **type** by
+    /// probing every registered slot in turn — so the guard on a first save,
+    /// which matches nothing, paid a page read per declared type, under the
+    /// journal lock that serializes all writers. The guard now carries the
+    /// STRUCT_HASH it routes by, so its cost is one lookup and cannot grow
+    /// with the schema.
+    #[test]
+    fn a_guard_costs_the_same_whatever_the_schemas_width() {
+        let _g = engine_gate();
+        // The same batch, the same guard, against a one-type registry and a
+        // two-type one. Sequential: the slots are process-global statics.
+        let narrow = guard_page_reads(&[&TEST_SLOT]);
+        let wide = guard_page_reads(&[&TEST_SLOT, &OTHER_SLOT]);
+        assert_eq!(
+            narrow, wide,
+            "a guard's page reads must not grow with the registry: {narrow} \
+             with one type, {wide} with two"
+        );
+        assert!(
+            wide <= 1,
+            "a guard is one routed lookup — at most the target type's own \
+             page, not a scan; charged {wide}"
+        );
+    }
+
+    /// Page reads charged by one absent-expectation guard against a store
+    /// whose every registered type holds settled, evicted pages — the state
+    /// in which a scan would actually have to read them.
+    fn guard_page_reads(types: &[&'static StructStorage]) -> u64 {
+        let d = tempfile::tempdir().unwrap();
+        let s = PageStore::open(d.path(), types).unwrap();
+        block_on(async {
+            for slot in types {
+                for k in 0..64u64 {
+                    s.apply(&[Write::Put(
+                        nonunique(k),
+                        rec(slot.struct_hash(), b"settled"),
+                    )])
+                    .await
+                    .unwrap();
+                }
+            }
+            s.drain().unwrap();
+            s.evict_settled(0); // the caches must not answer the guard
+            let before = s.file.io().snapshot().0;
+            // Absent everywhere, so the old probe fell through every slot.
+            s.apply(&[
+                Write::Expect(SH, nonunique(9_999), None),
+                Write::Put(nonunique(9_999), rec(SH, b"first version")),
+            ])
+            .await
+            .unwrap();
+            s.file.io().snapshot().0 - before
+        })
+    }
+
+    /// The same fix on the other write that named no type: routing a
+    /// `Remove` meant finding the id's owner by probing every cache and then
+    /// every settled page. It routes by its own hash now, so committing one
+    /// is memory work — which is what lets the whole commit section promise
+    /// it cannot touch a page (RFC 0063).
+    #[test]
+    fn a_remove_reads_no_page() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let s = PageStore::open(d.path(), &[&TEST_SLOT, &OTHER_SLOT]).unwrap();
+        block_on(async {
+            for k in 0..64u64 {
+                s.apply(&[Write::Put(nonunique(k), rec(SH, b"settled"))])
+                    .await
+                    .unwrap();
+            }
+            s.drain().unwrap();
+            s.evict_settled(0);
+
+            let before = s.file.io().snapshot().0;
+            s.apply(&[Write::Remove(SH, nonunique(5))]).await.unwrap();
+            assert_eq!(
+                s.file.io().snapshot().0,
+                before,
+                "committing a Remove must read no page"
+            );
+            assert_eq!(
+                s.get_of(SH, nonunique(5)).await.unwrap(),
+                None,
+                "the removal must still take effect"
             );
         });
     }
@@ -842,7 +934,7 @@ mod tests {
                 s.drain().unwrap();
                 // Evict, then remove: the owner must be found on the page.
                 TEST_SLOT.mem_cache().write().clear();
-                s.apply(&[Write::Remove(nonunique(3))]).await.unwrap();
+                s.apply(&[Write::Remove(SH, nonunique(3))]).await.unwrap();
                 // Before the settle lands, the tombstone must hide the
                 // (still-present) page bytes…
                 assert_eq!(s.get(nonunique(3)).await.unwrap(), None);
@@ -910,7 +1002,7 @@ mod tests {
                 .await
                 .unwrap();
             s.drain().unwrap(); // page holds v1
-            s.apply(&[Write::Remove(nonunique(9))]).await.unwrap();
+            s.apply(&[Write::Remove(SH, nonunique(9))]).await.unwrap();
             // Unsettled remove: the page still holds v1; reads must not
             // resurrect it.
             assert_eq!(s.get(nonunique(9)).await.unwrap(), None);
@@ -978,7 +1070,7 @@ mod tests {
                 ])
                 .await
                 .unwrap();
-                s.apply(&[Write::Remove(nonunique(2))]).await.unwrap();
+                s.apply(&[Write::Remove(SH, nonunique(2))]).await.unwrap();
                 s.commit_journal().unwrap();
                 // The frame is written but unsynced, so the retirement it
                 // authorises is still pending (RFC 0046) — the old journal
@@ -1063,7 +1155,7 @@ mod tests {
                 s.apply(&[Write::Put(nonunique(5), rec(SH, b"other"))])
                     .await
                     .unwrap();
-                s.apply(&[Write::Remove(nonunique(5))]).await.unwrap();
+                s.apply(&[Write::Remove(SH, nonunique(5))]).await.unwrap();
                 let old = journals(d.path()).pop().unwrap();
                 let bytes = std::fs::read(&old).unwrap();
                 s.commit_journal().unwrap();
