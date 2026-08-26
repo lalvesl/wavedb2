@@ -35,8 +35,14 @@ impl PageStore {
         // durability point. Guards are not state — the journal never holds
         // them, so replay re-applies only the effective writes.
         for w in batch {
-            if let Write::Expect(id, expected) = w
-                && self.read_any(*id)? != *expected
+            // One routed lookup, not a scan. Before RFC 0063's yield map made
+            // it visible, this read the id's *type* out of the store by
+            // probing every registered slot in turn — so an
+            // `Expect(id, None)`, the guard on every first save, matched
+            // nothing and paid a page read plus a zstd decode per type, here,
+            // under the lock that serializes all writers.
+            if let Write::Expect(hash, id, expected) = w
+                && self.read_of(*hash, *id)? != *expected
             {
                 return Err(StorageError::Core(wavedb_core::Error::Conflict(
                     *id,
@@ -63,7 +69,7 @@ impl PageStore {
             }
         }
         // Commit under the journal lock: cache order == journal order.
-        let touched = self.commit_to_caches(&effective)?;
+        let touched = self.commit_to_caches(&effective);
         merge_touched(&mut self.pending.lock(), touched);
         // The append's fsync flushed the whole file, so a checkpoint's deferred
         // `Commit` frame is now durable too — for free, and with nothing to do
@@ -74,10 +80,35 @@ impl PageStore {
         Ok(())
     }
 
-    /// Read `id`'s current bytes without knowing its type: caches first,
-    /// then settled pages — the sync body [`Store::get`] wraps, reused by
-    /// the `Expect` guard (whose absent-expectation carries no type head to
-    /// route by).
+    /// Read `id`'s current bytes from `struct_hash`'s slot: its cache, then
+    /// its settled page. The sync body [`Store::get_of`] wraps, reused by the
+    /// `Expect` guard — one binary search on the route table and at most one
+    /// page read, whatever the schema's width.
+    ///
+    /// An unregistered `struct_hash` reads as absent rather than faulting:
+    /// [`route_batch`](Self::route_batch) has already refused any batch that
+    /// would reach here with one.
+    pub(crate) fn read_of(
+        &self,
+        struct_hash: u64,
+        id: Id,
+    ) -> StorageResult<Option<Vec<u8>>> {
+        let Some(slot) = self.slot_of(struct_hash) else {
+            return Ok(None);
+        };
+        if let Some(bytes) = slot.get(id) {
+            return Ok(Some(bytes));
+        }
+        self.read_from_pages(slot, id)
+    }
+
+    /// Read `id`'s current bytes without knowing its type: every cache, then
+    /// every settled page — the sync body [`Store::get`] wraps.
+    ///
+    /// The cost is a page read per registered type, so nothing on a write
+    /// path may call this (RFC 0063). `Store::get` keeps it because an
+    /// untyped read is what that method *means*; typed callers spell
+    /// [`read_of`](Self::read_of).
     fn read_any(&self, id: Id) -> StorageResult<Option<Vec<u8>>> {
         if let Some(bytes) = self.types.iter().find_map(|s| s.get(id)) {
             return Ok(Some(bytes));
@@ -90,14 +121,21 @@ impl PageStore {
         Ok(None)
     }
 
-    /// Verify every `Put` in `batch` routes to a registered slot.
+    /// Verify every write in `batch` routes to a registered slot — `Put` by
+    /// the STRUCT_HASH at its bytes' head, `Remove` and `Expect` by the one
+    /// they carry.
+    ///
+    /// Checked before the journal sees the batch, so the log never holds a
+    /// batch replay would choke on; and it is what lets the commit path treat
+    /// a routing miss as unreachable rather than handling it twice.
     pub(crate) fn route_batch(&self, batch: &[Write]) -> StorageResult<()> {
         for w in batch {
-            if let Write::Put(_, bytes) = w {
-                let sh = struct_hash_of(bytes)?;
-                if self.slot_of(sh).is_none() {
-                    return Err(StorageError::UnregisteredStructHash(sh));
-                }
+            let sh = match w {
+                Write::Put(_, bytes) => struct_hash_of(bytes)?,
+                Write::Remove(hash, _) | Write::Expect(hash, _, _) => *hash,
+            };
+            if self.slot_of(sh).is_none() {
+                return Err(StorageError::UnregisteredStructHash(sh));
             }
         }
         Ok(())
@@ -107,25 +145,17 @@ impl PageStore {
     /// returning the touched ids per slot. Runs under the journal lock, so
     /// commits are ordered and each type's write guard is held only briefly.
     ///
-    /// A page probe (routing a `Remove` whose owner is not cached) can fail
-    /// on a disk fault — *after* the durability point. The live state then
-    /// under-applies the batch, but the journal holds it whole: a reopen
-    /// replays it correctly, which is the strongest promise a broken disk
-    /// leaves available.
-    pub(crate) fn commit_to_caches(
-        &self,
-        batch: &[Write],
-    ) -> StorageResult<Touched> {
+    /// Every write here routes by a hash it already carries, so this touches
+    /// no page and cannot fault: it is memory work under the commit lock, as
+    /// RFC 0063's map requires of anything inside that section.
+    pub(crate) fn commit_to_caches(&self, batch: &[Write]) -> Touched {
         let mut touched: Touched = Vec::new();
         for w in batch {
             match w {
                 Write::Put(id, bytes) => {
                     let sh = struct_hash_of(bytes)
                         .expect("route_batch validated the head");
-                    let idx = self
-                        .types
-                        .binary_search_by_key(&sh, |s| s.struct_hash())
-                        .expect("route_batch validated registration");
+                    let idx = self.slot_index(sh);
                     self.types[idx]
                         .mem_cache()
                         .write()
@@ -134,21 +164,28 @@ impl PageStore {
                     self.types[idx].clear_removed(*id);
                     note_touched(&mut touched, idx, *id);
                 }
-                Write::Remove(id) => {
-                    if let Some(idx) = self.owner_of(*id)? {
-                        self.types[idx].mem_cache().write().remove(&id.raw());
-                        // The page still holds the bytes until the settle
-                        // lands — tombstone so reads don't resurrect them.
-                        self.types[idx].mark_removed(*id);
-                        note_touched(&mut touched, idx, *id);
-                    }
+                Write::Remove(hash, id) => {
+                    let idx = self.slot_index(*hash);
+                    self.types[idx].mem_cache().write().remove(&id.raw());
+                    // The page still holds the bytes until the settle
+                    // lands — tombstone so reads don't resurrect them.
+                    self.types[idx].mark_removed(*id);
+                    note_touched(&mut touched, idx, *id);
                 }
                 // Validated and stripped in `apply_inner`; never reaches a
                 // journaled batch (nor, therefore, replay).
                 Write::Expect(..) => {}
             }
         }
-        Ok(touched)
+        touched
+    }
+
+    /// The slot index for a hash [`route_batch`](Self::route_batch) has
+    /// already accepted.
+    fn slot_index(&self, struct_hash: u64) -> usize {
+        self.types
+            .binary_search_by_key(&struct_hash, |s| s.struct_hash())
+            .expect("route_batch validated registration")
     }
 }
 
@@ -168,13 +205,7 @@ impl Store for PageStore {
         // One binary search on the route table, then this type's own cache
         // read lock — a cached read of one type never contends with another
         // type's. A miss reads through to the settled page.
-        let Some(slot) = self.slot_of(struct_hash) else {
-            return Ok(None);
-        };
-        if let Some(bytes) = slot.get(id) {
-            return Ok(Some(bytes));
-        }
-        Ok(self.read_from_pages(slot, id)?)
+        Ok(self.read_of(struct_hash, id)?)
     }
 
     async fn apply(&self, batch: &[Write]) -> CoreResult<()> {
