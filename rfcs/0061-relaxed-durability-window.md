@@ -1,14 +1,14 @@
 # RFC 0061 — Relaxed durability: a group-commit window
 
-- **Status:** Planned — opened 2026-08-14, prompted by the measurement in
-  [0060](0060-comparative-benchmark-suite.md). Not started.
+- **Status:** Implemented (landed 2026-08-21) — opened 2026-08-14, prompted by
+  the measurement in [0060](0060-comparative-benchmark-suite.md).
 - **Crates:** `wavedb-storage` (the write path), `wavedb-quick-node` (the
   node-side setting). No schema-crate or macro change; nothing folds into
   `STRUCT_HASH`.
-- **Code:** `apply.rs:50` (today's single barrier),
-  `journal.rs:{181,198,209}` (`append` / `append_deferred` / `sync`),
-  `page_store.rs:136` (`open`, where the setting would live),
-  `retire.rs:105` (`force_retirement`, which already syncs on shutdown).
+- **Code:** `crates/wavedb-storage/src/{apply,journal,page_store,retire}.rs`,
+  `crates/wavedb-quick-node/src/lib.rs` (`Server::relax_window`).
+- **Follow-on:** [0062](0062-relaxed-mode-refinements-PLANNED.md) — the
+  refinements this RFC deliberately left out.
 - **Related:** [0041](0041-single-barrier-checkpoint.md) (the checkpoint's one
   barrier), [0046](0046-directory-deltas-in-the-window.md) (which introduced
   `append_deferred`, and whose "ride the next barrier" trick this generalises),
@@ -71,7 +71,7 @@ forces the receipt's answer on both.
 place a barrier is taken:
 
 ```rust
-// apply.rs, replacing the single `journal.append(&frame)?` at line 50
+// apply.rs — the durability point, replacing the single `journal.append(…)?`
 if self.relax_window.is_zero() {
     journal.append(&frame)?;             // today: write + fsync
 } else {
@@ -82,11 +82,12 @@ if self.relax_window.is_zero() {
 }
 ```
 
-Both halves already exist. `append_deferred` (`journal.rs:198`) was built for
+Both halves already existed. `append_deferred` was built for
 RFC 0046's checkpoint frame — "the bytes are in the page cache, durable only once
-someone syncs this file" — and `sync` (`journal.rs:209`) is the barrier the
+someone syncs this file" — and `sync` is the barrier the
 checkpoint and the retirement already use. Nothing new is written to disk and no
-byte layout changes.
+byte layout changes. The only state added is a `last_sync: Instant` on the
+`Journal` (`since_last_sync()`), and `relax_window: Duration` on the store.
 
 **No background task.** The window is checked under the journal lock that
 `apply` already holds, so a burst of operations inside one window amortises to
@@ -109,7 +110,14 @@ next section is why that is safe rather than merely convenient.
   PostgreSQL's `synchronous_commit=off` semantics, and exactly why that setting
   is safe to offer while `fsync=off` is not: the failure mode is *lost*, never
   *corrupt*.
-- **The `Expect` guard** (`apply.rs:36`) reads through `read_any`, which checks
+- **Journal retirement** (RFC 0047) asks `carrier.barriers() <=
+  retiring.frame_barrier` — "was *this file* flushed since the frame was
+  appended?" — which is the right question in both modes, so the deferred
+  `Commit` frame stays correct and the fallback barrier stays the exception. It
+  is the surrounding *comment* that had to change: "every `Batch` append
+  `fsync`s" becomes "once per elapsed window", and a journal grown enough to
+  trigger a checkpoint has crossed many windows. Cost, not correctness.
+- **The `Expect` guard** reads through `read_any`, which checks
   the in-memory caches first, and the caches are still committed under the
   journal lock immediately after the append. A conflict is detected identically
   in both modes.
@@ -147,9 +155,12 @@ to compare against. Two things follow:
 - Default **zero** — today's behaviour, unchanged, for every existing caller.
   A weaker default is not a performance win, it is a silent downgrade of a
   promise the whole engine was built around.
-- `PageStore::open_with(dir, types, StoreOptions { relax_window })`, leaving
-  `open` as it is (a two-argument call is most of the test suite).
-- `wavedb-quick-node` exposes it on the builder, beside `.data_dir()`.
+- `PageStore::open_with(dir, types, StoreOptions { relax_window })`, with
+  `open` left as it is and now delegating with `StoreOptions::default()` (a
+  two-argument call is most of the test suite).
+- `PageStore::flush()` forces the barrier.
+- `wavedb-quick-node` exposes `Server::relax_window(Duration)` on the builder,
+  beside `.data_dir()`.
 - The client cache (`Db::open`'s write-through `PageStore`) is a candidate for a
   non-zero default in a *later* pass — it is a cache of node-owned state, so a
   lost suffix is re-fetched rather than lost — but not in this RFC, because
@@ -158,23 +169,31 @@ to compare against. Two things follow:
 
 ### 5. How it gets measured
 
-RFC 0060 already has the harness: a `wavedb/relaxed` row appears in both tables
-as soon as the setting exists, against SQLite's `synchronous = NORMAL`,
+RFC 0060 already has the harness, and the setting now exists — so the
+`wavedb/relaxed` row is a `StoreOptions` argument in the two WaveDB adapters,
+**not yet wired**. It races SQLite's `synchronous = NORMAL`,
 PostgreSQL's `synchronous_commit = off`, MySQL's
 `innodb_flush_log_at_trx_commit = 2` and MongoDB's `j: false`. The `kB/insert`
 column is the direct check on whether the barrier really was the cost: if the
 relaxed row does not fall to roughly a tenth, the diagnosis above was wrong.
 
-A durability claim also needs a durability test, and the existing convention
-covers it (`docs/development_standards.md`: storage changes need a
-reopen-and-replay or kill-during-write angle). Two cases:
+A durability claim also needs a durability test. Three landed in
+`page_store.rs`:
 
-1. **Window elapsed ⇒ durable.** Write, wait past the window, kill the process,
-   reopen: everything acked is there.
-2. **Inside the window ⇒ a lost suffix, never a broken store.** Kill mid-window,
-   reopen: replay succeeds, every surviving record decodes, indexes agree with
-   records, and what is missing is a suffix of the write order — not a hole in
-   the middle.
+- `a_zero_window_takes_one_barrier_per_batch` — the default is what guards the
+  promise from changing quietly, so it is the test that matters most.
+- `a_burst_inside_one_window_costs_one_barrier` — 32 batches under a window
+  long enough not to elapse take **no** barrier; `flush()` then takes exactly
+  one.
+- `an_elapsed_window_syncs_and_the_batch_replays` — the barrier is taken and a
+  reopen finds the record.
+
+Still owed: the **kill-during-write** angle, proving that a crash mid-window
+leaves a lost *suffix* rather than a broken store. The property follows from
+crc-framed frames and a replay that stops at the first torn one — the same
+mechanism `torn_tail_is_discarded_and_truncated` already covers — but the
+window makes a torn tail routine instead of rare, which is worth its own
+two-process test.
 
 ## Alternatives
 
@@ -202,18 +221,25 @@ reopen-and-replay or kill-during-write angle). Two cases:
   the same number of barriers. Worth doing regardless, and orthogonal — it does
   not turn 150 000 barriers into 300.
 
+## Resolved while implementing
+
+1. **The window's clock is `std::time::Instant`.** The platform seam is the
+   required route for *wall* clock, because `SystemTime::now()` panics on
+   wasm32 — but `wavedb-storage` is a `cfg(not(target_arch = "wasm32"))`
+   dependency and never compiles to wasm at all (the browser store is
+   IndexedDB and has no journal). What a window wants is monotonic anyway: a
+   rewound wall clock would either stall the window forever or sync on every
+   append.
+2. **`flush()` is on `PageStore`, not `Store`.** `MemStore` has nothing to
+   flush, and a no-op impl on a trait is how a guarantee becomes a lie.
+3. **The settle queue does not participate.** A batch is journalled and then
+   committed to caches under the same lock; settling to pages happens later and
+   is already crash-safe via replay, and none of that depends on *when* the
+   journal was flushed.
+
 ## Open questions
 
-1. **Where does the window's clock come from?** `platform::time` is the required
-   seam for wall-clock; a monotonic `Instant` is what this actually wants, and
-   the platform seam does not expose one today (browsers have
-   `performance.now()`; wasm has no `PageStore` anyway). Probably native-only,
-   which is fine — the wasm store is IndexedDB and has no journal.
-2. **Should `flush()` be on `Store` or only on `PageStore`?** On the trait it
-   reaches every backend including the client cache; on the concrete type it
-   stays a native-engine concern. Leaning concrete, since `MemStore` has nothing
-   to flush and a no-op impl on a trait is how a guarantee becomes a lie.
-3. **Does the settle queue need to participate?** A batch is journalled and then
-   committed to caches; settling to pages happens later and is already
-   crash-safe via replay. The expectation is that nothing changes there, but the
-   kill-during-write test is what settles it.
+1. **A quiet store keeps an unsynced tail** until the next write, checkpoint or
+   shutdown. Bounding it needs a task in a deliberately non-`Send` engine —
+   deferred to [0062](0062-relaxed-mode-refinements-PLANNED.md) along with the
+   rest of the refinements.
