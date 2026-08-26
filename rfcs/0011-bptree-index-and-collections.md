@@ -35,8 +35,13 @@ permission: Option<PermissionRef> // collection default (per-record Metadata ove
 - **No element counter** — a count would force a `Pivot` write on every
   insert/remove. The `Pivot` is effectively immutable, rewritten **only when a
   B+tree root moves**.
-- Created **explicitly** (`create_pivot`), one per tenant per type; the holder
+- Created **explicitly** (`create_pivot`), **one per holder**; the holder
   (a Unique struct or a nesting NonUnique) stores the returned `PivotId`.
+  There is no per-type limit — `create_pivot::<T>()` is just
+  `Collection::<T>::create`, callable as often as the schema nests — so a
+  nesting NonUnique mints one collection per record. That is what the
+  "millions of small trees" above means, and it is the property
+  [RFC 0064](0064-pivot-owned-concurrency-PLANNED.md) builds concurrency on.
 
 ### BpTree — Store-generic, keyed by instant
 

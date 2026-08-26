@@ -207,7 +207,8 @@ Its single live record sits at a **directly computable anchor address**
 **NonUnique** objects exist many times within a tenant and may nest recursively
 inside other NonUnique objects. A collection is referenced through a **`PivotId`**
 held in a field. The `Pivot` is **not created automatically**: you explicitly
-create it (one per tenant per definition) and **store the returned `PivotId`** in
+create it (one per holder — a nesting NonUnique mints one per record, so a type
+has as many collections as there are holders) and **store the returned `PivotId`** in
 a `Unique` struct or a nesting `NonUnique`; then you `get().await?` that pivot to
 navigate into the collection:
 
@@ -220,7 +221,7 @@ pub struct UserInterestedFruits {
 ```
 
 **Pivot** — the macro generates the _type_; an _instance_ is created on demand
-(one per tenant per definition) and its `PivotId` stored by the holder. It carries
+(one per holder) and its `PivotId` stored by the holder. It carries
 no business data — only the addressing into the index trees:
 
 ```rust

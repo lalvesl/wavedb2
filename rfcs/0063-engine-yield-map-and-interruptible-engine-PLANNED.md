@@ -5,11 +5,14 @@
   engine itself (Part 3) is designed and not started.
 - **Crates:** `wavedb-storage` (the map and the work), `wavedb-quick-node` (the
   loop that drives it), later `wavedb-platform` (the wasm yield)
-- **Successor to:** [RFC 0058](0058-per-type-actors-PLANNED-LOW.md), which stays
-  parked and stays valuable: it is the record of the multi-actor design and of
-  the eight points it left open. This RFC does not replace that design — it
+- **Successor to:** [RFC 0058](0058-per-type-actors-DEPRECATED.md). This RFC
   supplies the base case 0058 named as its own gate, and finds that the base
-  case is **not** an actor.
+  case is **not** an actor. *(0058 was still parked when this was written; it
+  was deprecated outright on 2026-08-22 — see the note on Part 4.)*
+- **Part 4 is superseded by**
+  [RFC 0064](0064-pivot-owned-concurrency-PLANNED.md). Parts 1–3 — the map, the
+  legality analysis, and the interruptible engine — stand unchanged and remain
+  the next executable step.
 - **Related:** [0041](0041-single-barrier-checkpoint.md) /
   [0046](0046-directory-deltas-in-the-window.md) (the checkpoint whose blocking
   is the motivation), [0057](0057-page-arena-and-checkpoint-staging.md) (the
@@ -299,6 +302,17 @@ or costs a schema change. It is additive and reversible — the right shape for 
 first step into an area where the order already came out wrong once.
 
 ## Part 4 — The elaboration, and where an actor does earn its keep
+
+> **Superseded 2026-08-22 by [RFC 0064](0064-pivot-owned-concurrency-PLANNED.md).**
+> This part assumed the elaboration would re-inherit 0058's design and its six
+> remaining open points. It does not: the unit of ownership is the **Pivot
+> instance**, not the type, so `Lane::Tree` and the `STRUCT_HASH` break it
+> charged are unnecessary, and the `Send` migration collapses to the disk
+> actors' message types. Two claims below are also overtaken — I1 does not need
+> a mechanism (a batch belongs to one owner, so it is atomic by ownership), and
+> the `Send` migration is not the elaboration's price. The rest of this section
+> is left as written, as the record of the reasoning 0064 replaced.
+
 
 Only once the base case exists does the multi-thread question become well-posed,
 because *then* "another task may run here" has a defined meaning: it is the same

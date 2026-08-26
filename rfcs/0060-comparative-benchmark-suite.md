@@ -229,7 +229,7 @@ Access distribution: uniform random over the key space, plus a Zipfian pass
 (skewed, the realistic shape) so the caches are exercised the way a real
 workload exercises them. Single-threaded first; a concurrency sweep only after
 the single-client numbers are trusted (see §9 — it is where WaveDB is predicted
-to lose hardest, and [0058](0058-per-type-actors-PLANNED-LOW.md) is parked).
+to lose hardest, and [0058](0058-per-type-actors-DEPRECATED.md) is parked).
 
 ### 3.1 The second workload: an e-commerce shop
 
@@ -959,7 +959,7 @@ materialising is `chmod -R u+w,go-rwx`, not `u+w`.
    sandboxed multi-hour derivation acceptable, or does size 3 need a
    build-outside-and-import path?
 5. **Concurrency sweep now or later?** WaveDB's concurrency design
-   ([0058](0058-per-type-actors-PLANNED-LOW.md)) is parked, so a multi-client
+   ([0058](0058-per-type-actors-DEPRECATED.md)) is parked, so a multi-client
    sweep would measure a placeholder — but §9 predicts that is exactly where the
    MongoDB gap appears. Leaning: single-client in phases 1–3, and the sweep as its
    own phase rather than never.

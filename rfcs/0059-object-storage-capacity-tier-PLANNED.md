@@ -205,7 +205,7 @@ this seam has to become awaitable.
 
 This is the one part of the design with a real dependency on unfinished work: it
 is the same synchronous-`fn`-on-the-request-path problem
-[RFC 0058](0058-per-type-actors-PLANNED-LOW.md) names, and 0058 is parked. This
+[RFC 0058](0058-per-type-actors-DEPRECATED.md) names, and 0058 is parked. This
 RFC does **not** depend on 0058's answer; it needs only that the read seam can
 yield. The narrow move — make `read_page` `async` and dispatch the remote fetch
 there, leaving `read_run` synchronous for the local case — is enough and does not
