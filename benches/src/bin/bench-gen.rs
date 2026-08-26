@@ -43,7 +43,8 @@ fn run() -> Result<String, String> {
 
     let mut it = args[1..].iter();
     while let Some(arg) = it.next() {
-        let mut next = || it.next().ok_or_else(|| format!("{arg} needs a value"));
+        let mut next =
+            || it.next().ok_or_else(|| format!("{arg} needs a value"));
         match arg.as_str() {
             "--rows" => {
                 rows = next()?.parse().map_err(|e| format!("--rows: {e}"))?;
@@ -65,7 +66,11 @@ fn run() -> Result<String, String> {
     match mode.as_str() {
         "emit-tsv" => {
             seed::emit_tsv(&out, rows, seed)?;
-            Ok(format!("wrote {rows} rows ({}) to {}", seed::COLUMNS, out.display()))
+            Ok(format!(
+                "wrote {rows} rows ({}) to {}",
+                seed::COLUMNS,
+                out.display()
+            ))
         }
         "fill-wavedb" => {
             seed::fill_wavedb(&out, rows, seed)?;

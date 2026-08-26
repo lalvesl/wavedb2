@@ -26,11 +26,7 @@ pub struct Server {
 
 impl Server {
     /// Start `cmd` detached from our stdio, with its own log file.
-    pub fn spawn(
-        cmd: &str,
-        args: &[&str],
-        log: &Path,
-    ) -> Result<Self, String> {
+    pub fn spawn(cmd: &str, args: &[&str], log: &Path) -> Result<Self, String> {
         let out = std::fs::File::create(log)
             .map_err(|e| format!("{cmd}: log {}: {e}", log.display()))?;
         let err = out
@@ -128,8 +124,7 @@ fn child_map() -> std::collections::HashMap<u32, Vec<u32>> {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue; // not a process directory
         };
-        let Ok(status) =
-            std::fs::read_to_string(format!("/proc/{pid}/status"))
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status"))
         else {
             continue; // exited between the readdir and here
         };
@@ -195,10 +190,16 @@ pub fn log_tail(log: &Path, lines: usize) -> String {
 ///
 /// It is **pinned rather than inferred**, and that is the whole point: each of
 /// these sizes its cache from the machine's RAM by default, not from the
-/// cgroup's — so under the suite's 2 GiB cage an unpinned MongoDB asks for
+/// cgroup's — so under the suite's 500 MB cage an unpinned MongoDB asks for
 /// gigabytes it cannot have and is OOM-killed, while MySQL and PostgreSQL
 /// quietly take different fractions of a machine none of them can see. Equal
 /// budgets are what makes the row a comparison (RFC 0060 §5).
-pub const CACHE_GB: &str = "0.5";
-pub const CACHE_MYSQL: &str = "512M";
-pub const CACHE_POSTGRES: &str = "512MB";
+/// 256 MB — **MongoDB's floor** (`--wiredTigerCacheSizeGB` refuses less than
+/// 0.25), which is what sets the number for all three: equal budgets are what
+/// make the row a comparison, so the least-adjustable server picks it. Half
+/// the suite's 500 MB cage, leaving the other half for the server's non-cache
+/// memory and the benchmark process that shares the cgroup with it. Only one
+/// server runs at a time.
+pub const CACHE_GB: &str = "0.25";
+pub const CACHE_MYSQL: &str = "256M";
+pub const CACHE_POSTGRES: &str = "256MB";

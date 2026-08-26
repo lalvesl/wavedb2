@@ -12,10 +12,10 @@
 
 use std::path::Path;
 
+use mongodb::IndexModel;
 use mongodb::bson::{Document, doc};
 use mongodb::options::{Acknowledgment, ClientOptions, WriteConcern};
 use mongodb::sync::{Client, Collection};
-use mongodb::IndexModel;
 
 use super::server::{self, CACHE_GB, Server};
 use super::{Cfg, Durability, SystemReport};
@@ -95,10 +95,7 @@ pub fn run(cfg: &Cfg, durability: Durability) -> Result<SystemReport, String> {
         durability,
         version,
         settings: vec![
-            (
-                "writeConcern".into(),
-                format!("{{ w: 1, j: {journal} }}"),
-            ),
+            ("writeConcern".into(), format!("{{ w: 1, j: {journal} }}")),
             ("storage_engine".into(), "WiredTiger".into()),
             ("wiredTigerCacheSizeGB".into(), CACHE_GB.into()),
             ("transport".into(), "loopback TCP".into()),
@@ -273,8 +270,9 @@ fn measure(data: &Path) -> Result<Footprint, String> {
 /// collection in the seed, and the same 200 MB beside 20 documents
 /// (RFC 0060 §4.1). `diagnostic.data` is FTDC telemetry, not stored data.
 fn is_log(path: &Path) -> bool {
-    path.components()
-        .any(|c| c.as_os_str() == "journal" || c.as_os_str() == "diagnostic.data")
+    path.components().any(|c| {
+        c.as_os_str() == "journal" || c.as_os_str() == "diagnostic.data"
+    })
 }
 
 fn s(p: &Path) -> String {

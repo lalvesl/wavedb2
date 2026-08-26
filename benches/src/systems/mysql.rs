@@ -137,11 +137,7 @@ pub fn run(cfg: &Cfg, durability: Durability) -> Result<SystemReport, String> {
     })
 }
 
-fn insert_phase(
-    cfg: &Cfg,
-    conn: &mut Conn,
-    pid: u32,
-) -> Result<Phase, String> {
+fn insert_phase(cfg: &Cfg, conn: &mut Conn, pid: u32) -> Result<Phase, String> {
     let stmt = conn.prep(INSERT).map_err(sql)?;
     Ok(metrics::phase_of(
         "insert",
@@ -197,11 +193,7 @@ fn read_phase(
     ))
 }
 
-fn update_phase(
-    cfg: &Cfg,
-    conn: &mut Conn,
-    pid: u32,
-) -> Result<Phase, String> {
+fn update_phase(cfg: &Cfg, conn: &mut Conn, pid: u32) -> Result<Phase, String> {
     let stmt = conn.prep(UPDATE).map_err(sql)?;
     let mut rng = Rng::new(cfg.seed ^ 0x0DDB_A11B_EEF0_0D15);
     Ok(metrics::phase_of(

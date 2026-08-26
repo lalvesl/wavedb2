@@ -7,7 +7,6 @@ use crate::footprint::Point;
 use crate::systems::SystemReport;
 use crate::systems::shop::PHASES;
 
-
 /// The e-commerce table. **Latency, not throughput**: these phases are composed
 /// operations a customer waits on, and the number that matters is what the slow
 /// tail costs, which a rate hides by construction. p99 is printed beside p50 for
@@ -101,11 +100,7 @@ pub fn print_table(reports: &[SystemReport]) {
         .filter(|r| r.footprint(Point::Baseline).allocated_bytes > 0)
         .map(|r| {
             let b = r.footprint(Point::Baseline);
-            format!(
-                "{} {:.1}M",
-                r.label(),
-                b.payload_bytes() as f64 / 1e6
-            )
+            format!("{} {:.1}M", r.label(), b.payload_bytes() as f64 / 1e6)
         })
         .collect();
     if !baselines.is_empty() {
@@ -124,4 +119,3 @@ pub fn print_table(reports: &[SystemReport]) {
          compare within one."
     );
 }
-

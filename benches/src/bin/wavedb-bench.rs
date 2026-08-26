@@ -17,16 +17,25 @@
 
 use std::process::ExitCode;
 
-
-use wavedb_bench::systems::{Cfg, Durability, SystemReport};
 use wavedb_bench::cli::{Options, USAGE};
+use wavedb_bench::systems::shop::ShopCfg;
+use wavedb_bench::systems::{Cfg, Durability, SystemReport};
 use wavedb_bench::tables::{print_shop_table, print_table};
-use wavedb_bench::systems::shop::{PHASES, ShopCfg};
 use wavedb_bench::{host, report, systems};
 
 /// Above this 1-minute load average the machine is too busy to record on. A
 /// slow row that a future bisect blames on a commit is worse than no row.
 const NOISE_LIMIT: f64 = 1.0;
+
+/// Above this share of used data block groups, btrfs stops finding contiguous
+/// free extents and starts carving new chunks, and a write-heavy row measures
+/// the allocator rather than the database. Measured on one machine at 96%: the
+/// same 8 000-user fill took **59 s and 1 297 s**, nothing else changed.
+///
+/// The same reasoning as [`NOISE_LIMIT`], applied to the other shared
+/// resource. `df` will not warn you — it reports the device's free space,
+/// while this is the fill of the groups already allocated.
+const FILL_LIMIT: f64 = 0.90;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -64,15 +73,21 @@ fn run(opts: &Options) -> Result<(), String> {
         seed_mongodb: opts.seed_mongodb.clone(),
     };
 
+    // Before the probe: the scope is created loose so fills get the machine,
+    // and the lane must be keyed by the budget the *numbers* ran under.
+    wavedb_bench::cage::init();
     let host = host::Host::probe(&work_dir);
     let prov = report::Provenance::probe(&opts.repo);
     eprintln!(
-        "host {} · {}/{} cpus · {} GiB cap · {} · {}",
+        "host {} · {}/{} cpus · {} MiB cap · {} · {}",
         host.key,
         host.cpu_budget,
         host.cores,
-        host.mem_budget / (1 << 30),
-        host.filesystem,
+        host.mem_budget / (1 << 20),
+        match host.data_fill {
+            Some(f) => format!("{} {:.0}% full", host.filesystem, f * 100.0),
+            None => host.filesystem.clone(),
+        },
         if prov.dirty {
             "dirty tree"
         } else {
@@ -84,13 +99,26 @@ fn run(opts: &Options) -> Result<(), String> {
         cfg.rows, cfg.reads, cfg.updates, cfg.seed
     );
 
+    // Checked *before* the work, unlike the load guard: a benchmark only ever
+    // writes, so this number cannot improve while one is running. Waiting for
+    // the end would learn nothing and burn the whole pass first — at the
+    // default sizes, on a filesystem in this state, that is days.
+    if let Some(fill) = host.data_fill
+        && fill > FILL_LIMIT
+        && !opts.force
+        && !opts.quick
+    {
+        return Err(fill_refusal(fill));
+    }
+
     let mut reports = Vec::new();
     if opts.workload != "shop" {
         run_micro(opts, &cfg, &mut reports)?;
     }
+    let shop_cfg = shop_cfg(opts, &work_dir);
     let mut shop = Vec::new();
     if opts.workload != "micro" {
-        run_shop(opts, &work_dir, &mut shop)?;
+        run_shop(opts, &shop_cfg, &mut shop)?;
     }
     if reports.is_empty() && shop.is_empty() {
         return Err("--only matched no system".into());
@@ -123,12 +151,25 @@ fn run(opts: &Options) -> Result<(), String> {
         ));
     }
     let results = opts.repo.join("benches/results");
-    let path = report::write(&results, &cfg, &host, &prov, &reports)?;
+    let path =
+        report::write(&results, &cfg, &shop_cfg, &host, &prov, &reports)?;
     println!("\nrecorded {}", path.display());
     if prov.dirty {
         println!("  marked dirty: this run measured uncommitted code.");
     }
     Ok(())
+}
+
+fn fill_refusal(fill: f64) -> String {
+    format!(
+        "btrfs data block groups are {:.1}% full (limit {:.0}%) — refusing to \
+         run: past this the allocator, not the database, sets the write times. \
+         `df` will disagree; it reports device free space, not the fill of the \
+         groups already allocated. Free space or point the run at another \
+         filesystem (--force to override, --quick to smoke-test anyway)",
+        fill * 100.0,
+        FILL_LIMIT * 100.0
+    )
 }
 
 /// The three server adapters share one signature, so the loop over them can be
@@ -173,13 +214,11 @@ fn run_micro(
     Ok(())
 }
 
-/// The e-commerce workload: composed operations, reported as latency.
-fn run_shop(
-    opts: &Options,
-    work_dir: &std::path::Path,
-    out: &mut Vec<SystemReport>,
-) -> Result<(), String> {
-    let cfg = ShopCfg {
+/// Built once, outside [`run_shop`], because the recorded result needs it even
+/// when `--workload micro` ran nothing: a corpus row that omits its sizes is a
+/// number nobody can reproduce.
+fn shop_cfg(opts: &Options, work_dir: &std::path::Path) -> ShopCfg {
+    ShopCfg {
         users: opts.users,
         orders_max: opts.orders_max,
         items_max: opts.items_max,
@@ -190,7 +229,15 @@ fn run_shop(
         detail_reads: opts.detail_reads,
         seed: opts.seed,
         work_dir: work_dir.to_path_buf(),
-    };
+    }
+}
+
+/// The e-commerce workload: composed operations, reported as latency.
+fn run_shop(
+    opts: &Options,
+    cfg: &ShopCfg,
+    out: &mut Vec<SystemReport>,
+) -> Result<(), String> {
     eprintln!(
         "\nshop: {} users · {} signups · {} checkouts · {} profile / {} page / \
          {} detail reads\n",
@@ -202,14 +249,14 @@ fn run_shop(
         cfg.detail_reads
     );
     if opts.wants("wavedb") {
-        take(out, "shop wavedb", systems::shop::wavedb::run(&cfg))?;
+        take(out, "shop wavedb", systems::shop::wavedb::run(cfg))?;
     }
     if opts.wants("sqlite") {
         for d in [Durability::Durable, Durability::Relaxed] {
             take(
                 out,
                 &format!("shop sqlite/{}", d.name()),
-                systems::shop::sqlite::run(&cfg, d),
+                systems::shop::sqlite::run(cfg, d),
             )?;
         }
     }
@@ -223,7 +270,7 @@ fn run_shop(
             continue;
         }
         for d in [Durability::Durable, Durability::Relaxed] {
-            take(out, &format!("shop {name}/{}", d.name()), run(&cfg, d))?;
+            take(out, &format!("shop {name}/{}", d.name()), run(cfg, d))?;
         }
     }
     Ok(())
