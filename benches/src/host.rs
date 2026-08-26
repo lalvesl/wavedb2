@@ -31,6 +31,11 @@ pub struct Host {
     /// `None` off btrfs. Deliberately **not** in the host key: it changes
     /// between runs on one machine, so it is a guard and a recorded fact, not
     /// a lane.
+    ///
+    /// `None` **while `filesystem == "btrfs"`** means the probe failed, which
+    /// is not the same thing as "no risk" — it is "the guard is blind". Say so
+    /// wherever this is displayed or recorded; the first version of this probe
+    /// failed exactly that way and the guard never fired.
     pub data_fill: Option<f64>,
     /// `<cpu-slug>-<budget>c-<budget>g-<fs>-<hash4>` — the lane identity. The
     /// budgets are in it on purpose: a caged run and an uncaged one on the same
@@ -199,16 +204,36 @@ fn mount_of(dir: &Path) -> Option<(String, String)> {
 /// measurement of the allocator's mood: the same 8 000-user fill measured
 /// 59 s and 1 297 s on one machine, with nothing about the benchmark changed.
 ///
-/// `None` when `dir` is not on btrfs, or the sysfs interface is absent.
+/// `None` when `dir` is not on btrfs — see [`Host::data_fill`] for what a
+/// `None` on btrfs would mean and why it must not happen silently.
 fn data_fill(dir: &Path) -> Option<f64> {
     let (dev, kind) = mount_of(dir)?;
     if kind != "btrfs" {
         return None;
     }
-    let name = Path::new(&dev).file_name()?.to_str()?.to_string();
+    // Match the filesystem by the device's **number**, not its name. The
+    // mount's device is whatever `/proc/mounts` recorded — commonly a
+    // `/dev/mapper/*` symlink under LUKS or LVM — while sysfs lists the
+    // kernel name (`dm-0`). Comparing basenames silently found nothing here,
+    // and a guard that finds nothing is a guard that never fires.
+    let rdev = std::fs::metadata(Path::new(&dev).canonicalize().ok()?)
+        .ok()?
+        .rdev();
+    let want = format!("{}:{}", libc_major(rdev), libc_minor(rdev));
     for entry in std::fs::read_dir("/sys/fs/btrfs").ok()?.flatten() {
         let fs = entry.path();
-        if !fs.join("devices").join(&name).exists() {
+        // `/sys/fs/btrfs` holds a `features/` directory beside the per-uuid
+        // ones, and it has no `devices/`. `?` here would abandon the whole
+        // probe on reaching it — order-dependently, since `read_dir` promises
+        // none. `continue` is the difference between a guard and a coin flip.
+        let Ok(listed) = std::fs::read_dir(fs.join("devices")) else {
+            continue;
+        };
+        if !listed
+            .flatten()
+            .map(|d| read_trim(d.path().join("dev")))
+            .any(|n| n == want)
+        {
             continue;
         }
         let alloc = fs.join("allocation/data");

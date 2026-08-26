@@ -99,7 +99,7 @@ impl Options {
             seed_mongodb: std::env::var_os("BENCH_SEED_MONGODB")
                 .map(Into::into),
             workload: "both".into(),
-            users: 200_000,
+            users: 20_000,
             orders_max: 20,
             items_max: 5,
             signups: 100,
