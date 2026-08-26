@@ -214,7 +214,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   pre-building the checkpoint window between checkpoints (a page image depends
   on its bucket's full contents and on a zstd dictionary that is not final until
   the round closes);
-  [0058](0058-per-type-actors-PLANNED-LOW.md) — the concurrency the two above ran
+  [0058](0058-per-type-actors-DEPRECATED.md) — the concurrency the two above ran
   into: `drain`/`settle`/`commit_journal` are synchronous `fn`s on a
   current-thread runtime, so a checkpoint blocks the request path by occupying
   the only thread — and that single-threadedness is *silently* supplying two
@@ -238,8 +238,9 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   `Sync`, by contrast, mostly *disappears*, and that is the actor's doing rather
   than `Send`'s: actors own instead of sharing, so the locks that exist only to
   satisfy `Sync` on a `static` stop existing rather than stop contending.
-  **Parked 2026-08-04 at low priority, status Planning rather than Planned** —
-  the design is not accepted and the planning is unfinished. The gate it fails:
+  **Parked 2026-08-04, then deprecated outright 2026-08-22** (see 0064 below;
+  the file is reduced to what it proposed, why it lost, and what survived). The
+  gate it fails:
   the engine must be able to run as **one actor on one thread** (the wasm
   target), and "N actors as N tasks on one worker" is a different execution
   model, not that one — the degenerate case is where the failures live and it
@@ -287,7 +288,51 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   `owner_of` is deleted. Five construction sites outside tests, every one of
   which already had the hash in hand. `Write` is a wire type — journal layout
   changes, free under the pre-release policy, and it folds into no
-  `STRUCT_HASH`, so no schema breaks;
+  `STRUCT_HASH`, so no schema breaks.
+  **[0064](0064-pivot-owned-concurrency-PLANNED.md)** *(Planned, opened
+  2026-08-22)* then settled the unit, which is what 0058 had got wrong and 0063
+  had deferred to an elaboration: **the unit of concurrency is the Pivot
+  instance, not the type.** It was invisible because four documents claimed a
+  Pivot is created "one per tenant per type" — the API imposes no such limit
+  (`create_pivot::<T>()` is just `Collection::<T>::create`) and the shop
+  workload nests one `Product` collection per `Shopping`, so a type has as many
+  collections as it has holders. Two collections of one type share *nothing*:
+  Pivot record, B+tree roots, recency/dead chains and list segments are all
+  their own; only the items inside one collection are inherently serial,
+  because those really do share a tree. Everything expensive then falls away.
+  There is **no hot-type ceiling** (the busiest type in the shop is one owner
+  per order, not one owner); **no balancer** (`shard = hash(pivot_id) % N` is
+  uniform because the units are millions, so it is a function rather than a
+  routing table — nothing splits, nothing migrates); and **no `Lane::Tree` and
+  therefore no `STRUCT_HASH` break**, because ownership need not follow storage
+  partitioning: the disk sits behind a single owner regardless, so the one
+  global `BPTREE_NODE_STORAGE` slot costs nothing and only the **caches** need
+  repartitioning — cache by owner, page directory by type, two axes free to
+  differ. The hierarchy is one scheme at three grains (tenant → pivot instance →
+  serial), so distributed sharding later is a *coarsening* rather than a second
+  design. A writer actor owns the journal (group commit) and a reader actor owns
+  `data.bin` — single ownership being what makes block de-duplication possible,
+  and the natural home for the [0044](0044-page-cache-PLANNED-LOW.md) page cache
+  and for zstd, following the actual Redis lesson (*one thread owns the data
+  structure; everything that is not data-structure mutation leaves it* — Redis 6
+  moved I/O off the core, it was never one thread doing everything). Routing is
+  verified against `Command`: `Insert`/`All`/`Listed`/`ListLen`/`Changes` carry
+  the pivot, Unique ops route by `(tenant, STRUCT_HASH)`, and `Get`/`Update`/
+  `Remove` carry only an `Id` — the same "an `Id` names no type" shape as A2,
+  resolved by the read actor reading `Metadata.pivot_id` (`record_pivot`) before
+  routing, which moves a decode off the owner thread rather than adding one.
+  Request/reply is `await`, not a synchronous message, so 0058's deadlock
+  surface disappears; `Rc` survives and **the engine does not become `Send`** —
+  only the disk actors' message types do. The compile-time single/multi switch is
+  just `N`: one shard with inlined disk actors (today, and wasm) or N pinned
+  `current_thread` runtimes — tokio's *work-stealing scheduler* is what to
+  avoid, not tokio, since stealing migrates tasks and destroys the locality the
+  design exists for. It also dissolves 0063's I1 (a batch belongs to one owner,
+  so it is atomic by ownership — no seqlock, no staged publish), leaves I2
+  untouched, and leaves 0063 Parts 1–3 standing as the next executable step. Its
+  own open question is the settle path, which straddles the boundary: `plan_slot`
+  reads owner-side caches and writes storage-side pages and the type's zstd
+  dictionary;
   [0045](0045-vector-search-PLANNED.md) — nearest-neighbour search as a
   declared index kind (IVF over the existing `BpTree`, per-tenant centroids);
   [0056](0056-fuzzy-string-search-WIP.md) *(engine side landed 2026-08-01;
@@ -514,11 +559,15 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0052](0052-segment-size-as-the-pagination-unit.md) | Segment size as the pagination unit | Implemented |
 | [0053](0053-tenant-fair-cache-retention-PLANNED.md) | Tenant-fair cache retention | Planned |
 | [0054](0054-no-duplication-by-default.md) | No duplication by default | Implemented |
+| [0055](0055-sparse-index-merge-PLANNED-LOW.md) | Sparse-index merge and root collapse | Planned (low) |
+| [0056](0056-fuzzy-string-search-WIP.md) | Fuzzy string search | In progress |
+| [0057](0057-page-arena-and-checkpoint-staging.md) | The page arena and checkpoint staging | Planned |
 | [0059](0059-object-storage-capacity-tier-PLANNED.md) | Object storage as the capacity tier | Planned |
 | [0060](0060-comparative-benchmark-suite.md) | Comparative benchmark suite (vs MongoDB/PostgreSQL/MySQL/SQLite) | Partial |
 | [0061](0061-relaxed-durability-window.md) | Relaxed durability: a group-commit window | Implemented |
 | [0062](0062-relaxed-mode-refinements-PLANNED.md) | Relaxed mode refinements | Planned |
 | [0063](0063-engine-yield-map-and-interruptible-engine-PLANNED.md) | The yield map, and an interruptible engine | Planned |
+| [0064](0064-pivot-owned-concurrency-PLANNED.md) | Pivot-owned concurrency | Planned |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |
@@ -532,6 +581,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0031](0031-node-per-page-bptree-DEPRECATED.md) | One-node-per-page B+tree format | [0011](0011-bptree-index-and-collections.md) |
 | [0032](0032-node-side-poll-buffer-DEPRECATED.md) | Node-side stateful poll buffer | [0022](0022-live-sync-navigation-catchup.md) |
 | [0033](0033-cold-history-slow-node-tier-DEPRECATED.md) | Cold/history slow-node tier | removed |
+| [0058](0058-per-type-actors-DEPRECATED.md) | Per-type actors, and a `Send` engine | [0064](0064-pivot-owned-concurrency-PLANNED.md) (the unit) + [0063](0063-engine-yield-map-and-interruptible-engine-PLANNED.md) (the motivation) |
 
 ## Status vocabulary
 
