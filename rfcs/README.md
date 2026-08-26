@@ -305,8 +305,10 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   fingerprint (rows compare only within one machine lane), the WaveDB SHA and the
   seed store paths, making a regression bisectable. The rest is what makes the
   numbers mean anything: **durability** is a row dimension, not a setting (WaveDB
-  `fsync`s once per op and has *no* relaxed mode to offer — `append_deferred` is
-  the checkpoint's, not a caller's), and **transport** is two brackets never merged
+  `fsync`s once per op by default; the relaxed row the first pass had no way to
+  offer is now a `StoreOptions` argument —
+  [0061](0061-relaxed-durability-window.md) — and still to be wired into the
+  adapters), and **transport** is two brackets never merged
   (engine vs SQLite in-process; `quick-node` vs Mongo/PG/MySQL over sockets). This
   pass compares **without history on the other side** by decision: WaveDB retains
   every version ([0009](0009-anchors-succession-and-history.md)) and they retain
@@ -356,6 +358,23 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   MySQL's redo+binlog 150 MB — configuration, not data), and the **empty-system
   baseline** is recorded as a correction term (an empty PostgreSQL is ~24 MB of
   catalogs, an empty MySQL ~55 MB).
+- **The relaxed row exists now, landed 2026-08-21 —
+  [0061](0061-relaxed-durability-window.md) *(Implemented)*:** the measurement
+  above showed the write cost is the **barrier, not the bytes** (SQLite pays
+  84.7 kB per durable insert of a 255-byte record against WaveDB's 101.6 kB —
+  the same number, because an `fsync` on btrfs costs ~85–100 kB whatever the
+  database), and that the same SQLite goes 36× faster by not syncing per
+  operation. `PageStore::open_with(.., StoreOptions { relax_window })` buys
+  that: `apply` appends without a barrier and syncs once per elapsed window,
+  one branch under the journal lock the write path already held — no timer, no
+  flusher task, nothing new on disk. **Default zero**, so every existing caller
+  keeps one barrier per batch; `flush()` forces it for the write that needs the
+  stronger answer. A crash inside the window loses a *suffix* of acknowledged
+  writes and never corrupts, which is `synchronous_commit=off`'s bargain and
+  the reason it is offerable at all. The refinements it left out —
+  bounded loss when a store goes quiet, `fdatasync`, per-write strength, a
+  relaxed client cache — are
+  [0062](0062-relaxed-mode-refinements-PLANNED.md).
 - **Deferred (low priority):**
   [0036](0036-offline-write-queue-PLANNED-LOW.md) — W8 offline write queue
   (slice 1, Unique offline, *shipped*; the NonUnique/durable/conflict-surface
@@ -457,7 +476,8 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0054](0054-no-duplication-by-default.md) | No duplication by default | Implemented |
 | [0059](0059-object-storage-capacity-tier-PLANNED.md) | Object storage as the capacity tier | Planned |
 | [0060](0060-comparative-benchmark-suite.md) | Comparative benchmark suite (vs MongoDB/PostgreSQL/MySQL/SQLite) | Partial |
-| [0061](0061-relaxed-durability-window-PLANNED.md) | Relaxed durability: a group-commit window | Planned |
+| [0061](0061-relaxed-durability-window.md) | Relaxed durability: a group-commit window | Implemented |
+| [0062](0062-relaxed-mode-refinements-PLANNED.md) | Relaxed mode refinements | Planned |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |

@@ -143,7 +143,9 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
 - **wavedb-storage** — the node engine behind `Store`: `data.bin` (4 KiB blocks,
   superblock in block 0), per-STRUCT_HASH linear-hashed page directories, `SlotPage`
   (checked-wire envelope, per-type zstd dictionaries with version = prefix length),
-  journal-first WAL (append + cache commit under the journal lock = the atomic unit),
+  journal-first WAL (append + cache commit under the journal lock = the atomic unit;
+  one barrier per batch by default, or one per elapsed `StoreOptions::relax_window`
+  — RFC 0061, `flush()` forces it),
   replay on open. Per-type state is compile-time (`StructStorage` statics) —
   consequence: **one open `PageStore` per process** (`EngineBusy`); tests serialize
   via an `engine_gate()` mutex and integration tests use a single `#[tokio::test]`.

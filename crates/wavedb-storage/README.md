@@ -447,6 +447,14 @@ several operations as one unit — remain a separate, later concern.)
 caches, and queues the touched ids. Nothing else reaches the disk on that path,
 and how many records a batch carries changes its size, not its IO count.
 
+A store opened with a **durability window** (`StoreOptions { relax_window }`,
+[RFC 0061](../../rfcs/0061-relaxed-durability-window.md)) keeps the one write
+and drops the per-batch barrier: `apply` appends without `fsync` and syncs once
+per elapsed window, so a burst amortises to a single barrier. `Ok` then means
+*journalled, ordered, and durable within the window* — a crash loses a suffix
+of acknowledged writes and never corrupts. `PageStore::flush` forces the
+barrier. **Default zero**: one barrier per batch, unchanged.
+
 **Per settle round: one write, no barrier.** The pending ids are grouped by
 bucket, each touched page is read **once**, and every resulting image is placed
 in **one contiguous window** and written with a single positioned write
