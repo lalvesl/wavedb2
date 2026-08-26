@@ -21,6 +21,21 @@
     clippy::needless_pass_by_value
 )]
 
+/// The durability window every **fill** in this suite opens its WaveDB store
+/// with (RFC 0061) — and no measured phase ever does.
+///
+/// A fill is not a measurement, and one op is one batch is one barrier, so a
+/// durable fill of a few million records is a few million `fsync`s: the reason
+/// the WaveDB seed took minutes where the others took seconds, and the reason
+/// a 200 000-user shop preload was not affordable at all. Every measured store
+/// reopens at the default (one barrier per batch), so this buys build time and
+/// changes no number in either table. The other four systems get the same
+/// courtesy under different names — `.import`, `\copy`, `LOAD DATA` and
+/// `mongoimport` are not the per-statement commit path either.
+pub const FILL_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(200);
+
+pub mod cage;
 pub mod cli;
 pub mod footprint;
 pub mod host;
@@ -30,5 +45,5 @@ pub mod report;
 pub mod schema;
 pub mod seed;
 pub mod shop;
-pub mod tables;
 pub mod systems;
+pub mod tables;

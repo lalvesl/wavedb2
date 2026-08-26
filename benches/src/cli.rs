@@ -5,7 +5,6 @@
 
 use std::path::PathBuf;
 
-
 pub struct Options {
     pub rows: u64,
     pub reads: u64,
@@ -100,12 +99,12 @@ impl Options {
             seed_mongodb: std::env::var_os("BENCH_SEED_MONGODB")
                 .map(Into::into),
             workload: "both".into(),
-            users: 20_000,
+            users: 200_000,
             orders_max: 20,
             items_max: 5,
             signups: 100,
             checkouts: 200,
-            profile_reads: 2000,
+            profile_reads: 10_000,
             page_reads: 1000,
             detail_reads: 1000,
             only: Vec::new(),
