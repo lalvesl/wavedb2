@@ -105,7 +105,11 @@ pub fn user_row(u: u64, seed: u64) -> UserRow {
     let mut rng = rng_for(seed, 0x5EED_0001, u, 0, 0);
     UserRow {
         name: format!("customer-{u:08}"),
-        address: format!("{} street, no {}", CITIES[pick(&mut rng, CITIES)], rng.below(9999)),
+        address: format!(
+            "{} street, no {}",
+            CITIES[pick(&mut rng, CITIES)],
+            rng.below(9999)
+        ),
         city: CITIES[pick(&mut rng, CITIES)].into(),
         email: format!("customer-{u:08}@example.test"),
     }

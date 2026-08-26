@@ -45,6 +45,7 @@ impl Provenance {
 pub fn write(
     results_dir: &Path,
     cfg: &Cfg,
+    shop: &crate::systems::shop::ShopCfg,
     host: &Host,
     prov: &Provenance,
     reports: &[SystemReport],
@@ -54,7 +55,7 @@ pub fn write(
     let name = format!("{}-{}.json", prov.timestamp, prov.git_sha);
     let path = lane.join(&name);
 
-    std::fs::write(&path, record(cfg, host, prov, reports))
+    std::fs::write(&path, record(cfg, shop, host, prov, reports))
         .map_err(|e| format!("write record: {e}"))?;
     append_index(results_dir, host, prov, reports)?;
     Ok(path)
@@ -62,6 +63,7 @@ pub fn write(
 
 fn record(
     cfg: &Cfg,
+    shop: &crate::systems::shop::ShopCfg,
     host: &Host,
     prov: &Provenance,
     reports: &[SystemReport],
@@ -90,6 +92,12 @@ fn record(
                 None => j.str("rotational", "unknown"),
             }
             j.boolean("virtualised", host.virtualised);
+            // Recorded, never keyed: it moves between runs on one machine.
+            // A row that looks slow is readable only beside this.
+            match host.data_fill {
+                Some(f) => j.ratio("data_block_group_fill", f),
+                None => j.str("data_block_group_fill", "n/a (not btrfs)"),
+            }
         });
         j.obj(Some("workload"), |j| {
             j.num("rows", cfg.rows);
@@ -98,6 +106,21 @@ fn record(
             j.num("seed", cfg.seed);
             j.str("access", "uniform random over the key space");
             j.str("os_page_cache_on_cold_read", "warm");
+        });
+        // The shop sizes, recorded for the same reason `rows` is: a row that
+        // does not say how much data it ran against is a number nobody can
+        // reproduce or compare. Without this a `--users 8000` calibration and
+        // a full `--users 200000` pass land in the corpus indistinguishable.
+        j.obj(Some("shop_workload"), |j| {
+            j.num("users", shop.users);
+            j.num("orders_max", shop.orders_max);
+            j.num("items_max", shop.items_max);
+            j.num("live_records", shop.live_records());
+            j.num("signups", shop.signups);
+            j.num("checkouts", shop.checkouts);
+            j.num("profile_reads", shop.profile_reads);
+            j.num("page_reads", shop.page_reads);
+            j.num("detail_reads", shop.detail_reads);
         });
         j.arr(Some("systems"), |j| {
             for r in reports {

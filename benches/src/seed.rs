@@ -62,8 +62,18 @@ pub fn fill_wavedb(dir: &Path, rows: u64, seed: u64) -> Result<(), String> {
     let data = dir.join("data");
     std::fs::create_dir_all(&data).map_err(|e| format!("mkdir: {e}"))?;
 
-    let store = PageStore::open(&data, &Thing::storage_entries())
-        .map_err(|e| format!("open: {e}"))?;
+    // A fill, not a measurement: the durability window (RFC 0061) turns one
+    // `fsync` per row into one per elapsed window. The measured store reopens
+    // at the default — `systems::wavedb::open` — so no recorded number is
+    // taken against a relaxed engine. See `crate::FILL_WINDOW`.
+    let store = PageStore::open_with(
+        &data,
+        &Thing::storage_entries(),
+        wavedb_storage::StoreOptions {
+            relax_window: crate::FILL_WINDOW,
+        },
+    )
+    .map_err(|e| format!("open: {e}"))?;
     let db = LocalHandle::new(&store, U48::from(TENANT));
     let pivot = block_on(Thing::create_pivot(&db))
         .map_err(|e| format!("create_pivot: {e}"))?;
