@@ -36,7 +36,7 @@ impl<'a, S: Store> Overlay<'a, S> {
                 Write::Put(id, bytes) => {
                     self.pending.insert(id.raw(), Some(bytes.clone()));
                 }
-                Write::Remove(id) => {
+                Write::Remove(_, id) => {
                     self.pending.insert(id.raw(), None);
                 }
                 // A guard is not state — nothing to stage.

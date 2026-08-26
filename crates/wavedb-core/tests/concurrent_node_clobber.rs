@@ -67,7 +67,7 @@ impl<const YIELDS: bool> Store for Backend<YIELDS> {
     async fn apply(&self, batch: &[Write]) -> Result<()> {
         let mut m = self.0.lock().unwrap();
         for w in batch {
-            if let Write::Expect(id, expected) = w
+            if let Write::Expect(_, id, expected) = w
                 && m.get(&id.raw()) != expected.as_ref()
             {
                 return Err(wavedb_core::Error::Conflict(*id));
@@ -78,7 +78,7 @@ impl<const YIELDS: bool> Store for Backend<YIELDS> {
                 Write::Put(id, b) => {
                     m.insert(id.raw(), b.clone());
                 }
-                Write::Remove(id) => {
+                Write::Remove(_, id) => {
                     m.remove(&id.raw());
                 }
                 Write::Expect(..) => {}

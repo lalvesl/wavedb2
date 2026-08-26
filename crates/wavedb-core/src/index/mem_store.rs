@@ -45,7 +45,7 @@ impl Store for MemStore {
         // Guards validate against the pre-batch state; any mismatch refuses
         // the whole batch before a single write lands.
         for w in batch {
-            if let Write::Expect(id, expected) = w
+            if let Write::Expect(_, id, expected) = w
                 && m.get(&id.raw()) != expected.as_ref()
             {
                 return Err(crate::error::Error::Conflict(*id));
@@ -56,7 +56,7 @@ impl Store for MemStore {
                 Write::Put(id, b) => {
                     m.insert(id.raw(), b.clone());
                 }
-                Write::Remove(id) => {
+                Write::Remove(_, id) => {
                     m.remove(&id.raw());
                 }
                 Write::Expect(..) => {}

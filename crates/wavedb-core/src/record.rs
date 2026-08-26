@@ -222,7 +222,7 @@ pub(crate) async fn plan_chained_save<V: WaveWire, S: Store>(
             ..Metadata::default()
         });
         let writes = vec![
-            Write::Expect(plan.live_id, None),
+            Write::Expect(plan.hash, plan.live_id, None),
             Write::Put(plan.live_id, encode_record(plan.hash, &meta, value)),
         ];
         return Ok((writes, None, meta));
@@ -254,7 +254,11 @@ pub(crate) async fn plan_chained_save<V: WaveWire, S: Store>(
         return Err(Error::ChainCorrupt(plan.live_id));
     };
 
-    let mut writes = vec![Write::Expect(plan.live_id, Some(old_bytes.clone()))];
+    let mut writes = vec![Write::Expect(
+        plan.hash,
+        plan.live_id,
+        Some(old_bytes.clone()),
+    )];
     // Archive the superseded version byte-for-byte at its derived slot,
     // its forward link stamped with the successor's instant — written once,
     // correct forever (the successor's own archival derives the same slot

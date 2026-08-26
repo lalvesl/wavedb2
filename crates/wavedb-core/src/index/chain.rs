@@ -506,7 +506,7 @@ impl<P: WaveWire> Chain<P> {
         writes: &mut Vec<Write>,
         id: LocalId,
     ) {
-        let write = Write::Remove(id.to_id(self.tenant));
+        let write = Write::Remove(self.lane_hash, id.to_id(self.tenant));
         view.stage(core::slice::from_ref(&write));
         writes.push(write);
     }

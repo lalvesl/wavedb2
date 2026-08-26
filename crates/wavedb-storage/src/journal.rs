@@ -354,6 +354,9 @@ mod tests {
         Id::new(key, U48::from(1u32), false, key as u16)
     }
 
+    /// The journal frames bytes; it never routes, so any hash serves.
+    const SH: u64 = 0xABCD;
+
     fn batch(frames: &[Write]) -> JournalFrame {
         JournalFrame::Batch(frames.to_vec())
     }
@@ -367,7 +370,7 @@ mod tests {
                 Write::Put(id(1), vec![1, 2, 3]),
                 Write::Put(id(2), vec![4]),
             ]))?;
-            j.append(&batch(&[Write::Remove(id(1))]))?;
+            j.append(&batch(&[Write::Remove(SH, id(1))]))?;
         }
         let (ts, path) = scan(d.path())?.pop().unwrap();
         assert_eq!(ts, 7);
@@ -380,7 +383,7 @@ mod tests {
                     Write::Put(id(1), vec![1, 2, 3]),
                     Write::Put(id(2), vec![4])
                 ]),
-                batch(&[Write::Remove(id(1))]),
+                batch(&[Write::Remove(SH, id(1))]),
             ]
         );
         Ok(())

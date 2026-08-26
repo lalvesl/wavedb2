@@ -80,7 +80,7 @@ impl IdbStore {
                         )
                         .map_err(|e| backend("put", &e))?;
                 }
-                Write::Remove(id) => {
+                Write::Remove(_, id) => {
                     store
                         .delete(&Self::key(*id).into())
                         .map_err(|e| backend("delete", &e))?;
@@ -120,7 +120,7 @@ impl Store for IdbStore {
         // apply the writes — the transaction holds the store, so
         // check-then-write is atomic.
         for w in batch {
-            if let Write::Expect(id, expected) = w {
+            if let Write::Expect(_, id, expected) = w {
                 let request = store
                     .get(&Self::key(*id).into())
                     .map_err(|e| backend("get", &e))?;

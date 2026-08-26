@@ -241,7 +241,7 @@ impl<K: NodeKey> BpTree<K> {
 
     /// A `Remove` write freeing `node` under this tenant.
     pub(super) fn remove_node(&self, node: LocalId) -> Write {
-        Write::Remove(node.to_id(self.tenant))
+        Write::Remove(BPTREE_NODE_STRUCT_HASH, node.to_id(self.tenant))
     }
 }
 

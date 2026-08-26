@@ -277,7 +277,8 @@ impl SparseTree {
                 None => {
                     // Covers nothing: drop the entry naming it and delete the
                     // value, so a shrinking index leaks no nodes.
-                    writes.push(Write::Remove(id.to_id(self.tenant)));
+                    let node_id = id.to_id(self.tenant);
+                    writes.push(Write::Remove(self.lane_hash, node_id));
                     entries.remove(frame.idx);
                 }
                 Some(first) => {
