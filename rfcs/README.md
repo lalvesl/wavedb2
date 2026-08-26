@@ -247,7 +247,39 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   deadlock surface, `Lane::Tree` charges a `STRUCT_HASH` break for a concurrency
   refactor, and every performance number in it is an estimate. What survives is
   the *motivation* — the synchronous `fn`s on the request path and the two
-  invariants single-threadedness silently supplies, documented nowhere else;
+  invariants single-threadedness silently supplies, documented nowhere else.
+  **Its successor is
+  [0063](0063-engine-yield-map-and-interruptible-engine-PLANNED.md)** *(Planned,
+  opened 2026-08-21)*, which takes that gate seriously and reaches two findings,
+  the second contradicting the word "actor" in it. **First, a prior question:
+  where may the engine give up its thread?** Today, nowhere —
+  `wavedb-storage` has no await point at all, so any scheduling scheme wrapped
+  around it is that code plus overhead. So 0063 is first a **map**: every
+  blocking site, what it blocks on, under which locks — and then the design
+  content, which of those sites the engine may legally be *observed* at, because
+  a yield point is a visibility commitment rather than a performance knob.
+  Yielding is illegal inside `apply_inner`'s journal-lock section (it would
+  expose half a batch), inside `place_in` (the window must not be handed out
+  twice), and inside `evict_settled` (it quiesces writers on purpose); it is
+  legal between `drain`'s rounds, the one point wasm needs and where a checkpoint
+  stops being a stall. **Second, the base case is not an actor**: a mailbox is
+  not what makes a yield point safe (the map is), and the engine is not missing
+  an executor — tokio and `wasm_bindgen_futures` already are one. What it lacks
+  is **interruptibility**, i.e. await points inside its own long-running work, so
+  a message loop in front of a single-threaded engine whose locks never contend
+  re-implements the scheduler underneath it. 0058 had filed exactly this as an
+  unresolved gap (*"the per-type state separation buys nothing and costs a
+  routing layer"*); the resolution is removal. An actor is about **ownership
+  across threads** — `RwLock<BTreeMap>` becoming `BTreeMap` — which is real when
+  there are threads to share between and worth nothing on one, so it belongs to
+  the elaboration. The base case is therefore `drain` becoming re-entrant, a
+  macrotask yield on wasm, and nothing else: no mailbox, no `Send` migration, no
+  `MaybeSend` seam, no `Lane::Tree` and therefore **no `STRUCT_HASH` break**.
+  Falling out of the map, and wrong on one thread too: **every guarded write does
+  a full-slot disk scan under the journal lock** — `apply_inner` validates each
+  `Write::Expect` by calling `read_any` *inside* the lock, and `Expect(id, None)`
+  (the guard on every first save) matches nothing, so it preads and zstd-decodes
+  once per registered type while no other write can proceed;
   [0045](0045-vector-search-PLANNED.md) — nearest-neighbour search as a
   declared index kind (IVF over the existing `BpTree`, per-tenant centroids);
   [0056](0056-fuzzy-string-search-WIP.md) *(engine side landed 2026-08-01;
@@ -478,6 +510,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0060](0060-comparative-benchmark-suite.md) | Comparative benchmark suite (vs MongoDB/PostgreSQL/MySQL/SQLite) | Partial |
 | [0061](0061-relaxed-durability-window.md) | Relaxed durability: a group-commit window | Implemented |
 | [0062](0062-relaxed-mode-refinements-PLANNED.md) | Relaxed mode refinements | Planned |
+| [0063](0063-engine-yield-map-and-interruptible-engine-PLANNED.md) | The yield map, and an interruptible engine | Planned |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |

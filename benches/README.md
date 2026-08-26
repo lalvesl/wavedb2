@@ -27,7 +27,7 @@ nix run .#bench -- --quick      # smoke pass, records nothing
 nix run .#bench -- --workload shop
 nix run .#bench -- --only wavedb,mongodb
 nix run .#bench -- --rows 1000000 --reads 200000 --updates 200000
-nix run .#bench -- --users 2000 --checkouts 500
+nix run .#bench -- --users 2000 --checkouts 500   # default is 200 000 users
 nix run .#bench -- --keep       # leave the scratch data dirs for inspection
 ```
 
@@ -45,16 +45,24 @@ machine instead of each inferring a different one from the host:
 | | |
 |---|---|
 | CPUs | **4**, via `taskset -c 0-3` |
-| Memory | **2 GiB**, via a `systemd-run --user --scope` cgroup (`MemoryMax`, `MemorySwapMax=0`) |
+| Memory | **500 MB**, via a `systemd-run --user --scope` cgroup (`MemoryMax`, `MemorySwapMax=0`) |
 | Namespace | `bwrap --dev-bind / / --unshare-pid` |
-| Server cache | **512 MB each**, pinned: `--wiredTigerCacheSizeGB 0.5`, `--innodb-buffer-pool-size=512M`, `shared_buffers=512MB` |
+| Server cache | **256 MB each**, pinned: `--wiredTigerCacheSizeGB 0.25`, `--innodb-buffer-pool-size=256M`, `shared_buffers=256MB` |
 
 Three things about that table are worth reading twice. **Bubblewrap caps
 nothing** — it is the namespace only; the limits are cgroups and affinity. The
 memory cap bounds the **page cache**, which is what makes a cold read actually
-cold instead of a memory read. And the server caches are pinned because each
-server sizes its cache from the *machine's* RAM rather than the cgroup's — an
-unpinned MongoDB asks for gigabytes it cannot have and is OOM-killed.
+cold instead of a memory read, and at 500 MB against a multi-gigabyte dataset
+it is what finally answers RFC 0060's "larger than RAM" question. And the
+server caches are pinned because each server sizes its cache from the
+*machine's* RAM rather than the cgroup's — an unpinned MongoDB asks for
+gigabytes it cannot have and is OOM-killed.
+
+256 MB is not a tuning choice: it is **MongoDB's floor**
+(`--wiredTigerCacheSizeGB` refuses less than 0.25), and equal budgets matter
+more than a smaller one, so the least-adjustable server sets the number for all
+three. Only one server runs at a time, so the cgroup holds one server plus the
+benchmark process.
 
 The budget is part of the **host key**, so a caged run and an uncaged one on the
 same hardware are different lanes. Both budgets are read back from the kernel
@@ -76,9 +84,17 @@ All five exist, including the three whose Rust adapters do not: the dataset is
 emitted once as TSV and each system loads that same file with its own bulk tool
 (`.import`, `\copy`, `LOAD DATA`, `mongoimport`) inside the builder, so those
 seeds are pinned and verified before the client code that will use them.
-Building the WaveDB seed takes minutes where the others take seconds — one
-insert is one batch is one `fsync`, and there is no bulk path. That is the
-group-commit gap seen from the build side.
+
+**Every fill opens WaveDB with a durability window** (`FILL_WINDOW`,
+[RFC 0061](../rfcs/0061-relaxed-durability-window.md)) — the Nix seed and the
+shop preload both. A fill is not a measurement, and one op is one batch is one
+`fsync`, so a durable fill of a few million records is a few million barriers:
+that is why the WaveDB seed used to take minutes where the others took seconds,
+and why a 200 000-user preload was not affordable at all. Every **measured**
+store reopens at the default, one barrier per batch, so no recorded number is
+taken against a relaxed engine. The other four get the same courtesy under
+other names — `.import`, `\copy`, `LOAD DATA` and `mongoimport` are not the
+per-statement commit path either.
 
 The MongoDB seed additionally needs **unprivileged user namespaces** on the
 build host: `mongod` aborts in the Nix sandbox (its tcmalloc `CHECK`s on
