@@ -576,6 +576,11 @@ carry no type today, so `owner_of`/`read_any` probe every slot — under actors
 that is a broadcast to N mailboxes. The caller always knows the type, so both
 variants should carry the `struct_hash`.
 
+**Landed 2026-08-21**, ahead of everything else here and for a stronger reason
+than the actors: RFC 0063's yield map found the same scan running *inside the
+journal lock*, which made it a live cost on one thread rather than a future
+cost under actors. Both variants now carry the hash, and `owner_of` is gone.
+
 ## What it costs
 
 **The state has to leave the statics.** This is the bulk of the work and it is

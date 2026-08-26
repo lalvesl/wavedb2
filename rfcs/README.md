@@ -275,11 +275,19 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   the elaboration. The base case is therefore `drain` becoming re-entrant, a
   macrotask yield on wasm, and nothing else: no mailbox, no `Send` migration, no
   `MaybeSend` seam, no `Lane::Tree` and therefore **no `STRUCT_HASH` break**.
-  Falling out of the map, and wrong on one thread too: **every guarded write does
-  a full-slot disk scan under the journal lock** — `apply_inner` validates each
-  `Write::Expect` by calling `read_any` *inside* the lock, and `Expect(id, None)`
-  (the guard on every first save) matches nothing, so it preads and zstd-decodes
-  once per registered type while no other write can proceed;
+  Falling out of the map, wrong on one thread too, and therefore **fixed the
+  same day**: every guarded write *did* a full-slot disk scan under the journal
+  lock — `apply_inner` validated each `Write::Expect` by calling `read_any`
+  *inside* the lock, and `Expect(id, None)` (the guard on every first save)
+  matches nothing, so it preaded and zstd-decoded once per registered type while
+  no other write could proceed. `Write::Remove` and `Write::Expect` now carry
+  the STRUCT_HASH they route by (`Put` does not — its bytes are already headed
+  with it), so a guard is one routed lookup whatever the schema's width,
+  committing a `Remove` reads no page, `commit_to_caches` became infallible and
+  `owner_of` is deleted. Five construction sites outside tests, every one of
+  which already had the hash in hand. `Write` is a wire type — journal layout
+  changes, free under the pre-release policy, and it folds into no
+  `STRUCT_HASH`, so no schema breaks;
   [0045](0045-vector-search-PLANNED.md) — nearest-neighbour search as a
   declared index kind (IVF over the existing `BpTree`, per-tenant centroids);
   [0056](0056-fuzzy-string-search-WIP.md) *(engine side landed 2026-08-01;

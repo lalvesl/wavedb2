@@ -334,7 +334,14 @@ pub trait Store {                  // key→value over Id + wire bytes
     async fn get_of(&self, struct_hash: u64, id: Id) -> Result<Option<Vec<u8>>>;
     async fn apply(&self, batch: &[Write]) -> Result<()>;  // atomic: all-or-nothing
 }
-pub enum Write { Put(Id, Vec<u8>), Remove(Id) }
+// `Put`'s type is the STRUCT_HASH at the head of its bytes; the other two
+// carry it, because an Id names no type and a per-type backend would
+// otherwise have to search every slot for one (RFC 0063).
+pub enum Write {
+    Put(Id, Vec<u8>),
+    Remove(u64, Id),
+    Expect(u64, Id, Option<Vec<u8>>),
+}
 ```
 
 - **native node** impl: the page engine (`wavedb-storage`) — `apply` = one journal
