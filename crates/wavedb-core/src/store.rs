@@ -18,20 +18,33 @@ use crate::wire::WaveWire;
 /// Derives [`WaveWire`], so a batch (`Vec<Write>`) is itself a wire value — the
 /// journal in `wavedb-storage` persists batches with the checked encoding
 /// instead of a hand-rolled format.
+///
+/// ## Why two variants name their type and one does not
+///
+/// An [`Id`] names no type (RFC 0063). A backend with per-type storage must
+/// therefore be *told* which type a write concerns, or search every one it
+/// has — which is what `Remove` and `Expect` used to force, at a page read
+/// per registered type, inside the lock that serializes all writers.
+///
+/// `Put` needs no such field: its bytes are STRUCT_HASH-headed, so the head
+/// already answers the question and a second copy could only disagree with
+/// it.
 #[derive(Debug, Clone, PartialEq, Eq, WaveWire)]
 pub enum Write {
-    /// Insert or overwrite `Id`'s wire bytes.
+    /// Insert or overwrite `Id`'s wire bytes. The type is the STRUCT_HASH at
+    /// the head of `bytes`.
     Put(Id, Vec<u8>),
-    /// Delete `Id`.
-    Remove(Id),
-    /// Commit-time guard: the batch applies only if `Id` currently holds
-    /// exactly these bytes (`None` = is absent). Every `Expect` in a batch
-    /// is validated against the **pre-batch** state inside the backend's
-    /// atomic section; any mismatch refuses the whole batch as
-    /// [`Error::Conflict`](crate::Error::Conflict) and nothing is written.
-    /// A guard is not state — a durable backend validates it but never
-    /// persists it.
-    Expect(Id, Option<Vec<u8>>),
+    /// Delete `Id` from the storage of `struct_hash` — the type whose bytes
+    /// were `Put` there.
+    Remove(u64, Id),
+    /// Commit-time guard: the batch applies only if `Id`, in `struct_hash`'s
+    /// storage, currently holds exactly these bytes (`None` = is absent).
+    /// Every `Expect` in a batch is validated against the **pre-batch** state
+    /// inside the backend's atomic section; any mismatch refuses the whole
+    /// batch as [`Error::Conflict`](crate::Error::Conflict) and nothing is
+    /// written. A guard is not state — a durable backend validates it but
+    /// never persists it.
+    Expect(u64, Id, Option<Vec<u8>>),
 }
 
 impl Write {
@@ -39,7 +52,20 @@ impl Write {
     #[must_use]
     pub const fn id(&self) -> Id {
         match self {
-            Self::Put(id, _) | Self::Remove(id) | Self::Expect(id, _) => *id,
+            Self::Put(id, _) | Self::Remove(_, id) | Self::Expect(_, id, _) => {
+                *id
+            }
+        }
+    }
+
+    /// The STRUCT_HASH this write routes to, when the variant carries it.
+    /// `Put` returns `None` — its type lives in the bytes' head, and reading
+    /// it is the decoding layer's job, not this accessor's.
+    #[must_use]
+    pub const fn struct_hash(&self) -> Option<u64> {
+        match self {
+            Self::Put(..) => None,
+            Self::Remove(hash, _) | Self::Expect(hash, _, _) => Some(*hash),
         }
     }
 }
@@ -143,8 +169,10 @@ mod tests {
             // No await between lock and unlock — the guard never spans a yield.
             {
                 let mut map = self.0.lock().unwrap();
+                // One flat keyspace, so the writes' `struct_hash` is ignored:
+                // it exists for backends with per-type storage.
                 for w in batch {
-                    if let Write::Expect(id, expected) = w
+                    if let Write::Expect(_, id, expected) = w
                         && map.get(&id.raw()) != expected.as_ref()
                     {
                         return Err(crate::Error::Conflict(*id));
@@ -155,7 +183,7 @@ mod tests {
                         Write::Put(id, bytes) => {
                             map.insert(id.raw(), bytes.clone());
                         }
-                        Write::Remove(id) => {
+                        Write::Remove(_, id) => {
                             map.remove(&id.raw());
                         }
                         Write::Expect(..) => {}
@@ -169,6 +197,9 @@ mod tests {
     fn id(key: u64) -> Id {
         Id::new(key, U48::from(1u32), false, 0)
     }
+
+    /// Any hash: this store has one flat keyspace and ignores routing.
+    const SH: u64 = 0xABCD;
 
     #[test]
     fn apply_is_all_or_nothing_visible() {
@@ -187,7 +218,7 @@ mod tests {
             assert_eq!(store.get(id(2)).await.unwrap(), Some(vec![30]));
 
             store
-                .apply(&[Write::Remove(id(1)), Write::Put(id(2), vec![99])])
+                .apply(&[Write::Remove(SH, id(1)), Write::Put(id(2), vec![99])])
                 .await
                 .unwrap();
             assert_eq!(store.get(id(1)).await.unwrap(), None);
@@ -198,6 +229,16 @@ mod tests {
     #[test]
     fn write_id_accessor() {
         assert_eq!(Write::Put(id(7), vec![]).id(), id(7));
-        assert_eq!(Write::Remove(id(7)).id(), id(7));
+        assert_eq!(Write::Remove(SH, id(7)).id(), id(7));
+        assert_eq!(Write::Expect(SH, id(7), None).id(), id(7));
+    }
+
+    #[test]
+    fn only_the_untyped_variants_carry_a_struct_hash() {
+        // `Put`'s type is the head of its bytes, so a second copy on the
+        // variant could only disagree with it.
+        assert_eq!(Write::Put(id(7), vec![]).struct_hash(), None);
+        assert_eq!(Write::Remove(SH, id(7)).struct_hash(), Some(SH));
+        assert_eq!(Write::Expect(SH, id(7), None).struct_hash(), Some(SH));
     }
 }
