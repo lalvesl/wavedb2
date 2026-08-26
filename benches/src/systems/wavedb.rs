@@ -23,6 +23,44 @@ use crate::metrics::{self, Phase};
 use crate::schema::{Rng, Thing, ThingPivotId, logical_bytes, thing, thing_v2};
 
 const TENANT: u32 = 1;
+
+/// Journal bytes that trigger a maintenance pass — `quick-node`'s own default
+/// (`Maintenance::checkpoint_after_bytes`).
+///
+/// Byte-driven for the reason that default is byte-driven: an **operation
+/// count cannot bound a log whose per-operation size depends on the data**.
+/// Here it emphatically does. A first attempt checkpointed every 5 000 inserts
+/// and never fired once: under 5 000 inserts of this schema had already
+/// written **649 MB** of journal — on the order of 130 KB each, against a
+/// ~400-byte record — while `data.bin` was still 4 KB.
+///
+/// That ratio is a finding in its own right and is **not explained here**; it
+/// wants its own measurement before anyone attributes it to a mechanism.
+const CHECKPOINT_AFTER_BYTES: u64 = 64 << 20;
+
+/// What the write cache is evicted **down to** — not to zero.
+///
+/// Evicting to zero drops the hot B+tree interior nodes along with everything
+/// else, so the next write descends through the page store instead of RAM; in
+/// the shop adapter that made a fill 6× slower. This has to sit far enough
+/// under the cage to leave room for the process itself.
+const CACHE_BUDGET_BYTES: usize = 96 << 20;
+
+/// One maintenance pass: checkpoint (which settles the queue into pages and
+/// retires the journal) and bring the write cache back under budget. Exactly
+/// what `quick-node`'s maintenance loop does, on the benchmark's own schedule.
+///
+/// Called from **inside** a timed phase but **outside** `Latencies::time`, so
+/// it changes no latency and no `ops_per_sec` — those sum the individually
+/// timed operations. It does land in the phase's `bytes_written`, which spans
+/// the whole closure, and that is right: those bytes are really written.
+fn maintain(store: &PageStore) {
+    if store.journal_len() <= CHECKPOINT_AFTER_BYTES {
+        return;
+    }
+    store.commit_journal().expect("checkpoint");
+    store.evict_settled(CACHE_BUDGET_BYTES);
+}
 /// Defrag budget: generous enough that one pass is the compaction, since the
 /// point of the "compacted" footprint is the floor, not a partial move.
 const DEFRAG_BUDGET_BLOCKS: u64 = 1 << 20;
@@ -154,6 +192,7 @@ fn fill_and_read(
                         block_on(col.insert(&db, &t)).expect("insert")
                     });
                     ids.push(id);
+                    maintain(&store);
                 }
             },
             cfg.rows as usize,
@@ -204,6 +243,9 @@ fn update_and_measure(
                 let id = ids[n as usize];
                 let t = thing_v2(n, cfg.seed);
                 lat.time(|| block_on(col.save(&db, id, &t)).expect("save"));
+                // A save archives the superseded version, so this loop grows
+                // the cache and the journal faster than the fill does.
+                maintain(&store);
             }
         },
         cfg.updates as usize,

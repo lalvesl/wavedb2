@@ -119,16 +119,22 @@ fn preload(cfg: &ShopCfg, dir: &Path) -> Result<(), String> {
         for s in 0..shopping_count(u, cfg.seed, cfg.orders_max) {
             block_on(create_order(&store, cfg, u, s))?;
         }
-        // The per-type cache is a *write* cache with no automatic eviction on
-        // a bare `PageStore` (a node gets that from `quick-node`'s maintenance
-        // loop). At ~43 records a user a large fill is millions of records,
-        // which without this would sit in RAM
-        // until the single drain at the end and be OOM-killed long before it
-        // — the 500 MB cage is the whole run's, server included. Settling in
-        // rounds is what a node does anyway; the fill is untimed, so the cost
-        // lands nowhere measured.
-        if u % DRAIN_EVERY == DRAIN_EVERY - 1 {
-            store.drain().map_err(|e| format!("drain: {e}"))?;
+        // A bare `PageStore` has no background maintenance — a node gets that
+        // from `quick-node`'s loop — so **two** things grow unbounded here,
+        // and an earlier version of this bounded only one: the write cache was
+        // evicted while the journal grew for the whole fill. At ~43 records a
+        // user this is millions of records against a 500 MB cage shared with
+        // the servers. The fill is untimed, so the cost lands nowhere
+        // measured; a node pays it on its own schedule.
+        //
+        // Triggered by journal **bytes**, not by a user count, for the reason
+        // `quick-node`'s own policy is: per-operation log size depends on the
+        // data. In the micro adapter a 5 000-op trigger never fired once while
+        // 649 MB accumulated.
+        if store.journal_len() > CHECKPOINT_AFTER_BYTES {
+            store
+                .commit_journal()
+                .map_err(|e| format!("checkpoint: {e}"))?;
             store.evict_settled(FILL_CACHE_BYTES);
         }
     }
@@ -368,7 +374,9 @@ use crate::{FILL_WINDOW as PRELOAD_WINDOW, RELAXED_WINDOW};
 /// Users between settle rounds during the fill — ~2 000 records a round at
 /// the default order/item spread, which keeps the write cache bounded well
 /// inside the cage without making the fill a checkpoint benchmark.
-const DRAIN_EVERY: u64 = 200;
+/// Journal bytes that trigger a checkpoint during the fill —
+/// `quick-node`'s own default (`Maintenance::checkpoint_after_bytes`).
+const CHECKPOINT_AFTER_BYTES: u64 = 64 << 20;
 
 /// What the fill's write cache is evicted **down to** — not to zero.
 ///
