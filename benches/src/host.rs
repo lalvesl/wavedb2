@@ -27,6 +27,11 @@ pub struct Host {
     pub filesystem: String,
     pub rotational: Option<bool>,
     pub virtualised: bool,
+    /// How full `data_dir`'s btrfs data block groups are (`0.0..=1.0`), or
+    /// `None` off btrfs. Deliberately **not** in the host key: it changes
+    /// between runs on one machine, so it is a guard and a recorded fact, not
+    /// a lane.
+    pub data_fill: Option<f64>,
     /// `<cpu-slug>-<budget>c-<budget>g-<fs>-<hash4>` — the lane identity. The
     /// budgets are in it on purpose: a caged run and an uncaged one on the same
     /// machine are different lanes, because they are different machines as far
@@ -43,15 +48,21 @@ impl Host {
         let cores = num_cpus();
         let cpu_budget = allowed_cpus().unwrap_or(cores);
         let mem_bytes = mem_total();
-        let mem_budget = cgroup_memory_max().unwrap_or(mem_bytes).min(mem_bytes);
+        let mem_budget =
+            cgroup_memory_max().unwrap_or(mem_bytes).min(mem_bytes);
         let kernel = read_trim("/proc/sys/kernel/osrelease");
         let filesystem = fs_type(data_dir);
         let rotational = rotational(data_dir);
         let virtualised = cpu_flag("hypervisor");
+        // Megabytes, not gigabytes: the cage is 500 MB and integer-dividing
+        // that by a GiB spelled the lane `-0g-`, which is both meaningless and
+        // a collision — every sub-gigabyte budget would share one key. The
+        // fingerprint below would still separate them, but a key a human
+        // cannot read is a key nobody checks.
         let mut key = format!(
-            "{}-{cpu_budget}c-{}g-{filesystem}",
+            "{}-{cpu_budget}c-{}m-{filesystem}",
             slug(&cpu),
-            mem_budget / (1 << 30)
+            mem_budget / (1 << 20)
         );
         let fingerprint = format!(
             "{cpu}|{cores}|{cpu_budget}|{mem_bytes}|{mem_budget}|{kernel}|\
@@ -68,6 +79,7 @@ impl Host {
             filesystem,
             rotational,
             virtualised,
+            data_fill: data_fill(data_dir),
             key,
         }
     }
@@ -112,9 +124,9 @@ fn num_cpus() -> u64 {
 /// (`0-3`, `0,2,4`, …). This is what `taskset` moves and `/proc/cpuinfo` does
 /// not.
 fn allowed_cpus() -> Option<u64> {
-    let list = read_trim("/proc/self/status")
-        .lines()
-        .find_map(|l| l.strip_prefix("Cpus_allowed_list:").map(str::to_string))?;
+    let list = read_trim("/proc/self/status").lines().find_map(|l| {
+        l.strip_prefix("Cpus_allowed_list:").map(str::to_string)
+    })?;
     let mut n = 0;
     for part in list.trim().split(',') {
         match part.split_once('-') {
@@ -136,7 +148,7 @@ fn cgroup_memory_max() -> Option<u64> {
     let rel = read_trim("/proc/self/cgroup")
         .lines()
         .find_map(|l| l.strip_prefix("0::").map(str::to_string))?;
-    let raw = read_trim(&format!("/sys/fs/cgroup{rel}/memory.max"));
+    let raw = read_trim(format!("/sys/fs/cgroup{rel}/memory.max"));
     raw.trim().parse().ok()
 }
 
@@ -153,21 +165,58 @@ fn mem_total() -> u64 {
 
 /// The mount whose path is the longest prefix of `dir` owns it.
 fn fs_type(dir: &Path) -> String {
+    mount_of(dir).map_or_else(|| "unknown".into(), |(_, kind)| kind)
+}
+
+/// `(device, fstype)` of the mount owning `dir`.
+fn mount_of(dir: &Path) -> Option<(String, String)> {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let mounts = read_trim("/proc/mounts");
-    let mut best = ("", "unknown");
+    let mut best: Option<(usize, String, String)> = None;
     for line in mounts.lines() {
         let mut f = line.split_whitespace();
-        let (Some(_dev), Some(point), Some(kind)) =
+        let (Some(dev), Some(point), Some(kind)) =
             (f.next(), f.next(), f.next())
         else {
             continue;
         };
-        if dir.starts_with(point) && point.len() >= best.0.len() {
-            best = (point, kind);
+        if dir.starts_with(point)
+            && best.as_ref().is_none_or(|(n, _, _)| point.len() >= *n)
+        {
+            best = Some((point.len(), dev.to_string(), kind.to_string()));
         }
     }
-    best.1.to_string()
+    best.map(|(_, dev, kind)| (dev, kind))
+}
+
+/// How full the **data block groups** are on `dir`'s btrfs, `0.0..=1.0`.
+///
+/// Not the same question as `df`, and the difference is why this exists. A
+/// filesystem can report 12% free while its allocated data block groups are
+/// 96% used — and it is that number the allocator lives under. Past ~90% btrfs
+/// stops finding contiguous free extents in existing groups and starts
+/// carving new chunks, which under COW turns a write-heavy benchmark into a
+/// measurement of the allocator's mood: the same 8 000-user fill measured
+/// 59 s and 1 297 s on one machine, with nothing about the benchmark changed.
+///
+/// `None` when `dir` is not on btrfs, or the sysfs interface is absent.
+fn data_fill(dir: &Path) -> Option<f64> {
+    let (dev, kind) = mount_of(dir)?;
+    if kind != "btrfs" {
+        return None;
+    }
+    let name = Path::new(&dev).file_name()?.to_str()?.to_string();
+    for entry in std::fs::read_dir("/sys/fs/btrfs").ok()?.flatten() {
+        let fs = entry.path();
+        if !fs.join("devices").join(&name).exists() {
+            continue;
+        }
+        let alloc = fs.join("allocation/data");
+        let total: f64 = read_trim(alloc.join("total_bytes")).parse().ok()?;
+        let used: f64 = read_trim(alloc.join("bytes_used")).parse().ok()?;
+        return (total > 0.0).then(|| used / total);
+    }
+    None
 }
 
 /// `/sys/dev/block/<major>:<minor>/queue/rotational`, falling back to the
@@ -213,7 +262,7 @@ fn slug(s: &str) -> String {
     out.trim_end_matches('-').to_string()
 }
 
-fn read_trim(path: &str) -> String {
+fn read_trim(path: impl AsRef<Path>) -> String {
     std::fs::read_to_string(path)
         .map(|s| s.trim_end().to_string())
         .unwrap_or_default()
