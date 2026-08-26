@@ -1,6 +1,8 @@
 # RFC 0063 — The yield map, and an interruptible engine
 
-- **Status:** Planned — opened 2026-08-21
+- **Status:** Planned — opened 2026-08-21. The map (Parts 1–2) is done and one
+  thing it found, **A2, is fixed and landed the same day**; the interruptible
+  engine itself (Part 3) is designed and not started.
 - **Crates:** `wavedb-storage` (the map and the work), `wavedb-quick-node` (the
   loop that drives it), later `wavedb-platform` (the wasm yield)
 - **Successor to:** [RFC 0058](0058-per-type-actors-PLANNED-LOW.md), which stays
@@ -87,11 +89,15 @@ here. What *is* verified is the control flow and the lock set.
 
 | # | site | blocks on | locks held | order |
 |---|---|---|---|---|
-| A1 | `route_batch` (`apply.rs:94`) | memory | — | ns |
-| A2 | `Expect` guard scan (`apply.rs:39` → `read_any` `apply.rs:81`) | **pread + zstd decode, once per slot** | **journal** | 10–100 µs **× N slots** |
+| A1 | `route_batch` (`apply.rs:131`) | memory | — | ns |
+| A2 | `Expect` guard (`apply.rs:44` → `read_of` `apply.rs:91`) | ~~pread × N slots~~ → **one routed pread** | journal | 10–100 µs |
 | A3 | `journal.append` (`apply.rs`) | **fsync** | journal | 10²–10³ µs |
-| A4 | commit to the per-type caches | memory, one write lock per type | journal | µs |
+| A4 | commit to the per-type caches (`commit_to_caches`) | memory, one write lock per type | journal | µs |
 | A5 | `pending` push | memory | journal + pending | ns |
+
+A2 is shown **as fixed**; the paragraph below is what it was and why it went
+first. A4 likewise no longer probes pages to route a `Remove`, so the whole
+journal-lock section is now one bounded read plus memory work plus the barrier.
 
 A3 is the durability point and the only site the engine already reasons about
 explicitly — RFC 0061's window is precisely a decision about *when* to block
@@ -119,9 +125,9 @@ M1 and M2 together are the answer to "why does a checkpoint stall the node": not
 a lock, but occupancy of the only thread, for a duration that scales with how
 much was written since the last one.
 
-### The finding that stands on its own — A2
+### The finding that stands on its own — A2 *(fixed, landed 2026-08-21)*
 
-**Every guarded write does a full-slot disk scan while holding the lock that
+**Every guarded write did a full-slot disk scan while holding the lock that
 serializes all writers.**
 
 `apply_inner` takes `self.journal.lock()` and *then*, inside it, validates each
@@ -142,17 +148,55 @@ what follows. The map is what made it visible — A2 is the only entry in the
 `apply` table that blocks on the disk *and* is not the barrier the engine
 intends to take there.
 
-Two candidate fixes, neither chosen here:
+#### What was done
 
-- **Resolve guards through the caches only**, and treat a cache miss as
-  "unknown" — which for `Expect(id, None)` would have to mean refusing rather
-  than guessing, so it changes behaviour and needs its own argument.
-- **Hoist the scan out of the lock and revalidate inside it.** Keeps the
-  semantics exactly, pays the scan twice on contention, and is the shape the
-  lock exists for. Note `Write::Remove`/`Expect` carry no `struct_hash` today
-  (RFC 0058 already flagged this) — giving them one collapses the N-slot scan
-  to one routed lookup and probably dissolves the problem entirely. `Write` is
-  a wire type, so that is a wire change.
+`Write::Remove` and `Write::Expect` now carry the STRUCT_HASH they route by —
+the fix RFC 0058 had already sketched for a different reason (under actors the
+scan is a broadcast to N mailboxes) and filed as future work. The yield map
+promoted it: the same scan is a live cost on one thread, in the worst possible
+place.
+
+```rust
+Put(Id, Vec<u8>)                    // type = the head of its own bytes
+Remove(u64, Id)                     // + struct_hash
+Expect(u64, Id, Option<Vec<u8>>)    // + struct_hash
+```
+
+`Put` deliberately gains nothing: its bytes are STRUCT_HASH-headed, and a
+second copy on the variant could only disagree with the head.
+
+Consequences, all of them narrowing:
+
+- The guard is `read_of(hash, id)` — one binary search on the route table, at
+  most one page read, **independent of how many types the schema declares**.
+- `commit_to_caches` routes a `Remove` by its hash instead of calling
+  `owner_of`, so it reads **no page at all**. It is now infallible and returns
+  `Touched` rather than `StorageResult<Touched>` — the commit section can state
+  that it cannot touch a page, which is what Part 2 needs of it.
+- `owner_of` is **deleted**. Nothing searches for an id's type any more.
+- `route_batch` validates all three variants uniformly, so an unregistered hash
+  is refused before the journal rather than becoming a silent no-op.
+
+The two rejected alternatives, recorded because they were live options:
+resolving guards from the caches alone (a miss would have to refuse rather than
+guess, changing behaviour); and hoisting the scan out of the lock with
+revalidation inside (correct, but keeps a scan nobody needs).
+
+Only the construction sites had to change, and there were **five** outside
+tests — two `Expect` in `record.rs` (both `plan.hash`) and three `Remove` in
+the index layer (`chain.rs` and `sparse_write.rs`: `self.lane_hash`; `tree.rs`:
+`BPTREE_NODE_STRUCT_HASH`). Every caller already had the hash in hand, which is
+the evidence that the field was missing rather than unknowable.
+
+`Write` is a wire type, so this changes the journal's on-disk layout — free
+under the pre-release policy (`FORMAT_VERSION` pinned, old `data.bin`
+unsupported), and it folds into **no** `STRUCT_HASH`: `Write` is engine
+plumbing, not a user type, so no schema changes.
+
+Proven by two tests in `page_store.rs`, each checked to fail against the old
+code: `a_guard_costs_the_same_whatever_the_schemas_width` (measured 1 read with
+one type and 2 with two before the fix; 1 and 1 after) and
+`a_remove_reads_no_page` (1 before, 0 after).
 
 ## Part 2 — Which sites are legal yield points
 
@@ -166,9 +210,10 @@ A4 exposes half a batch, violating I1 directly. The existing
 `#[allow(clippy::significant_drop_tightening)]` and its comment already say the
 guard must span the commit; the map makes it a rule rather than a note.
 
-*Consequence:* A2 must leave that section — not as an optimisation, but because
-it is the only blocking call inside a region that may not yield, which is the
-worst possible place for one.
+*Consequence:* A2 had to leave that section — not as an optimisation, but
+because it was the only unbounded blocking call inside a region that may not
+yield, which is the worst possible place for one. Done; the section is now one
+routed page read, memory work, and the barrier.
 
 **Illegal — `place_in` (M2, M5).** `alloc` and `meta` are held across
 carve → write → free deliberately: a window must not be handed out twice, and a
@@ -234,8 +279,8 @@ So the base case is:
    `setTimeout`), not an already-resolved promise: microtasks run to exhaustion
    before the browser paints, so a microtask yield gives the UI nothing. This is
    the difference between a checkpoint that stutters and one that freezes.
-3. **A2 moves out of the journal-lock section**, per Part 1 — independently
-   worth doing.
+3. ~~**A2 moves out of the journal-lock section**~~ — done, and it was
+   independently worth doing.
 
 ### What it explicitly does not require
 
@@ -323,9 +368,6 @@ a stripped-down special case.
 - **What granularity does the wasm yield want** — per round, per slot plan, per
   N pages? A frame budget (~16 ms) is the natural unit and nothing currently
   measures against it.
-- **Where does the A2 fix land** — cache-only guard resolution, hoist-and-
-  revalidate, or `struct_hash` on `Write::Remove`/`Expect`? The third looks
-  strongest and is the smallest change, but `Write` is a wire type.
 - **Does the maintenance tick stay a timer?** With a re-entrant `drain`, "settle
   a round whenever the loop is idle" becomes available and fits better than a
   200 ms poll — but it changes *when* checkpoints happen, which RFC 0041/0047
