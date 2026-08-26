@@ -171,7 +171,24 @@ Five things the numbers do not mean without their context:
 
 ## Guards
 
-The runner refuses to record when the 1-minute load average exceeds 1.0
-(`--force` overrides). A missing row beats a slow row that a future bisect
-blames on a commit. A run from an uncommitted tree records but is permanently
-marked `dirty`.
+Two guards, both `--force`-overridable. A missing row beats a slow row that a
+future bisect blames on a commit.
+
+**Noise.** The 1-minute load average at start must be under **half the CPUs the
+run may use** — 2.00 inside the standard 4-CPU cage, 4.00 uncaged on 8 cores,
+never below a floor of 2.00. It was a flat 1.00, which reads as one core's worth
+of demand and refuses an ordinary desktop; the contention being guarded against
+scales with the budget, so the limit does too. It stays a heuristic: `taskset`
+confines the benchmark to `benchCpus`, while load average counts the whole
+machine.
+
+**Disk.** On btrfs, at least **10% of the device must be unallocated**. That is
+the number that governs: while unallocated space lasts, a write that finds
+existing block groups awkward just carves a fresh chunk. How full the allocated
+data groups are is recorded beside it but *not* guarded — `btrfs balance` packs
+the groups it keeps, so it raises that figure while restoring the headroom that
+matters, and guarding on it would refuse the disk somebody had just repaired.
+The state that correlated with a 22× spread on one machine was both at once:
+8.5% unallocated and 96% fill.
+
+A run from an uncommitted tree records but is permanently marked `dirty`.
