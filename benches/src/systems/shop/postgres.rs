@@ -254,7 +254,7 @@ fn start(dir: &Path, sync: &str) -> Result<Server, String> {
         ],
         &log,
     )?;
-    server::wait_for("postgres", 60, || connect(dir).is_ok())
+    server::wait_for("postgres", server::STARTUP_SECS, || connect(dir).is_ok())
         .map_err(|e| format!("{e}\n{}", server::log_tail(&log, 10)))?;
     Ok(pg)
 }

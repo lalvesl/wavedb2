@@ -13,6 +13,15 @@ use crate::host::Host;
 use crate::json::{Json, fnv1a};
 use crate::systems::{Cfg, SystemReport};
 
+/// A system that did not produce its row.
+///
+/// Recorded rather than dropped: a corpus row that looks complete and quietly
+/// lacks a system is worse than one that says which system is missing and why.
+pub struct Skipped {
+    pub name: String,
+    pub reason: String,
+}
+
 pub struct Provenance {
     pub git_sha: String,
     pub dirty: bool,
@@ -49,13 +58,14 @@ pub fn write(
     host: &Host,
     prov: &Provenance,
     reports: &[SystemReport],
+    skipped: &[Skipped],
 ) -> Result<PathBuf, String> {
     let lane = results_dir.join(&host.key);
     std::fs::create_dir_all(&lane).map_err(|e| format!("mkdir: {e}"))?;
     let name = format!("{}-{}.json", prov.timestamp, prov.git_sha);
     let path = lane.join(&name);
 
-    std::fs::write(&path, record(cfg, shop, host, prov, reports))
+    std::fs::write(&path, record(cfg, shop, host, prov, reports, skipped))
         .map_err(|e| format!("write record: {e}"))?;
     append_index(results_dir, host, prov, reports)?;
     Ok(path)
@@ -67,6 +77,7 @@ fn record(
     host: &Host,
     prov: &Provenance,
     reports: &[SystemReport],
+    skipped: &[Skipped],
 ) -> String {
     let mut j = Json::new();
     j.obj(None, |j| {
@@ -94,14 +105,20 @@ fn record(
             j.boolean("virtualised", host.virtualised);
             // Recorded, never keyed: it moves between runs on one machine.
             // A row that looks slow is readable only beside this.
-            match (host.data_fill, host.filesystem.as_str()) {
-                (Some(f), _) => j.ratio("data_block_group_fill", f),
+            match (host.btrfs, host.filesystem.as_str()) {
+                (Some(s), _) => {
+                    // Both, always: the pair is what is interpretable. A high
+                    // fill beside plenty of unallocated space is a balanced
+                    // disk, not a stressed one.
+                    j.ratio("btrfs_unallocated", s.unallocated);
+                    j.ratio("btrfs_data_block_group_fill", s.data_fill);
+                }
                 // Never record "n/a" for a btrfs run: that would claim the
                 // guard had nothing to check, when it was blind.
                 (None, "btrfs") => {
-                    j.str("data_block_group_fill", "unreadable (probe failed)");
+                    j.str("btrfs_space", "unreadable (probe failed)");
                 }
-                (None, _) => j.str("data_block_group_fill", "n/a (not btrfs)"),
+                (None, _) => j.str("btrfs_space", "n/a (not btrfs)"),
             }
         });
         j.obj(Some("workload"), |j| {
@@ -130,6 +147,17 @@ fn record(
         j.arr(Some("systems"), |j| {
             for r in reports {
                 j.obj(None, |j| system(j, r));
+            }
+        });
+        // A row this pass tried to produce and could not. Recorded so a reader
+        // can tell "this system was not measured" from "this system was not
+        // asked for" — the two look identical in `systems` alone.
+        j.arr(Some("skipped"), |j| {
+            for s in skipped {
+                j.obj(None, |j| {
+                    j.str("system", &s.name);
+                    j.str("reason", &s.reason);
+                });
             }
         });
         j.arr(Some("out_of_scope"), |j| {

@@ -139,6 +139,17 @@ fn child_map() -> std::collections::HashMap<u32, Vec<u32>> {
     map
 }
 
+/// How long a server may take to become connectable.
+///
+/// Generous on purpose, and shared so the three adapters cannot drift apart.
+/// The per-site 60 s and 90 s this replaces were sized on an idle machine and
+/// are far too tight inside the cage: `mysqld` 8.4 building its data dictionary
+/// and redo logs on **4 CPUs against a contended disk** was still initialising
+/// InnoDB when its 90 s expired, and that one timeout discarded a 50-minute
+/// pass. Waiting costs nothing when the server is healthy — [`wait_for`] polls
+/// and returns the moment it connects.
+pub const STARTUP_SECS: u64 = 300;
+
 /// Poll `ready` until it answers true or `secs` elapse.
 ///
 /// Every server here takes seconds to become connectable, and every one of them

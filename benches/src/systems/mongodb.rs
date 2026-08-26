@@ -223,7 +223,7 @@ fn start(dir: &Path) -> Result<Server, String> {
         ],
         &dir.join("mongod.out"),
     )?;
-    server::wait_for("mongod", 60, || {
+    server::wait_for("mongod", server::STARTUP_SECS, || {
         connect(false).is_ok_and(|c| {
             c.database("admin")
                 .run_command(doc! { "ping": 1 })

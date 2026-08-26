@@ -243,7 +243,7 @@ fn start(dir: &Path, flush: &str) -> Result<Server, String> {
         ],
         &dir.join("mysqld.out"),
     )?;
-    server::wait_for("mysqld", 90, || connect(dir).is_ok())
+    server::wait_for("mysqld", server::STARTUP_SECS, || connect(dir).is_ok())
         .map_err(|e| format!("{e}\n{}", server::log_tail(&log, 10)))?;
     Ok(my)
 }

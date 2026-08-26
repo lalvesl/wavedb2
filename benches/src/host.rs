@@ -27,16 +27,15 @@ pub struct Host {
     pub filesystem: String,
     pub rotational: Option<bool>,
     pub virtualised: bool,
-    /// How full `data_dir`'s btrfs data block groups are (`0.0..=1.0`), or
-    /// `None` off btrfs. Deliberately **not** in the host key: it changes
-    /// between runs on one machine, so it is a guard and a recorded fact, not
-    /// a lane.
+    /// `data_dir`'s btrfs allocation state, or `None` off btrfs. Deliberately
+    /// **not** in the host key: it changes between runs on one machine, so it
+    /// is a guard and a recorded fact, not a lane.
     ///
     /// `None` **while `filesystem == "btrfs"`** means the probe failed, which
     /// is not the same thing as "no risk" — it is "the guard is blind". Say so
     /// wherever this is displayed or recorded; the first version of this probe
     /// failed exactly that way and the guard never fired.
-    pub data_fill: Option<f64>,
+    pub btrfs: Option<BtrfsSpace>,
     /// `<cpu-slug>-<budget>c-<budget>g-<fs>-<hash4>` — the lane identity. The
     /// budgets are in it on purpose: a caged run and an uncaged one on the same
     /// machine are different lanes, because they are different machines as far
@@ -84,7 +83,7 @@ impl Host {
             filesystem,
             rotational,
             virtualised,
-            data_fill: data_fill(data_dir),
+            btrfs: btrfs_space(data_dir),
             key,
         }
     }
@@ -194,19 +193,34 @@ fn mount_of(dir: &Path) -> Option<(String, String)> {
     best.map(|(_, dev, kind)| (dev, kind))
 }
 
-/// How full the **data block groups** are on `dir`'s btrfs, `0.0..=1.0`.
+/// What btrfs's allocator has to work with, as fractions of the device.
+#[derive(Clone, Copy)]
+pub struct BtrfsSpace {
+    /// Device bytes belonging to **no** block group yet. This is the one that
+    /// governs: while it lasts, a write that finds existing groups awkward
+    /// simply carves a fresh chunk, which is cheap. It is what a `balance`
+    /// gives back, and what running out of turns a write benchmark into a
+    /// measurement of the allocator.
+    pub unallocated: f64,
+    /// How full the allocated **data** block groups are. Fragmentation
+    /// pressure — informative, but not a fault on its own: right after a
+    /// balance this is *high by design*, because balance is what packed them.
+    pub data_fill: f64,
+}
+
+/// Read `dir`'s btrfs allocation state, or `None` off btrfs.
 ///
-/// Not the same question as `df`, and the difference is why this exists. A
-/// filesystem can report 12% free while its allocated data block groups are
-/// 96% used — and it is that number the allocator lives under. Past ~90% btrfs
-/// stops finding contiguous free extents in existing groups and starts
-/// carving new chunks, which under COW turns a write-heavy benchmark into a
-/// measurement of the allocator's mood: the same 8 000-user fill measured
-/// 59 s and 1 297 s on one machine, with nothing about the benchmark changed.
+/// The pair matters more than either half. The state that correlated with a
+/// 22× spread on one machine — the same 8 000-user fill measuring 59 s and
+/// 1 297 s, nothing else changed — was **96% data fill *and* 8.5%
+/// unallocated**: existing groups packed and nowhere cheap left to carve. A
+/// balance then moved it to 92% fill and 27% unallocated, healthier on the
+/// axis that governs and *worse* on the other. Guarding on data fill alone
+/// would refuse precisely the disk somebody had just repaired.
 ///
-/// `None` when `dir` is not on btrfs — see [`Host::data_fill`] for what a
-/// `None` on btrfs would mean and why it must not happen silently.
-fn data_fill(dir: &Path) -> Option<f64> {
+/// (Correlation, not a controlled experiment: the thresholds below are a
+/// precaution, not a proven cliff.)
+fn btrfs_space(dir: &Path) -> Option<BtrfsSpace> {
     let (dev, kind) = mount_of(dir)?;
     if kind != "btrfs" {
         return None;
@@ -229,17 +243,37 @@ fn data_fill(dir: &Path) -> Option<f64> {
         let Ok(listed) = std::fs::read_dir(fs.join("devices")) else {
             continue;
         };
-        if !listed
-            .flatten()
-            .map(|d| read_trim(d.path().join("dev")))
-            .any(|n| n == want)
-        {
+        let mut capacity = 0.0;
+        let mut matched = false;
+        for d in listed.flatten() {
+            matched |= read_trim(d.path().join("dev")) == want;
+            // `size` is in 512-byte sectors, and every device counts: the
+            // allocator draws from the pool, not from one member.
+            capacity += read_trim(d.path().join("size"))
+                .parse::<f64>()
+                .unwrap_or_default()
+                * 512.0;
+        }
+        if !matched || capacity <= 0.0 {
             continue;
         }
-        let alloc = fs.join("allocation/data");
-        let total: f64 = read_trim(alloc.join("total_bytes")).parse().ok()?;
-        let used: f64 = read_trim(alloc.join("bytes_used")).parse().ok()?;
-        return (total > 0.0).then(|| used / total);
+        let group = |kind: &str, field: &str| -> f64 {
+            read_trim(fs.join("allocation").join(kind).join(field))
+                .parse()
+                .unwrap_or_default()
+        };
+        let data_total = group("data", "total_bytes");
+        let allocated = data_total
+            + group("metadata", "total_bytes")
+            + group("system", "total_bytes");
+        return Some(BtrfsSpace {
+            unallocated: (capacity - allocated).max(0.0) / capacity,
+            data_fill: if data_total > 0.0 {
+                group("data", "bytes_used") / data_total
+            } else {
+                0.0
+            },
+        });
     }
     None
 }

@@ -273,7 +273,7 @@ fn start(dir: &Path) -> Result<Server, String> {
         ],
         &dir.join("mongod.out"),
     )?;
-    server::wait_for("mongod", 60, || {
+    server::wait_for("mongod", server::STARTUP_SECS, || {
         direct().is_ok_and(|c| {
             c.database("admin")
                 .run_command(doc! { "ping": 1 })
@@ -297,7 +297,7 @@ fn start(dir: &Path) -> Result<Server, String> {
             .run();
     }
     // Wait for the node to become primary, or the first write refuses.
-    server::wait_for("mongod primary", 60, || {
+    server::wait_for("mongod primary", server::STARTUP_SECS, || {
         direct().is_ok_and(|c| {
             c.database("admin")
                 .run_command(doc! { "hello": 1 })
