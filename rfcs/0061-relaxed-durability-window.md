@@ -169,13 +169,21 @@ to compare against. Two things follow:
 
 ### 5. How it gets measured
 
-RFC 0060 already has the harness, and the setting now exists — so the
-`wavedb/relaxed` row is a `StoreOptions` argument in the two WaveDB adapters,
-**not yet wired**. It races SQLite's `synchronous = NORMAL`,
-PostgreSQL's `synchronous_commit = off`, MySQL's
-`innodb_flush_log_at_trx_commit = 2` and MongoDB's `j: false`. The `kB/insert`
-column is the direct check on whether the barrier really was the cost: if the
-relaxed row does not fall to roughly a tenth, the diagnosis above was wrong.
+RFC 0060 already had the harness, and the row **landed 2026-08-22**: both
+WaveDB adapters take a `Durability` like the other four, each row gets its own
+store directory (sharing one would let the second row's `insert` phase measure
+a rewrite), and the measured window is chosen at the reopen — the fill's window
+never survives it. `RELAXED_WINDOW` is one second, mid-pack against SQLite's
+`synchronous = NORMAL`, PostgreSQL's `synchronous_commit = off`, MySQL's
+`innodb_flush_log_at_trx_commit = 2` and MongoDB's `j: false`.
+
+The `kB/insert` column was named here as the direct check on whether the
+barrier really was the cost — *"if the relaxed row does not fall to roughly a
+tenth, the diagnosis above was wrong."* On a `--quick` smoke (40 users, **not**
+a measurement and not recorded) it fell from **107.2 to 28.8**, with inserts
+going 178/s → 1826/s and a shop checkout 9.91 ms → 1.10 ms at the median,
+62.14 ms → 1.65 ms at p99. Directionally the diagnosis holds; the real number
+waits on a recordable run.
 
 A durability claim also needs a durability test. Three landed in
 `page_store.rs`:

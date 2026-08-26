@@ -27,7 +27,7 @@ nix run .#bench -- --quick      # smoke pass, records nothing
 nix run .#bench -- --workload shop
 nix run .#bench -- --only wavedb,mongodb
 nix run .#bench -- --rows 1000000 --reads 200000 --updates 200000
-nix run .#bench -- --users 2000 --checkouts 500   # default is 200 000 users
+nix run .#bench -- --users 2000 --checkouts 500   # default is 20 000 users
 nix run .#bench -- --keep       # leave the scratch data dirs for inspection
 ```
 
@@ -90,11 +90,20 @@ seeds are pinned and verified before the client code that will use them.
 shop preload both. A fill is not a measurement, and one op is one batch is one
 `fsync`, so a durable fill of a few million records is a few million barriers:
 that is why the WaveDB seed used to take minutes where the others took seconds,
-and why a 200 000-user preload was not affordable at all. Every **measured**
-store reopens at the default, one barrier per batch, so no recorded number is
-taken against a relaxed engine. The other four get the same courtesy under
-other names — `.import`, `\copy`, `LOAD DATA` and `mongoimport` are not the
-per-statement commit path either.
+and why a very large preload is not affordable at all. The other four get the
+same courtesy under other names — `.import`, `\copy`, `LOAD DATA` and
+`mongoimport` are not the per-statement commit path either.
+
+The fill's window is **not** the row's: every measured store is reopened, and
+that reopen is where durability is chosen. WaveDB now reports **two rows** like
+everyone else — `durable` (the default, one barrier per batch) and `relaxed`
+(`RELAXED_WINDOW`, one barrier per elapsed second). One second lands mid-pack
+rather than flattering: PostgreSQL's `synchronous_commit = off` risks ~600 ms,
+MySQL's `innodb_flush_log_at_trx_commit = 2` flushes once a second, and
+SQLite's `synchronous = NORMAL` holds until a checkpoint. None of those are
+equal to each other either; each row reports the configuration that system's
+own docs call relaxed, with the window named in its `settings` so a reader can
+discount it.
 
 The MongoDB seed additionally needs **unprivileged user namespaces** on the
 build host: `mongod` aborts in the Nix sandbox (its tcmalloc `CHECK`s on
