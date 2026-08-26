@@ -10,8 +10,8 @@ use mysql::{Conn, OptsBuilder, TxOpts, params};
 use super::ShopCfg;
 use crate::footprint::{Footprint, Point};
 use crate::shop::{
-    logical_bytes, product_count, product_row, shopping_count,
-    shopping_row, user_row,
+    logical_bytes, product_count, product_row, shopping_count, shopping_row,
+    user_row,
 };
 use crate::systems::server::{self, Server};
 use crate::systems::{Durability, SystemReport};
@@ -88,7 +88,11 @@ pub fn run(
     for ddl in [DDL_USERS, DDL_SHOPPING, DDL_PRODUCT] {
         conn.query_drop(ddl).map_err(sql)?;
     }
-    preload(cfg, &mut conn)?;
+    {
+        // A fill is not a measurement: it gets the machine, not the cage.
+        let _fill = crate::cage::for_fill();
+        preload(cfg, &mut conn)?;
+    }
     drop(conn);
 
     // Restart under the row's real durability, with an empty buffer pool.
@@ -128,7 +132,12 @@ pub fn run(
         phases,
         footprints,
         live_records: cfg.live_records(),
-        logical_bytes: logical_bytes(cfg.users, cfg.seed, cfg.orders_max, cfg.items_max),
+        logical_bytes: logical_bytes(
+            cfg.users,
+            cfg.seed,
+            cfg.orders_max,
+            cfg.items_max,
+        ),
         notes: vec![
             "The order page is ORDER BY … LIMIT 10 OFFSET n over an index, \
              not a materialised list."

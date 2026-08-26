@@ -163,4 +163,3 @@ pub(super) fn detail_phase(
         cfg.detail_reads as usize,
     ))
 }
-
