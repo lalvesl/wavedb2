@@ -94,9 +94,14 @@ fn record(
             j.boolean("virtualised", host.virtualised);
             // Recorded, never keyed: it moves between runs on one machine.
             // A row that looks slow is readable only beside this.
-            match host.data_fill {
-                Some(f) => j.ratio("data_block_group_fill", f),
-                None => j.str("data_block_group_fill", "n/a (not btrfs)"),
+            match (host.data_fill, host.filesystem.as_str()) {
+                (Some(f), _) => j.ratio("data_block_group_fill", f),
+                // Never record "n/a" for a btrfs run: that would claim the
+                // guard had nothing to check, when it was blind.
+                (None, "btrfs") => {
+                    j.str("data_block_group_fill", "unreadable (probe failed)");
+                }
+                (None, _) => j.str("data_block_group_fill", "n/a (not btrfs)"),
             }
         });
         j.obj(Some("workload"), |j| {
