@@ -18,8 +18,8 @@ use rusqlite::{Connection, params};
 use super::ShopCfg;
 use crate::footprint::{Footprint, Point};
 use crate::shop::{
-    logical_bytes, product_count, product_row, shopping_count,
-    shopping_row, user_row,
+    logical_bytes, product_count, product_row, shopping_count, shopping_row,
+    user_row,
 };
 use crate::systems::{Durability, SystemReport};
 
@@ -66,6 +66,8 @@ pub fn run(
     {
         // Preload in bulk, and deliberately so: it is never timed, and the
         // stored form it produces is the same either way.
+        // A fill is not a measurement: it gets the machine, not the cage.
+        let _fill = crate::cage::for_fill();
         let mut conn = connect(&path, "OFF")?;
         conn.execute_batch(DDL).map_err(sql)?;
         preload(cfg, &mut conn)?;
@@ -108,7 +110,12 @@ pub fn run(
         phases,
         footprints,
         live_records: cfg.live_records(),
-        logical_bytes: logical_bytes(cfg.users, cfg.seed, cfg.orders_max, cfg.items_max),
+        logical_bytes: logical_bytes(
+            cfg.users,
+            cfg.seed,
+            cfg.orders_max,
+            cfg.items_max,
+        ),
         notes: vec![
             "The order page is ORDER BY … LIMIT 10 OFFSET n over an index, \
              not a materialised list."

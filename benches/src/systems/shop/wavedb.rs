@@ -11,16 +11,15 @@ use std::path::Path;
 use futures::TryStreamExt as _;
 use futures::executor::block_on;
 use wavedb_core::{LocalHandle, U48};
-use wavedb_storage::PageStore;
+use wavedb_storage::{PageStore, StoreOptions};
 
 use super::ShopCfg;
 use crate::footprint::{Footprint, Point};
 use crate::metrics::{self, Phase};
 use crate::schema::Rng;
 use crate::shop::{
-    PAGE, Product, ProductLists, Shopping, ShoppingLists, User,
-    logical_bytes, product_count, product_row, shopping_count, shopping_row,
-    user_row,
+    PAGE, Product, ProductLists, Shopping, ShoppingLists, User, logical_bytes,
+    product_count, product_row, shopping_count, shopping_row, user_row,
 };
 use crate::systems::{Durability, SystemReport};
 
@@ -28,7 +27,11 @@ pub fn run(cfg: &ShopCfg) -> Result<SystemReport, String> {
     let dir = cfg.work_dir.join("shop-wavedb");
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
 
-    preload(cfg, &dir)?;
+    {
+        // A fill is not a measurement: it gets the machine, not the cage.
+        let _fill = crate::cage::for_fill();
+        preload(cfg, &dir)?;
+    }
 
     // Reopened: the per-type cache is a *write* cache, so everything the
     // preload just wrote would otherwise still be warm and the read phases
@@ -58,15 +61,31 @@ pub fn run(cfg: &ShopCfg) -> Result<SystemReport, String> {
         version: env!("CARGO_PKG_VERSION").into(),
         settings: vec![
             ("tenancy".into(), "one tenant per user".into()),
-            ("list".into(), format!("Shopping by bought_at, page = {PAGE}")),
+            (
+                "list".into(),
+                format!("Shopping by bought_at, page = {PAGE}"),
+            ),
             ("transaction".into(), "none: one op is one batch".into()),
+            // Recorded because it is the one place this row is not the
+            // default engine: the untimed fill only.
+            (
+                "preload".into(),
+                format!(
+                    "relax_window {PRELOAD_WINDOW:?}; measured phases durable"
+                ),
+            ),
         ],
         compression: "per-type zstd dictionaries",
         retains_history: true,
         phases,
         footprints,
         live_records: cfg.live_records(),
-        logical_bytes: logical_bytes(cfg.users, cfg.seed, cfg.orders_max, cfg.items_max),
+        logical_bytes: logical_bytes(
+            cfg.users,
+            cfg.seed,
+            cfg.orders_max,
+            cfg.items_max,
+        ),
         notes: vec![
             "A checkout is one order plus its line items, and WaveDB has no \
              multi-record transaction: it costs one batch — one barrier — per \
@@ -81,11 +100,22 @@ pub fn run(cfg: &ShopCfg) -> Result<SystemReport, String> {
 /// Fill: every user is a tenant, holding an order collection, each order
 /// holding a line-item collection. Not timed.
 fn preload(cfg: &ShopCfg, dir: &Path) -> Result<(), String> {
-    let store = open(dir)?;
+    let store = open_relaxed(dir)?;
     for u in 0..cfg.users {
         block_on(create_user(&store, cfg, u))?;
         for s in 0..shopping_count(u, cfg.seed, cfg.orders_max) {
             block_on(create_order(&store, cfg, u, s))?;
+        }
+        // The per-type cache is a *write* cache with no automatic eviction on
+        // a bare `PageStore` (a node gets that from `quick-node`'s maintenance
+        // loop). A 200 000-user fill is ~8.6M records, which would sit in RAM
+        // until the single drain at the end and be OOM-killed long before it
+        // — the 500 MB cage is the whole run's, server included. Settling in
+        // rounds is what a node does anyway; the fill is untimed, so the cost
+        // lands nowhere measured.
+        if u % DRAIN_EVERY == DRAIN_EVERY - 1 {
+            store.drain().map_err(|e| format!("drain: {e}"))?;
+            store.evict_settled(FILL_CACHE_BYTES);
         }
     }
     store.drain().map_err(|e| format!("drain: {e}"))?;
@@ -286,11 +316,55 @@ fn tenant(store: &PageStore, u: u64) -> LocalHandle<'_, PageStore> {
 /// Unique one, a NonUnique with a declared list six — so they are collected
 /// rather than concatenated as arrays.
 fn open(dir: &Path) -> Result<PageStore, String> {
+    open_with(dir, StoreOptions::default())
+}
+
+/// The **fill**'s store: a durability window, because a preload is not a
+/// measurement (RFC 0061).
+///
+/// This is the bulk-load-then-serve pattern the window exists for, and it is
+/// the only reason a 200 000-user preload is affordable: one op is one batch
+/// is one barrier, so filling 8.6M records durably is 8.6M `fsync`s. The
+/// measured phases reopen with [`open`] — the default, one barrier per batch —
+/// so **no measured number is taken against a relaxed store**. The other four
+/// systems do the same thing by different names: their bulk loaders are not
+/// running the per-statement commit path either.
+fn open_relaxed(dir: &Path) -> Result<PageStore, String> {
+    open_with(
+        dir,
+        StoreOptions {
+            relax_window: PRELOAD_WINDOW,
+        },
+    )
+}
+
+use crate::FILL_WINDOW as PRELOAD_WINDOW;
+
+/// Users between settle rounds during the fill — ~2 000 records a round at
+/// the default order/item spread, which keeps the write cache bounded well
+/// inside the cage without making the fill a checkpoint benchmark.
+const DRAIN_EVERY: u64 = 200;
+
+/// What the fill's write cache is evicted **down to** — not to zero.
+///
+/// Evicting to zero costs far more than it saves: it drops the hot B+tree
+/// interior nodes with everything else, so the next insert descends through
+/// the page store instead of RAM, and a fill that took 11 s at 4 000 users
+/// took 164 s at 8 000. Cold reads are this engine's known weak path; a fill
+/// is the last place to force them.
+///
+/// 4 GB, because the fill runs with the cage open (`crate::cage::for_fill`,
+/// 10 GB ceiling) — generous on purpose, and still a bound, since an
+/// unbounded write cache would simply move the failure to that ceiling.
+const FILL_CACHE_BYTES: usize = 192 << 20;
+
+fn open_with(dir: &Path, options: StoreOptions) -> Result<PageStore, String> {
     let mut entries = Vec::new();
     entries.extend_from_slice(&User::storage_entries());
     entries.extend_from_slice(&Shopping::storage_entries());
     entries.extend_from_slice(&Product::storage_entries());
-    PageStore::open(dir, &entries).map_err(|e| format!("open: {e}"))
+    PageStore::open_with(dir, &entries, options)
+        .map_err(|e| format!("open: {e}"))
 }
 
 /// Checkpoint until the footprint stops moving — journal retirement is

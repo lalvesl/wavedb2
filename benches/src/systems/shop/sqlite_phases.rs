@@ -8,7 +8,10 @@ use crate::metrics::{self, Phase};
 use crate::schema::Rng;
 use crate::shop::{PAGE, product_count, shopping_count};
 
-pub(super) fn signup_phase(cfg: &ShopCfg, conn: &mut Connection) -> Result<Phase, String> {
+pub(super) fn signup_phase(
+    cfg: &ShopCfg,
+    conn: &mut Connection,
+) -> Result<Phase, String> {
     Ok(metrics::phase(
         "signup",
         |lat| {
@@ -54,7 +57,10 @@ pub(super) fn checkout_phase(
     ))
 }
 
-pub(super) fn profile_phase(cfg: &ShopCfg, conn: &Connection) -> Result<Phase, String> {
+pub(super) fn profile_phase(
+    cfg: &ShopCfg,
+    conn: &Connection,
+) -> Result<Phase, String> {
     let mut stmt = conn
         .prepare("SELECT name, address, city, email FROM users WHERE id = ?1")
         .map_err(sql)?;
@@ -74,7 +80,10 @@ pub(super) fn profile_phase(cfg: &ShopCfg, conn: &Connection) -> Result<Phase, S
     ))
 }
 
-pub(super) fn page_phase(cfg: &ShopCfg, conn: &Connection) -> Result<Phase, String> {
+pub(super) fn page_phase(
+    cfg: &ShopCfg,
+    conn: &Connection,
+) -> Result<Phase, String> {
     let mut user = conn
         .prepare("SELECT name FROM users WHERE id = ?1")
         .map_err(sql)?;
@@ -95,9 +104,10 @@ pub(super) fn page_phase(cfg: &ShopCfg, conn: &Connection) -> Result<Phase, Stri
                 let n = lat.time(|| {
                     let _: String =
                         user.query_row(params![u], |r| r.get(0)).expect("user");
-                    page.query_map(params![u, PAGE as i64, p * PAGE as i64], |r| {
-                        r.get::<_, i64>(0)
-                    })
+                    page.query_map(
+                        params![u, PAGE as i64, p * PAGE as i64],
+                        |r| r.get::<_, i64>(0),
+                    )
                     .expect("page")
                     .count()
                 });
@@ -108,7 +118,10 @@ pub(super) fn page_phase(cfg: &ShopCfg, conn: &Connection) -> Result<Phase, Stri
     ))
 }
 
-pub(super) fn detail_phase(cfg: &ShopCfg, conn: &Connection) -> Result<Phase, String> {
+pub(super) fn detail_phase(
+    cfg: &ShopCfg,
+    conn: &Connection,
+) -> Result<Phase, String> {
     let mut user = conn
         .prepare("SELECT name FROM users WHERE id = ?1")
         .map_err(sql)?;
@@ -149,4 +162,3 @@ pub(super) fn detail_phase(cfg: &ShopCfg, conn: &Connection) -> Result<Phase, St
         cfg.detail_reads as usize,
     ))
 }
-
