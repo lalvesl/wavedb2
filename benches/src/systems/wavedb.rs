@@ -17,6 +17,7 @@ use wavedb_core::{CollectionHandle, LocalHandle, U48};
 use wavedb_storage::PageStore;
 
 use super::{Cfg, Durability, SystemReport};
+use crate::RELAXED_WINDOW;
 use crate::footprint::{Footprint, Point};
 use crate::metrics::{self, Phase};
 use crate::schema::{Rng, Thing, ThingPivotId, logical_bytes, thing, thing_v2};
@@ -26,8 +27,11 @@ const TENANT: u32 = 1;
 /// point of the "compacted" footprint is the floor, not a partial move.
 const DEFRAG_BUDGET_BLOCKS: u64 = 1 << 20;
 
-pub fn run(cfg: &Cfg) -> Result<SystemReport, String> {
-    let dir = cfg.work_dir.join("wavedb");
+pub fn run(cfg: &Cfg, d: Durability) -> Result<SystemReport, String> {
+    // Per row: the two durabilities must not share a store, or the second
+    // would inherit the first's pages and its `insert` phase would measure a
+    // rewrite.
+    let dir = cfg.work_dir.join(format!("wavedb-{}", d.name()));
     // A seed arrives as `<store>/data` plus its `ids.bin`/`pivot.bin` sidecar;
     // the sidecar is what makes it usable at all, since a NonUnique anchor id
     // is minted from the clock and cannot be recomputed.
@@ -44,23 +48,31 @@ pub fn run(cfg: &Cfg) -> Result<SystemReport, String> {
     let (mut phases, ids, pivot) = match seeded {
         Some((ids, pivot)) => {
             let data = dir.join("data");
-            (read_only(cfg, &data, pivot, &ids)?, ids, pivot)
+            (read_only(cfg, &data, d, pivot, &ids)?, ids, pivot)
         }
-        None => fill_and_read(cfg, &dir.join("data"))?,
+        None => fill_and_read(cfg, &dir.join("data"), d)?,
     };
     let (update, footprints) =
-        update_and_measure(cfg, &dir.join("data"), &ids, pivot)?;
+        update_and_measure(cfg, &dir.join("data"), d, &ids, pivot)?;
     phases.push(update);
 
     Ok(SystemReport {
         system: "wavedb",
         bracket: "embedded",
         workload: "micro",
-        durability: Durability::Durable,
+        durability: d,
         version: env!("CARGO_PKG_VERSION").to_string(),
         settings: vec![
             ("mode".into(), "PageStore (in-process)".into()),
-            ("barrier".into(), "fsync per apply batch (only mode)".into()),
+            (
+                "barrier".into(),
+                match d {
+                    Durability::Durable => "fsync per apply batch".to_string(),
+                    Durability::Relaxed => {
+                        format!("one fsync per elapsed {RELAXED_WINDOW:?}")
+                    }
+                },
+            ),
             ("block_size".into(), "4096".into()),
         ],
         compression: "zstd (per-type dictionaries)",
@@ -77,8 +89,9 @@ pub fn run(cfg: &Cfg) -> Result<SystemReport, String> {
 
 fn notes(seeded: bool) -> Vec<String> {
     let mut notes = vec![
-        "Only durability mode: every collection op is one apply batch and one \
-         fsync. There is no relaxed setting to compare against."
+        "Every collection op is one apply batch. The durable row takes one \
+         fsync per batch; the relaxed row takes one per elapsed window \
+         (RFC 0061), the counterpart of the others' relaxed knobs."
             .into(),
         "Retains every superseded version; the other systems retain none. Read \
          the update row beside the footprint, never alone."
@@ -105,10 +118,11 @@ fn notes(seeded: bool) -> Vec<String> {
 fn read_only(
     cfg: &Cfg,
     dir: &Path,
+    d: Durability,
     pivot: ThingPivotId,
     ids: &[wavedb_core::Id],
 ) -> Result<Vec<Phase>, String> {
-    let store = open(dir)?;
+    let store = open(dir, d)?;
     let db = LocalHandle::new(&store, U48::from(TENANT));
     let col = Thing::collection(pivot);
     Ok(vec![read_phase("read_cold", cfg, &db, col, ids)])
@@ -119,12 +133,13 @@ fn read_only(
 fn fill_and_read(
     cfg: &Cfg,
     dir: &Path,
+    d: Durability,
 ) -> Result<(Vec<Phase>, Vec<wavedb_core::Id>, ThingPivotId), String> {
     let mut ids = Vec::with_capacity(cfg.rows as usize);
     let mut phases = Vec::new();
 
     let pivot = {
-        let store = open(dir)?;
+        let store = open(dir, d)?;
         let db = LocalHandle::new(&store, U48::from(TENANT));
         let pivot = block_on(Thing::create_pivot(&db))
             .map_err(|e| format!("create_pivot: {e}"))?;
@@ -157,7 +172,7 @@ fn fill_and_read(
     // Reopen: engine caches are empty, so this is a genuine read-through to
     // pages. The OS page cache is still warm — see the note in `run`.
     {
-        let store = open(dir)?;
+        let store = open(dir, d)?;
         let db = LocalHandle::new(&store, U48::from(TENANT));
         let col = Thing::collection(pivot);
         phases.push(read_phase("read_cold", cfg, &db, col, &ids));
@@ -170,10 +185,11 @@ fn fill_and_read(
 fn update_and_measure(
     cfg: &Cfg,
     dir: &Path,
+    d: Durability,
     ids: &[wavedb_core::Id],
     pivot: ThingPivotId,
 ) -> Result<(Phase, Vec<(Point, Footprint)>), String> {
-    let store = open(dir)?;
+    let store = open(dir, d)?;
     let db = LocalHandle::new(&store, U48::from(TENANT));
     // The same pivot the fill used: a collection's chains hang off it, so a
     // fresh one would save into a different collection entirely.
@@ -264,9 +280,21 @@ fn read_phase(
     )
 }
 
-fn open(dir: &Path) -> Result<PageStore, String> {
-    PageStore::open(dir, &Thing::storage_entries())
-        .map_err(|e| format!("open: {e}"))
+/// Opened at the row's own durability (RFC 0061). Unlike the shop workload
+/// there is no untimed preload to exempt here — the fill **is** the `insert`
+/// phase — so every open in this adapter takes the row's window.
+fn open(dir: &Path, d: Durability) -> Result<PageStore, String> {
+    PageStore::open_with(
+        dir,
+        &Thing::storage_entries(),
+        wavedb_storage::StoreOptions {
+            relax_window: match d {
+                Durability::Durable => std::time::Duration::ZERO,
+                Durability::Relaxed => crate::RELAXED_WINDOW,
+            },
+        },
+    )
+    .map_err(|e| format!("open: {e}"))
 }
 
 fn io(e: std::io::Error) -> String {
