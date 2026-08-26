@@ -21,6 +21,10 @@ fn id(key: u64) -> Id {
     Id::new(key, U48::from(9u32), false, 1)
 }
 
+/// IndexedDB is one flat `Id → bytes` map, so a write's routing hash is
+/// ignored here — any value serves.
+const SH: u64 = 0xABCD;
+
 /// A database name no earlier run has touched.
 fn fresh(prefix: &str) -> String {
     format!("{prefix}-{}", js_sys::Date::now())
@@ -39,7 +43,7 @@ async fn raw_batches_roundtrip_and_survive_reopen() {
     assert_eq!(store.get(id(1)).await.unwrap(), Some(vec![1, 2, 3]));
 
     store
-        .apply(&[Write::Remove(id(1)), Write::Put(id(2), vec![9])])
+        .apply(&[Write::Remove(SH, id(1)), Write::Put(id(2), vec![9])])
         .await
         .unwrap();
     assert_eq!(store.get(id(1)).await.unwrap(), None, "removed");
