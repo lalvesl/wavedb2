@@ -12,10 +12,8 @@
     clippy::cast_lossless,
     clippy::cast_sign_loss
 )]
-// `PageStore`'s `Store` impl returns futures that are only `Send` when the
-// caller's usage is. These are internal node-side seams, not a public
-// `Send`-bounded API, so the missing auto-`Send` is intended — same stance core
-// takes with `async_fn_in_trait`.
+// The lint fires on the crate's `async fn`s in their *generic* setting; the
+// concrete engine's futures are `Send`, and `thread_safety` below asserts it.
 #![allow(clippy::future_not_send)]
 
 pub mod alloc;
@@ -53,3 +51,43 @@ pub use struct_storage::{
     BPTREE_NODE_STORAGE, StorageRegistry, StructDictionary, StructDirectory,
     StructMemCache, StructStorage,
 };
+
+/// The engine's thread-safety, **asserted rather than described**.
+///
+/// `PageStore` is `Send + Sync` and its futures are `Send` today, and nothing
+/// arranges that: it holds `parking_lot` locks and `&'static StructStorage`
+/// slots, and it never awaits, so both properties fall out of how the code
+/// happens to be written. A single `Rc`/`RefCell` field, or one non-`Send`
+/// value held across a future await point, would silently take them away.
+///
+/// That matters because two designs rest on them —
+/// [RFC 0064](../../../rfcs/0064-pivot-owned-concurrency-PLANNED.md) builds
+/// multi-thread ownership on top, and
+/// [RFC 0063](../../../rfcs/0063-engine-yield-map-and-interruptible-engine-PLANNED.md)'s
+/// yield map is only meaningful if they hold. 0063 also records what happens to
+/// a load-bearing property nobody asserts: its I1 and I2 became invariants by
+/// accident, discovered years later by reading for something else. A comment
+/// would have the same fate, so these are compile errors instead.
+///
+/// Both cost nothing at runtime — a `const` closure is type-checked and never
+/// called.
+mod thread_safety {
+    use super::PageStore;
+    use wavedb_core::store::Store;
+
+    const _: fn() = || {
+        const fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PageStore>();
+    };
+
+    // The type being `Send + Sync` does not imply its futures are: an `async
+    // fn` body may hold something non-`Send` across an await. That is the
+    // regression this second assertion catches and the first cannot.
+    const _: fn(&PageStore) = |store| {
+        fn assert_send<T: Send>(_: T) {}
+        let id = wavedb_core::Id::from_raw(0);
+        assert_send(async move { store.apply(&[]).await });
+        assert_send(async move { store.get(id).await });
+        assert_send(async move { store.get_of(0, id).await });
+    };
+}

@@ -315,6 +315,42 @@ pub(super) fn child_and_index<K: NodeKey>(
     }
 }
 
+/// The index layer's futures are `Send` over a `Send + Sync` store — asserted,
+/// because nothing arranges it.
+///
+/// It holds today only because `BpTree` takes its store **per call**
+/// (`S: Store`) instead of owning one, so there is no `Rc` to make it
+/// non-`Send`. Moving the store into a field, or holding any non-`Send` value
+/// across one of these awaits, would remove the property with no other
+/// symptom — and [RFC 0064](../../../../rfcs/0064-pivot-owned-concurrency-PLANNED.md)
+/// rests on it: a shard's messages cross threads even though the shard's own
+/// state never does.
+///
+/// `MemStore` stands in for any `Send + Sync` backend; `PageStore` is asserted
+/// separately in `wavedb-storage`, which is where the concrete engine lives.
+#[cfg(test)]
+mod send_assertions {
+    use super::BpTree;
+    use crate::index::mem_store::MemStore;
+    use crate::index::node_key::SecKey;
+    use crate::local_id::LocalId;
+    use crate::u48::U48;
+
+    const _: fn(&MemStore) = |store| {
+        fn assert_send<T: Send>(_: T) {}
+        let tree = BpTree::<SecKey>::at(LocalId::default(), U48::from(0u32));
+        assert_send(async move {
+            BpTree::<SecKey>::create(store, U48::from(0u32)).await
+        });
+        assert_send(async move { tree.max_key(store).await });
+        let key = SecKey {
+            field: Vec::new(),
+            rec: LocalId::default(),
+        };
+        assert_send(async move { tree.contains(store, key).await });
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;

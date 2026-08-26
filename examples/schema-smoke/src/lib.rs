@@ -307,6 +307,36 @@ mod tests {
     use wavedb_core::wire::{from_wire, to_wire};
     use wavedb_core::{LocalId, WaveDbStruct};
 
+    /// The **generated** collection path produces `Send` futures over a
+    /// `Send + Sync` store — the end-to-end version of the assertions in
+    /// `wavedb-core` (the index layer) and `wavedb-storage` (the engine).
+    ///
+    /// This is the one that covers `#[wavedb]`'s expansion, so it is the one
+    /// that would catch a macro change introducing an `Rc` or a `RefCell` into
+    /// a generated body. Nothing else would: the expansion compiles fine
+    /// non-`Send`, and the whole stack is driven single-threaded today, so the
+    /// loss would surface only when
+    /// [RFC 0064](../../../rfcs/0064-pivot-owned-concurrency-PLANNED.md)'s
+    /// multi-thread build was attempted — by which point the cause would be
+    /// somewhere in a year of macro commits.
+    ///
+    /// `Person` is the widest declared type here (two lists, one composite),
+    /// so it exercises the list-maintenance paths as well as the plain ones.
+    const _: fn(&mem::MemStore) = |store| {
+        fn assert_send<T: Send>(_: T) {}
+        assert_send(async move {
+            let db = wavedb_core::LocalHandle::new(
+                store,
+                wavedb_core::U48::from(7u32),
+            );
+            let col = super::Person::collection(
+                super::Person::create_pivot(&db).await?,
+            );
+            col.insert(&db, &super::Person::default()).await?;
+            col.get(&db, wavedb_core::Id::from_raw(0)).await
+        });
+    };
+
     // Every declared struct round-trips through its derive-emitted WaveWire
     // impl, and its STRUCT_HASH is a distinct compile-time const.
     #[test]
