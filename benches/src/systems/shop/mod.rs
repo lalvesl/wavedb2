@@ -65,8 +65,15 @@ impl ShopCfg {
         let mut n = 0;
         for u in 0..self.users {
             n += 1;
-            for s in 0..crate::shop::shopping_count(u, self.seed, self.orders_max) {
-                n += 1 + crate::shop::product_count(u, s, self.seed, self.items_max);
+            for s in
+                0..crate::shop::shopping_count(u, self.seed, self.orders_max)
+            {
+                n += 1 + crate::shop::product_count(
+                    u,
+                    s,
+                    self.seed,
+                    self.items_max,
+                );
             }
         }
         n
@@ -75,5 +82,10 @@ impl ShopCfg {
 
 /// The phase names, in report order. Shared so the table can print one row per
 /// system without every adapter agreeing by accident.
-pub const PHASES: [&str; 5] =
-    ["signup", "checkout", "profile", "order_page", "order_detail"];
+pub const PHASES: [&str; 5] = [
+    "signup",
+    "checkout",
+    "profile",
+    "order_page",
+    "order_detail",
+];

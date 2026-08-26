@@ -8,7 +8,9 @@ use mongodb::bson::{Document, doc};
 use mongodb::sync::{ClientSession, Database};
 
 use super::ShopCfg;
-use super::mongodb::{item_doc, items, next_id, order_doc, orders, profiles, user_doc};
+use super::mongodb::{
+    item_doc, items, next_id, order_doc, orders, profiles, user_doc,
+};
 use crate::metrics::{self, Phase, Writer};
 use crate::schema::Rng;
 use crate::shop::{PAGE, product_count, shopping_count};
@@ -159,4 +161,3 @@ pub(super) fn detail_phase(cfg: &ShopCfg, db: &Database, pid: u32) -> Phase {
         cfg.detail_reads as usize,
     )
 }
-

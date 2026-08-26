@@ -15,16 +15,16 @@
 
 use std::path::Path;
 
+use mongodb::IndexModel;
 use mongodb::bson::{Document, doc};
 use mongodb::options::{Acknowledgment, ClientOptions, WriteConcern};
 use mongodb::sync::{Client, Collection, Database};
-use mongodb::IndexModel;
 
 use super::ShopCfg;
 use crate::footprint::{Footprint, Point};
 use crate::shop::{
-    logical_bytes, product_count, product_row, shopping_count,
-    shopping_row, user_row,
+    logical_bytes, product_count, product_row, shopping_count, shopping_row,
+    user_row,
 };
 use crate::systems::server::{self, CACHE_GB, Server};
 use crate::systems::{Durability, SystemReport};
@@ -51,7 +51,11 @@ pub fn run(
         .unwrap_or("unknown")
         .to_string();
     indexes(&db)?;
-    preload(cfg, &db)?;
+    {
+        // A fill is not a measurement: it gets the machine, not the cage.
+        let _fill = crate::cage::for_fill();
+        preload(cfg, &db)?;
+    }
     drop(client);
 
     // Restart empties the WiredTiger cache, matching every other row.
@@ -62,7 +66,12 @@ pub fn run(
     let mut session = client.start_session().run().map_err(drv)?;
     let mut phases = vec![
         super::mongodb_phases::signup_phase(cfg, &db, mongo.pid),
-        super::mongodb_phases::checkout_phase(cfg, &db, &mut session, mongo.pid),
+        super::mongodb_phases::checkout_phase(
+            cfg,
+            &db,
+            &mut session,
+            mongo.pid,
+        ),
         super::mongodb_phases::profile_phase(cfg, &db, mongo.pid),
         super::mongodb_phases::page_phase(cfg, &db, mongo.pid),
         super::mongodb_phases::detail_phase(cfg, &db, mongo.pid),
@@ -93,7 +102,12 @@ pub fn run(
         phases,
         footprints,
         live_records: cfg.live_records(),
-        logical_bytes: logical_bytes(cfg.users, cfg.seed, cfg.orders_max, cfg.items_max),
+        logical_bytes: logical_bytes(
+            cfg.users,
+            cfg.seed,
+            cfg.orders_max,
+            cfg.items_max,
+        ),
         notes: vec![
             "Reference model, not embedded line items: the shape is held equal \
              to the other four so the row compares access paths rather than \
@@ -191,7 +205,14 @@ pub(super) fn order_doc(id: u64, u: u64, s: u64, cfg: &ShopCfg) -> Document {
     }
 }
 
-pub(super) fn item_doc(id: u64, order: u64, u: u64, s: u64, p: u64, cfg: &ShopCfg) -> Document {
+pub(super) fn item_doc(
+    id: u64,
+    order: u64,
+    u: u64,
+    s: u64,
+    p: u64,
+    cfg: &ShopCfg,
+) -> Document {
     let r = product_row(u, s, p, cfg.seed);
     doc! {
         "_id": id as i64, "shopping_id": order as i64, "name": r.name,
@@ -326,8 +347,9 @@ fn measure(data: &Path) -> Result<Footprint, String> {
 }
 
 fn is_log(path: &Path) -> bool {
-    path.components()
-        .any(|c| c.as_os_str() == "journal" || c.as_os_str() == "diagnostic.data")
+    path.components().any(|c| {
+        c.as_os_str() == "journal" || c.as_os_str() == "diagnostic.data"
+    })
 }
 
 fn s(p: &Path) -> String {
