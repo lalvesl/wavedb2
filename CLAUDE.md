@@ -261,8 +261,13 @@ no DTO layer and no query DSL (filtered reads = `#[server]` functions).
 - Stored values are STRUCT_HASH-headed: user records
   `[STRUCT_HASH][meta_len][Metadata][body]`; Pivots `[STRUCT_HASH][wire]`; BpTree
   nodes `[BPTREE_NODE_HASH][kind u8][wire]`. Decode verifies the head.
-- Pivot instances are created explicitly (`create_pivot`), one per tenant per type;
-  the holder stores the `PivotId`. The Pivot is rewritten only when a root moves.
+- Pivot instances are created explicitly (`create_pivot`), **one per holder** —
+  *not* one per tenant per type: the API imposes no such limit, so a nesting
+  NonUnique mints one per record and a type has as many collections as there
+  are holders (the shop workload: one `Product` collection per `Shopping`).
+  The holder stores the `PivotId`. The Pivot is rewritten only when a root
+  moves. Two collections of one type share nothing but their storage slot,
+  which is what makes the Pivot instance the unit of concurrency (RFC 0064).
 
 ## Testing conventions
 

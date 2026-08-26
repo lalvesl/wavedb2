@@ -511,8 +511,9 @@ tree nodes are served from the shared `BpTree` cache slot when warm.
 - **Unique** — `get` resolves the fixed anchor (`STRUCT_HASH · TENANT · 1 · 0`)
   in one lookup. `save` writes the new live bytes to the anchor and chains the
   previous version into history via `Metadata`.
-- **NonUnique** — a collection's `Pivot` is created **explicitly** (one per tenant
-  per definition) and its `PivotId` stored by the holder; never auto-created. A
+- **NonUnique** — a collection's `Pivot` is created **explicitly** (one per
+  holder, so a nesting NonUnique mints one per record) and its `PivotId` stored
+  by the holder; never auto-created. A
   record's **identity `Id` is fixed at `insert`** (stable anchor for references),
   so:
   - **`save`** (update) **re-keys only the trees whose field changed** — the
