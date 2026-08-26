@@ -72,6 +72,7 @@
 //! appends always covers everything committed.
 
 use std::path::Path;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use wavedb_core::Id;
@@ -89,6 +90,28 @@ const DEFAULT_TARGET_BLOCKS_PER_BUCKET: u64 = 8; // 32 KiB
 
 /// Ids one batch touched, grouped by registry slot — what the settle consumes.
 pub(crate) type Touched = Vec<(usize, Vec<Id>)>;
+
+/// How a store answers the durability question, chosen once at
+/// [`open_with`](PageStore::open_with) (RFC 0061).
+///
+/// Opened, never inferred: a durability mode that changes by itself is a
+/// guarantee nobody can reason about.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreOptions {
+    /// Longest a `Batch` may sit unsynced. **Zero (the default) is one
+    /// barrier per batch** — the promise the engine was built around, and
+    /// what every existing caller keeps.
+    ///
+    /// Non-zero trades it for group commit: `apply` appends without a barrier
+    /// and syncs only once the window has elapsed, so a burst inside one
+    /// window amortises to a single `fsync`. `Ok` from a write then means *in
+    /// the journal, ordered, and durable within the window unless the process
+    /// dies first* — a crash loses a **suffix** of acknowledged writes and
+    /// never corrupts (frames are crc-framed, replay stops at the first torn
+    /// one). [`flush`](PageStore::flush) forces the barrier when a particular
+    /// write does need the stronger answer.
+    pub relax_window: Duration,
+}
 
 /// The native, page-backed [`Store`](wavedb_core::Store).
 ///
@@ -117,6 +140,9 @@ pub struct PageStore {
     /// Touched ids committed to the caches but not yet settled into pages —
     /// what [`drain`](Self::drain) consumes.
     pub(crate) pending: Mutex<Touched>,
+    /// The durability window this store was opened with (RFC 0061); zero is
+    /// one barrier per batch.
+    pub(crate) relax_window: Duration,
     _claim: EngineClaim,
 }
 
@@ -136,6 +162,19 @@ impl PageStore {
     pub fn open(
         dir: impl AsRef<Path>,
         types: &[&'static StructStorage],
+    ) -> StorageResult<Self> {
+        Self::open_with(dir, types, StoreOptions::default())
+    }
+
+    /// [`open`](Self::open), with the durability question answered explicitly
+    /// (RFC 0061). `StoreOptions::default()` is exactly [`open`](Self::open).
+    ///
+    /// # Errors
+    /// The same faults as [`open`](Self::open).
+    pub fn open_with(
+        dir: impl AsRef<Path>,
+        types: &[&'static StructStorage],
+        options: StoreOptions,
     ) -> StorageResult<Self> {
         let claim = EngineClaim::acquire()?;
         let dir = dir.as_ref();
@@ -172,6 +211,7 @@ impl PageStore {
             seed,
             target_blocks_per_bucket: DEFAULT_TARGET_BLOCKS_PER_BUCKET,
             pending: Mutex::new(Vec::new()),
+            relax_window: options.relax_window,
             _claim: claim,
         };
         for batch in &recovered.replay {
@@ -180,6 +220,21 @@ impl PageStore {
             store.settle(&touched)?;
         }
         Ok(store)
+    }
+
+    /// Force the barrier now: every batch acknowledged so far is on the
+    /// platter when this returns.
+    ///
+    /// A no-op-shaped call on a zero-window store (each batch already synced,
+    /// so this just takes one more barrier over nothing) and the escape hatch
+    /// on a windowed one — the reason a window is a setting rather than a
+    /// wager. An application can be relaxed for the cart and strict for the
+    /// receipt (RFC 0061).
+    ///
+    /// # Errors
+    /// [`StorageError::Io`](crate::StorageError::Io) if the sync fails.
+    pub fn flush(&self) -> StorageResult<()> {
+        self.journal.lock().sync()
     }
 
     /// Number of live records currently cached across every registered type.
@@ -210,11 +265,12 @@ impl PageStore {
 
 #[cfg(test)]
 mod tests {
-    use super::PageStore;
+    use super::{PageStore, StoreOptions};
     use crate::error::StorageError;
     use crate::struct_storage::StructStorage;
     use futures::executor::block_on;
     use parking_lot::{Mutex, MutexGuard};
+    use std::time::Duration;
     use wavedb_core::{Id, Store, U48, Write};
 
     const SH: u64 = 0x1122_3344_5566_7788;
@@ -1281,5 +1337,84 @@ mod tests {
                 8 + 1024
             );
         });
+    }
+
+    /// The default is the promise the engine was built around, and the one
+    /// thing a durability window must never quietly change (RFC 0061).
+    #[test]
+    fn a_zero_window_takes_one_barrier_per_batch() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let s = open(d.path()); // StoreOptions::default()
+        let before = s.journal.lock().barriers();
+        block_on(async {
+            for k in 0..8u64 {
+                s.apply(&[Write::Put(nonunique(k), rec(SH, b"strict"))])
+                    .await
+                    .unwrap();
+            }
+        });
+        assert_eq!(s.journal.lock().barriers(), before + 8);
+    }
+
+    /// The whole point of the window: a burst inside one costs no barrier,
+    /// and `flush` buys the strong answer back for exactly one.
+    #[test]
+    fn a_burst_inside_one_window_costs_one_barrier() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let s = PageStore::open_with(
+            d.path(),
+            &[&TEST_SLOT],
+            StoreOptions {
+                // Long enough that nothing elapses during the test — the
+                // window's *timing* is the clock's business, not this test's.
+                relax_window: Duration::from_hours(1),
+            },
+        )
+        .unwrap();
+        let before = s.journal.lock().barriers();
+        block_on(async {
+            for k in 0..32u64 {
+                s.apply(&[Write::Put(nonunique(k), rec(SH, b"windowed"))])
+                    .await
+                    .unwrap();
+            }
+        });
+        assert_eq!(
+            s.journal.lock().barriers(),
+            before,
+            "32 batches inside one window must take no barrier"
+        );
+        s.flush().unwrap();
+        assert_eq!(s.journal.lock().barriers(), before + 1);
+    }
+
+    /// Elapsed window ⇒ the barrier is taken, and what was acked is on the
+    /// platter: a reopen replays it.
+    #[test]
+    fn an_elapsed_window_syncs_and_the_batch_replays() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        {
+            let s = PageStore::open_with(
+                d.path(),
+                &[&TEST_SLOT],
+                // Elapsed before the first append finishes writing.
+                StoreOptions {
+                    relax_window: Duration::from_nanos(1),
+                },
+            )
+            .unwrap();
+            let before = s.journal.lock().barriers();
+            block_on(s.apply(&[Write::Put(nonunique(7), rec(SH, b"elapsed"))]))
+                .unwrap();
+            assert_eq!(s.journal.lock().barriers(), before + 1);
+        }
+        let s = open(d.path());
+        assert_eq!(
+            block_on(s.get(nonunique(7))).unwrap(),
+            Some(rec(SH, b"elapsed"))
+        );
     }
 }

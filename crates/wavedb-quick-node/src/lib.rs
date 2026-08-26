@@ -43,10 +43,11 @@ use std::future::{Future, pending};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 use wavedb_core::expose::Exposure;
-use wavedb_storage::{PageStore, StorageRegistry};
+use wavedb_storage::{PageStore, StorageRegistry, StoreOptions};
 
 pub use error::{Result, ServerError};
 
@@ -63,6 +64,7 @@ pub struct Server<E> {
     data_dir: PathBuf,
     maintenance: Maintenance,
     secret: Option<[u8; 32]>,
+    store: StoreOptions,
 }
 
 /// The background maintenance policy: how the node settles, checkpoints,
@@ -125,6 +127,7 @@ where
             data_dir: PathBuf::from("data"),
             maintenance: Maintenance::default(),
             secret: None,
+            store: StoreOptions::default(),
         }
     }
 
@@ -142,6 +145,22 @@ where
     #[must_use]
     pub fn data_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.data_dir = dir.into();
+        self
+    }
+
+    /// Group-commit writes: allow an acknowledged batch to sit unsynced for
+    /// up to `window`, so a burst costs one `fsync` instead of one each
+    /// (RFC 0061).
+    ///
+    /// **Default zero — one barrier per batch**, which is the promise the
+    /// engine is built around. Setting this weakens what `Ok` means for
+    /// every write the node serves: a crash then loses a *suffix* of
+    /// acknowledged writes (never a corrupt store). Set it when the
+    /// application can say how much recent work it is willing to lose, and
+    /// not otherwise.
+    #[must_use]
+    pub const fn relax_window(mut self, window: Duration) -> Self {
+        self.store.relax_window = window;
         self
     }
 
@@ -167,8 +186,11 @@ where
     /// [`ServerError::Storage`] if the engine can't open (busy, corruption),
     /// [`ServerError::Io`] if the socket can't bind.
     pub async fn bind(self, addr: &str) -> Result<Bound<E>> {
-        let store =
-            PageStore::open(&self.data_dir, &self.registry.storage_entries())?;
+        let store = PageStore::open_with(
+            &self.data_dir,
+            &self.registry.storage_entries(),
+            self.store,
+        )?;
         let listener = TcpListener::bind(addr).await?;
         // Publish for the token-minting helpers (`wavedb::auth`) — one node
         // per process, like the engine's storage slots. The secret is

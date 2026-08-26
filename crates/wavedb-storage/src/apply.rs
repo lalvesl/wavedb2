@@ -14,8 +14,10 @@ use crate::page_store::{PageStore, Touched};
 impl PageStore {
     /// Journal first (durable fsync), then commit to the per-type caches and
     /// queue the touched ids for the settle drain. The batch is durable when
-    /// this returns; the page write happens later
-    /// ([`drain`](Self::drain)) — a crash before it replays from the journal.
+    /// this returns — unless the store was opened with a durability window,
+    /// in which case it is durable within that window (RFC 0061). The page
+    /// write happens later ([`drain`](Self::drain)) — a crash before it
+    /// replays from the journal.
     // The journal guard deliberately spans the cache commit — releasing it
     // earlier (the lint's suggestion) would let two applies commit their
     // caches in the opposite order to their journal frames, so replay could
@@ -46,8 +48,20 @@ impl PageStore {
             .filter(|w| !matches!(w, Write::Expect(..)))
             .cloned()
             .collect();
-        journal
-            .append(&crate::journal::JournalFrame::Batch(effective.clone()))?; // durability point
+        let frame = crate::journal::JournalFrame::Batch(effective.clone());
+        // The durability point, and the one place the window changes anything
+        // (RFC 0061). The check runs under the journal lock this function
+        // already holds, so a burst inside one window amortises to a single
+        // barrier with no timer, no flusher task, and no interaction with the
+        // engine's non-`Send` current-thread model.
+        if self.relax_window.is_zero() {
+            journal.append(&frame)?; // write + fsync
+        } else {
+            journal.append_deferred(&frame)?; // write, no barrier
+            if journal.since_last_sync() >= self.relax_window {
+                journal.sync()?; // one barrier for the whole window
+            }
+        }
         // Commit under the journal lock: cache order == journal order.
         let touched = self.commit_to_caches(&effective)?;
         merge_touched(&mut self.pending.lock(), touched);

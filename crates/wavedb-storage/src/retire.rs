@@ -58,9 +58,15 @@ impl PageStore {
     /// one holding that pending frame.
     ///
     /// Free in the ordinary case: a checkpoint fires because its journal grew,
-    /// growth means `Batch` appends, and every `Batch` append `fsync`s. The
-    /// fallback barrier is reached only by a checkpoint with no writes to
-    /// settle at all.
+    /// growth means `Batch` appends, and a `Batch` append `fsync`s — every
+    /// time on a zero-window store, once per elapsed window on a relaxed one
+    /// (RFC 0061), which a journal grown enough to trigger a checkpoint has
+    /// crossed many times over. The fallback barrier is reached only by a
+    /// checkpoint with no writes to settle at all.
+    ///
+    /// The `barriers()` comparison is what makes that a matter of cost rather
+    /// than correctness: it asks whether *this file* was flushed since the
+    /// frame was appended, which is the right question in both modes.
     ///
     /// # Errors
     /// A sync or unlink fault. The protection roll happens **first** precisely

@@ -6,6 +6,10 @@
 //! Everything else in the engine — pages, the page directories, the allocator —
 //! is a reconstruction rooted in journal frames.
 //!
+//! A store opened with a durability window takes the other door —
+//! [`append_deferred`](Journal::append_deferred) plus a windowed
+//! [`sync`](Journal::sync) — and the promise weakens accordingly (RFC 0061).
+//!
 //! ## Files
 //!
 //! Journals are timestamped: `journal_<nanos>.log`. Rotation creates a new
@@ -39,6 +43,7 @@
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use wavedb_core::Write;
 use wavedb_core::wire::{WaveWire, from_wire_checked, to_wire_checked};
@@ -96,6 +101,10 @@ pub struct Journal {
     end: u64,
     /// Barriers taken on this file (see [`syncs`](Self::syncs)).
     syncs: u64,
+    /// When the last barrier was taken — the durability window is measured
+    /// against this (RFC 0061). Monotonic, deliberately: a rewound wall clock
+    /// would either stall the window forever or sync on every append.
+    last_sync: Instant,
 }
 
 /// The journal files under `dir`, sorted by timestamp (oldest first).
@@ -139,6 +148,7 @@ impl Journal {
             ts,
             end: 0,
             syncs: 0,
+            last_sync: Instant::now(),
         })
     }
 
@@ -156,6 +166,7 @@ impl Journal {
             ts,
             end,
             syncs: 0,
+            last_sync: Instant::now(),
         })
     }
 
@@ -209,7 +220,15 @@ impl Journal {
     pub fn sync(&mut self) -> StorageResult<()> {
         self.file.sync_all()?;
         self.syncs += 1;
+        self.last_sync = Instant::now();
         Ok(())
+    }
+
+    /// Elapsed time since the last barrier — what a durability window is
+    /// compared against (RFC 0061). Zero-window stores never ask.
+    #[must_use]
+    pub fn since_last_sync(&self) -> Duration {
+        self.last_sync.elapsed()
     }
 
     /// Barriers this journal has taken — the accounting behind "a checkpoint
