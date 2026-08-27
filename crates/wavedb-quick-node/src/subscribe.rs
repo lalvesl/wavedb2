@@ -119,20 +119,49 @@ pub type Subscriptions = Rc<RefCell<SubTable>>;
 /// POST command, a WebSocket `Call`, or a `#[server]` body — reaches the
 /// live watchers; node-side seeding (which touches the raw engine before
 /// serving) does not, and neither do cache mirrors (a different store).
-pub struct NotifyStore<S> {
+pub struct NotifyStore<S, P = Subscriptions> {
     inner: Rc<S>,
-    subs: Subscriptions,
+    subs: P,
 }
 
-impl<S> NotifyStore<S> {
-    /// Wrap a shared engine handle, publishing mutations into `subs` (the
-    /// WebSocket push).
-    pub const fn new(inner: Rc<S>, subs: Subscriptions) -> Self {
+/// Where a committed mutation goes.
+///
+/// Two implementations, and the difference is **which thread owns the
+/// subscription table**. It is a trait rather than an enum because an enum
+/// holding the local variant would make every `NotifyStore` non-`Send`,
+/// including the ones that must cross — the property is per-instance, so it
+/// belongs in the type. Monomorphised: no `dyn`.
+pub trait Publish {
+    fn publish(&self, mutation: &Mutation);
+}
+
+/// Same thread as the table: fan out directly. Today's node, and the tests.
+impl Publish for Subscriptions {
+    fn publish(&self, mutation: &Mutation) {
+        self.borrow_mut().publish(mutation);
+    }
+}
+
+/// Another thread owns the table: hand the mutation over and return.
+///
+/// This is what lets an operation execute on a shard's thread — the mutation
+/// crosses as plain data, and the fan-out stays where the sessions are. A
+/// closed channel is dropped silently: the node is shutting down, and there
+/// is nobody left to deliver to.
+impl Publish for tokio::sync::mpsc::UnboundedSender<Mutation> {
+    fn publish(&self, mutation: &Mutation) {
+        let _ = self.send(mutation.clone());
+    }
+}
+
+impl<S, P> NotifyStore<S, P> {
+    /// Wrap a shared engine handle, publishing mutations through `subs`.
+    pub const fn new(inner: Rc<S>, subs: P) -> Self {
         Self { inner, subs }
     }
 }
 
-impl<S: Store> Store for NotifyStore<S> {
+impl<S: Store, P: Publish> Store for NotifyStore<S, P> {
     async fn get(&self, id: Id) -> wavedb_core::Result<Option<Vec<u8>>> {
         self.inner.get(id).await
     }
@@ -154,9 +183,23 @@ impl<S: Store> Store for NotifyStore<S> {
         // ordinary store's default drops the closure unbuilt), and only on
         // writes. The publish is exact-match routing — no data scan.
         let mutation = mutation();
-        self.subs.borrow_mut().publish(&mutation);
+        self.subs.publish(&mutation);
     }
 }
+
+/// What actually has to cross a thread for a shard to publish: the mutation
+/// and the channel carrying it.
+///
+/// **Not** the `NotifyStore` itself — that is built on the shard's own thread
+/// and holds an `Rc`, exactly like `ShardStore`, and must stay non-`Send` so
+/// it cannot drift. An earlier version of this assertion asked for the wrapper
+/// to be `Send` and the compiler refused, which was the right answer to the
+/// wrong question: the seam is the *message*, not the store.
+const _: fn() = || {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Mutation>();
+    assert_send::<tokio::sync::mpsc::UnboundedSender<Mutation>>();
+};
 
 #[cfg(test)]
 mod tests {
