@@ -86,6 +86,7 @@ pub struct Answer {
 pub async fn handle<E, S>(
     registry: &E,
     store: &S,
+    locks: &crate::shard::OwnerLocks,
     secret: &[u8; 32],
     request: Request,
 ) -> Answer
@@ -114,7 +115,27 @@ where
         };
     }
 
-    let response = execute(registry, store, caller, frame).await;
+    // Gate 1.5 — serialise the operation against others on the same owner.
+    //
+    // Required, not defensive: a collection op is a read-modify-write across
+    // several structures, and it is atomic today only because `PageStore`
+    // never suspends. Under any store that does — `ShardStore`, IndexedDB,
+    // anything network-backed — two interleaved ops silently lose an index
+    // update, leaving a record live at its anchor and reachable from nothing.
+    // See `CONCURRENCY_BRAKE.md` and `wavedb-core/tests/concurrent_node_clobber.rs`.
+    //
+    // The guard is dropped before the piggyback: that navigation is
+    // best-effort and read-only, so holding the owner through it would
+    // lengthen the critical section for nothing.
+    let response = {
+        let _owner = locks
+            .acquire(crate::shard::OwnerKey::of(
+                caller.tenant,
+                frame.struct_hash,
+            ))
+            .await;
+        execute(registry, store, caller, frame).await
+    };
     let delta = piggyback(registry, store, caller, &sync).await;
     Answer {
         response,
@@ -335,9 +356,15 @@ mod tests {
         secret: &[u8; 32],
         request: Request,
     ) -> Response {
-        super::handle(registry, store, secret, request)
-            .await
-            .response
+        super::handle(
+            registry,
+            store,
+            &crate::shard::OwnerLocks::new(),
+            secret,
+            request,
+        )
+        .await
+        .response
     }
 
     const SECRET: [u8; 32] = [9; 32];
@@ -542,6 +569,7 @@ mod tests {
         let plain = super::handle(
             &OneHash,
             &store,
+            &crate::shard::OwnerLocks::new(),
             &SECRET,
             request(auth.clone(), 0x1234),
         )
@@ -559,7 +587,14 @@ mod tests {
             },
             since: Some(40),
         }];
-        let answer = super::handle(&OneHash, &store, &SECRET, req).await;
+        let answer = super::handle(
+            &OneHash,
+            &store,
+            &crate::shard::OwnerLocks::new(),
+            &SECRET,
+            req,
+        )
+        .await;
         assert_eq!(
             answer.response,
             Response::Ok(Reply::Value(Some(vec![42]))),

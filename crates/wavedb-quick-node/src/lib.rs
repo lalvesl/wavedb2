@@ -38,6 +38,7 @@ mod serve;
 mod serve_ws;
 pub mod shard;
 mod subscribe;
+mod upkeep;
 
 use std::cell::RefCell;
 use std::future::{Future, pending};
@@ -102,10 +103,10 @@ impl Default for Maintenance {
 pub struct Bound<E> {
     registry: E,
     listener: TcpListener,
-    /// The raw engine — maintenance, node-side seeding, and the final commit
-    /// drive it directly (the notify wrapper is built per-serve around a
-    /// clone of this `Rc`).
-    store: Rc<PageStore>,
+    /// The engine, behind its disk actor (RFC 0064). `N = 1`: the ownership
+    /// boundary is real — nothing here can touch the `PageStore` except by
+    /// message — while routing across several shards is still to come.
+    shards: crate::shard::Shards,
     /// Shared with the serve-time [`NotifyStore`]; the WS session loops
     /// register their subscriptions here. (HTTP poll-watches hold no node
     /// state at all — each sync navigates the disk from the client's
@@ -206,7 +207,9 @@ where
         Ok(Bound {
             registry: self.registry,
             listener,
-            store: Rc::new(store),
+            shards: crate::shard::Shards::start(store, 1).map_err(|e| {
+                ServerError::Io(std::io::Error::other(e.to_string()))
+            })?,
             subs,
             maintenance: self.maintenance,
             secret,
@@ -240,8 +243,8 @@ where
     /// Seeding writes bypass the notify wrapper, so they raise no live
     /// events — subscriptions predate serving anyway.
     #[must_use]
-    pub fn store(&self) -> &PageStore {
-        &self.store
+    pub fn store(&self) -> Rc<shard::ShardStore> {
+        self.shards.store()
     }
 
     /// Accept and serve connections until the listener faults (runs forever
@@ -268,24 +271,37 @@ where
     ) -> Result<()> {
         // The serving store publishes mutations; maintenance + the final
         // commit drive the raw engine underneath it (same `Rc`).
-        let serving = Rc::new(NotifyStore::new(
-            Rc::clone(&self.store),
-            Rc::clone(&self.subs),
-        ));
+        let store = self.shards.store();
+        let serving = Rc::new(NotifyStore::new(store, Rc::clone(&self.subs)));
+        // One table for the node: the brake that keeps two interleaved
+        // collection ops from losing an index update now that the store
+        // underneath genuinely suspends (`CONCURRENCY_BRAKE.md`).
+        let locks = Rc::new(shard::OwnerLocks::new());
         serve::run(
             self.listener,
             self.registry,
-            serving,
-            self.secret,
-            Rc::clone(&self.subs),
-            maintain(Rc::clone(&self.store), self.maintenance),
+            serve::Node {
+                store: serving,
+                secret: self.secret,
+                locks,
+                subs: Rc::clone(&self.subs),
+            },
+            upkeep::maintain(self.shards.handle(), self.maintenance),
             shutdown,
         )
         .await?;
         // Clean shutdown: everything settled + committed, and the checkpoint's
-        // frame forced durable — a restart replays nothing.
-        self.store.commit_journal()?;
-        self.store.force_retirement()?;
+        // frame forced durable — a restart replays nothing. It is a *request*
+        // rather than a hint because this outcome is returned to the caller.
+        let (answer, wait) = tokio::sync::oneshot::channel();
+        self.shards
+            .handle()
+            .send(shard::DiskRequest::Shutdown { answer })
+            .await
+            .map_err(|_| upkeep::stopped())?;
+        wait.await
+            .map_err(|_| upkeep::stopped())
+            .and_then(|r| r.map_err(|_| upkeep::stopped()))?;
         Ok(())
     }
 }
@@ -296,37 +312,4 @@ where
 fn random_secret() -> [u8; 32] {
     wavedb_platform::rand::secret32()
         .unwrap_or_else(|_| unreachable!("native entropy is infallible"))
-}
-
-/// The background maintenance loop: periodically settle the pending queue,
-/// checkpoint once the journal crosses the threshold, and evict settled
-/// cache entries down to budget. An engine fault stops maintenance (acked
-/// writes stay safe in the journal); serving continues.
-async fn maintain(store: Rc<PageStore>, policy: Maintenance) {
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tick.tick().await;
-        if store.drain().is_err() {
-            return;
-        }
-        if store.journal_len() > policy.checkpoint_after_bytes
-            && store.commit_journal().is_err()
-        {
-            return;
-        }
-        store.evict_settled(policy.cache_budget_bytes);
-        // A checkpoint leaves its `Commit` frame unsynced for the next write to
-        // carry, for free, and its retired journal on disk until the next
-        // checkpoint disposes of it (RFC 0047). Maintenance has nothing to do
-        // about either: forcing the barrier here would spend the IOp the
-        // deferral exists to save, to reclaim disk — the abundant resource.
-        // Keep a window large enough for the next checkpoint to land in a
-        // hole rather than at the tail; a pass that finds nothing is free.
-        if store.largest_free_extent() < policy.defrag_below_blocks
-            && store.defragment(policy.defrag_budget_blocks).is_err()
-        {
-            return;
-        }
-    }
 }
