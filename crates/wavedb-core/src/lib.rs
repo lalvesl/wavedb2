@@ -82,7 +82,7 @@ pub use local_id::LocalId;
 pub use metadata::{Metadata, Succession};
 // Generated `natural_key` impls derive their anchor through this one fn,
 // so every build agrees on the address a key-field value set maps to.
-pub use mint::natural_key_hash;
+pub use mint::{natural_key_hash, type_salt};
 pub use notify::{Mutation, MutationKind};
 pub use permission::PermissionRef;
 pub use store::{Store, Write};

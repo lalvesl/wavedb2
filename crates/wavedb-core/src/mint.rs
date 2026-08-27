@@ -16,11 +16,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::id::Id;
 use crate::u48::U48;
 
-/// The 15-bit type discriminator every record id of a type carries: what
-/// keeps different types' ids apart in a **flat** keyspace (the browser's
+/// The 15-bit type discriminator every record id of a type carries.
+///
+/// It keeps different types' ids apart in a **flat** keyspace (the browser's
 /// IndexedDB store) that lacks the native engine's per-`STRUCT_HASH`
-/// partitions — and what makes archive addresses derivable without storing
-/// them.
+/// partitions, and it makes archive addresses derivable without storing them.
 pub const fn type_salt(hash: u64) -> u16 {
     (hash & 0x7FFF) as u16
 }

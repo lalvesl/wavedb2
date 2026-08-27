@@ -37,7 +37,7 @@ pub use disk::{
 };
 pub use msg::{DiskRequest, EngineStats, Maintenance};
 pub use priority::Priority;
-pub use route::shard_of;
+pub use route::{Owner, shard_of};
 pub use store::{CACHE_BYTES, ShardStore};
 
 use std::rc::Rc;
