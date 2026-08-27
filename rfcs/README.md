@@ -359,7 +359,23 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   untouched, and leaves 0063 Parts 1–3 standing as the next executable step. Its
   own open question is the settle path, which straddles the boundary: `plan_slot`
   reads owner-side caches and writes storage-side pages and the type's zstd
-  dictionary;
+  dictionary.
+  **First slice landed 2026-08-22** (`crates/wavedb-quick-node/src/shard/`):
+  the disk actor owns the `PageStore` and the node reaches it only by message;
+  `ShardStore` gives each shard its cache (and, because that cache remembers
+  *absence*, only a shard may have one — everything else takes the cacheless
+  handle); `OwnerLocks` is the brake, **one table for the node behind an `Arc`**
+  since two ops on one owner can now be picked up by two threads
+  (`CONCURRENCY_BRAKE.md`); and a POST is **routed** to a shard worker with its
+  own thread, runtime and cache, with committed mutations handed back to the
+  accept thread that owns the subscription table. The router keys on exactly the
+  brake's key — route one way and brake the other and the two locks are
+  different locks — so both narrow to the Pivot together or neither does.
+  Deferred with reasons in place: the journal/page actor split and the per-type
+  caches moving into shards (both wait on the settle straddle), Pivot-grained
+  routing (the wire change), and WebSocket `Call` routing (a session binds
+  identity once at `Hello`, so re-verifying per command would start refusing a
+  long watch at token expiry — a behaviour change, not a refactor);
   [0045](0045-vector-search-PLANNED.md) — nearest-neighbour search as a
   declared index kind (IVF over the existing `BpTree`, per-tenant centroids);
   [0056](0056-fuzzy-string-search-WIP.md) *(engine side landed 2026-08-01;
@@ -594,7 +610,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
 | [0061](0061-relaxed-durability-window.md) | Relaxed durability: a group-commit window | Implemented |
 | [0062](0062-relaxed-mode-refinements-PLANNED.md) | Relaxed mode refinements | Planned |
 | [0063](0063-engine-yield-map-and-interruptible-engine-PLANNED.md) | The yield map, and an interruptible engine | Planned |
-| [0064](0064-pivot-owned-concurrency-PLANNED.md) | Pivot-owned concurrency | Planned |
+| [0064](0064-pivot-owned-concurrency-PLANNED.md) | Pivot-owned concurrency | Planned (first slice built) |
 
 ### Deprecated / superseded
 | # | Title | Superseded by |

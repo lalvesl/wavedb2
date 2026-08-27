@@ -1,6 +1,7 @@
 # RFC 0064 — Pivot-owned concurrency
 
-- **Status:** Planned — opened 2026-08-22. Nothing built.
+- **Status:** Planned — opened 2026-08-22. **First slice built**, see
+  "What is built" below.
 - **Supersedes:** [RFC 0058](0058-per-type-actors-DEPRECATED.md) (per-type
   actors). 0058's *motivation* stands and is recorded in
   [0063](0063-engine-yield-map-and-interruptible-engine-PLANNED.md); its
@@ -50,9 +51,38 @@ The consequence is large enough to replace 0058's design outright:
 
 One piece is **separable and worth doing on its own**, the way A2 came out of
 0063: `Get`, `Update` and `Remove` must carry their pivot on the wire (see
-[Routing](#routing-at-ingress)). It is what makes ingress routing possible at
-all, it deletes a read per update and remove today, and it needs none of the
-rest of this RFC.
+[Routing](#routing-at-ingress)). It is what makes *Pivot-grained* routing
+possible, it deletes a read per update and remove today, and it needs none of
+the rest of this RFC.
+
+## What is built
+
+The ownership boundary and the ingress path, at type granularity.
+
+- **`shard::disk`** — one actor owns the `PageStore`. Nothing else can reach
+  it, so the process-wide `EngineClaim` has one holder by construction. Two
+  queues, requests over maintenance, arbitrated by `shard::priority` against
+  the journal's length; `settle_step` makes a settle round interruptible so
+  the valve has something to interleave between.
+- **`shard::store`** — `ShardStore`: a shard's cache in front of the actor.
+  Non-`Send` by construction. It remembers absence, so **only a shard may
+  cache**; every other holder takes the cacheless `Shards::store()`.
+- **`shard::lock`** — `OwnerLocks`, the brake. One table for the node behind
+  an `Arc`, because two operations on one owner can now be picked up by two
+  threads. `CONCURRENCY_BRAKE.md` is the standalone account.
+- **`shard::router` / `shard::worker`** — ingress routing. A POST is decoded
+  on the accept thread and executed on a shard worker: its own thread, its own
+  runtime, its own cache. The accept loop holds no engine on that path.
+  Committed mutations come back as plain `Mutation`s to the accept thread's
+  publisher, because the WebSocket subscription table lives there.
+
+**Not built, and each says why in place:** the journal/page actor split (the
+settle straddle below), the per-type caches moving into the shards (same),
+Pivot-grained routing and braking (the wire change above — both must narrow
+together, or an `Insert` on a Pivot key and an `Update` on a type key exclude
+nothing), and WebSocket `Call` routing (a session binds identity once at
+`Hello`; routing re-verifies per command, so a long watch would start refusing
+at token expiry — a behaviour change, not a refactor).
 
 ## Motivation — why the type is the wrong unit
 
