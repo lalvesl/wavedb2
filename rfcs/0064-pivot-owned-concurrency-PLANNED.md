@@ -203,6 +203,61 @@ same shard runs — and would otherwise observe pre-batch state. Serialising per
 pivot forbids it, and the serialisation is local to one thread: no atomics, no
 cross-core traffic.
 
+#### What keeps a shard from moving
+
+Three separate questions hide behind "how do you stop a shard drifting between
+threads", and they have different kinds of answer — one is a guarantee, one is
+a knob, one is a definition.
+
+**Task ↔ thread: enforced by the type system, and the mechanism already
+exists.** `wavedb-platform::task::spawn_detached` boots a dedicated thread
+carrying its own `new_current_thread` runtime, and its bound is
+
+```rust
+F:   FnOnce() -> Fut + Send + 'static,
+Fut: Future<Output = ()> + 'static,     // note: no Send bound
+```
+
+with a doc comment that already states the shard model: *"the future is built
+**on** the new thread, so it may own non-`Send` state (channels into it are the
+only thing that crosses threads)."* A shard is one of these. A non-`Send` future
+**cannot** be moved to another thread — that is a compile error, not a scheduler
+promise — and a current-thread runtime has no work-stealing to attempt it.
+
+This is the migration that matters. Work stealing can move a task at *every
+await point*, which is thousands of times a second and is what destroys the
+locality this design exists for. Type-level ownership rules it out for free,
+which is why the multi-thread build is N current-thread runtimes rather than one
+`multi_thread` runtime.
+
+**Thread ↔ core: the OS decides, and nothing here pins.** There is no affinity
+code in the workspace (`sched_setaffinity`, `core_id`: none; the only CPU-mask
+read is `benches/src/host.rs`, which is the harness). Linux may migrate a thread
+under load imbalance, though CFS's wake affinity keeps a busy thread largely put
+— pinning removes tail cases, not the average.
+
+Explicit pinning should be **opt-in, not default**: under a `cpu.max` quota with
+every core visible a fixed mask is either wrong or meaningless; pinning onto two
+SMT siblings of one physical core silently halves throughput; and a library
+running inside someone else's process cannot take the machine the way an
+appliance (Seastar, ScyllaDB) does.
+
+The usual objection to pinning — a blocked thread idles its core — does **not**
+apply here, and that is worth recording: a shard never touches disk, since all
+I/O belongs to the two actors. A pinned shard thread never blocks in a syscall,
+which is exactly the condition under which pinning pays.
+
+Crucially, **correctness does not depend on it.** Ownership is guaranteed by the
+first point; pinning only buys cache warmth. It is a tuning knob, not a
+prerequisite.
+
+**Pivot ↔ shard: a pure function.** `hash(pivot_id) % N` with `N` fixed at
+startup. A pivot never changes shard for the life of the process, so there is no
+ownership migration and no table to go stale — which is the same property that
+removed the balancer. The price, stated plainly: changing `N` means a restart.
+Live resharding would need cache entries moved between threads, which is the
+machinery range-sharding required and this design does not.
+
 ### The unit, and what it does and does not share
 
 An owner is one **Pivot instance** (a NonUnique collection), or the pair
@@ -365,8 +420,9 @@ The switch is `N`:
 
 - **single** — one shard; the disk actors are inlined as direct calls. This is
   what exists today, and it is what wasm gets.
-- **multi** — N shards, one `current_thread` runtime pinned per core, disk
-  actors on their own threads.
+- **multi** — N shards, one `current_thread` runtime per core, disk actors on
+  their own threads. Core pinning is optional and buys only cache warmth; see
+  [What keeps a shard from moving](#what-keeps-a-shard-from-moving).
 
 The shard does not know which it is. Two consequences worth stating because
 they reverse what earlier drafts of this work assumed:

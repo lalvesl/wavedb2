@@ -340,10 +340,21 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   Request/reply is `await`, not a synchronous message, so 0058's deadlock
   surface disappears; `Rc` survives and **the engine does not become `Send`** —
   only the disk actors' message types do. The compile-time single/multi switch is
-  just `N`: one shard with inlined disk actors (today, and wasm) or N pinned
+  just `N`: one shard with inlined disk actors (today, and wasm) or N
   `current_thread` runtimes — tokio's *work-stealing scheduler* is what to
   avoid, not tokio, since stealing migrates tasks and destroys the locality the
-  design exists for. It also dissolves 0063's I1 (a batch belongs to one owner,
+  design exists for. **A shard cannot drift between threads, and that is a
+  compile error rather than a scheduler promise**: `platform::task::
+  spawn_detached` already boots a dedicated thread with its own current-thread
+  runtime and bounds the future *without* `Send`, so the state cannot be moved
+  — the migration that matters (work stealing, possible at every await) is ruled
+  out by types, for free. Core pinning is a separate and *optional* question
+  that buys only cache warmth: nothing in the workspace pins today, correctness
+  does not depend on it, and a fixed mask is wrong under a `cpu.max` quota or
+  across SMT siblings — though the usual objection (a blocked thread idles its
+  core) does not apply, since a shard never touches disk. `hash(pivot) % N` with
+  `N` fixed at startup means a pivot never changes shard either; the price is
+  that changing `N` is a restart. It also dissolves 0063's I1 (a batch belongs to one owner,
   so it is atomic by ownership — no seqlock, no staged publish), leaves I2
   untouched, and leaves 0063 Parts 1–3 standing as the next executable step. Its
   own open question is the settle path, which straddles the boundary: `plan_slot`
