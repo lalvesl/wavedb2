@@ -31,6 +31,7 @@ pub mod error;
 pub mod journal;
 mod meta_log;
 pub mod page;
+pub mod page_cache;
 pub mod page_store;
 mod plan;
 mod read_through;
@@ -47,6 +48,7 @@ pub use error::{StorageError, StorageResult};
 pub use journal::{CommitFrame, Journal, JournalFrame};
 pub use page::SlotPage;
 pub use page_store::{PageStore, StoreOptions};
+pub use settle::Progress;
 pub use struct_storage::{
     BPTREE_NODE_STORAGE, StorageRegistry, StructDictionary, StructDirectory,
     StructMemCache, StructStorage,

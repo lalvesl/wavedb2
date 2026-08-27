@@ -268,6 +268,7 @@ impl PageStore {
 #[cfg(test)]
 mod tests {
     use super::{PageStore, StoreOptions};
+    use crate::Progress;
     use crate::error::StorageError;
     use crate::struct_storage::StructStorage;
     use futures::executor::block_on;
@@ -888,6 +889,68 @@ mod tests {
         drop(s);
         let s = open(d.path());
         assert_eq!(s.cache_len(), 0, "refused write must not reach the log");
+    }
+
+    /// A bounded settle round takes its budget and leaves the rest queued —
+    /// RFC 0063's interruptible drain, and the property the disk actor's
+    /// priority valve needs in order to have anything to interleave between.
+    ///
+    /// The budget has to bite **within** one slot, not only across slots: a
+    /// burst of one type is one slot, and that is the common case. A version
+    /// that only split at slot boundaries would pass every other assertion
+    /// here and settle all 20 records in one round.
+    #[test]
+    fn a_bounded_settle_step_leaves_the_rest_queued() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let s = open(d.path());
+        block_on(async {
+            for n in 1..=20u64 {
+                s.apply(&[Write::Put(nonunique(n), rec(SH, b"x"))])
+                    .await
+                    .unwrap();
+            }
+            assert!(s.has_pending(), "20 writes must queue a settle");
+
+            // One bounded round: some settled, the remainder still queued.
+            assert_eq!(s.settle_step(5).unwrap(), Progress::Settled);
+            assert!(
+                s.has_pending(),
+                "a budget of 5 must not have settled all 20"
+            );
+
+            // Driving it to exhaustion reaches the same place `drain` would.
+            let mut rounds = 1;
+            while s.settle_step(5).unwrap() == Progress::Settled {
+                rounds += 1;
+                assert!(rounds < 100, "step made no progress");
+            }
+            assert!(
+                rounds >= 4,
+                "20 ids at 5 per round is at least 4 rounds, took {rounds}"
+            );
+            assert!(!s.has_pending(), "the queue must end empty");
+
+            // And the records are all readable from their pages.
+            TEST_SLOT.mem_cache().write().clear();
+            for n in 1..=20u64 {
+                assert_eq!(
+                    s.get_of(SH, nonunique(n)).await.unwrap(),
+                    Some(rec(SH, b"x")),
+                    "record {n} lost across the stepped settle"
+                );
+            }
+        });
+    }
+
+    /// The step reports `Done` on an empty queue rather than looping.
+    #[test]
+    fn a_step_on_an_empty_queue_is_done() {
+        let _g = engine_gate();
+        let d = tempfile::tempdir().unwrap();
+        let s = open(d.path());
+        assert_eq!(s.settle_step(usize::MAX).unwrap(), Progress::Done);
+        assert_eq!(s.settle_step(1).unwrap(), Progress::Done);
     }
 
     #[test]

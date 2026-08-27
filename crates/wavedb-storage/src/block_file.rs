@@ -25,6 +25,7 @@ use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use wavedb_core::wire::{
@@ -33,6 +34,7 @@ use wavedb_core::wire::{
 
 use crate::block::{BLOCK_SIZE, Run};
 use crate::error::{StorageError, StorageResult};
+use crate::page_cache::{self, PageCache};
 
 /// Magic at the head of every WaveDB `data.bin` superblock.
 const MAGIC: &[u8; 8] = b"WAVEDBIN";
@@ -74,6 +76,17 @@ pub struct BlockFile {
     file: File,
     seed: [u64; 4],
     io: IoCounts,
+    /// Settled page images by run ([RFC 0044]).
+    ///
+    /// It lives here because the cache's key **is** this type's addressing
+    /// unit, so every event that can falsify an entry — a write into an extent
+    /// the allocator recycled, the defragmenter relocating one — already
+    /// passes through [`write_run`](BlockFile::write_run) or is one call away
+    /// from it. Putting it a layer up would mean re-deriving "which cached
+    /// bytes did that write invalidate?" from something that no longer knows.
+    ///
+    /// [RFC 0044]: ../../../rfcs/0044-page-cache-PLANNED-LOW.md
+    cache: PageCache,
 }
 
 /// Disk operations issued on one [`BlockFile`] since it was opened.
@@ -126,6 +139,7 @@ impl BlockFile {
                 file,
                 seed,
                 io: IoCounts::default(),
+                cache: PageCache::new(page_cache::DEFAULT_BUDGET_BYTES),
             };
             bf.write_superblock()?;
             bf.file.sync_all()?;
@@ -136,6 +150,7 @@ impl BlockFile {
                 file,
                 seed: body.seed,
                 io: IoCounts::default(),
+                cache: PageCache::new(page_cache::DEFAULT_BUDGET_BYTES),
             })
         }
     }
@@ -188,9 +203,42 @@ impl BlockFile {
             });
         }
         self.ensure_len(run.end() * BLOCK_SIZE as u64)?;
+        // Before the write, not after: a concurrent reader must never be able
+        // to take a cached image that the bytes underneath have already
+        // stopped matching. Cached runs are immutable while allocated, so this
+        // fires only where that stops being true — a recycled extent, and the
+        // defragmenter's relocation.
+        self.cache.invalidate(run);
         self.file.write_all_at(bytes, run.byte_offset())?;
         self.io.writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// [`read_run`](Self::read_run) through the page cache.
+    ///
+    /// Returns a shared image rather than an owned buffer: a hit is a refcount
+    /// bump instead of a copy of the page. Use this for anything read
+    /// repeatedly and consumed read-only — which is pages, and only pages.
+    /// The dictionary image, the addressing log's chunks and the
+    /// defragmenter's relocation buffers want owned bytes and are read once,
+    /// so they keep using [`read_run`](Self::read_run).
+    ///
+    /// # Errors
+    /// The same faults as [`read_run`](Self::read_run). A cache hit cannot
+    /// fault at all, which is the point.
+    pub fn read_run_shared(&self, run: Run) -> StorageResult<Arc<[u8]>> {
+        if let Some(hit) = self.cache.get(run) {
+            return Ok(hit);
+        }
+        let bytes: Arc<[u8]> = self.read_run(run)?.into();
+        self.cache.insert(run, &bytes);
+        Ok(bytes)
+    }
+
+    /// The page cache backing [`read_run_shared`](Self::read_run_shared).
+    #[must_use]
+    pub const fn page_cache(&self) -> &PageCache {
+        &self.cache
     }
 
     /// Flush all buffered data and metadata to stable storage (`fsync`).
