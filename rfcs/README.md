@@ -299,7 +299,12 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   collections as it has holders. Two collections of one type share *nothing*:
   Pivot record, B+tree roots, recency/dead chains and list segments are all
   their own; only the items inside one collection are inherently serial,
-  because those really do share a tree. Everything expensive then falls away.
+  because those really do share a tree. **The whole design slots in behind the
+  `Store` trait** — `Collection` and `BpTree` reach their backend through four
+  methods and take the store *per call* rather than owning one, so
+  `impl Store for PageStore` becoming `impl Store for ShardStore` is the extent
+  of the seam and the index layer is untouched. Everything expensive then falls
+  away.
   There is **no hot-type ceiling** (the busiest type in the shop is one owner
   per order, not one owner); **no balancer** (`shard = hash(pivot_id) % N` is
   uniform because the units are millions, so it is a function rather than a
@@ -310,7 +315,7 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   repartitioning — cache by owner, page directory by type, two axes free to
   differ. The hierarchy is one scheme at three grains (tenant → pivot instance →
   serial), so distributed sharding later is a *coarsening* rather than a second
-  design. A writer actor owns the journal (group commit) and a reader actor owns
+  design. A journal actor owns the journal (group commit) and a page actor owns
   `data.bin` — single ownership being what makes block de-duplication possible,
   and the natural home for the [0044](0044-page-cache-PLANNED-LOW.md) page cache
   and for zstd, following the actual Redis lesson (*one thread owns the data
@@ -318,9 +323,20 @@ _A snapshot for orientation; each RFC's status header is authoritative._
   moved I/O off the core, it was never one thread doing everything). Routing is
   verified against `Command`: `Insert`/`All`/`Listed`/`ListLen`/`Changes` carry
   the pivot, Unique ops route by `(tenant, STRUCT_HASH)`, and `Get`/`Update`/
-  `Remove` carry only an `Id` — the same "an `Id` names no type" shape as A2,
-  resolved by the read actor reading `Metadata.pivot_id` (`record_pivot`) before
-  routing, which moves a decode off the owner thread rather than adding one.
+  `Remove` carry only an `Id`, and **must change to carry the pivot**. Resolving
+  it node-side is impossible, not merely slower: cache and tombstones are
+  shard-owned and only the settled page is the page actor's, so a page actor
+  answering alone misses an unsettled write, serves stale bytes past a newer
+  cached version, and resurrects a record whose tombstone sits in a shard — a
+  read needs its owner, the owner needs the pivot, the pivot needs a read. The
+  exit is that `Collection<T>` **already holds the pivot and already passes it**
+  (`db.get_record(self.pivot, id)`); the client stub drops it before the wire and
+  the node then pays a read to recover it. Carrying it deletes `record_pivot`
+  outright — one `get_of` plus a decode per update/remove, and a page read on a
+  cold cache — and it is the **third instance of one shape**: an `Id` names
+  neither its type (A2) nor its tree (`BPTREE_NODE_STRUCT_HASH`) nor its owner,
+  the caller always knows, and every time the search was happening in the most
+  expensive place available.
   Request/reply is `await`, not a synchronous message, so 0058's deadlock
   surface disappears; `Rc` survives and **the engine does not become `Send`** —
   only the disk actors' message types do. The compile-time single/multi switch is
