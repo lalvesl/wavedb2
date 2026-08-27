@@ -16,7 +16,9 @@
 //!   RFC 6455 over `TcpStream` / the browser's own `WebSocket` object);
 //! - [`task`] — background tasks: the never-ending world the connection
 //!   manager runs on (dedicated thread + current-thread runtime /
-//!   `wasm_bindgen_futures::spawn_local` — no tokio in wasm).
+//!   `wasm_bindgen_futures::spawn_local` — no tokio in wasm);
+//! - [`cpu`] — usable parallelism (the affinity mask and container quota this
+//!   process actually has / a constant 1, the browser having no threads).
 //!
 //! Same module paths, same signatures, two implementations — conditional
 //! compilation is the dispatch (no traits, no `dyn`). The server halves of
@@ -27,6 +29,7 @@
 // stance across the workspace.
 #![allow(clippy::future_not_send)]
 
+pub mod cpu;
 pub mod error;
 pub mod http;
 pub mod rand;

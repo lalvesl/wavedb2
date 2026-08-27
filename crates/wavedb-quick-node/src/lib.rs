@@ -36,6 +36,7 @@ pub mod dispatch;
 pub mod error;
 mod serve;
 mod serve_ws;
+pub mod shard;
 mod subscribe;
 
 use std::cell::RefCell;
