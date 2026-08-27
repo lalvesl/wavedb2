@@ -361,6 +361,53 @@ It is a `Command` payload change, so a wire change: free under the pre-release
 policy, and `Command` is engine plumbing rather than a user type, so it folds
 into **no** `STRUCT_HASH`.
 
+#### Routing is a property of the operation, not of each id
+
+Worth stating separately, because "hash the id" is the obvious implementation
+and it is **wrong**. A Unique `save` writes two ids in one atomic batch:
+
+```rust
+// crates/wavedb-core/src/record.rs:269
+let slot = archive_id(plan.hash, plan.shape, authored, plan.tenant); // KEY = the instant
+writes.push(Write::Put(slot, …));                                    // superseded version
+writes.push(Write::Put(plan.live_id, …));                            // KEY = the STRUCT_HASH
+```
+
+Two ids with nothing in common. `hash(id) % N` would put them on different
+shards and there would be no owner for the batch to be atomic in.
+
+So the owner is decided **once, at ingress**, and every id the resulting batch
+writes belongs to it whatever that id hashes to. The same already holds for a
+collection — its B+tree nodes and chain segments carry ids that would route
+elsewhere — but a Unique type makes it plain, since there is no Pivot to
+suggest the answer.
+
+A Unique owner is `(tenant, STRUCT_HASH)`: the anchor is `KEY = STRUCT_HASH`
+under that tenant, and a Unique type has no tree and no chains, so an anchor
+plus derived archive slots is everything it stores.
+
+Its routing key is the two **concatenated** — `(tenant << 15) | type_salt` —
+rather than combined, and the reason is worth keeping:
+
+- **Both components must be in it.** The tenant alone puts every type of a
+  heavy writer on one shard; the type alone puts every tenant's `User` there,
+  and `User` is exactly the type every tenant has.
+- **Concatenation, because 48 + 15 = 63 bits fit.** The key is then injective,
+  so distinct owners can only collide at the final `% shards`, which nothing
+  avoids. `tenant ^ struct_hash` is not injective and its collisions are
+  *systematic*: for any two types `h1`, `h2`, every tenant pair with
+  `t2 = t1 ^ h1 ^ h2` maps to one key. A family, not an accident.
+- **The 15-bit `type_salt`, not the whole hash**, is what makes the fit
+  possible — 48 + 64 does not. The price is that two types sharing their low
+  15 bits route together within one tenant, which is already a known condition
+  the exposure registry warns about at compile time.
+
+A live record and its whole version history therefore land on one shard — and
+**not because their ids agree**. They do not: the anchor is
+`Id::new(STRUCT_HASH, tenant, true, 0)`, salt *zero*, while an archive is
+`Id::new(instant, tenant, false, type_salt(hash))`. They converge because the
+owner comes from the operation, so the anchor's salt is never consulted.
+
 #### The pattern, named
 
 This is the third instance of one shape, and it is worth stating as a rule
@@ -503,6 +550,17 @@ they reverse what earlier drafts of this work assumed:
   real either way, and does not exist today because the engine never awaits.
 - **Cost of repartitioning `mem_cache`.** It is a real edit to
   `struct_storage.rs` and the honest price of the design.
+- **The nesting chain crosses shards, and that was not examined.** A Unique
+  record routes by `(tenant, STRUCT_HASH)` and the collections it holds route
+  by their Pivots, so `User` and its `Shopping` collection land on different
+  shards — and a profile read walks exactly that link. The crossing is the
+  common path, not a corner.
+  For reads it costs one message (µs) against a page read (tens of µs) and
+  needs no atomicity across the hops, so it is probably acceptable; nothing
+  measures it. The tension it exposes is structural, and neither end of it is
+  free: routing by **Pivot** maximises parallelism and pays locality along the
+  nesting chain; routing by **tenant** maximises locality and collapses to one
+  shard in the single-tenant case, which is a stated sweet spot.
 - **Nothing here is measured.** 0058 was parked partly for treating estimates as
   findings; the orders of magnitude quoted in discussion (uncontended lock vs
   channel round-trip) are from the literature, not from this machine, and the
