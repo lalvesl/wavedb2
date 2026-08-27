@@ -102,40 +102,65 @@ pub async fn run(
             reads: !requests.is_empty(),
             maintenance: settling || !maintenance.is_empty(),
         };
-        match priority.next(avail, store.journal_len()) {
-            Some(Class::Read) => {
-                if let Ok(request) = requests.try_recv() {
-                    serve(&store, request).await;
-                }
-            }
+        // One funnel for requests, so the `Shutdown` handoff below has exactly
+        // one place to happen — it needs to *consume* the store, which a
+        // second serving site could not do.
+        let next = match priority.next(avail, store.journal_len()) {
+            Some(Class::Read) => requests.try_recv().ok(),
             // Owed work first: finishing a settle already begun beats
             // starting another.
             Some(Class::Maintenance) if settling => {
                 settling = step(&store);
+                None
             }
             Some(Class::Maintenance) => {
                 if let Ok(work) = maintenance.try_recv() {
                     settling = maintain(&store, &work);
                 }
+                None
             }
             // Both empty: block until either speaks. Without this the loop
             // would spin on an idle node.
             None => tokio::select! {
                 request = requests.recv() => match request {
-                    Some(request) => serve(&store, request).await,
+                    Some(request) => Some(request),
                     None => break,
                 },
                 // Requests outlive maintenance: with the maintenance senders
                 // gone the actor keeps serving reads, so this arm ends the
                 // round rather than the loop.
-                Some(work) = maintenance.recv() => { settling = maintain(&store, &work); },
+                Some(work) = maintenance.recv() => {
+                    settling = maintain(&store, &work);
+                    None
+                }
             },
+        };
+        match next {
+            None => {}
+            // The engine is **dropped before the answer is sent**, and that
+            // ordering is the whole point: dropping it releases the
+            // process-wide `EngineClaim`, and a caller that resumes first
+            // could re-open before it was free. `Server::run_with_shutdown`
+            // does exactly that on a restart, and gets `EngineBusy` if this
+            // is the other way round.
+            Some(DiskRequest::Shutdown { answer }) => {
+                let outcome = store
+                    .commit_journal()
+                    .and_then(|()| store.force_retirement())
+                    .map_err(|e| {
+                        wavedb_core::Error::Backend(format!("shutdown: {e}"))
+                    });
+                drop(store);
+                let _ = answer.send(outcome);
+                return;
+            }
+            Some(request) => serve(&store, request).await,
         }
     }
-    // Handles all dropped: nothing can ask for anything again, so this is the
-    // one point where the engine's own shutdown belongs. A failure is reported
-    // and not propagated — there is no caller left to receive it, and the
-    // journal still holds anything unsettled for the next open to replay.
+    // Handles all dropped without an explicit stop — nothing can ask for
+    // anything again. A failure is reported and not propagated: there is no
+    // caller left to receive it, and the journal still holds anything
+    // unsettled for the next open to replay.
     if let Err(e) = store.commit_journal() {
         eprintln!("disk actor: final checkpoint failed: {e}");
     }
@@ -160,7 +185,12 @@ async fn serve(store: &PageStore, request: DiskRequest) {
             let _ = answer.send(Ok(EngineStats {
                 pending: store.has_pending(),
                 journal_bytes: store.journal_len(),
+                largest_free_extent: store.largest_free_extent(),
             }));
+        }
+        // Handled in the loop, which owns the store it has to drop.
+        DiskRequest::Shutdown { answer } => {
+            let _ = answer.send(Ok(()));
         }
     }
 }
@@ -197,6 +227,11 @@ fn maintain(store: &PageStore, work: &Maintenance) -> bool {
         }
         Maintenance::Evict { budget_bytes } => {
             store.evict_settled(*budget_bytes);
+        }
+        Maintenance::Defragment { budget_blocks } => {
+            if let Err(e) = store.defragment(*budget_blocks) {
+                eprintln!("disk actor: defragment failed: {e}");
+            }
         }
     }
     false
