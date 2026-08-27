@@ -165,4 +165,12 @@ async fn shards_serve_collections_over_one_disk_actor() {
         }
     }
     assert!(settled, "the maintenance hint never reached the engine");
+
+    // Concurrent operations on one collection are **not** exercised here, and
+    // that is deliberate: `ShardStore` genuinely suspends, so two interleaved
+    // collection ops can lose an index update
+    // (`wavedb-core/tests/concurrent_node_clobber.rs` states the invariant).
+    // What prevents it is `shard::OwnerLocks`, tested at the unit level; a
+    // probe here passed one interleaving and proved nothing, so it is gone
+    // rather than left looking like a guarantee.
 }

@@ -58,6 +58,14 @@ pub enum DiskRequest {
     /// What the engine currently holds. High priority because it is cheap and
     /// because a policy blocked on it is a policy not being applied.
     Stats { answer: Answer<EngineStats> },
+    /// Settle, checkpoint, and force the retirement barrier — the clean-stop
+    /// sequence, so a restart replays nothing.
+    ///
+    /// A request rather than [`Maintenance`] precisely because someone *is*
+    /// waiting: `Server::run_with_shutdown` returns this outcome, and a node
+    /// that reports a clean stop it did not achieve is worse than one that
+    /// reports the fault.
+    Shutdown { answer: Answer<()> },
 }
 
 /// What the engine will say about itself.
@@ -73,6 +81,8 @@ pub struct EngineStats {
     /// Committed journal bytes — what the valve weighs, and what grows without
     /// bound if maintenance never runs.
     pub journal_bytes: u64,
+    /// Blocks in the largest free extent — the defragmenter's trigger.
+    pub largest_free_extent: u64,
 }
 
 /// Work nobody is waiting on — the low-priority class.
@@ -88,6 +98,8 @@ pub enum Maintenance {
     Checkpoint,
     /// Drop settled cache entries down to `budget_bytes`.
     Evict { budget_bytes: usize },
+    /// Relocate stranded live pages so free space coalesces (RFC 0042).
+    Defragment { budget_blocks: u64 },
 }
 
 impl DiskRequest {
@@ -102,7 +114,8 @@ impl DiskRequest {
             Self::Get { answer, .. } | Self::GetOf { answer, .. } => {
                 let _ = answer.send(Err(cause));
             }
-            Self::Apply { answer, .. } => {
+            // Both answer `()`, so one arm serves them.
+            Self::Apply { answer, .. } | Self::Shutdown { answer } => {
                 let _ = answer.send(Err(cause));
             }
             Self::Stats { answer } => {

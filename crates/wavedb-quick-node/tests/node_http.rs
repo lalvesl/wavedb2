@@ -82,8 +82,12 @@ fn start(dir: PathBuf) -> Node {
                 .expect("open + bind");
             let addr = bound.local_addr().expect("local addr");
             // create_pivot is node-side only in M3 (no server fns yet).
+            // Node-side seeding now goes through the disk actor like
+            // everything else: `store()` hands back a `ShardStore`, not the
+            // engine, and it has to outlive the handle borrowing it.
+            let engine = bound.store();
             let seed =
-                wavedb_core::LocalHandle::new(bound.store(), U48::from(TENANT));
+                wavedb_core::LocalHandle::new(&*engine, U48::from(TENANT));
             let pivot = Note::create_pivot(&seed).await.expect("seed pivot");
             info_tx
                 .send((addr, pivot.local_id()))

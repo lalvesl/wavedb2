@@ -76,8 +76,12 @@ fn start(dir: PathBuf) -> Node {
                 .await
                 .expect("open + bind");
             let addr = bound.local_addr().expect("local addr");
+            // Node-side seeding now goes through the disk actor like
+            // everything else: `store()` hands back a `ShardStore`, not the
+            // engine, and it has to outlive the handle borrowing it.
+            let engine = bound.store();
             let seed =
-                wavedb_core::LocalHandle::new(bound.store(), U48::from(TENANT));
+                wavedb_core::LocalHandle::new(&*engine, U48::from(TENANT));
             let rows = Row::create_pivot(&seed).await.expect("seed rows");
             info_tx.send((addr, rows.local_id())).expect("test dropped");
             bound

@@ -27,6 +27,7 @@
 //! [RFC 0064]: ../../../../rfcs/0064-pivot-owned-concurrency-PLANNED.md
 
 mod disk;
+mod lock;
 mod msg;
 pub mod priority;
 mod route;
@@ -35,6 +36,7 @@ mod store;
 pub use disk::{
     DiskHandle, MAINTENANCE_DEPTH, QUEUE_DEPTH, start as start_disk,
 };
+pub use lock::{OwnerKey, OwnerLocks};
 pub use msg::{DiskRequest, EngineStats, Maintenance};
 pub use priority::Priority;
 pub use route::{Owner, shard_of};
