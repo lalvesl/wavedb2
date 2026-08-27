@@ -35,9 +35,7 @@ use crate::{dispatch, serve_ws};
 pub async fn run<E, S, F, M>(
     listener: TcpListener,
     registry: E,
-    store: Rc<S>,
-    secret: [u8; 32],
-    subs: Rc<RefCell<SubTable>>,
+    node: Node<S>,
     maintenance: M,
     shutdown: F,
 ) -> wavedb_net::Result<()>
@@ -62,19 +60,41 @@ where
                         return Ok(());
                     }
                 };
-                let store = Rc::clone(&store);
-                let subs = Rc::clone(&subs);
+                let node = node.clone();
                 spawn_local(async move {
                     // A per-connection fault is dropped: it never takes the
                     // node down. (No tracing dep yet — silent.)
-                    let _ = serve_connection(
-                        sock, &registry, &*store, &secret, &subs,
-                    )
-                    .await;
+                    let _ = serve_connection(sock, &registry, &node).await;
                 });
             }
         })
         .await
+}
+
+/// Everything a connection needs beyond its socket and the registry.
+///
+/// One struct rather than four parameters, because they travel together
+/// everywhere and are cloned together per connection — each field is an `Rc`
+/// or a key, so a clone is refcount bumps.
+pub struct Node<S> {
+    pub store: Rc<S>,
+    pub secret: [u8; 32],
+    /// Per-owner serialisation — see `CONCURRENCY_BRAKE.md`.
+    pub locks: Rc<crate::shard::OwnerLocks>,
+    pub subs: Rc<RefCell<SubTable>>,
+}
+
+// Manual: a derive would demand `S: Clone`, and the store is shared by `Rc`
+// rather than cloned.
+impl<S> Clone for Node<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: Rc::clone(&self.store),
+            secret: self.secret,
+            locks: Rc::clone(&self.locks),
+            subs: Rc::clone(&self.subs),
+        }
+    }
 }
 
 /// Read one request and answer it: a POST body dispatches + writes the
@@ -83,9 +103,7 @@ where
 async fn serve_connection<E, S>(
     sock: TcpStream,
     registry: &E,
-    store: &S,
-    secret: &[u8; 32],
-    subs: &Rc<RefCell<SubTable>>,
+    node: &Node<S>,
 ) -> wavedb_net::Result<()>
 where
     E: Exposure,
@@ -97,9 +115,14 @@ where
         Some(Incoming::Post(body)) => {
             match from_wire::<Request>(&body) {
                 Ok(request) => {
-                    let answer =
-                        dispatch::handle(registry, store, secret, request)
-                            .await;
+                    let answer = dispatch::handle(
+                        registry,
+                        &*node.store,
+                        &node.locks,
+                        &node.secret,
+                        request,
+                    )
+                    .await;
                     write_response(&mut writer, answer).await
                 }
                 // The envelope is malformed — a transport-level client
@@ -110,7 +133,15 @@ where
         Some(Incoming::Upgrade { key }) => {
             let accept = wavedb_platform::ws::codec::accept_key(&key);
             http::write_switching_head(&mut writer, &accept).await?;
-            serve_ws::serve(reader, writer, registry, store, secret, subs).await
+            serve_ws::serve(
+                reader,
+                writer,
+                registry,
+                &*node.store,
+                &node.secret,
+                &node.subs,
+            )
+            .await
         }
     }
 }
