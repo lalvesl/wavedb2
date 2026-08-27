@@ -1,0 +1,288 @@
+//! The disk actor — sole owner of the storage engine ([RFC 0064]).
+//!
+//! Every shard reaches storage by message; nothing else holds the
+//! [`PageStore`]. That single ownership is what the design is for, and it buys
+//! three things at once:
+//!
+//! - the engine's locks stop having a second party to contend with;
+//! - two shards wanting the same page produce one read rather than two (the
+//!   de-duplication a shared cache cannot do without a single owner);
+//! - the process-wide `EngineClaim` has exactly one holder by construction
+//!   instead of by convention.
+//!
+//! ## Two queues
+//!
+//! Requests ([`DiskRequest`]) are high priority — a shard is awaiting each
+//! one. Maintenance ([`Maintenance`]) is low — nobody is. Which to serve is
+//! [`Priority`]'s decision, driven by the journal's length, and the reasoning
+//! (including why strict priority would be an out-of-memory rather than an
+//! unfairness) is in [`super::priority`].
+//!
+//! **The valve bounds waiting, not latency.** Because the actor serves one
+//! message at a time, a read arriving while a long checkpoint runs waits for
+//! that whole checkpoint — priority between *queued* items says nothing about
+//! the item *executing*. Bounding read latency needs the maintenance work
+//! itself to become interruptible, which is [RFC 0063]'s re-entrant `drain`.
+//! That makes 0063 a prerequisite of this scheme rather than a parallel item.
+//!
+//! ## Not split in two yet
+//!
+//! RFC 0064's target splits this into a **journal actor** and a **page
+//! actor**. That waits on the settle path's ownership question — `plan_slot`
+//! reads shard-side caches to write page-actor-side dictionaries — which is
+//! open. One actor owning the whole engine is the ownership boundary drawn
+//! where it can be drawn correctly today.
+//!
+//! [RFC 0064]: ../../../../rfcs/0064-pivot-owned-concurrency-PLANNED.md
+//! [RFC 0063]: ../../../../rfcs/0063-engine-yield-map-and-interruptible-engine-PLANNED.md
+
+use tokio::sync::mpsc;
+use wavedb_core::store::Store;
+use wavedb_storage::{PageStore, Progress};
+
+use super::msg::{DiskRequest, EngineStats, Maintenance};
+use super::priority::{Available, Class, Priority};
+
+/// Requests in flight before a sender waits.
+///
+/// Bounded on purpose. An unbounded queue converts a shard outrunning the disk
+/// into unbounded memory growth, which is the failure this project has already
+/// hit twice by other routes; a bound converts it into backpressure, which is
+/// the thing that was wanted.
+pub const QUEUE_DEPTH: usize = 1024;
+
+/// Maintenance queued before a caller waits. Short: the requests coalesce —
+/// two queued settles do the work of one — so a deep queue would only hold
+/// duplicates.
+pub const MAINTENANCE_DEPTH: usize = 16;
+
+/// A handle onto the actor. Cheap to clone, `Send`, and the only way to reach
+/// storage once the actor owns it.
+#[derive(Clone)]
+pub struct DiskHandle {
+    requests: mpsc::Sender<DiskRequest>,
+    maintenance: mpsc::Sender<Maintenance>,
+}
+
+impl DiskHandle {
+    /// Queue a request, waiting if the actor is behind.
+    ///
+    /// # Errors
+    /// The actor is gone.
+    pub async fn send(
+        &self,
+        request: DiskRequest,
+    ) -> Result<(), mpsc::error::SendError<DiskRequest>> {
+        self.requests.send(request).await
+    }
+
+    /// Ask for maintenance, **dropping the request if the queue is full**.
+    ///
+    /// Not a failure: a full queue already holds a settle that has not run, and
+    /// a second one would do the same work. Blocking here would be worse than
+    /// dropping — it would make a caller who is explicitly not waiting wait.
+    pub fn hint(&self, work: Maintenance) {
+        let _ = self.maintenance.try_send(work);
+    }
+}
+
+/// Own `store` and serve both queues until every handle is dropped.
+pub async fn run(
+    store: PageStore,
+    mut requests: mpsc::Receiver<DiskRequest>,
+    mut maintenance: mpsc::Receiver<Maintenance>,
+) {
+    let mut priority = Priority::default();
+    // A settle left part-done by the last round. It is maintenance the actor
+    // owes itself, so it counts as queued even when the channel is empty —
+    // otherwise a half-settled queue would wait for the next external hint.
+    let mut settling = false;
+    loop {
+        let avail = Available {
+            reads: !requests.is_empty(),
+            maintenance: settling || !maintenance.is_empty(),
+        };
+        match priority.next(avail, store.journal_len()) {
+            Some(Class::Read) => {
+                if let Ok(request) = requests.try_recv() {
+                    serve(&store, request).await;
+                }
+            }
+            // Owed work first: finishing a settle already begun beats
+            // starting another.
+            Some(Class::Maintenance) if settling => {
+                settling = step(&store);
+            }
+            Some(Class::Maintenance) => {
+                if let Ok(work) = maintenance.try_recv() {
+                    settling = maintain(&store, &work);
+                }
+            }
+            // Both empty: block until either speaks. Without this the loop
+            // would spin on an idle node.
+            None => tokio::select! {
+                request = requests.recv() => match request {
+                    Some(request) => serve(&store, request).await,
+                    None => break,
+                },
+                // Requests outlive maintenance: with the maintenance senders
+                // gone the actor keeps serving reads, so this arm ends the
+                // round rather than the loop.
+                Some(work) = maintenance.recv() => { settling = maintain(&store, &work); },
+            },
+        }
+    }
+    // Handles all dropped: nothing can ask for anything again, so this is the
+    // one point where the engine's own shutdown belongs. A failure is reported
+    // and not propagated — there is no caller left to receive it, and the
+    // journal still holds anything unsettled for the next open to replay.
+    if let Err(e) = store.commit_journal() {
+        eprintln!("disk actor: final checkpoint failed: {e}");
+    }
+}
+
+async fn serve(store: &PageStore, request: DiskRequest) {
+    match request {
+        DiskRequest::Get { id, answer } => {
+            let _ = answer.send(store.get(id).await);
+        }
+        DiskRequest::GetOf {
+            struct_hash,
+            id,
+            answer,
+        } => {
+            let _ = answer.send(store.get_of(struct_hash, id).await);
+        }
+        DiskRequest::Apply { batch, answer } => {
+            let _ = answer.send(store.apply(&batch).await);
+        }
+        DiskRequest::Stats { answer } => {
+            let _ = answer.send(Ok(EngineStats {
+                pending: store.has_pending(),
+                journal_bytes: store.journal_len(),
+            }));
+        }
+    }
+}
+
+/// Ids a settle round may take before the actor looks at its queues again.
+///
+/// This is what makes maintenance interruptible in practice: without a bound,
+/// one burst becomes one round and the priority valve has nothing to
+/// interleave between, since it can only choose between *queued* items and not
+/// preempt the one running.
+///
+/// Unmeasured, like the valve's marks — small enough that a round is short,
+/// large enough that the per-round fixed cost (one window allocation, one
+/// positioned write) is not paid per handful of records.
+pub const SETTLE_BUDGET_IDS: usize = 4096;
+
+/// Run one unit of maintenance. Returns whether a settle is still owed.
+///
+/// Faults are reported, never propagated: nobody asked, so there is nobody to
+/// return to. Nothing acknowledged is at risk either way — the journal still
+/// holds every unsettled batch, and the next round or the reopen retries.
+fn maintain(store: &PageStore, work: &Maintenance) -> bool {
+    match work {
+        Maintenance::Settle => return step(store),
+        // A checkpoint is deliberately **not** stepped: it drains, syncs
+        // `data.bin` and frames the journal as one thing, and a partial
+        // checkpoint is not a checkpoint. It is the one maintenance unit
+        // that must run to completion, and therefore the one that bounds
+        // read latency — see the module note on RFC 0063.
+        Maintenance::Checkpoint => {
+            if let Err(e) = store.commit_journal() {
+                eprintln!("disk actor: checkpoint failed: {e}");
+            }
+        }
+        Maintenance::Evict { budget_bytes } => {
+            store.evict_settled(*budget_bytes);
+        }
+    }
+    false
+}
+
+/// One settle round. `true` if more remain.
+fn step(store: &PageStore) -> bool {
+    match store.settle_step(SETTLE_BUDGET_IDS) {
+        Ok(Progress::Settled) => true,
+        Ok(Progress::Done) => false,
+        Err(e) => {
+            eprintln!("disk actor: settle failed: {e}");
+            // The round went back on the queue. Stop claiming to owe a settle
+            // so a failing disk cannot spin the actor at full speed; the next
+            // hint, or the reopen replay, retries it.
+            false
+        }
+    }
+}
+
+/// Start the actor on a thread of its own and return the handle shards use.
+///
+/// The `PageStore` is **moved onto** the actor's thread, which is only legal
+/// because the engine is `Send + Sync` — asserted in `wavedb-storage`'s
+/// `thread_safety` module rather than assumed here.
+///
+/// # Errors
+/// The carrier thread failing to spawn.
+pub fn start(store: PageStore) -> wavedb_platform::Result<DiskHandle> {
+    let (requests, rx) = mpsc::channel(QUEUE_DEPTH);
+    let (maintenance, mrx) = mpsc::channel(MAINTENANCE_DEPTH);
+    wavedb_platform::task::spawn_detached("wavedb-disk", move || {
+        run(store, rx, mrx)
+    })?;
+    Ok(DiskHandle {
+        requests,
+        maintenance,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DiskRequest, QUEUE_DEPTH};
+    use tokio::sync::{mpsc, oneshot};
+    use wavedb_core::Id;
+
+    /// A queued request whose actor never arrives is still answered.
+    ///
+    /// The caller is awaiting a `oneshot`; dropping it yields a bare channel
+    /// error with no cause, so the shutdown path has to say why instead.
+    #[tokio::test]
+    async fn a_refused_request_reports_a_cause() {
+        let (answer, rx) = oneshot::channel();
+        DiskRequest::Get {
+            id: Id::from_raw(7),
+            answer,
+        }
+        .refuse("engine closed");
+        let err = rx.await.expect("answered").expect_err("must refuse");
+        assert!(
+            format!("{err}").contains("engine closed"),
+            "cause lost: {err}"
+        );
+    }
+
+    /// The request queue bounds itself, so a shard outrunning the disk waits
+    /// rather than growing the process.
+    #[tokio::test]
+    async fn the_queue_applies_backpressure() {
+        let (tx, _rx) = mpsc::channel::<DiskRequest>(QUEUE_DEPTH);
+        for _ in 0..QUEUE_DEPTH {
+            let (answer, _) = oneshot::channel();
+            tx.try_send(DiskRequest::Get {
+                id: Id::from_raw(1),
+                answer,
+            })
+            .expect("within depth");
+        }
+        let (answer, _) = oneshot::channel();
+        assert!(
+            tx.try_send(DiskRequest::Get {
+                id: Id::from_raw(1),
+                answer,
+            })
+            .is_err(),
+            "a full queue must refuse, not grow"
+        );
+    }
+}
