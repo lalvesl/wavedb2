@@ -40,19 +40,27 @@
 //! those three commands carry one, which RFC 0064 already lists as separable
 //! work worth doing on its own.
 //!
-//! ## Why an async mutex on one thread
+//! ## Why an async mutex, and why one table for the whole node
 //!
-//! Not for thread safety — a shard is one thread and nothing here crosses.
-//! It is for *suspension*: the lock has to be held across the operation's
-//! awaits, which a `RefCell` cannot do and a blocking mutex would deadlock on.
-//! Uncontended it is a fast path; contended it parks the task and the shard
-//! runs something else, which is the whole point.
+//! The per-owner lock is `tokio`'s because it must be held across the
+//! operation's awaits — a `RefCell` cannot span one and a blocking mutex would
+//! deadlock on it. Uncontended it is a fast path; contended it parks the task
+//! and the shard runs something else, which is the point.
+//!
+//! The **table** is a plain `std` mutex, and the table is shared by every
+//! thread that serves — the accept loop, every shard worker. That is not
+//! optional. Once routing exists, two operations on one owner can be picked up
+//! by two different threads; a per-thread table would give each its own lock
+//! and exclude neither, which is the silent loss above with more machinery in
+//! front of it. Exclusion has to be a property of the owner, so the table
+//! naming owners has to be one. Its critical section is a map lookup with no
+//! await inside, so blocking there costs a few nanoseconds and can never
+//! deadlock.
 //!
 //! [RFC 0064]: ../../../../rfcs/0064-pivot-owned-concurrency-PLANNED.md
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use wavedb_core::U48;
@@ -76,16 +84,16 @@ impl OwnerKey {
     }
 }
 
-/// One table per shard.
+/// One table for the node — every serving thread holds the same `Arc`.
 ///
-/// The `Arc` is not for sharing across threads — nothing here crosses one. It
-/// is what `tokio`'s *owned* guard requires, and an owned guard is what lets
-/// the lock be held across an operation's awaits without also borrowing this
-/// table for the duration. Uncontended, that is one atomic increment against
-/// a whole operation's work.
+/// The inner `Arc<Mutex<()>>` is what `tokio`'s *owned* guard requires, and an
+/// owned guard is what lets a lock be held across an operation's awaits
+/// without also borrowing this table for the duration. Uncontended, an acquire
+/// is one map lookup and one atomic increment against a whole operation's
+/// work.
 #[derive(Default)]
 pub struct OwnerLocks {
-    locks: RefCell<HashMap<OwnerKey, Arc<Mutex<()>>>>,
+    locks: StdMutex<HashMap<OwnerKey, Arc<Mutex<()>>>>,
 }
 
 impl OwnerLocks {
@@ -100,23 +108,21 @@ impl OwnerLocks {
     /// without borrowing this table for the duration — which would make the
     /// table itself the thing that cannot be shared.
     pub async fn acquire(&self, key: OwnerKey) -> OwnedMutexGuard<()> {
-        // Cloned out *before* the await. Holding the `RefCell` borrow across
-        // it would panic the moment a second task reached this line — the
-        // exact hazard this module exists to remove, reintroduced one level
-        // down.
-        let lock = Arc::clone(
-            self.locks
-                .borrow_mut()
-                .entry(key)
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        );
+        // Cloned out *before* the await: the table's own lock is never held
+        // across one. Doing otherwise would stall every other owner behind
+        // whichever one happened to be waiting.
+        let lock = self.with(|map| {
+            Arc::clone(
+                map.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        });
         lock.lock_owned().await
     }
 
     /// Locks currently tracked, for tests and introspection.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.locks.borrow().len()
+        self.with(|map| map.len())
     }
 
     /// Whether nothing has been locked yet.
@@ -124,7 +130,31 @@ impl OwnerLocks {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Run `f` under the table's lock.
+    ///
+    /// Poisoning is recovered rather than propagated: the map holds
+    /// independent `Arc`s and no invariant spanning them, so a panic elsewhere
+    /// leaves it perfectly usable — and refusing to hand out locks after one
+    /// would turn an unrelated fault into a node that can no longer serve the
+    /// owner it was serving.
+    fn with<R>(
+        &self,
+        f: impl FnOnce(&mut HashMap<OwnerKey, Arc<Mutex<()>>>) -> R,
+    ) -> R {
+        let mut map = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut map)
+    }
 }
+
+/// The brake is only a brake if every serving thread shares one table.
+const _: fn() = || {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<OwnerLocks>();
+};
 
 #[cfg(test)]
 mod tests {
