@@ -9,7 +9,29 @@
 //! also serving (`shard::priority`). A hint dropped because the queue is full
 //! is a hint the actor has already been given.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use wavedb_core::notify::Mutation;
+
+use crate::subscribe::{Publish, SubTable};
 use crate::{Maintenance, ServerError, shard};
+
+/// Fan committed mutations out to the WebSocket subscribers.
+///
+/// The shards execute writes on their own threads and cannot touch the
+/// subscription table, so each one hands its [`Mutation`] over as plain data
+/// and this task — on the accept thread, which owns the table — does the
+/// delivery. Ends when the last shard's sender drops, i.e. when there is
+/// nothing left that could publish.
+pub async fn publish(
+    mut incoming: tokio::sync::mpsc::UnboundedReceiver<Mutation>,
+    subs: Rc<RefCell<SubTable>>,
+) {
+    while let Some(mutation) = incoming.recv().await {
+        subs.publish(&mutation);
+    }
+}
 
 /// The background maintenance loop: periodically settle the pending queue,
 /// checkpoint once the journal crosses the threshold, and evict settled
@@ -65,4 +87,15 @@ pub const fn stopped() -> ServerError {
     ServerError::Storage(wavedb_storage::StorageError::Corrupt(
         "disk actor stopped before the node did",
     ))
+}
+
+/// Run two never-ending background jobs as one future.
+///
+/// Neither returns under normal operation, so this is a way to hand the serve
+/// loop a single thing to spawn and abort — not a join whose result matters.
+pub async fn background(
+    a: impl std::future::Future<Output = ()>,
+    b: impl std::future::Future<Output = ()>,
+) {
+    tokio::join!(a, b);
 }
