@@ -6,11 +6,27 @@
 //! the `Store`-generic engine futures (deliberately non-`Send` — an internal
 //! node seam, not a public API).
 //!
+//! ## What this thread does, and what it hands off
+//!
+//! A POST is **routed**: decoded here, executed on the shard that owns it
+//! ([`Router`](crate::shard::Router)), written back here. This thread runs no
+//! gate and touches no engine on that path.
+//!
+//! A WebSocket session is not routed yet, and it still executes its `Call`s
+//! here — over a **cacheless** store, which is what makes two executors over
+//! one engine sound, and under the same [`OwnerLocks`](crate::shard::OwnerLocks)
+//! table, which is what keeps the brake a brake across both. Routing it too
+//! turns on a question this seam does not get to answer alone: a session binds
+//! its identity once at `Hello`, and routing re-verifies the token per
+//! command, so a long-lived watch would start refusing the moment its token
+//! expired. That is arguably more correct and definitely a behaviour change.
+//!
 //! [`spawn_local`]: tokio::task::spawn_local
 
 use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use tokio::io::AsyncWrite;
 use tokio::net::{TcpListener, TcpStream};
@@ -21,6 +37,7 @@ use wavedb_core::wire::{from_wire, to_wire};
 use wavedb_net::frame::{Request, Response, StreamFrame};
 use wavedb_net::http::{self, Incoming};
 
+use crate::shard::{OwnerLocks, Router};
 use crate::subscribe::SubTable;
 use crate::{dispatch, serve_ws};
 
@@ -73,14 +90,19 @@ where
 
 /// Everything a connection needs beyond its socket and the registry.
 ///
-/// One struct rather than four parameters, because they travel together
-/// everywhere and are cloned together per connection — each field is an `Rc`
-/// or a key, so a clone is refcount bumps.
+/// One struct rather than five parameters, because they travel together
+/// everywhere and are cloned together per connection — each field is a
+/// refcount or a key, so a clone is a handful of increments.
 pub struct Node<S> {
+    /// Where a POST goes: the shard that owns it.
+    pub router: Router,
+    /// The accept thread's own cacheless view, for the WebSocket sessions
+    /// that still execute here. See the module note.
     pub store: Rc<S>,
     pub secret: [u8; 32],
-    /// Per-owner serialisation — see `CONCURRENCY_BRAKE.md`.
-    pub locks: Rc<crate::shard::OwnerLocks>,
+    /// Per-owner serialisation — see `CONCURRENCY_BRAKE.md`. One table for
+    /// the whole node, `Arc` because the shard workers hold it too.
+    pub locks: Arc<OwnerLocks>,
     pub subs: Rc<RefCell<SubTable>>,
 }
 
@@ -89,9 +111,10 @@ pub struct Node<S> {
 impl<S> Clone for Node<S> {
     fn clone(&self) -> Self {
         Self {
+            router: self.router.clone(),
             store: Rc::clone(&self.store),
             secret: self.secret,
-            locks: Rc::clone(&self.locks),
+            locks: Arc::clone(&self.locks),
             subs: Rc::clone(&self.subs),
         }
     }
@@ -114,15 +137,11 @@ where
         None => Ok(()), // peer closed without sending — clean.
         Some(Incoming::Post(body)) => {
             match from_wire::<Request>(&body) {
+                // Handed off, not handled: the gates and the engine run on
+                // the owning shard, and this task only waits for bytes to
+                // write back.
                 Ok(request) => {
-                    let answer = dispatch::handle(
-                        registry,
-                        &*node.store,
-                        &node.locks,
-                        &node.secret,
-                        request,
-                    )
-                    .await;
+                    let answer = node.router.dispatch(request).await;
                     write_response(&mut writer, answer).await
                 }
                 // The envelope is malformed — a transport-level client
@@ -138,6 +157,7 @@ where
                 writer,
                 registry,
                 &*node.store,
+                &node.locks,
                 &node.secret,
                 &node.subs,
             )
