@@ -60,6 +60,7 @@ pub async fn serve<E, S>(
     mut write: OwnedWriteHalf,
     registry: &E,
     store: &S,
+    locks: &crate::shard::OwnerLocks,
     secret: &[u8; 32],
     subs: &Rc<RefCell<SubTable>>,
 ) -> wavedb_net::Result<()>
@@ -96,7 +97,7 @@ where
             from_client = client_rx.recv() => {
                 let Some(item) = from_client else { break Ok(()); };
                 if let Err(e) = handle_client(
-                    &mut write, registry, store, caller, subs, conn,
+                    &mut write, registry, store, locks, caller, subs, conn,
                     &event_tx, &mut topics, item,
                 )
                 .await
@@ -132,6 +133,7 @@ async fn handle_client<E, S>(
     write: &mut OwnedWriteHalf,
     registry: &E,
     store: &S,
+    locks: &crate::shard::OwnerLocks,
     caller: Caller,
     subs: &Rc<RefCell<SubTable>>,
     conn: u64,
@@ -148,8 +150,19 @@ where
             codec::write_message(write, OP_PONG, &payload, false).await?;
         }
         FromClient::Msg(ClientMsg::Call(frame)) => {
-            let response =
-                dispatch::execute(registry, store, caller, frame).await;
+            // Under the same brake the routed path takes, against the same
+            // table. Without it a WebSocket write and a POST write on one
+            // owner exclude nothing — and this path never took it at all,
+            // which was a hole even before routing existed.
+            let response = {
+                let _owner = locks
+                    .acquire(crate::shard::OwnerKey::of(
+                        caller.tenant,
+                        frame.struct_hash,
+                    ))
+                    .await;
+                dispatch::execute(registry, store, caller, frame).await
+            };
             write_reply(write, response).await?;
         }
         FromClient::Msg(ClientMsg::Subscribe(topic)) => {

@@ -10,7 +10,7 @@
 //! ```no_run
 //! # async fn run<E>(registry: E) -> wavedb_quick_node::Result<()>
 //! # where E: wavedb_core::expose::Exposure
-//! #     + wavedb_storage::StorageRegistry + Copy + 'static {
+//! #     + wavedb_storage::StorageRegistry + Copy + Send + 'static {
 //! wavedb_quick_node::Server::new(registry)
 //!     .data_dir("./data")
 //!     .serve("0.0.0.0:7700")
@@ -45,6 +45,7 @@ use std::future::{Future, pending};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -118,7 +119,7 @@ pub struct Bound<E> {
 
 impl<E> Server<E>
 where
-    E: Exposure + StorageRegistry + Copy + 'static,
+    E: Exposure + StorageRegistry + Copy + Send + 'static,
 {
     /// Configure a node around a schema registry. Data goes to `./data`
     /// until [`data_dir`](Self::data_dir) says otherwise.
@@ -227,7 +228,7 @@ where
 
 impl<E> Bound<E>
 where
-    E: Exposure + Copy + 'static,
+    E: Exposure + Copy + Send + 'static,
 {
     /// The address the listener actually bound (resolves an `:0` request).
     ///
@@ -269,24 +270,51 @@ where
         self,
         shutdown: impl Future<Output = ()>,
     ) -> Result<()> {
-        // The serving store publishes mutations; maintenance + the final
-        // commit drive the raw engine underneath it (same `Rc`).
-        let store = self.shards.store();
-        let serving = Rc::new(NotifyStore::new(store, Rc::clone(&self.subs)));
         // One table for the node: the brake that keeps two interleaved
         // collection ops from losing an index update now that the store
-        // underneath genuinely suspends (`CONCURRENCY_BRAKE.md`).
-        let locks = Rc::new(shard::OwnerLocks::new());
+        // underneath genuinely suspends (`CONCURRENCY_BRAKE.md`). Shared with
+        // every shard worker, which is what makes it exclude anything at all
+        // once operations run on more than this thread.
+        let locks = Arc::new(shard::OwnerLocks::new());
+        // Committed mutations come back from the shards as plain data; the
+        // subscription table lives here and is fanned out by `publish`.
+        let (mutations, incoming) = tokio::sync::mpsc::unbounded_channel();
+        let router = shard::Router::start(
+            self.registry,
+            &self.shards.handle(),
+            &locks,
+            &mutations,
+            self.secret,
+            self.shards.count(),
+        )
+        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+        // Ours goes; the workers hold the live clones, so the publisher task
+        // ends when the last of them does rather than never.
+        drop(mutations);
+        // The accept thread's own view: cacheless (see `Shards::store`) and
+        // wrapped so a WebSocket `Call` executed here still reaches the
+        // watchers, exactly as a routed one does from its shard.
+        let serving = Rc::new(NotifyStore::new(
+            self.shards.store(),
+            Rc::clone(&self.subs),
+        ));
         serve::run(
             self.listener,
             self.registry,
             serve::Node {
+                router,
                 store: serving,
                 secret: self.secret,
                 locks,
                 subs: Rc::clone(&self.subs),
             },
-            upkeep::maintain(self.shards.handle(), self.maintenance),
+            // Both background jobs as one future: `serve::run` spawns it on
+            // the accept `LocalSet` and aborts it on shutdown, which is the
+            // right lifetime for each.
+            upkeep::background(
+                upkeep::maintain(self.shards.handle(), self.maintenance),
+                upkeep::publish(incoming, Rc::clone(&self.subs)),
+            ),
             shutdown,
         )
         .await?;
