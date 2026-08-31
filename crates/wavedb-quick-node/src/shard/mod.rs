@@ -31,7 +31,9 @@ mod lock;
 mod msg;
 pub mod priority;
 mod route;
+mod router;
 mod store;
+mod worker;
 
 pub use disk::{
     DiskHandle, MAINTENANCE_DEPTH, QUEUE_DEPTH, start as start_disk,
@@ -40,7 +42,9 @@ pub use lock::{OwnerKey, OwnerLocks};
 pub use msg::{DiskRequest, EngineStats, Maintenance};
 pub use priority::Priority;
 pub use route::{Owner, shard_of};
+pub use router::Router;
 pub use store::{CACHE_BYTES, ShardStore};
+pub use worker::{JOB_DEPTH, Job};
 
 use std::rc::Rc;
 
@@ -94,12 +98,17 @@ impl Shards {
         shard_of(pivot, self.count)
     }
 
-    /// Build a shard's store. Call this **on the shard's own thread** — the
-    /// returned value is non-`Send` by construction and holds that thread's
-    /// cache.
+    /// A **cacheless** store onto the disk actor, for the threads that are not
+    /// shards: node-side seeding, and the accept loop's WebSocket sessions.
+    ///
+    /// Cacheless is not a tuning choice, it is the correctness condition.
+    /// [`ShardStore`]'s cache remembers absence, and that is sound only while
+    /// exactly one holder reaches a given record — a second cache would keep
+    /// serving a `None` after a shard's insert filled it. So the shards cache
+    /// and nobody else does; every other holder forwards straight through.
     #[must_use]
     pub fn store(&self) -> Rc<ShardStore> {
-        Rc::new(ShardStore::new(self.disk.clone()))
+        Rc::new(ShardStore::with_budget(self.disk.clone(), 0))
     }
 
     /// A handle for a thread that will build its own store later.

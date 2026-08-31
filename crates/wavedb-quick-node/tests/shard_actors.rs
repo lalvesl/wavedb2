@@ -11,21 +11,63 @@
 //! 2. the write really reaches the engine rather than sitting in a shard's
 //!    cache, observed by a *second* shard whose cache is empty;
 //! 3. a shard genuinely runs **on its own thread**, built there because its
-//!    state is non-`Send` — only the `DiskHandle` crosses.
+//!    state is non-`Send` — only the `DiskHandle` crosses;
+//! 4. a low-priority `Maintenance` hint travels the second queue and runs;
+//! 5. a wire [`Request`] handed to the [`Router`] is executed by a shard
+//!    worker and answered — the ingress path with no engine on the caller's
+//!    thread at all.
 
 // Shard futures are non-`Send` by construction; the test runtime is
 // current-thread, which is the model this crate already declares.
 #![allow(clippy::future_not_send)]
 
 use std::rc::Rc;
+use std::sync::Arc;
 
-use schema_smoke::{Note, REGISTRY};
+use schema_smoke::{AboutUser, Note, REGISTRY};
 
+use wavedb_core::expose::{Command, Reply};
+use wavedb_core::wire::{from_wire, to_wire};
 use wavedb_core::{LocalHandle, LocalId, U48};
-use wavedb_quick_node::shard::{Maintenance, ShardStore, Shards, shard_of};
+use wavedb_net::auth::{AccessClaims, TokenPurpose, sign};
+use wavedb_net::frame::{Auth, CommandFrame, Request, Response};
+use wavedb_quick_node::shard::{
+    Maintenance, OwnerLocks, Router, ShardStore, Shards, shard_of,
+};
 use wavedb_storage::{PageStore, StorageRegistry};
 
 const TENANT: u32 = 7;
+const SECRET: [u8; 32] = [9; 32];
+
+/// A signed access token: struct commands refuse the anonymous tier, so the
+/// routed request has to carry a real identity — which is also what the
+/// router reads to pick a shard.
+fn auth() -> Auth {
+    Auth::Token(sign(
+        &SECRET,
+        &AccessClaims {
+            user: U48::from(TENANT),
+            tenant: U48::from(TENANT),
+            expires_at: wavedb_net::auth::unix_now() + 3600,
+            purpose: TokenPurpose::Access,
+            session: 0,
+            nonce: 0,
+        },
+    ))
+}
+
+/// One wire request, as the accept loop would decode it off a socket.
+fn request(struct_hash: u64, command: Command, payload: Vec<u8>) -> Request {
+    Request {
+        auth: auth(),
+        frame: CommandFrame {
+            struct_hash,
+            command,
+            payload,
+        },
+        sync: Vec::new(),
+    }
+}
 
 fn note(body: &str) -> Note {
     Note {
@@ -46,7 +88,11 @@ async fn shards_serve_collections_over_one_disk_actor() {
     assert_eq!(shards.count(), 4);
 
     // ---- 1. the index layer, unmodified, over a shard ---------------------
-    let first: Rc<ShardStore> = shards.store();
+    // A **caching** store, which is what a shard has. `Shards::store` hands
+    // out the cacheless one instead, because only a shard may cache: the
+    // cache remembers absence, and that is sound only while one holder
+    // reaches a record. This test stands in for a shard's thread.
+    let first = Rc::new(ShardStore::new(shards.handle()));
     let db = LocalHandle::new(&*first, U48::from(TENANT));
 
     let pivot = Note::create_pivot(&db).await.expect("create pivot");
@@ -68,12 +114,13 @@ async fn shards_serve_collections_over_one_disk_actor() {
     );
 
     // ---- 2. the write reached the engine, not just the cache -------------
-    // A second `ShardStore` on the same actor, with an empty cache: whatever
-    // it can see came back over the wire from the engine. (It shares a Pivot
-    // with `first`, which routing would normally forbid — here it is a
-    // read-only probe of what actually landed, and nothing writes through it.)
+    // The cacheless store, which is exactly the right probe: it cannot answer
+    // from anything of its own, so whatever it sees came back over the wire
+    // from the engine. (It shares a Pivot with `first`, which routing would
+    // normally forbid — sound here precisely because it caches nothing and
+    // nothing writes through it.)
     let observer: Rc<ShardStore> = shards.store();
-    assert_eq!(observer.cached_len(), 0, "a fresh shard starts cold");
+    assert_eq!(observer.cached_len(), 0, "a bypass store holds nothing");
 
     let cold_db = LocalHandle::new(&*observer, U48::from(TENANT));
     let cold = Note::collection(pivot);
@@ -86,9 +133,11 @@ async fn shards_serve_collections_over_one_disk_actor() {
         seen.body, "note 7",
         "the first shard's cache was answering for a write that never landed"
     );
-    assert!(
-        observer.cached_bytes() > 0,
-        "the cold read should have been memoised"
+    assert_eq!(
+        observer.cached_bytes(),
+        0,
+        "a bypass store must not memoise — a second cache over one record is \
+         how a stale `None` outlives another holder's insert"
     );
 
     // ---- 3. a shard on a thread of its own -------------------------------
@@ -173,4 +222,76 @@ async fn shards_serve_collections_over_one_disk_actor() {
     // What prevents it is `shard::OwnerLocks`, tested at the unit level; a
     // probe here passed one interleaving and proved nothing, so it is gone
     // rather than left looking like a guarantee.
+
+    // ---- 5. the ingress path: a wire request, routed and answered --------
+    ingress_routes_to_a_worker(&shards, &observer).await;
+}
+
+/// A wire request handed to the [`Router`], executed by a shard worker, and
+/// answered — the whole new chain in one place.
+///
+/// The router picks the owning shard, the request crosses to that worker's
+/// thread, the gates and the engine run *there*, and the answer comes back.
+/// Nothing on the calling thread touches storage: a `Router` holds no `Store`
+/// at all, which is what the accept loop now looks like.
+///
+/// `AboutUser` is Unique, so the anchor is `KEY = STRUCT_HASH` under the
+/// tenant and the save needs no Pivot: the request is exactly what a POST
+/// carries.
+async fn ingress_routes_to_a_worker(shards: &Shards, bypass: &ShardStore) {
+    wavedb_net::auth::set_node_secret(SECRET);
+    let locks = Arc::new(OwnerLocks::new());
+    let (mutations, _drain) = tokio::sync::mpsc::unbounded_channel();
+    let router = Router::start(
+        REGISTRY,
+        &shards.handle(),
+        &locks,
+        &mutations,
+        SECRET,
+        4,
+    )
+    .expect("start the shard workers");
+    assert_eq!(router.count(), 4);
+
+    let profile = AboutUser {
+        name: "ada".into(),
+        city: "london".into(),
+    };
+    let saved = router
+        .dispatch(request(
+            AboutUser::STRUCT_HASH,
+            Command::Save,
+            to_wire(&profile),
+        ))
+        .await;
+    assert!(
+        matches!(saved.response, Response::Ok(_)),
+        "the routed save was refused: {:?}",
+        saved.response
+    );
+
+    // Read it back the same way. Note what this does *not* show: both
+    // requests carry the same key, so both land on one worker — but the read
+    // would succeed from any of them, because a miss just asks the disk
+    // actor. Same-owner-same-shard is a property of `shard_for`, and it is
+    // pinned where it can actually fail, in `router`'s unit tests.
+    let read = router
+        .dispatch(request(AboutUser::STRUCT_HASH, Command::Get, Vec::new()))
+        .await;
+    let Response::Ok(Reply::Value(Some(bytes))) = read.response else {
+        panic!("expected the saved record back: {:?}", read.response);
+    };
+    assert_eq!(
+        from_wire::<AboutUser>(&bytes).expect("decode"),
+        profile,
+        "the routed read did not see the routed write"
+    );
+
+    // And it really landed in the engine, not just in that worker's cache —
+    // read through the cacheless bypass store, which can answer from nothing.
+    let direct = AboutUser::get(&LocalHandle::new(bypass, U48::from(TENANT)))
+        .await
+        .expect("bypass read")
+        .expect("the routed save must have reached the engine");
+    assert_eq!(direct, profile);
 }
