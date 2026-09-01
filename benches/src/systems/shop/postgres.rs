@@ -89,11 +89,7 @@ pub fn run(
         .map(|r| r.get::<_, String>(0))
         .map_err(sql)?;
     client.batch_execute(DDL).map_err(sql)?;
-    {
-        // A fill is not a measurement: it gets the machine, not the cage.
-        let _fill = crate::cage::for_fill();
-        preload(cfg, &mut client)?;
-    }
+    preload(cfg, &mut client)?;
     drop(client);
 
     // Restart under the row's real durability, with an empty `shared_buffers`.

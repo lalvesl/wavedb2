@@ -23,7 +23,7 @@ use wavedb_bench::systems::engine::Engine;
 use wavedb_bench::systems::shop::ShopCfg;
 use wavedb_bench::systems::{Cfg, Durability, SystemReport};
 use wavedb_bench::tables::{print_shop_table, print_table};
-use wavedb_bench::{host, report, systems};
+use wavedb_bench::{cage, host, report, systems};
 
 /// How busy the machine may be and still be worth recording on, as a share of
 /// the CPUs **this run** may actually use. A slow row that a future bisect
@@ -109,11 +109,13 @@ fn run(opts: &Options) -> Result<(), String> {
         seed_mongodb: opts.seed_mongodb.clone(),
     };
 
-    // Before the probe: the scope is created loose so fills get the machine,
-    // and the lane must be keyed by the budget the *numbers* ran under.
-    wavedb_bench::cage::init();
+    // Before the probe: the lane is keyed by the budget the *numbers* ran
+    // under, so the cgroup must already hold it when the host is fingerprinted.
+    cage::init();
     let host = host::Host::probe(&work_dir);
-    let prov = report::Provenance::probe(&opts.repo);
+    let mut prov = report::Provenance::probe(&opts.repo);
+    prov.caged = cage::is_caged(host.mem_budget, host.cpu_budget);
+    prov.forced = opts.force;
     eprintln!(
         "host {} · {}/{} cpus · {} MiB cap · {} · {}",
         host.key,
@@ -200,6 +202,14 @@ fn run(opts: &Options) -> Result<(), String> {
     if opts.quick {
         println!("\n--quick: nothing recorded.");
         return Ok(());
+    }
+    // The corpus has exactly one measured configuration (RFC 0060 §5). An
+    // uncaged run is not a worse row, it is a row from another machine: it
+    // would land in its own host lane, comparable with nothing, and the
+    // servers inside it would each have helped themselves to a different
+    // fraction of the RAM.
+    if !opts.force {
+        cage::verify(host.mem_budget, host.cpu_budget)?;
     }
     let noise = noise_limit(host.cpu_budget);
     if prov.load_average > noise && !opts.force {

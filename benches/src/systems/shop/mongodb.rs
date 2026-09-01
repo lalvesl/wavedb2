@@ -51,11 +51,7 @@ pub fn run(
         .unwrap_or("unknown")
         .to_string();
     indexes(&db)?;
-    {
-        // A fill is not a measurement: it gets the machine, not the cage.
-        let _fill = crate::cage::for_fill();
-        preload(cfg, &db)?;
-    }
+    preload(cfg, &db)?;
     drop(client);
 
     // Restart empties the WiredTiger cache, matching every other row.

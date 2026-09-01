@@ -66,8 +66,6 @@ pub fn run(
     {
         // Preload in bulk, and deliberately so: it is never timed, and the
         // stored form it produces is the same either way.
-        // A fill is not a measurement: it gets the machine, not the cage.
-        let _fill = crate::cage::for_fill();
         let mut conn = connect(&path, "OFF")?;
         conn.execute_batch(DDL).map_err(sql)?;
         preload(cfg, &mut conn)?;

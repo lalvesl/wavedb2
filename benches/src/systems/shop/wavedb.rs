@@ -30,11 +30,7 @@ pub fn run(cfg: &ShopCfg, d: Durability) -> Result<SystemReport, String> {
     });
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
 
-    {
-        // A fill is not a measurement: it gets the machine, not the cage.
-        let _fill = crate::cage::for_fill();
-        preload(cfg, &dir)?;
-    }
+    preload(cfg, &dir)?;
 
     // Reopened: the per-type cache is a *write* cache, so everything the
     // preload just wrote would otherwise still be warm and the read phases
@@ -386,10 +382,10 @@ const CHECKPOINT_AFTER_BYTES: u64 = 64 << 20;
 /// took 164 s at 8 000. Cold reads are this engine's known weak path; a fill
 /// is the last place to force them.
 ///
-/// 192 MB: comfortably inside the measurement cage, so the fill behaves the
-/// same whether or not `crate::cage::for_fill` opened it — and still a bound,
-/// since an unbounded write cache would simply move the failure to whatever
-/// ceiling is in force.
+/// 192 MB: comfortably inside the 500 MB cage the fill also runs in (see
+/// [`crate::cage`] — there is one configuration and the fill is not an
+/// exception to it), and still a bound, since an unbounded write cache would
+/// simply move the failure to whatever ceiling is in force.
 const FILL_CACHE_BYTES: usize = 192 << 20;
 
 fn open_with(dir: &Path, options: StoreOptions) -> Result<PageStore, String> {
