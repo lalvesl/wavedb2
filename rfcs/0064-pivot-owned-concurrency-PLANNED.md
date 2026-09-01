@@ -76,6 +76,21 @@ The ownership boundary and the ingress path, at type granularity.
   Committed mutations come back as plain `Mutation`s to the accept thread's
   publisher, because the WebSocket subscription table lives there.
 
+**Measured.** The comparative suite reports WaveDB four times — two durability
+modes across two engine seams, `wavedb` (the `PageStore` in the caller's thread)
+and `wavedb-sharded` (this design: disk actor on its own thread, reached by
+message through a `ShardStore`). Same workload, same index layer, generic over
+the seam. It measures **the cost of the boundary and not the benefit of
+parallelism**, because the harness issues one operation at a time *and* because
+the brake's key is the type — so this workload is one owner whatever `N` is.
+That pair is the honest measurement available before the two things the
+concurrency actually needs (a concurrent client, and the Pivot-grained brake)
+exist. One caveat rides with it: `ShardStore` memoises on read while the
+engine's per-type cache is a write cache, so the sharded row carries a read
+cache the direct row lacks — RFC 0044's gap, closed as a side effect — and
+`read_cold` is therefore not comparable across the pair. `benches/README.md`
+carries this, and each sharded row repeats it in its own `notes`.
+
 **Not built, and each says why in place:** the journal/page actor split (the
 settle straddle below), the per-type caches moving into the shards (same),
 Pivot-grained routing and braking (the wire change above — both must narrow

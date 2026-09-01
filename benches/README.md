@@ -105,6 +105,31 @@ equal to each other either; each row reports the configuration that system's
 own docs call relaxed, with the window named in its `settings` so a reader can
 discount it.
 
+## The engine axis: `wavedb` and `wavedb-sharded`
+
+WaveDB reports each durability twice, over two engine seams — four micro rows.
+`wavedb` is the `PageStore` in the benchmark's own thread. `wavedb-sharded` is
+the [RFC 0064](../rfcs/0064-pivot-owned-concurrency-PLANNED.md) shape: the
+engine owned by a **disk actor** on its own thread, reached by message through
+a `ShardStore` with its own cache. Same workload, same index layer, generic over
+the seam (`systems::engine`); nothing above `Store` knows the difference.
+
+**What the pair shows is the cost of the boundary, not the benefit of
+parallelism**, and the reason is structural twice over. The harness issues one
+operation at a time (`block_on` per op, each timed alone), so a second shard
+never has a second operation to run. And the brake that keeps two operations on
+one owner from interleaving keys on `(tenant, STRUCT_HASH)` today, while this
+workload is one type under one tenant — so it would still be *one owner* even
+under a concurrent client. Measuring the concurrency the shards exist for needs
+both a concurrent client here and the Pivot-grained brake there.
+
+One column is **not** comparable across the pair: `read_cold`. `ShardStore`
+memoises on read, and the engine's per-type cache is a write cache that reads
+never populate — so the sharded row carries a read cache the direct row does
+not (the gap RFC 0044 names, filled as a side effect of a shard owning its
+cache). A faster `read_cold` on that row is that difference, not a faster read
+path. The row's own `notes` say so in the results file.
+
 The MongoDB seed additionally needs **unprivileged user namespaces** on the
 build host: `mongod` aborts in the Nix sandbox (its tcmalloc `CHECK`s on
 `/sys/devices/system/cpu/possible`, which the sandbox does not provide), so that
