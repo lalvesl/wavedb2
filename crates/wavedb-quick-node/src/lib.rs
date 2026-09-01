@@ -55,6 +55,7 @@ use wavedb_storage::{PageStore, StorageRegistry, StoreOptions};
 pub use error::{Result, ServerError};
 
 use subscribe::{NotifyStore, SubTable};
+use upkeep::Maintenance;
 
 /// A node, configured but not yet bound.
 ///
@@ -68,34 +69,8 @@ pub struct Server<E> {
     maintenance: Maintenance,
     secret: Option<[u8; 32]>,
     store: StoreOptions,
-}
-
-/// The background maintenance policy: how the node settles, checkpoints,
-/// and bounds its caches while serving.
-#[derive(Debug, Clone, Copy)]
-struct Maintenance {
-    /// Journal bytes that trigger a checkpoint (journal truncates to zero).
-    checkpoint_after_bytes: u64,
-    /// Cache bytes the settle task evicts down to (settled entries only).
-    cache_budget_bytes: usize,
-    /// Defragment once the largest free extent falls below this many blocks —
-    /// the point where a checkpoint's window stops fitting a hole and starts
-    /// growing the tail (RFC 0042).
-    defrag_below_blocks: u64,
-    /// Blocks one defragmentation pass may copy. The cleaner's whole cost is
-    /// this, so it is a plain IO budget per tick.
-    defrag_budget_blocks: u64,
-}
-
-impl Default for Maintenance {
-    fn default() -> Self {
-        Self {
-            checkpoint_after_bytes: 64 * 1024 * 1024, // 64 MiB of journal
-            cache_budget_bytes: 1024 * 1024 * 1024,   // 1 GiB — generous
-            defrag_below_blocks: 256, // 1 MiB of contiguous room
-            defrag_budget_blocks: 256, // ≤ 1 MiB copied per tick
-        }
-    }
+    /// Shard workers to serve on — see [`Server::shards`].
+    shard_count: usize,
 }
 
 /// A node that has opened its engine and bound its socket — ready to
@@ -104,9 +79,9 @@ impl Default for Maintenance {
 pub struct Bound<E> {
     registry: E,
     listener: TcpListener,
-    /// The engine, behind its disk actor (RFC 0064). `N = 1`: the ownership
-    /// boundary is real — nothing here can touch the `PageStore` except by
-    /// message — while routing across several shards is still to come.
+    /// The engine, behind its disk actor (RFC 0064). Nothing here can touch
+    /// the `PageStore` except by message; requests are routed across
+    /// [`Server::shards`] workers, one by default.
     shards: crate::shard::Shards,
     /// Shared with the serve-time [`NotifyStore`]; the WS session loops
     /// register their subscriptions here. (HTTP poll-watches hold no node
@@ -131,6 +106,7 @@ where
             maintenance: Maintenance::default(),
             secret: None,
             store: StoreOptions::default(),
+            shard_count: 1,
         }
     }
 
@@ -183,6 +159,24 @@ where
         self
     }
 
+    /// How many shard workers serve requests (RFC 0064). Default 1.
+    ///
+    /// Each shard is a thread with its own runtime and its own cache, and a
+    /// request is routed to the shard owning it. **Raising this only buys
+    /// throughput where the owners differ**: two operations on one owner
+    /// serialise on the brake wherever they land (`CONCURRENCY_BRAKE.md`), and
+    /// the brake's key is `(tenant, STRUCT_HASH)` today — so one type under
+    /// one tenant is one owner however many shards there are. It costs a
+    /// thread and a cache each, and `ShardStore::CACHE_BYTES` is *per shard*.
+    ///
+    /// Zero is clamped to one: no shards is not a degraded node, it is a node
+    /// that serves nothing.
+    #[must_use]
+    pub const fn shards(mut self, count: usize) -> Self {
+        self.shard_count = count;
+        self
+    }
+
     /// Open the engine and bind the listener, without yet accepting.
     ///
     /// # Errors
@@ -208,9 +202,10 @@ where
         Ok(Bound {
             registry: self.registry,
             listener,
-            shards: crate::shard::Shards::start(store, 1).map_err(|e| {
-                ServerError::Io(std::io::Error::other(e.to_string()))
-            })?,
+            shards: crate::shard::Shards::start(store, self.shard_count)
+                .map_err(|e| {
+                    ServerError::Io(std::io::Error::other(e.to_string()))
+                })?,
             subs,
             maintenance: self.maintenance,
             secret,
