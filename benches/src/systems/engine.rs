@@ -182,8 +182,8 @@ impl Sharded {
     /// `Store` directly has no requests to route. Passing `N` here would spawn
     /// nothing and describe a configuration that is not running.
     pub fn new(store: PageStore) -> Result<Self, String> {
-        let shards =
-            Shards::start(store, 1).map_err(|e| format!("start shards: {e}"))?;
+        let shards = Shards::start(store, 1)
+            .map_err(|e| format!("start shards: {e}"))?;
         let store = Rc::new(ShardStore::with_budget(
             shards.handle(),
             SHARD_CACHE_BYTES,
