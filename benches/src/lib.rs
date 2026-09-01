@@ -53,6 +53,7 @@ pub mod cage;
 pub mod cli;
 pub mod footprint;
 pub mod host;
+pub mod index;
 pub mod json;
 pub mod metrics;
 pub mod report;
