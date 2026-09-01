@@ -84,6 +84,46 @@ impl DiskHandle {
     pub fn hint(&self, work: Maintenance) {
         let _ = self.maintenance.try_send(work);
     }
+
+    /// Run `work` to completion and report the outcome.
+    ///
+    /// The waiting counterpart of [`hint`](Self::hint), and the difference
+    /// between them is who is on the other end: a hint may be dropped and its
+    /// faults are only printed, which is right for a policy loop and wrong for
+    /// an operator or a measurement. `Settle` here drains rather than stepping.
+    ///
+    /// # Errors
+    /// The actor is gone, or the maintenance itself faulted.
+    pub async fn maintain(&self, work: Maintenance) -> wavedb_core::Result<()> {
+        self.ask(|answer| DiskRequest::Maintain { work, answer })
+            .await
+    }
+
+    /// What the engine currently holds.
+    ///
+    /// Has to be a message: once the actor owns the `PageStore`, "is anything
+    /// unsettled?" is not answerable by looking.
+    ///
+    /// # Errors
+    /// The actor is gone.
+    pub async fn stats(&self) -> wavedb_core::Result<EngineStats> {
+        self.ask(|answer| DiskRequest::Stats { answer }).await
+    }
+
+    /// Send a request and await its answer, naming both failures at this seam
+    /// rather than inventing one further up.
+    async fn ask<T>(
+        &self,
+        build: impl FnOnce(super::msg::Answer<T>) -> DiskRequest,
+    ) -> wavedb_core::Result<T> {
+        let (answer, wait) = tokio::sync::oneshot::channel();
+        self.requests.send(build(answer)).await.map_err(|_| {
+            wavedb_core::Error::Backend("disk actor stopped".into())
+        })?;
+        wait.await.map_err(|_| {
+            wavedb_core::Error::Backend("disk actor dropped the answer".into())
+        })?
+    }
 }
 
 /// Own `store` and serve both queues until every handle is dropped.
@@ -188,6 +228,11 @@ async fn serve(store: &PageStore, request: DiskRequest) {
                 largest_free_extent: store.largest_free_extent(),
             }));
         }
+        DiskRequest::Maintain { work, answer } => {
+            let _ = answer.send(run_now(store, &work).map_err(|e| {
+                wavedb_core::Error::Backend(format!("maintain: {e}"))
+            }));
+        }
         // Handled in the loop, which owns the store it has to drop.
         DiskRequest::Shutdown { answer } => {
             let _ = answer.send(Ok(()));
@@ -235,6 +280,30 @@ fn maintain(store: &PageStore, work: &Maintenance) -> bool {
         }
     }
     false
+}
+
+/// Run one unit of maintenance **to completion**, for a caller who is waiting.
+///
+/// The difference from [`maintain`] is not the work, it is the contract. A hint
+/// is droppable and its faults are unobservable, which is right for a policy
+/// loop and wrong for anyone who asked. So a fault comes back here, and
+/// `Settle` **drains** rather than taking one bounded step: a caller that asked
+/// to settle and was told "done" after 4096 ids would have been misled.
+fn run_now(
+    store: &PageStore,
+    work: &Maintenance,
+) -> Result<(), wavedb_storage::StorageError> {
+    match work {
+        Maintenance::Settle => store.drain(),
+        Maintenance::Checkpoint => store.commit_journal(),
+        Maintenance::Evict { budget_bytes } => {
+            store.evict_settled(*budget_bytes);
+            Ok(())
+        }
+        Maintenance::Defragment { budget_blocks } => {
+            store.defragment(*budget_blocks).map(|_| ())
+        }
+    }
 }
 
 /// One settle round. `true` if more remain.
