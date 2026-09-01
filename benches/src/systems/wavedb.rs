@@ -16,6 +16,7 @@ use futures::executor::block_on;
 use wavedb_core::{CollectionHandle, LocalHandle, U48};
 use wavedb_storage::PageStore;
 
+use super::engine::{Engine, Engineish, Sharded};
 use super::{Cfg, Durability, SystemReport};
 use crate::RELAXED_WINDOW;
 use crate::footprint::{Footprint, Point};
@@ -54,22 +55,27 @@ const CACHE_BUDGET_BYTES: usize = 96 << 20;
 /// it changes no latency and no `ops_per_sec` — those sum the individually
 /// timed operations. It does land in the phase's `bytes_written`, which spans
 /// the whole closure, and that is right: those bytes are really written.
-fn maintain(store: &PageStore) {
-    if store.journal_len() <= CHECKPOINT_AFTER_BYTES {
+fn maintain<E: Engineish>(engine: &E) {
+    if engine.journal_len() <= CHECKPOINT_AFTER_BYTES {
         return;
     }
-    store.commit_journal().expect("checkpoint");
-    store.evict_settled(CACHE_BUDGET_BYTES);
+    engine.checkpoint().expect("checkpoint");
+    engine.evict(CACHE_BUDGET_BYTES);
 }
 /// Defrag budget: generous enough that one pass is the compaction, since the
 /// point of the "compacted" footprint is the floor, not a partial move.
 const DEFRAG_BUDGET_BLOCKS: u64 = 1 << 20;
 
-pub fn run(cfg: &Cfg, d: Durability) -> Result<SystemReport, String> {
-    // Per row: the two durabilities must not share a store, or the second
-    // would inherit the first's pages and its `insert` phase would measure a
-    // rewrite.
-    let dir = cfg.work_dir.join(format!("wavedb-{}", d.name()));
+pub fn run(
+    cfg: &Cfg,
+    d: Durability,
+    engine: Engine,
+) -> Result<SystemReport, String> {
+    // Per row: no two rows may share a store, or the second would inherit the
+    // first's pages and its `insert` phase would measure a rewrite.
+    let dir =
+        cfg.work_dir
+            .join(format!("wavedb-{}-{}", engine.name(), d.name()));
     // A seed arrives as `<store>/data` plus its `ids.bin`/`pivot.bin` sidecar;
     // the sidecar is what makes it usable at all, since a NonUnique anchor id
     // is minted from the clock and cannot be recomputed.
@@ -83,25 +89,42 @@ pub fn run(cfg: &Cfg, d: Durability) -> Result<SystemReport, String> {
         None
     };
 
-    let (mut phases, ids, pivot) = match seeded {
-        Some((ids, pivot)) => {
-            let data = dir.join("data");
-            (read_only(cfg, &data, d, pivot, &ids)?, ids, pivot)
+    let data = dir.join("data");
+    // The engine choice is made **once**, here, and everything downstream is
+    // generic over it: one workload, two seams, no duplicated phase code.
+    let (phases, footprints) = match engine {
+        Engine::Direct => drive(cfg, &data, seeded, || open(&data, d))?,
+        Engine::Sharded => {
+            drive(cfg, &data, seeded, || Sharded::new(open(&data, d)?))?
         }
-        None => fill_and_read(cfg, &dir.join("data"), d)?,
     };
-    let (update, footprints) =
-        update_and_measure(cfg, &dir.join("data"), d, &ids, pivot)?;
-    phases.push(update);
 
     Ok(SystemReport {
-        system: "wavedb",
+        system: match engine {
+            Engine::Direct => "wavedb",
+            Engine::Sharded => "wavedb-sharded",
+        },
         bracket: "embedded",
         workload: "micro",
         durability: d,
         version: env!("CARGO_PKG_VERSION").to_string(),
         settings: vec![
-            ("mode".into(), "PageStore (in-process)".into()),
+            ("mode".into(), engine.mode().into()),
+            // Counted, not assumed. `Shards::start` spawns the **disk actor**
+            // and nothing else — the per-shard worker threads belong to the
+            // node's `Router`, which a benchmark driving `Store` directly never
+            // builds. So the sharded row is this thread acting as the one
+            // shard, plus the actor's: two threads, not N+1.
+            (
+                "threads".into(),
+                match engine {
+                    Engine::Direct => "1 (everything here)".to_string(),
+                    Engine::Sharded => {
+                        "2 — this thread is the shard, + 1 disk actor"
+                            .to_string()
+                    }
+                },
+            ),
             (
                 "barrier".into(),
                 match d {
@@ -119,13 +142,41 @@ pub fn run(cfg: &Cfg, d: Durability) -> Result<SystemReport, String> {
         footprints,
         live_records: cfg.rows,
         logical_bytes: logical_bytes(cfg.rows, cfg.seed),
-        notes: notes(cfg.seed_wavedb.is_some()),
+        notes: notes(cfg.seed_wavedb.is_some(), engine),
         seed_path: cfg.seed_wavedb.as_ref().map(|p| p.display().to_string()),
         materialise_ms,
     })
 }
 
-fn notes(seeded: bool) -> Vec<String> {
+/// Everything one row produces: its timed phases and its footprint points.
+type Row = (Vec<Phase>, Vec<(Point, Footprint)>);
+
+/// The whole row, generic over which engine seam is under it.
+///
+/// `open` is a factory rather than a value because the sequence **reopens**:
+/// the cold-read phase depends on a store with empty caches, and the
+/// process-wide `EngineClaim` means the previous one must be closed first.
+fn drive<E, F>(
+    cfg: &Cfg,
+    data: &Path,
+    seeded: Option<(Vec<wavedb_core::Id>, ThingPivotId)>,
+    open: F,
+) -> Result<Row, String>
+where
+    E: Engineish,
+    F: Fn() -> Result<E, String>,
+{
+    let (mut phases, ids, pivot) = match seeded {
+        Some((ids, pivot)) => (read_only(cfg, &open, pivot, &ids)?, ids, pivot),
+        None => fill_and_read(cfg, data, &open)?,
+    };
+    let (update, footprints) =
+        update_and_measure(cfg, data, &open, &ids, pivot)?;
+    phases.push(update);
+    Ok((phases, footprints))
+}
+
+fn notes(seeded: bool, engine: Engine) -> Vec<String> {
     let mut notes = vec![
         "Every collection op is one apply batch. The durable row takes one \
          fsync per batch; the relaxed row takes one per elapsed window \
@@ -147,38 +198,72 @@ fn notes(seeded: bool) -> Vec<String> {
                 .into(),
         );
     }
+    if engine == Engine::Sharded {
+        notes.push(
+            "Sharded row: the engine is owned by a disk actor on its own \
+             thread and reached by message through a ShardStore. It is the \
+             single/multi-thread axis, and it measures the cost of that \
+             boundary — NOT parallelism. This benchmark issues one operation \
+             at a time, so only one shard ever has work; and the brake keys \
+             on (tenant, STRUCT_HASH), so one type under one tenant would be \
+             one owner even under a concurrent client."
+                .into(),
+        );
+        notes.push(
+            "read_cold is NOT comparable to the direct row. ShardStore \
+             memoises on read; the engine's per-type cache is a write cache \
+             that reads never populate. So the sharded row has a read cache \
+             the direct row does not — the gap RFC 0044 names, filled here as \
+             a side effect of the shard owning its own cache. A faster \
+             read_cold on this row is that difference, not a faster read path."
+                .into(),
+        );
+        notes.push(
+            "Measured cost of a ShardStore MISS: the same row run with a \
+             16 MiB shard budget against a ~40 MB working set reported \
+             read_hot at 96 175/s where the direct row reported 1 269 423/s. \
+             The round trip is roughly an order of magnitude over an \
+             in-process hit, so the row's result is governed by the shard's \
+             hit rate — and ShardStore bounds itself by clearing the whole \
+             cache rather than evicting (RFC 0044 is that gap). This row uses \
+             the shipped 64 MiB default, which holds this working set."
+                .into(),
+        );
+    }
     notes
 }
 
 /// A seeded store's read phase. Only `read_cold` exists here, and the reason is
 /// itself a finding: a read that misses the cache does not populate it, so a
 /// store opened over prefilled pages has no warm state to measure.
-fn read_only(
+fn read_only<E: Engineish>(
     cfg: &Cfg,
-    dir: &Path,
-    d: Durability,
+    open: &impl Fn() -> Result<E, String>,
     pivot: ThingPivotId,
     ids: &[wavedb_core::Id],
 ) -> Result<Vec<Phase>, String> {
-    let store = open(dir, d)?;
-    let db = LocalHandle::new(&store, U48::from(TENANT));
+    let engine = open()?;
+    let db = LocalHandle::new(engine.store(), U48::from(TENANT));
     let col = Thing::collection(pivot);
-    Ok(vec![read_phase("read_cold", cfg, &db, col, ids)])
+    let phase = read_phase("read_cold", cfg, &db, col, ids);
+    engine.close();
+    Ok(vec![phase])
 }
 
 /// Insert every row, then read back hot (engine caches warm) and cold (store
 /// reopened, so the caches are empty and reads fall through to settled pages).
-fn fill_and_read(
+fn fill_and_read<E: Engineish>(
     cfg: &Cfg,
     dir: &Path,
-    d: Durability,
+    open: &impl Fn() -> Result<E, String>,
 ) -> Result<(Vec<Phase>, Vec<wavedb_core::Id>, ThingPivotId), String> {
+    let _ = dir;
     let mut ids = Vec::with_capacity(cfg.rows as usize);
     let mut phases = Vec::new();
 
     let pivot = {
-        let store = open(dir, d)?;
-        let db = LocalHandle::new(&store, U48::from(TENANT));
+        let engine = open()?;
+        let db = LocalHandle::new(engine.store(), U48::from(TENANT));
         let pivot = block_on(Thing::create_pivot(&db))
             .map_err(|e| format!("create_pivot: {e}"))?;
         let col = Thing::collection(pivot);
@@ -192,7 +277,7 @@ fn fill_and_read(
                         block_on(col.insert(&db, &t)).expect("insert")
                     });
                     ids.push(id);
-                    maintain(&store);
+                    maintain(&engine);
                 }
             },
             cfg.rows as usize,
@@ -200,36 +285,36 @@ fn fill_and_read(
 
         // Quiesce before reading so the read phase measures the read path and
         // not a settle that happened to land inside it.
-        store.drain().map_err(|e| format!("drain: {e}"))?;
+        engine.drain()?;
         phases.push(read_phase("read_hot", cfg, &db, col, &ids));
-        store
-            .commit_journal()
-            .map_err(|e| format!("checkpoint: {e}"))?;
+        engine.checkpoint()?;
+        engine.close();
         pivot
     };
 
     // Reopen: engine caches are empty, so this is a genuine read-through to
     // pages. The OS page cache is still warm — see the note in `run`.
     {
-        let store = open(dir, d)?;
-        let db = LocalHandle::new(&store, U48::from(TENANT));
+        let engine = open()?;
+        let db = LocalHandle::new(engine.store(), U48::from(TENANT));
         let col = Thing::collection(pivot);
         phases.push(read_phase("read_cold", cfg, &db, col, &ids));
+        engine.close();
     }
 
     Ok((phases, ids, pivot))
 }
 
 /// Whole-record saves at known anchors, then the three footprint points.
-fn update_and_measure(
+fn update_and_measure<E: Engineish>(
     cfg: &Cfg,
     dir: &Path,
-    d: Durability,
+    open: &impl Fn() -> Result<E, String>,
     ids: &[wavedb_core::Id],
     pivot: ThingPivotId,
 ) -> Result<(Phase, Vec<(Point, Footprint)>), String> {
-    let store = open(dir, d)?;
-    let db = LocalHandle::new(&store, U48::from(TENANT));
+    let engine = open()?;
+    let db = LocalHandle::new(engine.store(), U48::from(TENANT));
     // The same pivot the fill used: a collection's chains hang off it, so a
     // fresh one would save into a different collection entirely.
     let col = Thing::collection(pivot);
@@ -245,19 +330,17 @@ fn update_and_measure(
                 lat.time(|| block_on(col.save(&db, id, &t)).expect("save"));
                 // A save archives the superseded version, so this loop grows
                 // the cache and the journal faster than the fill does.
-                maintain(&store);
+                maintain(&engine);
             }
         },
         cfg.updates as usize,
     );
 
     let mut points = vec![(Point::Hot, measure(dir)?)];
-    points.push((Point::Settled, quiesce(&store, dir)?));
-    store
-        .defragment(DEFRAG_BUDGET_BLOCKS)
-        .map_err(|e| format!("defragment: {e}"))?;
-    points.push((Point::Compacted, quiesce(&store, dir)?));
-
+    points.push((Point::Settled, quiesce(&engine, dir)?));
+    engine.defragment(DEFRAG_BUDGET_BLOCKS)?;
+    points.push((Point::Compacted, quiesce(&engine, dir)?));
+    engine.close();
     Ok((update, points))
 }
 
@@ -269,19 +352,17 @@ fn update_and_measure(
 /// journal as though it were stored data — which is how a 1.4 MB database
 /// first measured as 34 MB. Looping until stable is the honest reading of
 /// "the system's own natural quiescence", and it costs a few barriers.
-fn quiesce(store: &PageStore, dir: &Path) -> Result<Footprint, String> {
+fn quiesce<E: Engineish>(engine: &E, dir: &Path) -> Result<Footprint, String> {
     const MAX_ROUNDS: usize = 6;
     // `u64::MAX` forces at least two rounds: the first checkpoint supersedes
     // the journal, the second is the one that may delete it, so a size that
     // merely failed to grow proves nothing yet.
     let mut last = u64::MAX;
     for _ in 0..MAX_ROUNDS {
-        store.drain().map_err(|e| format!("drain: {e}"))?;
-        store
-            .commit_journal()
-            .map_err(|e| format!("checkpoint: {e}"))?;
+        engine.drain()?;
+        engine.checkpoint()?;
         let now = measure(dir)?;
-        if now.allocated_bytes == last && !store.has_pending() {
+        if now.allocated_bytes == last && !engine.has_pending() {
             return Ok(now);
         }
         last = now.allocated_bytes;
@@ -301,10 +382,10 @@ fn is_log(path: &Path) -> bool {
         .is_some_and(|n| n.to_string_lossy().starts_with("journal_"))
 }
 
-fn read_phase(
+fn read_phase<S: wavedb_core::Store>(
     name: &'static str,
     cfg: &Cfg,
-    db: &LocalHandle<'_, PageStore>,
+    db: &LocalHandle<'_, S>,
     col: CollectionHandle<Thing>,
     ids: &[wavedb_core::Id],
 ) -> Phase {
