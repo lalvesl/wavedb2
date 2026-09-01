@@ -151,24 +151,32 @@
         # `--dev-bind / /` on purpose: the databases must write to the real
         # disk. A tmpfs would put them in RAM and measure the wrong thing.
         benchCpus = "0-3";
-        # 500 MB for the run AND its server while it MEASURES, which is the
-        # point: at this size the page cache stops hiding the disk, so a cold
-        # read is cold and a dataset larger than memory is a dataset larger
-        # than memory (RFC 0060 open question 4). Every server's cache is
-        # pinned well under it — each sizes itself from the *machine's* RAM,
-        # not the cgroup's, so an unpinned one asks for gigabytes it cannot
-        # have and is OOM-killed.
+        benchCpuBudget = "4"; # how many `benchCpus` names, for the guard
+        # 500 MB for the run AND its server, from the first instruction to the
+        # last. Two reasons, and the second is the stronger one:
+        #
+        #   the measurement  at this size the page cache stops hiding the disk,
+        #                    so a cold read is cold and a dataset larger than
+        #                    memory is one (RFC 0060 open question 4);
+        #   the comparison   Postgres, MySQL and MongoDB each size their caches
+        #                    from the *machine's* RAM by default, so an uncaged
+        #                    run does not compare five systems on one machine —
+        #                    it compares five opinions about how much of the
+        #                    machine to take. Each is pinned to 256 MB
+        #                    (`benches/src/systems/server.rs`), MongoDB's floor
+        #                    setting the number for all three.
+        #
+        # The scope is created AT the budget rather than loose-then-tightened:
+        # a fill runs inside it too (it measured *faster* there — see
+        # `benches/src/cage.rs`), so there was nothing left for the loose
+        # window to buy, and one configuration with no exceptions is the whole
+        # point. `benches/src/cage.rs` refuses to record outside it.
         benchMemMax = "524288000"; # 500 MB, in bytes for `memory.max`
-        # …and the scope is created THIS loose, because a fill is not a
-        # measurement. `benches/src/cage.rs` tightens to `benchMemMax` at
-        # startup and reopens the cage only around an untimed preload, so the
-        # tight budget is the default state and the loose one is scoped.
-        # A ceiling rather than `infinity`: a runaway fill should still die.
-        benchLoadMem = "10G";
         benchCage = ''
           export BENCH_MEM_MAX=${benchMemMax}
+          export BENCH_CPU_BUDGET=${benchCpuBudget}
           exec systemd-run --user --scope -q \
-            -p MemoryMax=${benchLoadMem} -p MemorySwapMax=0 \
+            -p MemoryMax=${benchMemMax} -p MemorySwapMax=0 \
             -p Delegate=yes -- \
             taskset -c ${benchCpus} \
             bwrap --dev-bind / / --unshare-pid --proc /proc -- \
