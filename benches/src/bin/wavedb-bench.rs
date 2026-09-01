@@ -19,6 +19,7 @@ use std::process::ExitCode;
 
 use wavedb_bench::cli::{Options, USAGE};
 use wavedb_bench::report::Skipped;
+use wavedb_bench::systems::engine::Engine;
 use wavedb_bench::systems::shop::ShopCfg;
 use wavedb_bench::systems::{Cfg, Durability, SystemReport};
 use wavedb_bench::tables::{print_shop_table, print_table};
@@ -271,13 +272,27 @@ fn run_micro(
     skipped: &mut Vec<Skipped>,
 ) {
     if opts.wants("wavedb") {
-        for d in [Durability::Durable, Durability::Relaxed] {
-            take(
-                out,
-                skipped,
-                &format!("wavedb/{}", d.name()),
-                systems::wavedb::run(cfg, d),
-            );
+        // Four rows: the two durability modes across the two engine seams.
+        // The engine axis is single-thread (`PageStore` here) against the
+        // RFC 0064 shape (disk actor on its own thread, reached by message) —
+        // see `systems::engine` for what that pair does and does not show.
+        for engine in [Engine::Direct, Engine::Sharded] {
+            for d in [Durability::Durable, Durability::Relaxed] {
+                // The direct row keeps the bare `wavedb` name it has always
+                // recorded under: results are append-only and compared across
+                // runs, so renaming the existing row would orphan its history
+                // to add a new one beside it.
+                let name = match engine {
+                    Engine::Direct => "wavedb".to_string(),
+                    Engine::Sharded => "wavedb-sharded".to_string(),
+                };
+                take(
+                    out,
+                    skipped,
+                    &format!("{name}/{}", d.name()),
+                    systems::wavedb::run(cfg, d, engine),
+                );
+            }
         }
     }
     if opts.wants("sqlite") {

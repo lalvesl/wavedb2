@@ -5,6 +5,7 @@
 //! compaction steps, and hiding that behind one interface would only make the
 //! differences harder to read.
 
+pub mod engine;
 pub mod server;
 pub mod shop;
 pub mod sqlite;

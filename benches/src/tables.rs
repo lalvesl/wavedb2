@@ -13,13 +13,13 @@ use crate::systems::shop::PHASES;
 /// exactly that reason.
 pub fn print_shop_table(reports: &[SystemReport]) {
     println!("e-commerce workload — median / p99 milliseconds per operation");
-    print!("{:<18} {:>8}", "system/row", "bracket");
+    print!("{:<23} {:>8}", "system/row", "bracket");
     for p in PHASES {
         print!(" {p:>21}");
     }
     println!(" {:>11} {:>8}", "kB/checkout", "payload");
     for r in reports {
-        print!("{:<18} {:>8}", r.label(), r.bracket);
+        print!("{:<23} {:>8}", r.label(), r.bracket);
         for name in PHASES {
             match r.phase(name) {
                 Some(p) => print!(
@@ -65,7 +65,7 @@ fn kb_per_op(r: &SystemReport, phase: &str) -> f64 {
 
 pub fn print_table(reports: &[SystemReport]) {
     println!(
-        "{:<18} {:>8} {:>9} {:>10} {:>10} {:>8} {:>9} {:>9} {:>7} {:>6} {:>6}",
+        "{:<23} {:>8} {:>9} {:>10} {:>10} {:>8} {:>9} {:>9} {:>7} {:>6} {:>6}",
         "system/row",
         "bracket",
         "insert/s",
@@ -81,7 +81,7 @@ pub fn print_table(reports: &[SystemReport]) {
     for r in reports {
         let settled = r.footprint(Point::Settled);
         println!(
-            "{:<18} {:>8} {:>9.0} {:>10.0} {:>10.0} {:>8.0} {:>9.1} {:>9.1} {:>6.1}M {:>5.1}M {:>5.2}×",
+            "{:<23} {:>8} {:>9.0} {:>10.0} {:>10.0} {:>8.0} {:>9.1} {:>9.1} {:>6.1}M {:>5.1}M {:>5.2}×",
             r.label(),
             r.bracket,
             r.phase("insert").map_or(0.0, |p| p.dist.ops_per_sec()),
