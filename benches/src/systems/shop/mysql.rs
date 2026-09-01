@@ -88,11 +88,7 @@ pub fn run(
     for ddl in [DDL_USERS, DDL_SHOPPING, DDL_PRODUCT] {
         conn.query_drop(ddl).map_err(sql)?;
     }
-    {
-        // A fill is not a measurement: it gets the machine, not the cage.
-        let _fill = crate::cage::for_fill();
-        preload(cfg, &mut conn)?;
-    }
+    preload(cfg, &mut conn)?;
     drop(conn);
 
     // Restart under the row's real durability, with an empty buffer pool.
