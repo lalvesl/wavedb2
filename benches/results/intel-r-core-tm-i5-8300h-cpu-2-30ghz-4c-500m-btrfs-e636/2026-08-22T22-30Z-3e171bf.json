@@ -1,0 +1,231 @@
+
+{
+  "schema": "wavedb-bench/1",
+  "timestamp": "2026-08-22T22-30Z",
+  "provenance": {
+    "git_sha": "3e171bf",
+    "dirty": true,
+    "flake_lock_fnv1a": "3fed1fc29370313f",
+    "load_average_at_start": 0.750
+  },
+  "host": {
+    "key": "intel-r-core-tm-i5-8300h-cpu-2-30ghz-4c-500m-btrfs-e636",
+    "cpu": "Intel(R) Core(TM) i5-8300H CPU @ 2.30GHz",
+    "cores": 8,
+    "cpu_budget": 4,
+    "mem_bytes": 16604991488,
+    "mem_budget_bytes": 524288000,
+    "kernel": "6.18.38",
+    "filesystem": "btrfs",
+    "rotational": "unknown",
+    "virtualised": false,
+    "btrfs_unallocated": 0.275,
+    "btrfs_data_block_group_fill": 0.923
+  },
+  "workload": {
+    "rows": 100000,
+    "reads": 50000,
+    "updates": 50000,
+    "seed": 42,
+    "access": "uniform random over the key space",
+    "os_page_cache_on_cold_read": "warm"
+  },
+  "shop_workload": {
+    "users": 20000,
+    "orders_max": 20,
+    "items_max": 5,
+    "live_records": 860384,
+    "signups": 100,
+    "checkouts": 200,
+    "profile_reads": 10000,
+    "page_reads": 1000,
+    "detail_reads": 1000
+  },
+  "systems": [
+    {
+      "system": "wavedb",
+      "bracket": "embedded",
+      "durability_row": "durable",
+      "version": "0.1.0",
+      "compression": "zstd (per-type dictionaries)",
+      "retains_history": true,
+      "settings": {
+        "mode": "PageStore (in-process)",
+        "barrier": "fsync per apply batch",
+        "block_size": "4096"
+      },
+      "phases": [
+        {
+          "name": "insert",
+          "count": 100000,
+          "ops_per_sec": 220.977,
+          "p50_ns": 2991045,
+          "p95_ns": 4184338,
+          "p99_ns": 58337454,
+          "max_ns": 641506959,
+          "disk_write_bytes": 13454790656
+        },
+        {
+          "name": "read_hot",
+          "count": 50000,
+          "ops_per_sec": 1268403.778,
+          "p50_ns": 774,
+          "p95_ns": 967,
+          "p99_ns": 1187,
+          "max_ns": 10405,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "read_cold",
+          "count": 50000,
+          "ops_per_sec": 774.312,
+          "p50_ns": 1285918,
+          "p95_ns": 1404640,
+          "p99_ns": 1499101,
+          "max_ns": 4392440,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "update",
+          "count": 50000,
+          "ops_per_sec": 139.840,
+          "p50_ns": 5563965,
+          "p95_ns": 7198165,
+          "p99_ns": 66922699,
+          "max_ns": 661305212,
+          "disk_write_bytes": 7220977664
+        }
+      ],
+      "footprint": [
+        {
+          "point": "hot",
+          "apparent_bytes": 277279897,
+          "allocated_bytes": 277282816,
+          "files": 3,
+          "bytes_per_record": 1728.881,
+          "amplification": 6.807
+        },
+        {
+          "point": "settled",
+          "apparent_bytes": 172888122,
+          "allocated_bytes": 172896256,
+          "files": 3,
+          "bytes_per_record": 1728.881,
+          "amplification": 6.807
+        },
+        {
+          "point": "compacted",
+          "apparent_bytes": 172888122,
+          "allocated_bytes": 172896256,
+          "files": 3,
+          "bytes_per_record": 1728.881,
+          "amplification": 6.807
+        }
+      ],
+      "live_records": 100000,
+      "logical_bytes": 25400000,
+      "seed": "none (filled by this run)",
+      "notes": [
+        "Every collection op is one apply batch. The durable row takes one fsync per batch; the relaxed row takes one per elapsed window (RFC 0061), the counterpart of the others' relaxed knobs.",
+        "Retains every superseded version; the other systems retain none. Read the update row beside the footprint, never alone.",
+        "Barrier count is not recorded: PageStore exposes no public IoCounts accessor and RFC 0060 forbids changing a shipped crate."
+      ]
+    },
+    {
+      "system": "wavedb",
+      "bracket": "embedded",
+      "durability_row": "relaxed",
+      "version": "0.1.0",
+      "compression": "zstd (per-type dictionaries)",
+      "retains_history": true,
+      "settings": {
+        "mode": "PageStore (in-process)",
+        "barrier": "one fsync per elapsed 1s",
+        "block_size": "4096"
+      },
+      "phases": [
+        {
+          "name": "insert",
+          "count": 100000,
+          "ops_per_sec": 1052.810,
+          "p50_ns": 861883,
+          "p95_ns": 1243019,
+          "p99_ns": 1768655,
+          "max_ns": 260042780,
+          "disk_write_bytes": 5109219328
+        },
+        {
+          "name": "read_hot",
+          "count": 50000,
+          "ops_per_sec": 1232691.076,
+          "p50_ns": 789,
+          "p95_ns": 1038,
+          "p99_ns": 1306,
+          "max_ns": 34042,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "read_cold",
+          "count": 50000,
+          "ops_per_sec": 775.392,
+          "p50_ns": 1285251,
+          "p95_ns": 1403232,
+          "p99_ns": 1476838,
+          "max_ns": 3390354,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "update",
+          "count": 50000,
+          "ops_per_sec": 327.053,
+          "p50_ns": 3312686,
+          "p95_ns": 4360282,
+          "p99_ns": 4864546,
+          "max_ns": 92524457,
+          "disk_write_bytes": 3115909120
+        }
+      ],
+      "footprint": [
+        {
+          "point": "hot",
+          "apparent_bytes": 284054681,
+          "allocated_bytes": 284057600,
+          "files": 3,
+          "bytes_per_record": 1796.628,
+          "amplification": 7.073
+        },
+        {
+          "point": "settled",
+          "apparent_bytes": 179662906,
+          "allocated_bytes": 179671040,
+          "files": 3,
+          "bytes_per_record": 1796.628,
+          "amplification": 7.073
+        },
+        {
+          "point": "compacted",
+          "apparent_bytes": 179662906,
+          "allocated_bytes": 179671040,
+          "files": 3,
+          "bytes_per_record": 1796.628,
+          "amplification": 7.073
+        }
+      ],
+      "live_records": 100000,
+      "logical_bytes": 25400000,
+      "seed": "none (filled by this run)",
+      "notes": [
+        "Every collection op is one apply batch. The durable row takes one fsync per batch; the relaxed row takes one per elapsed window (RFC 0061), the counterpart of the others' relaxed knobs.",
+        "Retains every superseded version; the other systems retain none. Read the update row beside the footprint, never alone.",
+        "Barrier count is not recorded: PageStore exposes no public IoCounts accessor and RFC 0060 forbids changing a shipped crate."
+      ]
+    }
+  ],
+  "skipped": [],
+  "out_of_scope": [
+    "joins and ad-hoc predicates (WaveDB has none)",
+    "history comparison — RFC 0060 phase 4",
+    "server bracket: MongoDB, PostgreSQL, MySQL — phases 2-3",
+    "concurrency sweep — phase 5"
+  ]
+}
