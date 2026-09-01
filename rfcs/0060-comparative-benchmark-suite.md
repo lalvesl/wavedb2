@@ -444,7 +444,8 @@ its budget from the host rather than being told one. So the whole run executes
 inside a fixed cage, and every server's cache is pinned rather than inferred.
 
 ```sh
-systemd-run --user --scope -p MemoryMax=2G -p MemorySwapMax=0 -- \
+systemd-run --user --scope -p MemoryMax=500M -p MemorySwapMax=0 \
+    -p Delegate=yes -- \
   taskset -c 0-3 \
   bwrap --dev-bind / / --unshare-pid --proc /proc -- wavedb-bench …
 ```
@@ -471,12 +472,28 @@ precise about which does what:
   wrong thing.
 
 **Each server's cache is pinned to the same budget** — MongoDB
-`--wiredTigerCacheSizeGB 0.5`, MySQL `--innodb-buffer-pool-size=512M`,
-PostgreSQL `-c shared_buffers=512MB` — and that is not tidiness either. Every
+`--wiredTigerCacheSizeGB 0.25`, MySQL `--innodb-buffer-pool-size=256M`,
+PostgreSQL `-c shared_buffers=256MB` — and that is not tidiness either. Every
 one of them sizes its cache from the *machine's* RAM, not the cgroup's, so under
-a 2 GiB cage an unpinned MongoDB asks for gigabytes it cannot have and is
+the cage an unpinned MongoDB asks for gigabytes it cannot have and is
 OOM-killed, while MySQL and PostgreSQL quietly take different fractions of a
 machine none of them can see. Equal budgets are what make the row a comparison.
+256 MB is not a tuning choice: it is MongoDB's floor (`--wiredTigerCacheSizeGB`
+refuses less than 0.25), so the least-adjustable server sets the number for all
+three. Only one server runs at a time, so the cgroup holds one server plus the
+benchmark process.
+
+**One configuration, and the run may not record outside it.** Two exceptions
+existed and both are closed. The scope used to be created loose (10 G) and
+tightened at startup so that *fills* got the machine; that measured **worse** —
+8 000 shop users filled in 27 s at 500 MB and 483 s at 10 G, because a fill is
+write-bound and the extra RAM only defers the writeback into one cliff — so the
+scope is now created at the budget and the fill runs inside it. And an uncaged
+process (a plain `cargo run`) used to record perfectly happily into a host lane
+of its own; it now prints and refuses, because such a row is not a worse
+measurement but a measurement of **another machine**, comparable with nothing
+in the corpus. `--force` overrides, and marks the record `"forced": true`
+beside `"caged"`.
 The embedded pair has no equivalent knob: SQLite's page cache defaults to a
 couple of megabytes and WaveDB's per-type cache is unbounded, which under the
 cage is itself a thing worth watching.
