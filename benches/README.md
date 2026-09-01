@@ -69,6 +69,29 @@ same hardware are different lanes. Both budgets are read back from the kernel
 (`Cpus_allowed_list`, the cgroup's `memory.max`) rather than assumed, so a
 recorded row states what it really ran under.
 
+### One configuration, no exceptions
+
+There is exactly one measured configuration, and both of the ways out of it are
+closed:
+
+- **Fills run inside the cage too.** They used to be able to open it
+  (`BENCH_FILL_MEM`), on the theory that a preload is scaffolding and should
+  get the machine. It measured *worse*: 8 000 shop users filled in 27 s at
+  500 MB and 483 s at 10 GB on an idle machine. A fill is write-bound, and the
+  extra RAM only lets dirty pages pile up until something forces the kernel to
+  write them all back at once. The escape hatch is gone and the scope is now
+  created **at** the budget rather than loosened and tightened.
+- **An uncaged run cannot record.** `cargo run` still works — it just prints.
+  Recording requires the budgets the wrapper declares (`BENCH_MEM_MAX`,
+  `BENCH_CPU_BUDGET`) to match what the process actually observes;
+  `--force` overrides, and the row is then marked `"forced": true` in its
+  provenance beside `"caged"`.
+
+That refusal is the same reasoning as the load-average guard. An uncaged number
+is not a worse number, it is a number from **another machine**: its lane name
+differs, nothing in the corpus is comparable with it, and the three servers
+inside it have each taken a different fraction of the RAM.
+
 ## Seeds
 
 Refilling every database before every run is the tedium that stops a benchmark
