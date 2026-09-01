@@ -166,19 +166,7 @@ async fn shards_serve_collections_over_one_disk_actor() {
     assert_eq!(from_other_thread, "note 7");
 
     // ---- routing is a function of the pivot, not of anything ambient -----
-    assert_eq!(shard_of(pivot.0, 4), shard_of(pivot.0, 4));
-    assert!(shard_of(pivot.0, 4) < 4);
-    // Two collections of one type are separate owners — the whole premise.
-    let second_pivot = Note::create_pivot(&db).await.expect("second pivot");
-    assert_ne!(pivot, second_pivot);
-    let spread: std::collections::HashSet<usize> = [pivot, second_pivot]
-        .iter()
-        .map(|p| shard_of(p.0, 4))
-        .collect();
-    assert!(!spread.is_empty());
-
-    // A Pivot minted here is a `LocalId`, so routing needs nothing but it.
-    let _: LocalId = pivot.0;
+    routing_is_a_pure_function_of_the_pivot(&db, pivot).await;
 
     for n in 0..40u32 {
         col.insert(&db, &note(&format!("more {n}")))
@@ -215,6 +203,9 @@ async fn shards_serve_collections_over_one_disk_actor() {
     }
     assert!(settled, "the maintenance hint never reached the engine");
 
+    // ---- 4b. the *waiting* form of the same work -------------------------
+    maintain_waits(&shards, &first, &db, col).await;
+
     // Concurrent operations on one collection are **not** exercised here, and
     // that is deliberate: `ShardStore` genuinely suspends, so two interleaved
     // collection ops can lose an index update
@@ -225,6 +216,58 @@ async fn shards_serve_collections_over_one_disk_actor() {
 
     // ---- 5. the ingress path: a wire request, routed and answered --------
     ingress_routes_to_a_worker(&shards, &observer).await;
+}
+
+/// A Pivot's shard is decided by the Pivot and nothing else — no table, no
+/// ambient state, no balancer. Two collections of one type are separate owners,
+/// which is the premise the whole model rests on.
+async fn routing_is_a_pure_function_of_the_pivot(
+    db: &LocalHandle<'_, ShardStore>,
+    pivot: schema_smoke::NotePivotId,
+) {
+    assert_eq!(shard_of(pivot.0, 4), shard_of(pivot.0, 4));
+    assert!(shard_of(pivot.0, 4) < 4);
+    let second = Note::create_pivot(db).await.expect("second pivot");
+    assert_ne!(pivot, second);
+    let spread: std::collections::HashSet<usize> =
+        [pivot, second].iter().map(|p| shard_of(p.0, 4)).collect();
+    assert!(!spread.is_empty());
+    // A Pivot minted here is a `LocalId`, so routing needs nothing but it.
+    let _: LocalId = pivot.0;
+}
+
+/// `hint` is droppable and needs a poll loop to observe. `maintain` is the
+/// counterpart for a caller who is waiting, and its contract is exactly that no
+/// loop is needed: when it returns, the work is done.
+///
+/// Worth its own assertion because both callers of it depend on the difference
+/// — a benchmark measuring a quiesced footprint and an operator compacting a
+/// store are each measuring nothing if the settle they asked for was silently
+/// dropped. Negative control: make the settle arm a no-op and this fails.
+async fn maintain_waits(
+    shards: &Shards,
+    store: &ShardStore,
+    db: &LocalHandle<'_, ShardStore>,
+    col: wavedb_core::CollectionHandle<Note>,
+) {
+    for n in 0..40u32 {
+        col.insert(db, &note(&format!("again {n}")))
+            .await
+            .expect("insert");
+    }
+    assert!(
+        store.engine_stats().await.expect("stats").pending,
+        "40 inserts must leave a settle queued"
+    );
+    shards
+        .handle()
+        .maintain(Maintenance::Settle)
+        .await
+        .expect("settle");
+    assert!(
+        !store.engine_stats().await.expect("stats").pending,
+        "maintain must not return before the settle it was asked for is done"
+    );
 }
 
 /// A wire request handed to the [`Router`], executed by a shard worker, and
