@@ -37,6 +37,13 @@ servers = ["dep:mongodb", "dep:postgres", "dep:mysql"]
 wavedb-core = { path = "../crates/wavedb-core" }
 wavedb-macros = { path = "../crates/wavedb-macros" }
 wavedb-storage = { path = "../crates/wavedb-storage" }
+# The shard model (RFC 0064). The "sharded" engine rows drive the disk actor
+# instead of the `PageStore` directly, which is what makes single-thread and
+# multi-thread two measured rows rather than one claim.
+wavedb-quick-node = { path = "../crates/wavedb-quick-node" }
+# Only to `block_on` the disk actor's request/reply from the benchmark thread;
+# the actor builds its own current-thread runtime on its own thread.
+tokio = { version = "1", features = ["sync"] }
 # block_on for the engine's non-Send futures (current-thread model).
 futures = "0.3"
 # System SQLite, NOT `bundled` — the version must come from `flake.lock` like
