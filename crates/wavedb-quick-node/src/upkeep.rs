@@ -15,7 +15,35 @@ use std::rc::Rc;
 use wavedb_core::notify::Mutation;
 
 use crate::subscribe::{Publish, SubTable};
-use crate::{Maintenance, ServerError, shard};
+use crate::{ServerError, shard};
+
+/// The background maintenance policy: how the node settles, checkpoints,
+/// and bounds its caches while serving.
+#[derive(Debug, Clone, Copy)]
+pub struct Maintenance {
+    /// Journal bytes that trigger a checkpoint (journal truncates to zero).
+    pub checkpoint_after_bytes: u64,
+    /// Cache bytes the settle task evicts down to (settled entries only).
+    pub cache_budget_bytes: usize,
+    /// Defragment once the largest free extent falls below this many blocks —
+    /// the point where a checkpoint's window stops fitting a hole and starts
+    /// growing the tail (RFC 0042).
+    pub defrag_below_blocks: u64,
+    /// Blocks one defragmentation pass may copy. The cleaner's whole cost is
+    /// this, so it is a plain IO budget per tick.
+    pub defrag_budget_blocks: u64,
+}
+
+impl Default for Maintenance {
+    fn default() -> Self {
+        Self {
+            checkpoint_after_bytes: 64 * 1024 * 1024, // 64 MiB of journal
+            cache_budget_bytes: 1024 * 1024 * 1024,   // 1 GiB — generous
+            defrag_below_blocks: 256, // 1 MiB of contiguous room
+            defrag_budget_blocks: 256, // ≤ 1 MiB copied per tick
+        }
+    }
+}
 
 /// Fan committed mutations out to the WebSocket subscribers.
 ///
@@ -46,7 +74,7 @@ pub async fn maintain(disk: shard::DiskHandle, policy: Maintenance) {
         // to act on them against the reads it is also serving (`shard::
         // priority`). A hint dropped because the queue is full is a hint the
         // actor has already been given.
-        let Ok(stats) = engine_stats(&disk).await else {
+        let Ok(stats) = disk.stats().await else {
             return; // the actor is gone; serving is over too
         };
         disk.hint(shard::Maintenance::Settle);
@@ -69,17 +97,6 @@ pub async fn maintain(disk: shard::DiskHandle, policy: Maintenance) {
             });
         }
     }
-}
-
-/// Ask the actor what the engine holds. `Err` means the actor is gone.
-async fn engine_stats(
-    disk: &shard::DiskHandle,
-) -> std::result::Result<shard::EngineStats, ()> {
-    let (answer, wait) = tokio::sync::oneshot::channel();
-    disk.send(shard::DiskRequest::Stats { answer })
-        .await
-        .map_err(|_| ())?;
-    wait.await.map_err(|_| ())?.map_err(|_| ())
 }
 
 /// The engine's owner is gone — nothing can be asked of it again.
