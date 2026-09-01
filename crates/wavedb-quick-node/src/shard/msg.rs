@@ -58,6 +58,19 @@ pub enum DiskRequest {
     /// What the engine currently holds. High priority because it is cheap and
     /// because a policy blocked on it is a policy not being applied.
     Stats { answer: Answer<EngineStats> },
+    /// Run one unit of [`Maintenance`] **to completion** and report it.
+    ///
+    /// The same work as the low-priority queue, asked for by someone who is
+    /// waiting — which is exactly what moves it to this queue and this type.
+    /// Not a duplicate of the hint: a hint is droppable and unobservable, and
+    /// there are callers for whom both of those are wrong. An operator
+    /// compacting a store needs to know it happened; a benchmark measuring a
+    /// quiesced footprint is measuring nothing if the settle it asked for was
+    /// silently discarded.
+    Maintain {
+        work: Maintenance,
+        answer: Answer<()>,
+    },
     /// Settle, checkpoint, and force the retirement barrier — the clean-stop
     /// sequence, so a restart replays nothing.
     ///
@@ -114,8 +127,10 @@ impl DiskRequest {
             Self::Get { answer, .. } | Self::GetOf { answer, .. } => {
                 let _ = answer.send(Err(cause));
             }
-            // Both answer `()`, so one arm serves them.
-            Self::Apply { answer, .. } | Self::Shutdown { answer } => {
+            // All three answer `()`, so one arm serves them.
+            Self::Apply { answer, .. }
+            | Self::Maintain { answer, .. }
+            | Self::Shutdown { answer } => {
                 let _ = answer.send(Err(cause));
             }
             Self::Stats { answer } => {
