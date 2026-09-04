@@ -1,0 +1,1004 @@
+
+{
+  "schema": "wavedb-bench/1",
+  "timestamp": "2026-08-24T04-36Z",
+  "provenance": {
+    "git_sha": "e16f415",
+    "dirty": true,
+    "flake_lock_fnv1a": "3fed1fc29370313f",
+    "load_average_at_start": 8.180
+  },
+  "host": {
+    "key": "intel-r-core-tm-i5-8300h-cpu-2-30ghz-8c-15835m-btrfs-0b97",
+    "cpu": "Intel(R) Core(TM) i5-8300H CPU @ 2.30GHz",
+    "cores": 8,
+    "cpu_budget": 8,
+    "mem_bytes": 16604991488,
+    "mem_budget_bytes": 16604991488,
+    "kernel": "6.18.38",
+    "filesystem": "btrfs",
+    "rotational": "unknown",
+    "virtualised": false,
+    "btrfs_unallocated": 0.275,
+    "btrfs_data_block_group_fill": 0.926
+  },
+  "workload": {
+    "rows": 100000,
+    "reads": 50000,
+    "updates": 50000,
+    "seed": 42,
+    "access": "uniform random over the key space",
+    "os_page_cache_on_cold_read": "warm"
+  },
+  "shop_workload": {
+    "users": 20000,
+    "orders_max": 20,
+    "items_max": 5,
+    "live_records": 860384,
+    "signups": 100,
+    "checkouts": 200,
+    "profile_reads": 10000,
+    "page_reads": 1000,
+    "detail_reads": 1000
+  },
+  "systems": [
+    {
+      "system": "wavedb",
+      "bracket": "embedded",
+      "durability_row": "durable",
+      "version": "0.1.0",
+      "compression": "zstd (per-type dictionaries)",
+      "retains_history": true,
+      "settings": {
+        "mode": "PageStore (in-process, one thread)",
+        "threads": "1 (everything here)",
+        "barrier": "fsync per apply batch",
+        "block_size": "4096"
+      },
+      "phases": [
+        {
+          "name": "insert",
+          "count": 100000,
+          "ops_per_sec": 231.231,
+          "p50_ns": 2651381,
+          "p95_ns": 3995951,
+          "p99_ns": 57962015,
+          "max_ns": 2682689226,
+          "disk_write_bytes": 13459181568
+        },
+        {
+          "name": "read_hot",
+          "count": 50000,
+          "ops_per_sec": 1625141.696,
+          "p50_ns": 599,
+          "p95_ns": 768,
+          "p99_ns": 977,
+          "max_ns": 108321,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "read_cold",
+          "count": 50000,
+          "ops_per_sec": 1019.043,
+          "p50_ns": 974429,
+          "p95_ns": 1058818,
+          "p99_ns": 1110807,
+          "max_ns": 4275883,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "update",
+          "count": 50000,
+          "ops_per_sec": 177.547,
+          "p50_ns": 4546856,
+          "p95_ns": 5947224,
+          "p99_ns": 58902365,
+          "max_ns": 886074641,
+          "disk_write_bytes": 7282917376
+        }
+      ],
+      "footprint": [
+        {
+          "point": "hot",
+          "apparent_bytes": 297288857,
+          "allocated_bytes": 297291776,
+          "files": 3,
+          "bytes_per_record": 1928.970,
+          "amplification": 7.594
+        },
+        {
+          "point": "settled",
+          "apparent_bytes": 192897082,
+          "allocated_bytes": 192905216,
+          "files": 3,
+          "bytes_per_record": 1928.970,
+          "amplification": 7.594
+        },
+        {
+          "point": "compacted",
+          "apparent_bytes": 192897082,
+          "allocated_bytes": 192905216,
+          "files": 3,
+          "bytes_per_record": 1928.970,
+          "amplification": 7.594
+        }
+      ],
+      "live_records": 100000,
+      "logical_bytes": 25400000,
+      "seed": "none (filled by this run)",
+      "notes": [
+        "Every collection op is one apply batch. The durable row takes one fsync per batch; the relaxed row takes one per elapsed window (RFC 0061), the counterpart of the others' relaxed knobs.",
+        "Retains every superseded version; the other systems retain none. Read the update row beside the footprint, never alone.",
+        "Barrier count is not recorded: PageStore exposes no public IoCounts accessor and RFC 0060 forbids changing a shipped crate."
+      ]
+    },
+    {
+      "system": "wavedb",
+      "bracket": "embedded",
+      "durability_row": "relaxed",
+      "version": "0.1.0",
+      "compression": "zstd (per-type dictionaries)",
+      "retains_history": true,
+      "settings": {
+        "mode": "PageStore (in-process, one thread)",
+        "threads": "1 (everything here)",
+        "barrier": "one fsync per elapsed 1s",
+        "block_size": "4096"
+      },
+      "phases": [
+        {
+          "name": "insert",
+          "count": 100000,
+          "ops_per_sec": 1440.386,
+          "p50_ns": 654175,
+          "p95_ns": 911617,
+          "p99_ns": 1006851,
+          "max_ns": 96995652,
+          "disk_write_bytes": 5091594240
+        },
+        {
+          "name": "read_hot",
+          "count": 50000,
+          "ops_per_sec": 1597054.724,
+          "p50_ns": 612,
+          "p95_ns": 784,
+          "p99_ns": 1011,
+          "max_ns": 8592,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "read_cold",
+          "count": 50000,
+          "ops_per_sec": 1011.879,
+          "p50_ns": 982964,
+          "p95_ns": 1070287,
+          "p99_ns": 1109239,
+          "max_ns": 4302890,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "update",
+          "count": 50000,
+          "ops_per_sec": 417.699,
+          "p50_ns": 2544547,
+          "p95_ns": 3315327,
+          "p99_ns": 3704328,
+          "max_ns": 156421684,
+          "disk_write_bytes": 3113377792
+        }
+      ],
+      "footprint": [
+        {
+          "point": "hot",
+          "apparent_bytes": 278131865,
+          "allocated_bytes": 278134784,
+          "files": 3,
+          "bytes_per_record": 1737.400,
+          "amplification": 6.840
+        },
+        {
+          "point": "settled",
+          "apparent_bytes": 173740090,
+          "allocated_bytes": 173748224,
+          "files": 3,
+          "bytes_per_record": 1737.400,
+          "amplification": 6.840
+        },
+        {
+          "point": "compacted",
+          "apparent_bytes": 173740090,
+          "allocated_bytes": 173748224,
+          "files": 3,
+          "bytes_per_record": 1737.400,
+          "amplification": 6.840
+        }
+      ],
+      "live_records": 100000,
+      "logical_bytes": 25400000,
+      "seed": "none (filled by this run)",
+      "notes": [
+        "Every collection op is one apply batch. The durable row takes one fsync per batch; the relaxed row takes one per elapsed window (RFC 0061), the counterpart of the others' relaxed knobs.",
+        "Retains every superseded version; the other systems retain none. Read the update row beside the footprint, never alone.",
+        "Barrier count is not recorded: PageStore exposes no public IoCounts accessor and RFC 0060 forbids changing a shipped crate."
+      ]
+    },
+    {
+      "system": "wavedb-sharded",
+      "bracket": "embedded",
+      "durability_row": "durable",
+      "version": "0.1.0",
+      "compression": "zstd (per-type dictionaries)",
+      "retains_history": true,
+      "settings": {
+        "mode": "ShardStore → disk actor (RFC 0064)",
+        "threads": "2 — this thread is the shard, + 1 disk actor",
+        "barrier": "fsync per apply batch",
+        "block_size": "4096"
+      },
+      "phases": [
+        {
+          "name": "insert",
+          "count": 100000,
+          "ops_per_sec": 282.026,
+          "p50_ns": 2699515,
+          "p95_ns": 3420250,
+          "p99_ns": 42291356,
+          "max_ns": 547532616,
+          "disk_write_bytes": 13492908032
+        },
+        {
+          "name": "read_hot",
+          "count": 50000,
+          "ops_per_sec": 2026210.656,
+          "p50_ns": 485,
+          "p95_ns": 592,
+          "p99_ns": 830,
+          "max_ns": 13190,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "read_cold",
+          "count": 50000,
+          "ops_per_sec": 1193.869,
+          "p50_ns": 1036481,
+          "p95_ns": 1146635,
+          "p99_ns": 1228295,
+          "max_ns": 3668677,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "update",
+          "count": 50000,
+          "ops_per_sec": 179.694,
+          "p50_ns": 4696953,
+          "p95_ns": 5882126,
+          "p99_ns": 58139886,
+          "max_ns": 1122056798,
+          "disk_write_bytes": 7276613632
+        }
+      ],
+      "footprint": [
+        {
+          "point": "hot",
+          "apparent_bytes": 267744409,
+          "allocated_bytes": 267747328,
+          "files": 3,
+          "bytes_per_record": 1633.526,
+          "amplification": 6.431
+        },
+        {
+          "point": "settled",
+          "apparent_bytes": 163352634,
+          "allocated_bytes": 163360768,
+          "files": 3,
+          "bytes_per_record": 1633.526,
+          "amplification": 6.431
+        },
+        {
+          "point": "compacted",
+          "apparent_bytes": 163352634,
+          "allocated_bytes": 163360768,
+          "files": 3,
+          "bytes_per_record": 1633.526,
+          "amplification": 6.431
+        }
+      ],
+      "live_records": 100000,
+      "logical_bytes": 25400000,
+      "seed": "none (filled by this run)",
+      "notes": [
+        "Every collection op is one apply batch. The durable row takes one fsync per batch; the relaxed row takes one per elapsed window (RFC 0061), the counterpart of the others' relaxed knobs.",
+        "Retains every superseded version; the other systems retain none. Read the update row beside the footprint, never alone.",
+        "Barrier count is not recorded: PageStore exposes no public IoCounts accessor and RFC 0060 forbids changing a shipped crate.",
+        "Sharded row: the engine is owned by a disk actor on its own thread and reached by message through a ShardStore. It is the single/multi-thread axis, and it measures the cost of that boundary — NOT parallelism. This benchmark issues one operation at a time, so only one shard ever has work; and the brake keys on (tenant, STRUCT_HASH), so one type under one tenant would be one owner even under a concurrent client.",
+        "read_cold is NOT comparable to the direct row. ShardStore memoises on read; the engine's per-type cache is a write cache that reads never populate. So the sharded row has a read cache the direct row does not — the gap RFC 0044 names, filled here as a side effect of the shard owning its own cache. A faster read_cold on this row is that difference, not a faster read path.",
+        "Measured cost of a ShardStore MISS: the same row run with a 16 MiB shard budget against a ~40 MB working set reported read_hot at 96 175/s where the direct row reported 1 269 423/s. The round trip is roughly an order of magnitude over an in-process hit, so the row's result is governed by the shard's hit rate — and ShardStore bounds itself by clearing the whole cache rather than evicting (RFC 0044 is that gap). This row uses the shipped 64 MiB default, which holds this working set."
+      ]
+    },
+    {
+      "system": "wavedb-sharded",
+      "bracket": "embedded",
+      "durability_row": "relaxed",
+      "version": "0.1.0",
+      "compression": "zstd (per-type dictionaries)",
+      "retains_history": true,
+      "settings": {
+        "mode": "ShardStore → disk actor (RFC 0064)",
+        "threads": "2 — this thread is the shard, + 1 disk actor",
+        "barrier": "one fsync per elapsed 1s",
+        "block_size": "4096"
+      },
+      "phases": [
+        {
+          "name": "insert",
+          "count": 100000,
+          "ops_per_sec": 1269.047,
+          "p50_ns": 764313,
+          "p95_ns": 1027501,
+          "p99_ns": 1157339,
+          "max_ns": 138852989,
+          "disk_write_bytes": 5094543360
+        },
+        {
+          "name": "read_hot",
+          "count": 50000,
+          "ops_per_sec": 2027390.697,
+          "p50_ns": 485,
+          "p95_ns": 590,
+          "p99_ns": 831,
+          "max_ns": 12205,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "read_cold",
+          "count": 50000,
+          "ops_per_sec": 1198.972,
+          "p50_ns": 1032390,
+          "p95_ns": 1145521,
+          "p99_ns": 1209491,
+          "max_ns": 4564804,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "update",
+          "count": 50000,
+          "ops_per_sec": 393.316,
+          "p50_ns": 2685886,
+          "p95_ns": 3530366,
+          "p99_ns": 4029308,
+          "max_ns": 115846707,
+          "disk_write_bytes": 3114545152
+        }
+      ],
+      "footprint": [
+        {
+          "point": "hot",
+          "apparent_bytes": 275264665,
+          "allocated_bytes": 275267584,
+          "files": 3,
+          "bytes_per_record": 1708.728,
+          "amplification": 6.727
+        },
+        {
+          "point": "settled",
+          "apparent_bytes": 170872890,
+          "allocated_bytes": 170881024,
+          "files": 3,
+          "bytes_per_record": 1708.728,
+          "amplification": 6.727
+        },
+        {
+          "point": "compacted",
+          "apparent_bytes": 172036154,
+          "allocated_bytes": 172044288,
+          "files": 3,
+          "bytes_per_record": 1720.361,
+          "amplification": 6.773
+        }
+      ],
+      "live_records": 100000,
+      "logical_bytes": 25400000,
+      "seed": "none (filled by this run)",
+      "notes": [
+        "Every collection op is one apply batch. The durable row takes one fsync per batch; the relaxed row takes one per elapsed window (RFC 0061), the counterpart of the others' relaxed knobs.",
+        "Retains every superseded version; the other systems retain none. Read the update row beside the footprint, never alone.",
+        "Barrier count is not recorded: PageStore exposes no public IoCounts accessor and RFC 0060 forbids changing a shipped crate.",
+        "Sharded row: the engine is owned by a disk actor on its own thread and reached by message through a ShardStore. It is the single/multi-thread axis, and it measures the cost of that boundary — NOT parallelism. This benchmark issues one operation at a time, so only one shard ever has work; and the brake keys on (tenant, STRUCT_HASH), so one type under one tenant would be one owner even under a concurrent client.",
+        "read_cold is NOT comparable to the direct row. ShardStore memoises on read; the engine's per-type cache is a write cache that reads never populate. So the sharded row has a read cache the direct row does not — the gap RFC 0044 names, filled here as a side effect of the shard owning its own cache. A faster read_cold on this row is that difference, not a faster read path.",
+        "Measured cost of a ShardStore MISS: the same row run with a 16 MiB shard budget against a ~40 MB working set reported read_hot at 96 175/s where the direct row reported 1 269 423/s. The round trip is roughly an order of magnitude over an in-process hit, so the row's result is governed by the shard's hit rate — and ShardStore bounds itself by clearing the whole cache rather than evicting (RFC 0044 is that gap). This row uses the shipped 64 MiB default, which holds this working set."
+      ]
+    },
+    {
+      "system": "sqlite",
+      "bracket": "embedded",
+      "durability_row": "durable",
+      "version": "3.51.2",
+      "compression": "none",
+      "retains_history": false,
+      "settings": {
+        "journal_mode": "WAL",
+        "synchronous": "FULL",
+        "transaction": "one per operation (autocommit)"
+      },
+      "phases": [
+        {
+          "name": "insert",
+          "count": 100000,
+          "ops_per_sec": 340.751,
+          "p50_ns": 1579192,
+          "p95_ns": 2234477,
+          "p99_ns": 56056633,
+          "max_ns": 578234578,
+          "disk_write_bytes": 9413931008
+        },
+        {
+          "name": "read_hot",
+          "count": 50000,
+          "ops_per_sec": 204371.234,
+          "p50_ns": 4913,
+          "p95_ns": 5206,
+          "p99_ns": 5641,
+          "max_ns": 172998,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "read_cold",
+          "count": 50000,
+          "ops_per_sec": 171890.933,
+          "p50_ns": 5832,
+          "p95_ns": 6107,
+          "p99_ns": 7898,
+          "max_ns": 31449,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "update",
+          "count": 50000,
+          "ops_per_sec": 387.263,
+          "p50_ns": 1592112,
+          "p95_ns": 2056241,
+          "p99_ns": 42601722,
+          "max_ns": 346607150,
+          "disk_write_bytes": 4905984000
+        }
+      ],
+      "footprint": [
+        {
+          "point": "hot",
+          "apparent_bytes": 34680432,
+          "allocated_bytes": 34680832,
+          "files": 3,
+          "bytes_per_record": 305.029,
+          "amplification": 1.201
+        },
+        {
+          "point": "settled",
+          "apparent_bytes": 30539776,
+          "allocated_bytes": 30539776,
+          "files": 3,
+          "bytes_per_record": 305.070,
+          "amplification": 1.201
+        },
+        {
+          "point": "compacted",
+          "apparent_bytes": 28016640,
+          "allocated_bytes": 28016640,
+          "files": 3,
+          "bytes_per_record": 279.511,
+          "amplification": 1.100
+        }
+      ],
+      "live_records": 100000,
+      "logical_bytes": 25400000,
+      "seed": "none (filled by this run)",
+      "notes": [
+        "Retains no superseded versions: an update overwrites in place and the previous row is unrecoverable."
+      ]
+    },
+    {
+      "system": "sqlite",
+      "bracket": "embedded",
+      "durability_row": "relaxed",
+      "version": "3.51.2",
+      "compression": "none",
+      "retains_history": false,
+      "settings": {
+        "journal_mode": "WAL",
+        "synchronous": "NORMAL",
+        "transaction": "one per operation (autocommit)"
+      },
+      "phases": [
+        {
+          "name": "insert",
+          "count": 100000,
+          "ops_per_sec": 10578.208,
+          "p50_ns": 26112,
+          "p95_ns": 53092,
+          "p99_ns": 77485,
+          "max_ns": 510076525,
+          "disk_write_bytes": 1155735552
+        },
+        {
+          "name": "read_hot",
+          "count": 50000,
+          "ops_per_sec": 204021.628,
+          "p50_ns": 4904,
+          "p95_ns": 5222,
+          "p99_ns": 7147,
+          "max_ns": 30799,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "read_cold",
+          "count": 50000,
+          "ops_per_sec": 171312.302,
+          "p50_ns": 5825,
+          "p95_ns": 6124,
+          "p99_ns": 9317,
+          "max_ns": 59753,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "update",
+          "count": 50000,
+          "ops_per_sec": 12349.515,
+          "p50_ns": 31092,
+          "p95_ns": 37465,
+          "p99_ns": 78917,
+          "max_ns": 31998302,
+          "disk_write_bytes": 795365376
+        }
+      ],
+      "footprint": [
+        {
+          "point": "hot",
+          "apparent_bytes": 34680432,
+          "allocated_bytes": 34680832,
+          "files": 3,
+          "bytes_per_record": 305.029,
+          "amplification": 1.201
+        },
+        {
+          "point": "settled",
+          "apparent_bytes": 30539776,
+          "allocated_bytes": 30539776,
+          "files": 3,
+          "bytes_per_record": 305.070,
+          "amplification": 1.201
+        },
+        {
+          "point": "compacted",
+          "apparent_bytes": 28016640,
+          "allocated_bytes": 28016640,
+          "files": 3,
+          "bytes_per_record": 279.511,
+          "amplification": 1.100
+        }
+      ],
+      "live_records": 100000,
+      "logical_bytes": 25400000,
+      "seed": "none (filled by this run)",
+      "notes": [
+        "Retains no superseded versions: an update overwrites in place and the previous row is unrecoverable."
+      ]
+    },
+    {
+      "system": "wavedb",
+      "bracket": "embedded",
+      "durability_row": "durable",
+      "version": "0.1.0",
+      "compression": "per-type zstd dictionaries",
+      "retains_history": true,
+      "settings": {
+        "tenancy": "one tenant per user",
+        "list": "Shopping by bought_at, page = 10",
+        "transaction": "none: one op is one batch",
+        "relax_window": "0 — one barrier per batch",
+        "preload": "relax_window 200ms, untimed"
+      },
+      "phases": [
+        {
+          "name": "signup",
+          "count": 100,
+          "ops_per_sec": 65.783,
+          "p50_ns": 5301784,
+          "p95_ns": 59958089,
+          "p99_ns": 76744738,
+          "max_ns": 77275099,
+          "disk_write_bytes": 12021760
+        },
+        {
+          "name": "checkout",
+          "count": 200,
+          "ops_per_sec": 19.793,
+          "p50_ns": 33278851,
+          "p95_ns": 128476926,
+          "p99_ns": 150666690,
+          "max_ns": 301670392,
+          "disk_write_bytes": 68935680
+        },
+        {
+          "name": "profile",
+          "count": 10000,
+          "ops_per_sec": 1139.279,
+          "p50_ns": 880735,
+          "p95_ns": 918778,
+          "p99_ns": 957508,
+          "max_ns": 2517330,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "order_page",
+          "count": 1000,
+          "ops_per_sec": 312.276,
+          "p50_ns": 3024449,
+          "p95_ns": 3959804,
+          "p99_ns": 4107735,
+          "max_ns": 5145574,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "order_detail",
+          "count": 1000,
+          "ops_per_sec": 199.282,
+          "p50_ns": 4973236,
+          "p95_ns": 5637920,
+          "p99_ns": 6019989,
+          "max_ns": 7113258,
+          "disk_write_bytes": 0
+        }
+      ],
+      "footprint": [
+        {
+          "point": "hot",
+          "apparent_bytes": 416359793,
+          "allocated_bytes": 416362496,
+          "files": 2,
+          "bytes_per_record": 482.903,
+          "amplification": 17.419
+        },
+        {
+          "point": "settled",
+          "apparent_bytes": 415481914,
+          "allocated_bytes": 415490048,
+          "files": 3,
+          "bytes_per_record": 482.903,
+          "amplification": 17.419
+        }
+      ],
+      "live_records": 860384,
+      "logical_bytes": 23852087,
+      "seed": "none (filled by this run)",
+      "notes": [
+        "A checkout is one order plus its line items, and WaveDB has no multi-record transaction: it costs one batch — one barrier — per record, where the other four commit the whole checkout once."
+      ]
+    },
+    {
+      "system": "wavedb",
+      "bracket": "embedded",
+      "durability_row": "relaxed",
+      "version": "0.1.0",
+      "compression": "per-type zstd dictionaries",
+      "retains_history": true,
+      "settings": {
+        "tenancy": "one tenant per user",
+        "list": "Shopping by bought_at, page = 10",
+        "transaction": "none: one op is one batch",
+        "relax_window": "1s",
+        "preload": "relax_window 200ms, untimed"
+      },
+      "phases": [
+        {
+          "name": "signup",
+          "count": 100,
+          "ops_per_sec": 541.986,
+          "p50_ns": 1812793,
+          "p95_ns": 1915556,
+          "p99_ns": 1953827,
+          "max_ns": 5856586,
+          "disk_write_bytes": 49152
+        },
+        {
+          "name": "checkout",
+          "count": 200,
+          "ops_per_sec": 97.469,
+          "p50_ns": 10556008,
+          "p95_ns": 11222263,
+          "p99_ns": 11907081,
+          "max_ns": 17024161,
+          "disk_write_bytes": 966656
+        },
+        {
+          "name": "profile",
+          "count": 10000,
+          "ops_per_sec": 1136.828,
+          "p50_ns": 877172,
+          "p95_ns": 941524,
+          "p99_ns": 983037,
+          "max_ns": 2408067,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "order_page",
+          "count": 1000,
+          "ops_per_sec": 308.153,
+          "p50_ns": 3047405,
+          "p95_ns": 3975998,
+          "p99_ns": 4475006,
+          "max_ns": 4822804,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "order_detail",
+          "count": 1000,
+          "ops_per_sec": 197.631,
+          "p50_ns": 5006898,
+          "p95_ns": 5784559,
+          "p99_ns": 6259221,
+          "max_ns": 8425473,
+          "disk_write_bytes": 0
+        }
+      ],
+      "footprint": [
+        {
+          "point": "hot",
+          "apparent_bytes": 417150321,
+          "allocated_bytes": 417153024,
+          "files": 2,
+          "bytes_per_record": 483.822,
+          "amplification": 17.452
+        },
+        {
+          "point": "settled",
+          "apparent_bytes": 416272442,
+          "allocated_bytes": 416280576,
+          "files": 3,
+          "bytes_per_record": 483.822,
+          "amplification": 17.452
+        }
+      ],
+      "live_records": 860384,
+      "logical_bytes": 23852087,
+      "seed": "none (filled by this run)",
+      "notes": [
+        "A checkout is one order plus its line items, and WaveDB has no multi-record transaction: it costs one batch — one barrier — per record, where the other four commit the whole checkout once."
+      ]
+    },
+    {
+      "system": "sqlite",
+      "bracket": "embedded",
+      "durability_row": "durable",
+      "version": "3.51.2",
+      "compression": "none",
+      "retains_history": false,
+      "settings": {
+        "journal_mode": "WAL",
+        "synchronous": "FULL",
+        "tenancy": "user_id column + index",
+        "transaction": "one per checkout"
+      },
+      "phases": [
+        {
+          "name": "signup",
+          "count": 100,
+          "ops_per_sec": 560.242,
+          "p50_ns": 1579914,
+          "p95_ns": 1717195,
+          "p99_ns": 1848173,
+          "max_ns": 23559128,
+          "disk_write_bytes": 6344704
+        },
+        {
+          "name": "checkout",
+          "count": 200,
+          "ops_per_sec": 583.451,
+          "p50_ns": 1695209,
+          "p95_ns": 1920003,
+          "p99_ns": 2731902,
+          "max_ns": 3030046,
+          "disk_write_bytes": 20176896
+        },
+        {
+          "name": "profile",
+          "count": 10000,
+          "ops_per_sec": 276693.975,
+          "p50_ns": 3350,
+          "p95_ns": 5223,
+          "p99_ns": 6902,
+          "max_ns": 38600,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "order_page",
+          "count": 1000,
+          "ops_per_sec": 41859.592,
+          "p50_ns": 24059,
+          "p95_ns": 28945,
+          "p99_ns": 35559,
+          "max_ns": 68377,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "order_detail",
+          "count": 1000,
+          "ops_per_sec": 36069.831,
+          "p50_ns": 27489,
+          "p95_ns": 31216,
+          "p99_ns": 35342,
+          "max_ns": 68777,
+          "disk_write_bytes": 0
+        }
+      ],
+      "footprint": [
+        {
+          "point": "hot",
+          "apparent_bytes": 50724152,
+          "allocated_bytes": 50724864,
+          "files": 3,
+          "bytes_per_record": 54.162,
+          "amplification": 1.954
+        },
+        {
+          "point": "settled",
+          "apparent_bytes": 46678016,
+          "allocated_bytes": 46678016,
+          "files": 3,
+          "bytes_per_record": 54.214,
+          "amplification": 1.956
+        }
+      ],
+      "live_records": 860384,
+      "logical_bytes": 23852087,
+      "seed": "none (filled by this run)",
+      "notes": [
+        "The order page is ORDER BY … LIMIT 10 OFFSET n over an index, not a materialised list."
+      ]
+    },
+    {
+      "system": "sqlite",
+      "bracket": "embedded",
+      "durability_row": "relaxed",
+      "version": "3.51.2",
+      "compression": "none",
+      "retains_history": false,
+      "settings": {
+        "journal_mode": "WAL",
+        "synchronous": "NORMAL",
+        "tenancy": "user_id column + index",
+        "transaction": "one per checkout"
+      },
+      "phases": [
+        {
+          "name": "signup",
+          "count": 100,
+          "ops_per_sec": 3982.447,
+          "p50_ns": 27456,
+          "p95_ns": 36890,
+          "p99_ns": 64436,
+          "max_ns": 22267241,
+          "disk_write_bytes": 499712
+        },
+        {
+          "name": "checkout",
+          "count": 200,
+          "ops_per_sec": 11669.680,
+          "p50_ns": 81108,
+          "p95_ns": 126621,
+          "p99_ns": 153269,
+          "max_ns": 188231,
+          "disk_write_bytes": 3661824
+        },
+        {
+          "name": "profile",
+          "count": 10000,
+          "ops_per_sec": 288412.608,
+          "p50_ns": 3355,
+          "p95_ns": 4752,
+          "p99_ns": 5647,
+          "max_ns": 32569,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "order_page",
+          "count": 1000,
+          "ops_per_sec": 42511.299,
+          "p50_ns": 23801,
+          "p95_ns": 28157,
+          "p99_ns": 31056,
+          "max_ns": 53680,
+          "disk_write_bytes": 0
+        },
+        {
+          "name": "order_detail",
+          "count": 1000,
+          "ops_per_sec": 35730.008,
+          "p50_ns": 27920,
+          "p95_ns": 30798,
+          "p99_ns": 34855,
+          "max_ns": 47720,
+          "disk_write_bytes": 0
+        }
+      ],
+      "footprint": [
+        {
+          "point": "hot",
+          "apparent_bytes": 50724152,
+          "allocated_bytes": 50724864,
+          "files": 3,
+          "bytes_per_record": 54.162,
+          "amplification": 1.954
+        },
+        {
+          "point": "settled",
+          "apparent_bytes": 46678016,
+          "allocated_bytes": 46678016,
+          "files": 3,
+          "bytes_per_record": 54.214,
+          "amplification": 1.956
+        }
+      ],
+      "live_records": 860384,
+      "logical_bytes": 23852087,
+      "seed": "none (filled by this run)",
+      "notes": [
+        "The order page is ORDER BY … LIMIT 10 OFFSET n over an index, not a materialised list."
+      ]
+    }
+  ],
+  "skipped": [
+    {
+      "system": "mongodb/durable",
+      "reason": "spawn mongod: No such file or directory (os error 2)"
+    },
+    {
+      "system": "mongodb/relaxed",
+      "reason": "spawn mongod: No such file or directory (os error 2)"
+    },
+    {
+      "system": "postgres/durable",
+      "reason": "initdb: No such file or directory (os error 2)"
+    },
+    {
+      "system": "postgres/relaxed",
+      "reason": "initdb: No such file or directory (os error 2)"
+    },
+    {
+      "system": "mysql/durable",
+      "reason": "mysqld: No such file or directory (os error 2)"
+    },
+    {
+      "system": "mysql/relaxed",
+      "reason": "mysqld: No such file or directory (os error 2)"
+    },
+    {
+      "system": "shop mongodb/durable",
+      "reason": "spawn mongod: No such file or directory (os error 2)"
+    },
+    {
+      "system": "shop mongodb/relaxed",
+      "reason": "spawn mongod: No such file or directory (os error 2)"
+    },
+    {
+      "system": "shop postgres/durable",
+      "reason": "initdb: No such file or directory (os error 2)"
+    },
+    {
+      "system": "shop postgres/relaxed",
+      "reason": "initdb: No such file or directory (os error 2)"
+    },
+    {
+      "system": "shop mysql/durable",
+      "reason": "mysqld: No such file or directory (os error 2)"
+    },
+    {
+      "system": "shop mysql/relaxed",
+      "reason": "mysqld: No such file or directory (os error 2)"
+    }
+  ],
+  "out_of_scope": [
+    "joins and ad-hoc predicates (WaveDB has none)",
+    "history comparison — RFC 0060 phase 4",
+    "server bracket: MongoDB, PostgreSQL, MySQL — phases 2-3",
+    "concurrency sweep — phase 5"
+  ]
+}
