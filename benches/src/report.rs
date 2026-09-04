@@ -5,10 +5,8 @@
 //! `index.md` gets one human line per run so `git log` on that file reads as a
 //! history.
 
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::footprint::Point;
 use crate::host::Host;
 use crate::json::{Json, fnv1a};
 use crate::systems::{Cfg, SystemReport};
@@ -28,6 +26,18 @@ pub struct Provenance {
     pub flake_lock: String,
     pub timestamp: String,
     pub load_average: f64,
+    /// Did this run measure inside the declared 500 MB / 4 CPU cage?
+    ///
+    /// Recorded rather than assumed, and only ever `false` beside `forced`:
+    /// the guard refuses to record otherwise. A reader should not have to
+    /// re-derive it from the budgets to know whether a row is standard.
+    pub caged: bool,
+    /// Was a guard overridden with `--force`?
+    ///
+    /// Without this a forced row is indistinguishable from a clean one on a
+    /// casual read — the load average is recorded, but nobody recomputes the
+    /// budget from the CPU count to check it.
+    pub forced: bool,
 }
 
 impl Provenance {
@@ -46,6 +56,10 @@ impl Provenance {
             flake_lock,
             timestamp: utc_stamp(),
             load_average: crate::host::load_average(),
+            // Both are the runner's to answer: it holds the flags and has
+            // fingerprinted the host by the time it can tell.
+            caged: false,
+            forced: false,
         }
     }
 }
@@ -67,7 +81,7 @@ pub fn write(
 
     std::fs::write(&path, record(cfg, shop, host, prov, reports, skipped))
         .map_err(|e| format!("write record: {e}"))?;
-    append_index(results_dir, host, prov, reports)?;
+    append_index(results_dir, host, prov, reports, skipped)?;
     Ok(path)
 }
 
@@ -88,6 +102,8 @@ fn record(
             j.boolean("dirty", prov.dirty);
             j.str("flake_lock_fnv1a", &prov.flake_lock);
             j.ratio("load_average_at_start", prov.load_average);
+            j.boolean("caged", prov.caged);
+            j.boolean("forced", prov.forced);
         });
         j.obj(Some("host"), |j| {
             j.str("key", &host.key);
@@ -229,51 +245,30 @@ fn append_index(
     host: &Host,
     prov: &Provenance,
     reports: &[SystemReport],
+    skipped: &[Skipped],
 ) -> Result<(), String> {
     let index = results_dir.join("index.md");
     if !index.exists() {
         std::fs::write(&index, INDEX_HEADER)
             .map_err(|e| format!("index: {e}"))?;
     }
-    let mut line = format!(
-        "- `{}` · {} · `{}`{} — ",
-        prov.timestamp,
-        host.key,
-        prov.git_sha,
-        if prov.dirty { " **(dirty tree)**" } else { "" }
-    );
-    for (i, r) in reports.iter().enumerate() {
-        if i > 0 {
-            line.push_str("; ");
-        }
-        let settled = r.footprint(Point::Settled);
-        let _ = write!(
-            line,
-            "{}: insert {:.0}/s, read_cold {:.0}/s, update {:.0}/s, {:.2}× space",
-            r.label(),
-            r.phase("insert").map_or(0.0, |p| p.dist.ops_per_sec()),
-            r.phase("read_cold").map_or(0.0, |p| p.dist.ops_per_sec()),
-            r.phase("update").map_or(0.0, |p| p.dist.ops_per_sec()),
-            settled.amplification(r.logical_bytes),
-        );
-    }
-    line.push('\n');
-
     let mut text =
         std::fs::read_to_string(&index).map_err(|e| format!("index: {e}"))?;
-    text.push_str(&line);
+    text.push_str(&crate::index::section(host, prov, reports, skipped));
     std::fs::write(&index, text).map_err(|e| format!("index: {e}"))
 }
 
 const INDEX_HEADER: &str = "\
 # Benchmark results
 
-Append-only (RFC 0060 §7). One line per recorded run; the JSON record beside it
-carries the full configuration. **Rows are comparable only within one host
-key** — a different machine is a different lane, never a trend line.
+Append-only (RFC 0060 §7). One section per recorded run — the table it printed,
+under the machine it ran on; the JSON record beside it carries the full
+configuration. **Rows are comparable only within one host key**: a different
+machine is a different lane, never a trend line, and every heading names its
+lane for that reason.
 
-`update` rows: WaveDB retains every superseded version and the others retain
-none, so read them beside the space column.
+`update` columns: WaveDB retains every superseded version and the others retain
+none, so read them beside `payload` and `amp`.
 
 ";
 
